@@ -126,7 +126,7 @@ contains
     real(RP) :: vel_y = 1.0_RP
     real(RP) :: vel_z = 1.0_RP
     character(len=8) :: DGOptrKernel_OptType = "OPT1" ! GENERAL or OPT1
-    character(len=16) :: DqdtKernel_Type = "OPENACC_SPLIT"
+    character(len=20) :: DqdtKernel_Type = "OPENACC_SPLIT"
 
     namelist /PARAM_ADVECT3D/ &
       NeX, NeY, NeZ, PolyOrder,   &

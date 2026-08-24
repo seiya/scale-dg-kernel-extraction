@@ -35,7 +35,7 @@ module mod_common
     integer(IP) :: count_accum = 0_int64
     integer(IP) :: count_rate  = 0_int64
   end type Timer  
-  public :: Timer_start, Timer_stop, Timer_elapsed
+  public :: Timer_start, Timer_stop, Timer_add, Timer_elapsed
 
 contains
 !OCL SERIAL
@@ -57,6 +57,20 @@ contains
                     + (count_now - this%count_start)
     return
   end subroutine Timer_stop  
+!OCL SERIAL
+  subroutine Timer_add(this, time_sec)
+    implicit none
+    type(Timer), intent(inout) :: this
+    real(RP), intent(in) :: time_sec
+    integer(IP) :: count_now
+    !------------------------------------------------------------------------------
+    if (this%count_rate == 0_int64) then
+      call system_clock(count_now, this%count_rate)
+    end if
+    this%count_accum = this%count_accum &
+                    + nint(time_sec*real(this%count_rate,RP),IP)
+    return
+  end subroutine Timer_add
 !OCL SERIAL
   function Timer_elapsed(this) result(time_sec)
     implicit none

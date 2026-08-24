@@ -108,8 +108,7 @@ Both `GENERAL` and `OPT1` kernels are supported. `OPT1` continues to be
 generated from `mod_dg_optr_kernel_opt1.F90.erb`; run `make` after changing the
 template to regenerate `mod_dg_optr_kernel_opt1.f90`.
 
-Two OpenACC implementations of the volume derivative and surface lifting are
-available in the same executable and can be selected in the input file:
+The following tendency implementations can be selected in the input file:
 
 - `DqdtKernel_Type = "OPENACC_ASIS"` runs the original single `cal_dqdt`
   accelerator region with element-private temporary arrays. Its `ke` loop is
@@ -120,11 +119,63 @@ available in the same executable and can be selected in the input file:
   kernels are launched by the all-element DG operator routines themselves;
   their lowest layer owns the `ke` loop and the element-internal vector loops.
 
-The total `Volume derivate + surface lift` timing is printed for both modes.
-The split mode additionally prints one timing for each of its four kernels, so
+### CUDA Fortran split build
+
+The CUDA Fortran split implementation is built together with the OpenACC
+implementations by running
+
+```bash
+make clean
+make CUDA=1
+```
+
+Select it at run time with
+
+```fortran
+DqdtKernel_Type = "CUDAFORTRAN_SPLIT"
+```
+
+An additional p=7-only fused variant is selected with
+
+```fortran
+DqdtKernel_Type = "CUDAFORTRAN_FUSED"
+```
+
+It evaluates the complete element tendency in one CUDA Fortran kernel. Each
+p=7 element uses one 256-thread block: every thread evaluates two volume nodes,
+reusing their x/y contraction coefficients. Volume fluxes, boundary fluxes,
+and minus-side field values are staged in shared memory, after which the same
+kernel performs tensor-product differentiation, surface lifting, and final
+assembly. No intermediate volume-flux, derivative, lift, or boundary-flux
+array is required.
+
+The CUDA Fortran kernels are in `mod_cuda_dg_kernels.cuf`. OpenACC `host_data`
+regions pass the resident device arrays directly to CUDA Fortran, without
+copying the fields through the host. The FUSED tendency synchronizes once
+after its single kernel, and a CUDA event reports its device-execution time. The
+aggregate `Volume derivate + surface lift` timer remains the end-to-end wall
+time; unlike the OpenACC per-kernel wall timers, CUDA's detailed values exclude
+host launch and synchronization overhead.
+
+For the benchmark default `PolyOrder = 7` (`Nq = 8`), CUDA Fortran
+differentiation dispatches to a specialized one-block-per-element kernel. It
+uses 512 threads in SPLIT and 256 threads (two nodes per thread) in FUSED, and
+stages the three volume fluxes and the derivative matrices in shared memory.
+The specialized lift kernels read face values directly; avoiding shared-memory
+staging removes the double-precision bank conflicts seen on GB200. Other
+polynomial orders use the general CUDA kernels;
+`DGOptrKernel_OptType` continues to select GENERAL or OPT1 only for the
+OpenACC implementations. A build made without `CUDA=1` rejects
+both CUDA Fortran modes at startup.
+
+The total `Volume derivate + surface lift` timing is printed for every mode.
+The split modes additionally print their component timings, so
 the implementations can be compared by changing only `DqdtKernel_Type` while
 keeping all other input values unchanged. The split mode allocates seven
 additional `Np`-by-`Ne` work arrays (about 896 MiB for p=7 and a 32-cubed mesh).
+The FUSED mode does not allocate any of these work arrays. It is specialized
+for this extraction program's spatially uniform, time-invariant velocity
+fields and uses one representative `u`, `v`, and `w` value in the kernel.
 
 The supplied `input_large.conf` is a representative p=7 GPU benchmark
 with 32 elements in each direction. It requires approximately a few GiB of GPU
@@ -149,7 +200,7 @@ Simulation parameters are specified in `input.conf`, including
 - Number of mesh elements in each direction (`NeX`, `NeY`, `NeZ`),
 - Polynomial order (`PolyOrder`),
 - DG operator optimization type (`DGOptrKernel_OptType`).
-- OpenACC tendency kernel type (`DqdtKernel_Type`).
+- Tendency kernel type (`DqdtKernel_Type`).
 - Time step (`dt`)
 - Number of time steps (`nstep`)
 

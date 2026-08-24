@@ -1,0 +1,1001 @@
+!> CUDA Fortran implementation of the split tendency kernels.
+module mod_cuda_dg_kernels
+  use cudafor
+  use mod_common, only: RP
+  implicit none
+  private
+
+  logical, public, parameter :: cuda_dg_kernels_available = .true.
+
+  integer, parameter :: CUDA_BLOCK_SIZE = 256
+  integer, parameter :: CUDA_P7_BLOCK_SIZE = 512
+  integer, parameter :: CUDA_FUSED_P7_BLOCK_SIZE = 256
+
+  type(cudaEvent), save :: split_events(5)
+  logical, save :: split_events_initialized = .false.
+
+  public :: cuda_cal_volume_flux
+  public :: cuda_cal_volume_deriv
+  public :: cuda_cal_surface_lift
+  public :: cuda_assemble_dqdt
+  public :: cuda_cal_dqdt_split
+  public :: cuda_cal_dqdt_fused
+  public :: cuda_cal_elembnd_flux
+
+contains
+
+  subroutine cuda_cal_elembnd_flux( &
+    flux, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, &
+    Np, NfpTot, Ne, NeA )
+    implicit none
+    integer, intent(in) :: Np, NfpTot, Ne, NeA
+    real(RP), device, intent(out) :: flux(NfpTot,Ne)
+    real(RP), device, intent(in) :: q(Np,NeA), u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    integer, device, intent(in) :: VMapM(NfpTot,Ne), VMapP(NfpTot,Ne)
+    real(RP), device, intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+
+    integer :: nface, nblock
+
+    nface = NfpTot*Ne
+    nblock = (nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    call elembnd_flux_kernel<<<nblock,CUDA_BLOCK_SIZE>>>( &
+      flux, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    call synchronize_cuda_kernel("elembnd_flux_kernel")
+  end subroutine cuda_cal_elembnd_flux
+
+  subroutine cuda_cal_dqdt_fused( &
+    dqdt, q, u, v, w, D1D, D1D_tr, Lift_mat, Escale, &
+    VMapM, VMapP, normal_fn, Fscale, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), device, intent(out) :: dqdt(Np,NeA)
+    real(RP), device, intent(in) :: q(Np,NeA), u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), device, intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
+    real(RP), device, intent(in) :: Lift_mat(Nq,Nq,Nq,6)
+    real(RP), device, intent(in) :: Escale(Np,Ne,3)
+    integer, device, intent(in) :: VMapM(NfpTot,Ne), VMapP(NfpTot,Ne)
+    real(RP), device, intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+    real(RP), intent(out) :: kernel_time(2)
+
+    integer :: istat, iev
+    real :: elapsed_ms
+
+    if (Nq /= 8) then
+      write(*,*) "CUDAFORTRAN_FUSED currently requires PolyOrder=7"
+      error stop
+    end if
+    if (.not. split_events_initialized) then
+      do iev = 1, 5
+        istat = cudaEventCreate(split_events(iev))
+        if (istat /= cudaSuccess) call cuda_failure("cudaEventCreate",istat)
+      end do
+      split_events_initialized = .true.
+    end if
+
+    istat = cudaEventRecord(split_events(1),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call tendency_fused_p7_kernel<<<Ne,CUDA_FUSED_P7_BLOCK_SIZE>>>( &
+      dqdt, Escale, D1D, D1D_tr, Lift_mat, q, u, v, w, &
+      VMapM, VMapP, normal_fn, Fscale, Ne )
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) call cuda_failure( &
+      "tendency_fused_p7_kernel",istat)
+    istat = cudaEventRecord(split_events(2),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    istat = cudaEventSynchronize(split_events(2))
+    if (istat /= cudaSuccess) call cuda_failure("CUDA fused kernels",istat)
+
+    istat = cudaEventElapsedTime(elapsed_ms,split_events(1),split_events(2))
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventElapsedTime",istat)
+    kernel_time(1) = real(elapsed_ms,RP)*1.0e-3_RP
+    kernel_time(2) = 0.0_RP
+  end subroutine cuda_cal_dqdt_fused
+
+  subroutine cuda_cal_dqdt_split( &
+    flux_x, flux_y, flux_z, deriv_x, deriv_y, deriv_z, lift_out, dqdt, &
+    q, u, v, w, D1D, D1D_tr, Lift_mat, flux_bnd, Escale, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), device, intent(out) :: flux_x(Np,Ne), flux_y(Np,Ne), flux_z(Np,Ne)
+    real(RP), device, intent(out) :: deriv_x(Np,Ne), deriv_y(Np,Ne), deriv_z(Np,Ne)
+    real(RP), device, intent(out) :: lift_out(Np,Ne), dqdt(Np,NeA)
+    real(RP), device, intent(in) :: q(Np,NeA), u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), device, intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
+    real(RP), device, intent(in) :: Lift_mat(Nq,Nq,Nq,6), flux_bnd(NfpTot,Ne)
+    real(RP), device, intent(in) :: Escale(Np,Ne,3)
+    real(RP), intent(out) :: kernel_time(4)
+
+    integer :: istat, iev, npoint, nblock
+    real :: elapsed_ms
+
+    if (.not. split_events_initialized) then
+      do iev = 1, 5
+        istat = cudaEventCreate(split_events(iev))
+        if (istat /= cudaSuccess) call cuda_failure("cudaEventCreate",istat)
+      end do
+      split_events_initialized = .true.
+    end if
+
+    npoint = Np*Ne
+    nblock = (npoint+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    istat = cudaEventRecord(split_events(1),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+
+    call volume_flux_kernel<<<nblock,CUDA_BLOCK_SIZE>>>( &
+      flux_x, flux_y, flux_z, q, u, v, w, npoint )
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) call cuda_failure("volume_flux_kernel",istat)
+    istat = cudaEventRecord(split_events(2),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+
+    if (Nq == 8) then
+      call volume_deriv_p7_kernel<<<Ne,CUDA_P7_BLOCK_SIZE>>>( &
+        deriv_x, deriv_y, deriv_z, D1D, D1D_tr, flux_x, flux_y, flux_z, Ne )
+    else
+      call volume_deriv_kernel<<<nblock,CUDA_BLOCK_SIZE>>>( &
+        deriv_x, deriv_y, deriv_z, D1D, D1D_tr, &
+        flux_x, flux_y, flux_z, Nq, Np, npoint )
+    end if
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) call cuda_failure("volume_deriv_kernel",istat)
+    istat = cudaEventRecord(split_events(3),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+
+    if (Nq == 8) then
+      call surface_lift_p7_kernel<<<Ne,CUDA_P7_BLOCK_SIZE>>>( &
+        lift_out, Lift_mat, flux_bnd, Ne )
+    else
+      call surface_lift_kernel<<<nblock,CUDA_BLOCK_SIZE>>>( &
+        lift_out, Lift_mat, flux_bnd, Nq, Np, NfpTot, npoint )
+    end if
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) call cuda_failure("surface_lift_kernel",istat)
+    istat = cudaEventRecord(split_events(4),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+
+    call dqdt_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE>>>( &
+      dqdt, Escale, deriv_x, deriv_y, deriv_z, lift_out, npoint )
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) call cuda_failure("dqdt_assembly_kernel",istat)
+    istat = cudaEventRecord(split_events(5),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    istat = cudaEventSynchronize(split_events(5))
+    if (istat /= cudaSuccess) call cuda_failure("CUDA split kernels",istat)
+
+    do iev = 1, 4
+      istat = cudaEventElapsedTime(elapsed_ms,split_events(iev),split_events(iev+1))
+      if (istat /= cudaSuccess) call cuda_failure("cudaEventElapsedTime",istat)
+      kernel_time(iev) = real(elapsed_ms,RP)*1.0e-3_RP
+    end do
+  end subroutine cuda_cal_dqdt_split
+  attributes(global) subroutine volume_flux_kernel( &
+    flux_x, flux_y, flux_z, q, u, v, w, npoint )
+    implicit none
+    integer, value :: npoint
+    real(RP), device :: flux_x(*), flux_y(*), flux_z(*)
+    real(RP), device :: q(*), u(*), v(*), w(*)
+
+    integer :: idx
+
+    idx = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    if (idx <= npoint) then
+      flux_x(idx) = q(idx)*u(idx)
+      flux_y(idx) = q(idx)*v(idx)
+      flux_z(idx) = q(idx)*w(idx)
+    end if
+  end subroutine volume_flux_kernel
+
+  attributes(global) subroutine volume_deriv_kernel( &
+    deriv_x, deriv_y, deriv_z, D1D, D1D_tr, &
+    flux_x, flux_y, flux_z, Nq, Np, npoint )
+    implicit none
+    integer, value :: Nq, Np, npoint
+    real(RP), device :: deriv_x(*), deriv_y(*), deriv_z(*)
+    real(RP), device :: D1D(*), D1D_tr(*)
+    real(RP), device :: flux_x(*), flux_y(*), flux_z(*)
+
+    integer :: idx, node, elem_offset
+    integer :: i, j, k, l, nq2
+    integer :: ix, iy, iz
+    real(RP) :: sum_x, sum_y, sum_z
+
+    idx = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    nq2 = Nq*Nq
+
+    if (idx <= npoint) then
+      node = mod(idx-1,Np) + 1
+      elem_offset = idx - node
+      i = mod(node-1,Nq) + 1
+      j = mod((node-1)/Nq,Nq) + 1
+      k = (node-1)/nq2 + 1
+
+      sum_x = 0.0_RP
+      sum_y = 0.0_RP
+      sum_z = 0.0_RP
+      do l = 1, Nq
+        ix = elem_offset + l + (j-1)*Nq + (k-1)*nq2
+        iy = elem_offset + i + (l-1)*Nq + (k-1)*nq2
+        iz = elem_offset + i + (j-1)*Nq + (l-1)*nq2
+        sum_x = sum_x + D1D(i+(l-1)*Nq)*flux_x(ix)
+        sum_y = sum_y + D1D_tr(l+(j-1)*Nq)*flux_y(iy)
+        sum_z = sum_z + D1D_tr(l+(k-1)*Nq)*flux_z(iz)
+      end do
+
+      deriv_x(idx) = sum_x
+      deriv_y(idx) = sum_y
+      deriv_z(idx) = sum_z
+    end if
+  end subroutine volume_deriv_kernel
+
+  !> Polynomial-order-7 derivative kernel.  One CUDA block owns one
+  !! element, so values reused by the three tensor contractions are read
+  !! from global memory once and then served from shared memory.
+  attributes(global) subroutine volume_deriv_p7_kernel( &
+    deriv_x, deriv_y, deriv_z, D1D, D1D_tr, &
+    flux_x, flux_y, flux_z, Ne )
+    implicit none
+    integer, value :: Ne
+    real(RP), device :: deriv_x(*), deriv_y(*), deriv_z(*)
+    real(RP), device :: D1D(*), D1D_tr(*)
+    real(RP), device :: flux_x(*), flux_y(*), flux_z(*)
+
+    real(RP), shared :: sD1D(64), sD1D_tr(64)
+    real(RP), shared :: sflux_x(512), sflux_y(512), sflux_z(512)
+    integer :: elem, elem_offset, tid, node, i, j, k, l
+    integer :: ix, iy, iz
+    real(RP) :: sum_x, sum_y, sum_z
+
+    elem = blockIdx%x
+    if (elem > Ne) return
+
+    tid = threadIdx%x
+    elem_offset = (elem-1)*512
+
+    if (tid <= 64) then
+      sD1D(tid) = D1D(tid)
+      sD1D_tr(tid) = D1D_tr(tid)
+    end if
+    node = tid
+    sflux_x(node) = flux_x(elem_offset+node)
+    sflux_y(node) = flux_y(elem_offset+node)
+    sflux_z(node) = flux_z(elem_offset+node)
+    call syncthreads()
+
+    i = mod(node-1,8) + 1
+    j = mod((node-1)/8,8) + 1
+    k = (node-1)/64 + 1
+
+    sum_x = 0.0_RP
+    sum_y = 0.0_RP
+    sum_z = 0.0_RP
+    do l = 1, 8
+      ix = l + (j-1)*8 + (k-1)*64
+      iy = i + (l-1)*8 + (k-1)*64
+      iz = i + (j-1)*8 + (l-1)*64
+      sum_x = sum_x + sD1D(i+(l-1)*8)*sflux_x(ix)
+      sum_y = sum_y + sD1D_tr(l+(j-1)*8)*sflux_y(iy)
+      sum_z = sum_z + sD1D_tr(l+(k-1)*8)*sflux_z(iz)
+    end do
+
+    deriv_x(elem_offset+node) = sum_x
+    deriv_y(elem_offset+node) = sum_y
+    deriv_z(elem_offset+node) = sum_z
+  end subroutine volume_deriv_p7_kernel
+
+  !> Form the p=7 volume fluxes directly in shared memory and immediately
+  !! apply the tensor-product derivative, avoiding three global work arrays.
+  attributes(global) subroutine volume_flux_deriv_p7_kernel( &
+    deriv_x, deriv_y, deriv_z, D1D, D1D_tr, q, u, v, w, Ne )
+    implicit none
+    integer, value :: Ne
+    real(RP), device :: deriv_x(*), deriv_y(*), deriv_z(*)
+    real(RP), device :: D1D(*), D1D_tr(*)
+    real(RP), device :: q(*), u(*), v(*), w(*)
+
+    real(RP), shared :: sD1D(64), sD1D_tr(64)
+    real(RP), shared :: sflux_x(512), sflux_y(512), sflux_z(512)
+    integer :: elem, elem_offset, tid, node1, node2, i, j, k1, k2, l
+    integer :: ix1, iy1, iz, ix2, iy2
+    real(RP) :: q_node, mat_x, mat_y, mat_z1, mat_z2
+    real(RP) :: sum_x1, sum_y1, sum_z1, sum_x2, sum_y2, sum_z2
+
+    elem = blockIdx%x
+    if (elem > Ne) return
+
+    tid = threadIdx%x
+    node1 = tid
+    node2 = tid + 256
+    elem_offset = (elem-1)*512
+
+    if (tid <= 64) then
+      sD1D(tid) = D1D(tid)
+      sD1D_tr(tid) = D1D_tr(tid)
+    end if
+    q_node = q(elem_offset+node1)
+    sflux_x(node1) = q_node*u(elem_offset+node1)
+    sflux_y(node1) = q_node*v(elem_offset+node1)
+    sflux_z(node1) = q_node*w(elem_offset+node1)
+    q_node = q(elem_offset+node2)
+    sflux_x(node2) = q_node*u(elem_offset+node2)
+    sflux_y(node2) = q_node*v(elem_offset+node2)
+    sflux_z(node2) = q_node*w(elem_offset+node2)
+    call syncthreads()
+
+    i = mod(node1-1,8) + 1
+    j = mod((node1-1)/8,8) + 1
+    k1 = (node1-1)/64 + 1
+    k2 = k1 + 4
+
+    sum_x1 = 0.0_RP
+    sum_y1 = 0.0_RP
+    sum_z1 = 0.0_RP
+    sum_x2 = 0.0_RP
+    sum_y2 = 0.0_RP
+    sum_z2 = 0.0_RP
+    do l = 1, 8
+      ix1 = l + (j-1)*8 + (k1-1)*64
+      iy1 = i + (l-1)*8 + (k1-1)*64
+      iz = i + (j-1)*8 + (l-1)*64
+      ix2 = ix1 + 256
+      iy2 = iy1 + 256
+      mat_x = sD1D(i+(l-1)*8)
+      mat_y = sD1D_tr(l+(j-1)*8)
+      mat_z1 = sD1D_tr(l+(k1-1)*8)
+      mat_z2 = sD1D_tr(l+(k2-1)*8)
+      sum_x1 = sum_x1 + mat_x*sflux_x(ix1)
+      sum_y1 = sum_y1 + mat_y*sflux_y(iy1)
+      sum_z1 = sum_z1 + mat_z1*sflux_z(iz)
+      sum_x2 = sum_x2 + mat_x*sflux_x(ix2)
+      sum_y2 = sum_y2 + mat_y*sflux_y(iy2)
+      sum_z2 = sum_z2 + mat_z2*sflux_z(iz)
+    end do
+
+    deriv_x(elem_offset+node1) = sum_x1
+    deriv_y(elem_offset+node1) = sum_y1
+    deriv_z(elem_offset+node1) = sum_z1
+    deriv_x(elem_offset+node2) = sum_x2
+    deriv_y(elem_offset+node2) = sum_y2
+    deriv_z(elem_offset+node2) = sum_z2
+  end subroutine volume_flux_deriv_p7_kernel
+
+  !> Form volume fluxes, differentiate, lift surface fluxes, and assemble dqdt.
+  !! Two nodes with common x/y contraction coefficients are handled per thread.
+  attributes(global) subroutine volume_flux_deriv_lift_assembly_p7_kernel( &
+    dqdt, Escale, D1D, D1D_tr, Lift_mat, flux_bnd, q, u, v, w, Ne )
+    implicit none
+    integer, value :: Ne
+    real(RP), device :: dqdt(*), Escale(*), D1D(*), D1D_tr(*)
+    real(RP), device :: Lift_mat(*), flux_bnd(*), q(*), u(*), v(*), w(*)
+
+    real(RP), shared :: sD1D(64), sD1D_tr(64)
+    real(RP), shared :: sflux_x(512), sflux_y(512), sflux_z(512)
+    integer :: elem, elem_offset, face_offset, tid, node1, node2
+    integer :: i, j, k1, k2, l, ix1, iy1, iz, ix2, iy2
+    integer :: face11, face12, face13, face14, face15, face16
+    integer :: face21, face22, face23, face24, face25, face26
+    integer :: idx1, idx2, npoint
+    real(RP) :: q_node, mat_x, mat_y, mat_z1, mat_z2
+    real(RP) :: sum_x1, sum_y1, sum_z1, sum_x2, sum_y2, sum_z2
+    real(RP) :: lift1, lift2
+
+    elem = blockIdx%x
+    if (elem > Ne) return
+
+    tid = threadIdx%x
+    node1 = tid
+    node2 = tid + 256
+    elem_offset = (elem-1)*512
+    face_offset = (elem-1)*384
+
+    if (tid <= 64) then
+      sD1D(tid) = D1D(tid)
+      sD1D_tr(tid) = D1D_tr(tid)
+    end if
+    q_node = q(elem_offset+node1)
+    sflux_x(node1) = q_node*u(elem_offset+node1)
+    sflux_y(node1) = q_node*v(elem_offset+node1)
+    sflux_z(node1) = q_node*w(elem_offset+node1)
+    q_node = q(elem_offset+node2)
+    sflux_x(node2) = q_node*u(elem_offset+node2)
+    sflux_y(node2) = q_node*v(elem_offset+node2)
+    sflux_z(node2) = q_node*w(elem_offset+node2)
+    call syncthreads()
+
+    i = mod(node1-1,8) + 1
+    j = mod((node1-1)/8,8) + 1
+    k1 = (node1-1)/64 + 1
+    k2 = k1 + 4
+
+    sum_x1 = 0.0_RP
+    sum_y1 = 0.0_RP
+    sum_z1 = 0.0_RP
+    sum_x2 = 0.0_RP
+    sum_y2 = 0.0_RP
+    sum_z2 = 0.0_RP
+    do l = 1, 8
+      ix1 = l + (j-1)*8 + (k1-1)*64
+      iy1 = i + (l-1)*8 + (k1-1)*64
+      iz = i + (j-1)*8 + (l-1)*64
+      ix2 = ix1 + 256
+      iy2 = iy1 + 256
+      mat_x = sD1D(i+(l-1)*8)
+      mat_y = sD1D_tr(l+(j-1)*8)
+      mat_z1 = sD1D_tr(l+(k1-1)*8)
+      mat_z2 = sD1D_tr(l+(k2-1)*8)
+      sum_x1 = sum_x1 + mat_x*sflux_x(ix1)
+      sum_y1 = sum_y1 + mat_y*sflux_y(iy1)
+      sum_z1 = sum_z1 + mat_z1*sflux_z(iz)
+      sum_x2 = sum_x2 + mat_x*sflux_x(ix2)
+      sum_y2 = sum_y2 + mat_y*sflux_y(iy2)
+      sum_z2 = sum_z2 + mat_z2*sflux_z(iz)
+    end do
+
+    face11 = i + (k1-1)*8
+    face12 = 64 + j + (k1-1)*8
+    face13 = 128 + i + (k1-1)*8
+    face14 = 192 + j + (k1-1)*8
+    face15 = 256 + i + (j-1)*8
+    face16 = 320 + i + (j-1)*8
+    face21 = i + (k2-1)*8
+    face22 = 64 + j + (k2-1)*8
+    face23 = 128 + i + (k2-1)*8
+    face24 = 192 + j + (k2-1)*8
+    face25 = face15
+    face26 = face16
+
+    lift1 = &
+        Lift_mat(node1)       *flux_bnd(face_offset+face11) &
+      + Lift_mat(node1+512)   *flux_bnd(face_offset+face12) &
+      + Lift_mat(node1+1024)  *flux_bnd(face_offset+face13) &
+      + Lift_mat(node1+1536)  *flux_bnd(face_offset+face14) &
+      + Lift_mat(node1+2048)  *flux_bnd(face_offset+face15) &
+      + Lift_mat(node1+2560)  *flux_bnd(face_offset+face16)
+    lift2 = &
+        Lift_mat(node2)       *flux_bnd(face_offset+face21) &
+      + Lift_mat(node2+512)   *flux_bnd(face_offset+face22) &
+      + Lift_mat(node2+1024)  *flux_bnd(face_offset+face23) &
+      + Lift_mat(node2+1536)  *flux_bnd(face_offset+face24) &
+      + Lift_mat(node2+2048)  *flux_bnd(face_offset+face25) &
+      + Lift_mat(node2+2560)  *flux_bnd(face_offset+face26)
+
+    idx1 = elem_offset + node1
+    idx2 = elem_offset + node2
+    npoint = 512*Ne
+    dqdt(idx1) = -(Escale(idx1)*sum_x1 + Escale(idx1+npoint)*sum_y1 &
+      + Escale(idx1+2*npoint)*sum_z1 + lift1)
+    dqdt(idx2) = -(Escale(idx2)*sum_x2 + Escale(idx2+npoint)*sum_y2 &
+      + Escale(idx2+2*npoint)*sum_z2 + lift2)
+  end subroutine volume_flux_deriv_lift_assembly_p7_kernel
+
+  !> Complete p=7 element tendency. Boundary and volume fluxes are staged in
+  !! shared memory before differentiation, lifting, and final assembly.
+  attributes(global) subroutine tendency_fused_p7_kernel( &
+    dqdt, Escale, D1D, D1D_tr, Lift_mat, q, u, v, w, &
+    VMapM, VMapP, normal_fn, Fscale, Ne )
+    implicit none
+    integer, value :: Ne
+    real(RP), device :: dqdt(*), Escale(*), D1D(*), D1D_tr(*)
+    real(RP), device :: Lift_mat(*), q(*), u(*), v(*), w(*)
+    integer, device :: VMapM(*), VMapP(*)
+    real(RP), device :: normal_fn(*), Fscale(*)
+
+    real(RP), shared :: sD1D(64), sD1D_tr(64)
+    real(RP), shared :: sflux_x(512), sflux_y(512), sflux_z(512)
+    real(RP), shared :: sflux_bnd(384)
+    real(RP), shared :: sQ(512)
+    integer :: elem, elem_offset, face_offset, tid, node1, node2
+    integer :: i, j, k1, k2, l, ix1, iy1, iz, ix2, iy2
+    integer :: face11, face12, face13, face14, face15, face16
+    integer :: face21, face22, face23, face24, face25, face26
+    integer :: idx1, idx2, npoint, nface, fp, fidx, iM, iP
+    real(RP) :: q_node, u_node, v_node, w_node
+    real(RP) :: mat_x, mat_y, mat_z1, mat_z2
+    real(RP) :: sum_x1, sum_y1, sum_z1, sum_x2, sum_y2, sum_z2
+    real(RP) :: lift1, lift2, qM, qP, VelM, VelP, alpha
+
+    elem = blockIdx%x
+    if (elem > Ne) return
+
+    tid = threadIdx%x
+    node1 = tid
+    node2 = tid + 256
+    elem_offset = (elem-1)*512
+    face_offset = (elem-1)*384
+    nface = 384*Ne
+
+    if (tid <= 64) then
+      sD1D(tid) = D1D(tid)
+      sD1D_tr(tid) = D1D_tr(tid)
+    end if
+    u_node = u(1)
+    v_node = v(1)
+    w_node = w(1)
+    q_node = q(elem_offset+node1)
+    sQ(node1) = q_node
+    sflux_x(node1) = q_node*u_node
+    sflux_y(node1) = q_node*v_node
+    sflux_z(node1) = q_node*w_node
+    q_node = q(elem_offset+node2)
+    sQ(node2) = q_node
+    sflux_x(node2) = q_node*u_node
+    sflux_y(node2) = q_node*v_node
+    sflux_z(node2) = q_node*w_node
+    call syncthreads()
+
+    fp = tid
+    fidx = face_offset + fp
+    iM = VMapM(fidx)
+    iP = VMapP(fidx)
+    iM = iM - elem_offset
+    qM = sQ(iM)
+    qP = q(iP)
+    VelM = u_node*normal_fn(fidx) + v_node*normal_fn(fidx+nface) &
+      + w_node*normal_fn(fidx+2*nface)
+    VelP = u_node*normal_fn(fidx) + v_node*normal_fn(fidx+nface) &
+      + w_node*normal_fn(fidx+2*nface)
+    alpha = 0.5_RP*abs(VelP+VelM)
+    sflux_bnd(fp) = 0.5_RP*Fscale(fidx)*( &
+      qP*VelP-qM*VelM-alpha*(qP-qM))
+    if (tid <= 128) then
+      fp = tid + 256
+      fidx = face_offset + fp
+      iM = VMapM(fidx)
+      iP = VMapP(fidx)
+      iM = iM - elem_offset
+      qM = sQ(iM)
+      qP = q(iP)
+      VelM = u_node*normal_fn(fidx) + v_node*normal_fn(fidx+nface) &
+        + w_node*normal_fn(fidx+2*nface)
+      VelP = u_node*normal_fn(fidx) + v_node*normal_fn(fidx+nface) &
+        + w_node*normal_fn(fidx+2*nface)
+      alpha = 0.5_RP*abs(VelP+VelM)
+      sflux_bnd(fp) = 0.5_RP*Fscale(fidx)*( &
+        qP*VelP-qM*VelM-alpha*(qP-qM))
+    end if
+    call syncthreads()
+
+    i = mod(node1-1,8) + 1
+    j = mod((node1-1)/8,8) + 1
+    k1 = (node1-1)/64 + 1
+    k2 = k1 + 4
+    sum_x1 = 0.0_RP
+    sum_y1 = 0.0_RP
+    sum_z1 = 0.0_RP
+    sum_x2 = 0.0_RP
+    sum_y2 = 0.0_RP
+    sum_z2 = 0.0_RP
+    do l = 1, 8
+      ix1 = l + (j-1)*8 + (k1-1)*64
+      iy1 = i + (l-1)*8 + (k1-1)*64
+      iz = i + (j-1)*8 + (l-1)*64
+      ix2 = ix1 + 256
+      iy2 = iy1 + 256
+      mat_x = sD1D(i+(l-1)*8)
+      mat_y = sD1D_tr(l+(j-1)*8)
+      mat_z1 = sD1D_tr(l+(k1-1)*8)
+      mat_z2 = sD1D_tr(l+(k2-1)*8)
+      sum_x1 = sum_x1 + mat_x*sflux_x(ix1)
+      sum_y1 = sum_y1 + mat_y*sflux_y(iy1)
+      sum_z1 = sum_z1 + mat_z1*sflux_z(iz)
+      sum_x2 = sum_x2 + mat_x*sflux_x(ix2)
+      sum_y2 = sum_y2 + mat_y*sflux_y(iy2)
+      sum_z2 = sum_z2 + mat_z2*sflux_z(iz)
+    end do
+
+    face11 = i + (k1-1)*8
+    face12 = 64 + j + (k1-1)*8
+    face13 = 128 + i + (k1-1)*8
+    face14 = 192 + j + (k1-1)*8
+    face15 = 256 + i + (j-1)*8
+    face16 = 320 + i + (j-1)*8
+    face21 = i + (k2-1)*8
+    face22 = 64 + j + (k2-1)*8
+    face23 = 128 + i + (k2-1)*8
+    face24 = 192 + j + (k2-1)*8
+    face25 = face15
+    face26 = face16
+    lift1 = Lift_mat(node1)*sflux_bnd(face11) &
+      + Lift_mat(node1+512)*sflux_bnd(face12) &
+      + Lift_mat(node1+1024)*sflux_bnd(face13) &
+      + Lift_mat(node1+1536)*sflux_bnd(face14) &
+      + Lift_mat(node1+2048)*sflux_bnd(face15) &
+      + Lift_mat(node1+2560)*sflux_bnd(face16)
+    lift2 = Lift_mat(node2)*sflux_bnd(face21) &
+      + Lift_mat(node2+512)*sflux_bnd(face22) &
+      + Lift_mat(node2+1024)*sflux_bnd(face23) &
+      + Lift_mat(node2+1536)*sflux_bnd(face24) &
+      + Lift_mat(node2+2048)*sflux_bnd(face25) &
+      + Lift_mat(node2+2560)*sflux_bnd(face26)
+
+    idx1 = elem_offset + node1
+    idx2 = elem_offset + node2
+    npoint = 512*Ne
+    dqdt(idx1) = -(Escale(idx1)*sum_x1 + Escale(idx1+npoint)*sum_y1 &
+      + Escale(idx1+2*npoint)*sum_z1 + lift1)
+    dqdt(idx2) = -(Escale(idx2)*sum_x2 + Escale(idx2+npoint)*sum_y2 &
+      + Escale(idx2+2*npoint)*sum_z2 + lift2)
+  end subroutine tendency_fused_p7_kernel
+
+  !> One-node-per-thread variant used to trade coefficient reuse for occupancy.
+  attributes(global) subroutine tendency_fused_p7_512_kernel( &
+    dqdt, Escale, D1D, D1D_tr, Lift_mat, q, u, v, w, &
+    VMapM, VMapP, normal_fn, Fscale, Ne )
+    implicit none
+    integer, value :: Ne
+    real(RP), device :: dqdt(*), Escale(*), D1D(*), D1D_tr(*)
+    real(RP), device :: Lift_mat(*), q(*), u(*), v(*), w(*)
+    integer, device :: VMapM(*), VMapP(*)
+    real(RP), device :: normal_fn(*), Fscale(*)
+
+    real(RP), shared :: sD1D(64), sD1D_tr(64)
+    real(RP), shared :: sflux_x(512), sflux_y(512), sflux_z(512)
+    real(RP), shared :: sflux_bnd(384)
+    real(RP), shared :: sQ(512)
+    integer :: elem, elem_offset, face_offset, tid, node
+    integer :: i, j, k, l, ix, iy, iz
+    integer :: face1, face2, face3, face4, face5, face6
+    integer :: idx, npoint, nface, fidx, iM, iP
+    real(RP) :: q_node, u_node, v_node, w_node
+    real(RP) :: sum_x, sum_y, sum_z, lift_value
+    real(RP) :: qM, qP, VelM, VelP, alpha
+
+    elem = blockIdx%x
+    if (elem > Ne) return
+    tid = threadIdx%x
+    node = tid
+    elem_offset = (elem-1)*512
+    face_offset = (elem-1)*384
+    nface = 384*Ne
+
+    if (tid <= 64) then
+      sD1D(tid) = D1D(tid)
+      sD1D_tr(tid) = D1D_tr(tid)
+    end if
+    q_node = q(elem_offset+node)
+    u_node = u(1)
+    v_node = v(1)
+    w_node = w(1)
+    sQ(node) = q_node
+    sflux_x(node) = q_node*u_node
+    sflux_y(node) = q_node*v_node
+    sflux_z(node) = q_node*w_node
+    call syncthreads()
+
+    if (tid <= 384) then
+      fidx = face_offset + tid
+      iM = VMapM(fidx)
+      iP = VMapP(fidx)
+      iM = iM - elem_offset
+      qM = sQ(iM)
+      qP = q(iP)
+      VelM = u_node*normal_fn(fidx) + v_node*normal_fn(fidx+nface) &
+        + w_node*normal_fn(fidx+2*nface)
+      VelP = u_node*normal_fn(fidx) + v_node*normal_fn(fidx+nface) &
+        + w_node*normal_fn(fidx+2*nface)
+      alpha = 0.5_RP*abs(VelP+VelM)
+      sflux_bnd(tid) = 0.5_RP*Fscale(fidx)*( &
+        qP*VelP-qM*VelM-alpha*(qP-qM))
+    end if
+    call syncthreads()
+
+    i = mod(node-1,8) + 1
+    j = mod((node-1)/8,8) + 1
+    k = (node-1)/64 + 1
+    sum_x = 0.0_RP
+    sum_y = 0.0_RP
+    sum_z = 0.0_RP
+    do l = 1, 8
+      ix = l + (j-1)*8 + (k-1)*64
+      iy = i + (l-1)*8 + (k-1)*64
+      iz = i + (j-1)*8 + (l-1)*64
+      sum_x = sum_x + sD1D(i+(l-1)*8)*sflux_x(ix)
+      sum_y = sum_y + sD1D_tr(l+(j-1)*8)*sflux_y(iy)
+      sum_z = sum_z + sD1D_tr(l+(k-1)*8)*sflux_z(iz)
+    end do
+
+    face1 = i + (k-1)*8
+    face2 = 64 + j + (k-1)*8
+    face3 = 128 + i + (k-1)*8
+    face4 = 192 + j + (k-1)*8
+    face5 = 256 + i + (j-1)*8
+    face6 = 320 + i + (j-1)*8
+    lift_value = Lift_mat(node)*sflux_bnd(face1) &
+      + Lift_mat(node+512)*sflux_bnd(face2) &
+      + Lift_mat(node+1024)*sflux_bnd(face3) &
+      + Lift_mat(node+1536)*sflux_bnd(face4) &
+      + Lift_mat(node+2048)*sflux_bnd(face5) &
+      + Lift_mat(node+2560)*sflux_bnd(face6)
+
+    idx = elem_offset + node
+    npoint = 512*Ne
+    dqdt(idx) = -(Escale(idx)*sum_x + Escale(idx+npoint)*sum_y &
+      + Escale(idx+2*npoint)*sum_z + lift_value)
+  end subroutine tendency_fused_p7_512_kernel
+
+  attributes(global) subroutine surface_lift_kernel( &
+    lift_out, Lift_mat, flux_bnd, Nq, Np, NfpTot, npoint )
+    implicit none
+    integer, value :: Nq, Np, NfpTot, npoint
+    real(RP), device :: lift_out(*), Lift_mat(*), flux_bnd(*)
+
+    integer :: idx, node, elem, elem_face_offset
+    integer :: i, j, k, nq2
+    integer :: face1, face2, face3, face4, face5, face6
+
+    idx = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    nq2 = Nq*Nq
+
+    if (idx <= npoint) then
+      node = mod(idx-1,Np) + 1
+      elem = (idx-1)/Np + 1
+      elem_face_offset = (elem-1)*NfpTot
+      i = mod(node-1,Nq) + 1
+      j = mod((node-1)/Nq,Nq) + 1
+      k = (node-1)/nq2 + 1
+
+      face1 = elem_face_offset + i + (k-1)*Nq
+      face2 = elem_face_offset + nq2 + j + (k-1)*Nq
+      face3 = elem_face_offset + 2*nq2 + i + (k-1)*Nq
+      face4 = elem_face_offset + 3*nq2 + j + (k-1)*Nq
+      face5 = elem_face_offset + 4*nq2 + i + (j-1)*Nq
+      face6 = elem_face_offset + 5*nq2 + i + (j-1)*Nq
+
+      lift_out(idx) = &
+          Lift_mat(node)       * flux_bnd(face1) &
+        + Lift_mat(node+Np)    * flux_bnd(face2) &
+        + Lift_mat(node+2*Np)  * flux_bnd(face3) &
+        + Lift_mat(node+3*Np)  * flux_bnd(face4) &
+        + Lift_mat(node+4*Np)  * flux_bnd(face5) &
+        + Lift_mat(node+5*Np)  * flux_bnd(face6)
+    end if
+  end subroutine surface_lift_kernel
+
+  !> Polynomial-order-7 lifting kernel using the read-only cache for face data.
+  attributes(global) subroutine surface_lift_p7_kernel( &
+    lift_out, Lift_mat, flux_bnd, Ne )
+    implicit none
+    integer, value :: Ne
+    real(RP), device :: lift_out(*), Lift_mat(*), flux_bnd(*)
+
+    integer :: elem, elem_offset, elem_face_offset, tid, node
+    integer :: i, j, k
+    integer :: face1, face2, face3, face4, face5, face6
+
+    elem = blockIdx%x
+    if (elem > Ne) return
+
+    tid = threadIdx%x
+    elem_offset = (elem-1)*512
+    elem_face_offset = (elem-1)*384
+
+    node = tid
+    i = mod(node-1,8) + 1
+    j = mod((node-1)/8,8) + 1
+    k = (node-1)/64 + 1
+
+    face1 = i + (k-1)*8
+    face2 = 64 + j + (k-1)*8
+    face3 = 128 + i + (k-1)*8
+    face4 = 192 + j + (k-1)*8
+    face5 = 256 + i + (j-1)*8
+    face6 = 320 + i + (j-1)*8
+
+    lift_out(elem_offset+node) = &
+        Lift_mat(node)        * flux_bnd(elem_face_offset+face1) &
+      + Lift_mat(node+512)    * flux_bnd(elem_face_offset+face2) &
+      + Lift_mat(node+1024)   * flux_bnd(elem_face_offset+face3) &
+      + Lift_mat(node+1536)   * flux_bnd(elem_face_offset+face4) &
+      + Lift_mat(node+2048)   * flux_bnd(elem_face_offset+face5) &
+      + Lift_mat(node+2560)   * flux_bnd(elem_face_offset+face6)
+  end subroutine surface_lift_p7_kernel
+
+  !> Polynomial-order-7 lifting and final tendency assembly in one kernel.
+  attributes(global) subroutine surface_lift_assembly_p7_kernel( &
+    dqdt, Escale, deriv_x, deriv_y, deriv_z, Lift_mat, flux_bnd, Ne )
+    implicit none
+    integer, value :: Ne
+    real(RP), device :: dqdt(*), Escale(*)
+    real(RP), device :: deriv_x(*), deriv_y(*), deriv_z(*)
+    real(RP), device :: Lift_mat(*), flux_bnd(*)
+
+    integer :: elem, elem_offset, elem_face_offset, tid, node, idx, npoint
+    integer :: i, j, k
+    integer :: face1, face2, face3, face4, face5, face6
+    real(RP) :: lift_value
+
+    elem = blockIdx%x
+    if (elem > Ne) return
+
+    tid = threadIdx%x
+    elem_offset = (elem-1)*512
+    elem_face_offset = (elem-1)*384
+
+    node = tid
+    i = mod(node-1,8) + 1
+    j = mod((node-1)/8,8) + 1
+    k = (node-1)/64 + 1
+
+    face1 = i + (k-1)*8
+    face2 = 64 + j + (k-1)*8
+    face3 = 128 + i + (k-1)*8
+    face4 = 192 + j + (k-1)*8
+    face5 = 256 + i + (j-1)*8
+    face6 = 320 + i + (j-1)*8
+
+    lift_value = &
+        Lift_mat(node)        * flux_bnd(elem_face_offset+face1) &
+      + Lift_mat(node+512)    * flux_bnd(elem_face_offset+face2) &
+      + Lift_mat(node+1024)   * flux_bnd(elem_face_offset+face3) &
+      + Lift_mat(node+1536)   * flux_bnd(elem_face_offset+face4) &
+      + Lift_mat(node+2048)   * flux_bnd(elem_face_offset+face5) &
+      + Lift_mat(node+2560)   * flux_bnd(elem_face_offset+face6)
+
+    idx = elem_offset + node
+    npoint = 512*Ne
+    dqdt(idx) = -( &
+        Escale(idx)*deriv_x(idx) &
+      + Escale(idx+npoint)*deriv_y(idx) &
+      + Escale(idx+2*npoint)*deriv_z(idx) &
+      + lift_value )
+  end subroutine surface_lift_assembly_p7_kernel
+
+  attributes(global) subroutine dqdt_assembly_kernel( &
+    dqdt, Escale, deriv_x, deriv_y, deriv_z, lift_in, npoint )
+    implicit none
+    integer, value :: npoint
+    real(RP), device :: dqdt(*), Escale(*)
+    real(RP), device :: deriv_x(*), deriv_y(*), deriv_z(*), lift_in(*)
+
+    integer :: idx
+
+    idx = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    if (idx <= npoint) then
+      dqdt(idx) = -( &
+          Escale(idx)*deriv_x(idx) &
+        + Escale(idx+npoint)*deriv_y(idx) &
+        + Escale(idx+2*npoint)*deriv_z(idx) &
+        + lift_in(idx) )
+    end if
+  end subroutine dqdt_assembly_kernel
+
+  attributes(global) subroutine elembnd_flux_kernel( &
+    flux, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    implicit none
+    integer, value :: nface
+    real(RP), device :: flux(*), q(*), u(*), v(*), w(*)
+    integer, device :: VMapM(*), VMapP(*)
+    real(RP), device :: normal_fn(*), Fscale(*)
+
+    integer :: idx, iM, iP
+    real(RP) :: qM, qP, VelM, VelP, alpha
+
+    idx = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    if (idx <= nface) then
+      iM = VMapM(idx)
+      iP = VMapP(idx)
+      qM = q(iM)
+      qP = q(iP)
+      VelM = u(iM)*normal_fn(idx) &
+           + v(iM)*normal_fn(idx+nface) &
+           + w(iM)*normal_fn(idx+2*nface)
+      VelP = u(iP)*normal_fn(idx) &
+           + v(iP)*normal_fn(idx+nface) &
+           + w(iP)*normal_fn(idx+2*nface)
+      alpha = 0.5_RP*abs(VelP+VelM)
+      flux(idx) = 0.5_RP*Fscale(idx)*( &
+        qP*VelP-qM*VelM-alpha*(qP-qM) )
+    end if
+  end subroutine elembnd_flux_kernel
+
+  subroutine cuda_cal_volume_flux( &
+    flux_x, flux_y, flux_z, q, u, v, w, Np, Ne, NeA )
+    implicit none
+    integer, intent(in) :: Np, Ne, NeA
+    real(RP), device, intent(out) :: flux_x(Np,Ne), flux_y(Np,Ne), flux_z(Np,Ne)
+    real(RP), device, intent(in) :: q(Np,NeA)
+    real(RP), device, intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+
+    integer :: npoint, nblock
+
+    npoint = Np*Ne
+    nblock = (npoint+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    call volume_flux_kernel<<<nblock,CUDA_BLOCK_SIZE>>>( &
+      flux_x, flux_y, flux_z, q, u, v, w, npoint )
+    call synchronize_cuda_kernel("volume_flux_kernel")
+  end subroutine cuda_cal_volume_flux
+
+  subroutine cuda_cal_volume_deriv( &
+    deriv_x, deriv_y, deriv_z, D1D, D1D_tr, &
+    flux_x, flux_y, flux_z, Nq, Np, Ne )
+    implicit none
+    integer, intent(in) :: Nq, Np, Ne
+    real(RP), device, intent(out) :: deriv_x(Np,Ne), deriv_y(Np,Ne), deriv_z(Np,Ne)
+    real(RP), device, intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
+    real(RP), device, intent(in) :: flux_x(Np,Ne), flux_y(Np,Ne), flux_z(Np,Ne)
+
+    integer :: npoint, nblock
+
+    if (Nq == 8) then
+      call volume_deriv_p7_kernel<<<Ne,CUDA_P7_BLOCK_SIZE>>>( &
+        deriv_x, deriv_y, deriv_z, D1D, D1D_tr, &
+        flux_x, flux_y, flux_z, Ne )
+      call synchronize_cuda_kernel("volume_deriv_p7_kernel")
+    else
+      npoint = Np*Ne
+      nblock = (npoint+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+      call volume_deriv_kernel<<<nblock,CUDA_BLOCK_SIZE>>>( &
+        deriv_x, deriv_y, deriv_z, D1D, D1D_tr, &
+        flux_x, flux_y, flux_z, Nq, Np, npoint )
+      call synchronize_cuda_kernel("volume_deriv_kernel")
+    end if
+  end subroutine cuda_cal_volume_deriv
+
+  subroutine cuda_cal_surface_lift( &
+    lift_out, Lift_mat, flux_bnd, Nq, Np, NfpTot, Ne )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne
+    real(RP), device, intent(out) :: lift_out(Np,Ne)
+    real(RP), device, intent(in) :: Lift_mat(Nq,Nq,Nq,6)
+    real(RP), device, intent(in) :: flux_bnd(NfpTot,Ne)
+
+    integer :: npoint, nblock
+
+    if (Nq == 8) then
+      call surface_lift_p7_kernel<<<Ne,CUDA_P7_BLOCK_SIZE>>>( &
+        lift_out, Lift_mat, flux_bnd, Ne )
+      call synchronize_cuda_kernel("surface_lift_p7_kernel")
+    else
+      npoint = Np*Ne
+      nblock = (npoint+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+      call surface_lift_kernel<<<nblock,CUDA_BLOCK_SIZE>>>( &
+        lift_out, Lift_mat, flux_bnd, Nq, Np, NfpTot, npoint )
+      call synchronize_cuda_kernel("surface_lift_kernel")
+    end if
+  end subroutine cuda_cal_surface_lift
+
+  subroutine cuda_assemble_dqdt( &
+    dqdt, Escale, deriv_x, deriv_y, deriv_z, lift_in, Np, Ne, NeA )
+    implicit none
+    integer, intent(in) :: Np, Ne, NeA
+    real(RP), device, intent(out) :: dqdt(Np,NeA)
+    real(RP), device, intent(in) :: Escale(Np,Ne,3)
+    real(RP), device, intent(in) :: deriv_x(Np,Ne), deriv_y(Np,Ne), deriv_z(Np,Ne)
+    real(RP), device, intent(in) :: lift_in(Np,Ne)
+
+    integer :: npoint, nblock
+
+    npoint = Np*Ne
+    nblock = (npoint+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    call dqdt_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE>>>( &
+      dqdt, Escale, deriv_x, deriv_y, deriv_z, lift_in, npoint )
+    call synchronize_cuda_kernel("dqdt_assembly_kernel")
+  end subroutine cuda_assemble_dqdt
+
+  subroutine cuda_failure(operation,istat)
+    implicit none
+    character(len=*), intent(in) :: operation
+    integer, intent(in) :: istat
+
+    write(*,*) trim(operation), ": ", trim(cudaGetErrorString(istat))
+    error stop
+  end subroutine cuda_failure
+
+  subroutine synchronize_cuda_kernel(kernel_name)
+    implicit none
+    character(len=*), intent(in) :: kernel_name
+    integer :: istat
+
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) then
+      write(*,*) trim(kernel_name), ": launch failed: ", trim(cudaGetErrorString(istat))
+      error stop
+    end if
+    istat = cudaDeviceSynchronize()
+    if (istat /= cudaSuccess) then
+      write(*,*) trim(kernel_name), ": execution failed: ", trim(cudaGetErrorString(istat))
+      error stop
+    end if
+  end subroutine synchronize_cuda_kernel
+end module mod_cuda_dg_kernels

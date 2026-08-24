@@ -8,7 +8,12 @@
 !<
 module mod_advect3d_eq
   use mod_common, only: RP, &
-  Timer, Timer_start, Timer_stop, Timer_elapsed
+  Timer, Timer_start, Timer_stop, Timer_add, Timer_elapsed
+  use mod_cuda_dg_kernels, only: &
+    cuda_dg_kernels_available,  &
+    cuda_cal_volume_flux, cuda_cal_volume_deriv, &
+    cuda_cal_surface_lift, cuda_assemble_dqdt, cuda_cal_dqdt_split, &
+    cuda_cal_dqdt_fused, cuda_cal_elembnd_flux
   implicit none
   private
 
@@ -25,8 +30,10 @@ module mod_advect3d_eq
 
   integer, parameter :: DQDT_KERNEL_OPENACC_ASIS  = 1
   integer, parameter :: DQDT_KERNEL_OPENACC_SPLIT = 2
+  integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_SPLIT = 3
+  integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_FUSED = 4
   integer :: dqdt_kernel_typeid
-  character(len=16) :: dqdt_kernel_name
+  character(len=20) :: dqdt_kernel_name
 
   real(RP), allocatable :: ebnd_flux(:,:)
   real(RP), allocatable :: volume_flux_x(:,:)
@@ -52,20 +59,48 @@ contains
     case ("OPENACC_SPLIT")
       dqdt_kernel_typeid = DQDT_KERNEL_OPENACC_SPLIT
       dqdt_kernel_name = "OPENACC_SPLIT"
+    case ("CUDAFORTRAN_SPLIT")
+      if (.not. cuda_dg_kernels_available) then
+        write(*,*) "CUDAFORTRAN_SPLIT requires a build with CUDA=1"
+        error stop
+      end if
+      dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_SPLIT
+      dqdt_kernel_name = "CUDAFORTRAN_SPLIT"
+    case ("CUDAFORTRAN_FUSED")
+      if (.not. cuda_dg_kernels_available) then
+        write(*,*) "CUDAFORTRAN_FUSED requires a build with CUDA=1"
+        error stop
+      end if
+      if (Np /= 512) then
+        write(*,*) "CUDAFORTRAN_FUSED currently requires PolyOrder=7"
+        error stop
+      end if
+      dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_FUSED
+      dqdt_kernel_name = "CUDAFORTRAN_FUSED"
     case default
       write(*,*) "Unsupported dqdt_kernel_type: ", trim(dqdt_kernel_type)
       error stop
     end select
 
-    allocate(ebnd_flux(NfpTot,Ne))
-    !$acc enter data create(ebnd_flux)
+    if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED) then
+      allocate(ebnd_flux(NfpTot,Ne))
+      !$acc enter data create(ebnd_flux)
+    end if
 
-    if (dqdt_kernel_typeid == DQDT_KERNEL_OPENACC_SPLIT) then
-      allocate(volume_flux_x(Np,Ne), volume_flux_y(Np,Ne), volume_flux_z(Np,Ne))
+    if (dqdt_kernel_typeid /= DQDT_KERNEL_OPENACC_ASIS .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED) then
       allocate(volume_deriv_x(Np,Ne), volume_deriv_y(Np,Ne), volume_deriv_z(Np,Ne))
+      !$acc enter data create(volume_deriv_x,volume_deriv_y,volume_deriv_z)
+    end if
+    if (dqdt_kernel_typeid /= DQDT_KERNEL_OPENACC_ASIS .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED) then
       allocate(surface_lift(Np,Ne))
-      !$acc enter data create(volume_flux_x,volume_flux_y,volume_flux_z) &
-      !$acc& create(volume_deriv_x,volume_deriv_y,volume_deriv_z,surface_lift)
+      !$acc enter data create(surface_lift)
+    end if
+    if (dqdt_kernel_typeid == DQDT_KERNEL_OPENACC_SPLIT .or. &
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_SPLIT) then
+      allocate(volume_flux_x(Np,Ne), volume_flux_y(Np,Ne), volume_flux_z(Np,Ne))
+      !$acc enter data create(volume_flux_x,volume_flux_y,volume_flux_z)
     end if
 
     return
@@ -76,23 +111,45 @@ contains
     implicit none
     !------------------------------------------------------------------------------
     write(*,'(A30,A24)') "Dqdt kernel type:", trim(dqdt_kernel_name)
-    write(*,'(A30,ES24.5)') "Element boundary flux:", Timer_elapsed(timer_ebnd_flux)
+    if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED) then
+      write(*,'(A30,1X,A23)') "Element boundary flux:", "included in fused kernel"
+    else
+      write(*,'(A30,ES24.5)') "Element boundary flux:", Timer_elapsed(timer_ebnd_flux)
+    end if
     write(*,'(A30,ES24.5)') "Volume derivate + surface lift:", Timer_elapsed(timer_dqdt)
 
-    if (dqdt_kernel_typeid == DQDT_KERNEL_OPENACC_SPLIT) then
-      write(*,'(A30,ES24.5)') "  Volume flux:", Timer_elapsed(timer_volume_flux)
-      write(*,'(A30,ES24.5)') "  Tensor-product derivative:", Timer_elapsed(timer_volume_deriv)
-      write(*,'(A30,ES24.5)') "  Surface lift:", Timer_elapsed(timer_surface_lift)
-      write(*,'(A30,ES24.5)') "  Dqdt assembly:", Timer_elapsed(timer_dqdt_assemble)
-      !$acc exit data delete(volume_flux_x,volume_flux_y,volume_flux_z) &
-      !$acc& delete(volume_deriv_x,volume_deriv_y,volume_deriv_z,surface_lift)
-      deallocate(volume_flux_x, volume_flux_y, volume_flux_z)
-      deallocate(volume_deriv_x, volume_deriv_y, volume_deriv_z)
-      deallocate(surface_lift)
+    if (dqdt_kernel_typeid /= DQDT_KERNEL_OPENACC_ASIS) then
+      if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_SPLIT) then
+        write(*,'(A30,ES24.5)') "  CUDA device volume flux:", Timer_elapsed(timer_volume_flux)
+        write(*,'(A30,ES24.5)') "  CUDA device derivative:", Timer_elapsed(timer_volume_deriv)
+        write(*,'(A30,ES24.5)') "  CUDA device surface lift:", Timer_elapsed(timer_surface_lift)
+        write(*,'(A30,ES24.5)') "  CUDA device assembly:", Timer_elapsed(timer_dqdt_assemble)
+      else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED) then
+        write(*,'(A30,ES24.5)') "  CUDA device fused tendency:", Timer_elapsed(timer_volume_deriv)
+      else
+        write(*,'(A30,ES24.5)') "  Volume flux:", Timer_elapsed(timer_volume_flux)
+        write(*,'(A30,ES24.5)') "  Tensor-product derivative:", Timer_elapsed(timer_volume_deriv)
+        write(*,'(A30,ES24.5)') "  Surface lift:", Timer_elapsed(timer_surface_lift)
+        write(*,'(A30,ES24.5)') "  Dqdt assembly:", Timer_elapsed(timer_dqdt_assemble)
+      end if
+      if (allocated(volume_flux_x)) then
+        !$acc exit data delete(volume_flux_x,volume_flux_y,volume_flux_z)
+        deallocate(volume_flux_x, volume_flux_y, volume_flux_z)
+      end if
+      if (allocated(volume_deriv_x)) then
+        !$acc exit data delete(volume_deriv_x,volume_deriv_y,volume_deriv_z)
+        deallocate(volume_deriv_x, volume_deriv_y, volume_deriv_z)
+      end if
+      if (allocated(surface_lift)) then
+        !$acc exit data delete(surface_lift)
+        deallocate(surface_lift)
+      end if
     end if
 
-    !$acc exit data delete(ebnd_flux)
-    deallocate(ebnd_flux)
+    if (allocated(ebnd_flux)) then
+      !$acc exit data delete(ebnd_flux)
+      deallocate(ebnd_flux)
+    end if
     return
   end subroutine setup_advect3d_eq_finalize
 
@@ -126,10 +183,12 @@ contains
     !------------------------------------------------------------
 
     call Timer_start(timer_ebnd_flux)
-    call cal_elembnd_flux( ebnd_flux,   & ! (out)
-       q, u, v, w,                      & ! (in)
-       VMapM, VMapP, normal_fn, Fscale, & ! (in)
-       Np, NfpTot, Ne, NeA )
+    if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED) then
+      call cal_elembnd_flux( ebnd_flux,   & ! (out)
+         q, u, v, w,                      & ! (in)
+         VMapM, VMapP, normal_fn, Fscale, & ! (in)
+         Np, NfpTot, Ne, NeA )
+    end if
     call Timer_stop(timer_ebnd_flux)
 
     call Timer_start(timer_dqdt)
@@ -138,11 +197,22 @@ contains
          q, u, v, w,  ebnd_flux,        & ! (in)
          D1D, D1D_tr, Lift_mat,         & ! (in)
          Escale, Nq, Np, NfpTot, Ne, NeA ) ! (in)
-    else
+    else if (dqdt_kernel_typeid == DQDT_KERNEL_OPENACC_SPLIT) then
       call cal_dqdt_openacc_split( dqdt, & ! (out)
          q, u, v, w,  ebnd_flux,         & ! (in)
          D1D, D1D_tr, Lift_mat,          & ! (in)
          Escale, Nq, Np, NfpTot, Ne, NeA ) ! (in)
+    else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_SPLIT) then
+      call cal_dqdt_cudafortran_split( dqdt, & ! (out)
+         q, u, v, w,  ebnd_flux,            & ! (in)
+         D1D, D1D_tr, Lift_mat,             & ! (in)
+         Escale, Nq, Np, NfpTot, Ne, NeA )    ! (in)
+    else
+      call cal_dqdt_cudafortran_fused( dqdt, & ! (out)
+         q, u, v, w,                         & ! (in)
+         D1D, D1D_tr, Lift_mat,             & ! (in)
+         VMapM, VMapP, normal_fn, Fscale,   & ! (in)
+         Escale, Nq, Np, NfpTot, Ne, NeA )    ! (in)
     end if
     call Timer_stop(timer_dqdt)
 
@@ -318,6 +388,77 @@ contains
 
     return
   end subroutine cal_dqdt_openacc_split
+
+  !> Calculate the split tendency using CUDA Fortran kernels
+!OCL SERIAL
+  subroutine cal_dqdt_cudafortran_split( dqdt, & ! (out)
+    q, u, v, w, flux_bnd,                     & ! (in)
+    D1D, D1D_tr, Lift_mat, Escale,            & ! (in)
+    Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(in) :: q(Np,NeA)
+    real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), intent(in) :: flux_bnd(NfpTot,Ne)
+    real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
+    real(RP), intent(in) :: Lift_mat(Nq,Nq,Nq,6)
+    real(RP), intent(in) :: Escale(Np,Ne,3)
+    real(RP) :: kernel_time(4)
+    !------------------------------------------------------------
+
+    !$acc host_data use_device(volume_flux_x,volume_flux_y,volume_flux_z) &
+    !$acc& use_device(volume_deriv_x,volume_deriv_y,volume_deriv_z) &
+    !$acc& use_device(surface_lift,dqdt,q,u,v,w,D1D,D1D_tr) &
+    !$acc& use_device(Lift_mat,flux_bnd,Escale)
+    call cuda_cal_dqdt_split( &
+      volume_flux_x, volume_flux_y, volume_flux_z, &
+      volume_deriv_x, volume_deriv_y, volume_deriv_z, surface_lift, dqdt, &
+      q, u, v, w, D1D, D1D_tr, Lift_mat, flux_bnd, Escale, &
+      Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    !$acc end host_data
+
+    call Timer_add(timer_volume_flux,kernel_time(1))
+    call Timer_add(timer_volume_deriv,kernel_time(2))
+    call Timer_add(timer_surface_lift,kernel_time(3))
+    call Timer_add(timer_dqdt_assemble,kernel_time(4))
+
+    return
+  end subroutine cal_dqdt_cudafortran_split
+
+  !> Calculate the tendency with fused volume-flux and derivative generation
+!OCL SERIAL
+  subroutine cal_dqdt_cudafortran_fused( dqdt, & ! (out)
+    q, u, v, w,                               & ! (in)
+    D1D, D1D_tr, Lift_mat,                    & ! (in)
+    VMapM, VMapP, normal_fn, Fscale, Escale,  & ! (in)
+    Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(in) :: q(Np,NeA)
+    real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
+    real(RP), intent(in) :: Lift_mat(Nq,Nq,Nq,6)
+    real(RP), intent(in) :: Escale(Np,Ne,3)
+    integer, intent(in) :: VMapM(NfpTot,Ne), VMapP(NfpTot,Ne)
+    real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+    real(RP) :: kernel_time(2)
+    !------------------------------------------------------------
+
+    !$acc host_data use_device(dqdt,q,u,v,w,D1D,D1D_tr,Lift_mat,Escale) &
+    !$acc& use_device(VMapM,VMapP,normal_fn,Fscale)
+    call cuda_cal_dqdt_fused( &
+      dqdt, q, u, v, w, D1D, D1D_tr, Lift_mat, Escale, &
+      VMapM, VMapP, normal_fn, Fscale, &
+      Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    !$acc end host_data
+
+    call Timer_add(timer_volume_deriv,kernel_time(1))
+    call Timer_add(timer_surface_lift,kernel_time(2))
+
+    return
+  end subroutine cal_dqdt_cudafortran_fused
 
   !> Calculate Cartesian volume fluxes
 !OCL SERIAL
