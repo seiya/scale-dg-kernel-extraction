@@ -79,6 +79,10 @@ program main
         Nq, Np, NfpTot, Ne, NeA )
       call Timer_stop(timer_cal_tend)
 
+      if (istep == 1 .and. stage == 1) then
+        call dump_dqdt_if_requested(dqdt, Np, Ne)
+      end if
+
       !$omp parallel do private(pnode)
       !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt)
       do kelem=1, Ne
@@ -126,17 +130,20 @@ contains
     real(RP) :: vel_y = 1.0_RP
     real(RP) :: vel_z = 1.0_RP
     character(len=8) :: DGOptrKernel_OptType = "OPT1" ! GENERAL or OPT1
-    character(len=20) :: DqdtKernel_Type = "OPENACC_SPLIT"
+    character(len=24) :: DqdtKernel_Type = "OPENACC_SPLIT"
+    logical :: CublasEmulation = .false.
 
     namelist /PARAM_ADVECT3D/ &
       NeX, NeY, NeZ, PolyOrder,   &
       dt, nstep, output_interval, &
       vel_x, vel_y, vel_z,        &
       DGOptrKernel_OptType,        &
-      DqdtKernel_Type
+      DqdtKernel_Type,             &
+      CublasEmulation
 
     integer :: fid
     integer :: ke, p
+    character(len=8) :: vary_coeff
     !------------------------------------------------------------
 
     dt    = 1.0e-3_RP
@@ -168,7 +175,7 @@ contains
     call dg_optr_kernel_setup( DGOptrKernel_OptType )
 
     !- Initialize a advection equation module
-    call setup_advect3d_eq_setup(NfpTot, Np, Ne, DqdtKernel_Type)
+    call setup_advect3d_eq_setup(NfpTot, Np, Ne, DqdtKernel_Type, CublasEmulation)
 
     !- Set initial condition
 
@@ -184,6 +191,27 @@ contains
       w(p,ke) = vel_z
     end do
     end do
+
+    vary_coeff = '0'
+    call get_environment_variable('SCALE_DG_VARYING_COEFF', vary_coeff)
+    if (trim(vary_coeff) == '1') then
+      do ke = 1, Ne
+        do p = 1, Np
+          u(p,ke) = vel_x + 0.15_RP * sin(2.0_RP*PI*pos_en(p,ke,1))
+          v(p,ke) = vel_y + 0.11_RP * cos(2.0_RP*PI*pos_en(p,ke,2))
+          w(p,ke) = vel_z + 0.07_RP * sin(2.0_RP*PI*pos_en(p,ke,3))
+          Escale(p,ke,1) = Escale(p,ke,1) * (1.0_RP + 0.02_RP * sin(2.0_RP*PI*pos_en(p,ke,1)))
+          Escale(p,ke,2) = Escale(p,ke,2) * (1.0_RP + 0.03_RP * cos(2.0_RP*PI*pos_en(p,ke,2)))
+          Escale(p,ke,3) = Escale(p,ke,3) * (1.0_RP + 0.04_RP * sin(2.0_RP*PI*pos_en(p,ke,3)))
+        end do
+        do p = 1, NfpTot
+          Fscale(p,ke) = Fscale(p,ke) * (1.0_RP + 0.01_RP * sin(dble(p)))
+          normal_fn(p,ke,1) = normal_fn(p,ke,1) + 0.01_RP * sin(dble(p+ke))
+          normal_fn(p,ke,2) = normal_fn(p,ke,2) + 0.01_RP * cos(dble(p+ke))
+          normal_fn(p,ke,3) = normal_fn(p,ke,3) + 0.01_RP * sin(dble(2*p+ke))
+        end do
+      end do
+    end if
 
     return
   end subroutine init
@@ -204,4 +232,24 @@ contains
     call mesh_finalize()
     return
   end subroutine final
+
+  subroutine dump_dqdt_if_requested(dqdt, Np, Ne)
+    implicit none
+    integer, intent(in) :: Np, Ne
+    real(RP), intent(in) :: dqdt(:,:)
+    character(len=256) :: dump_file
+    integer :: ke, p, fid
+    dump_file = ''
+    call get_environment_variable('SCALE_DG_DUMP_DQDT', dump_file)
+    if (len_trim(dump_file) == 0) return
+    !$acc update host(dqdt)
+    fid = 21
+    open(fid, file=trim(dump_file), status='replace', action='write')
+    do ke = 1, Ne
+      do p = 1, Np
+        write(fid,'(ES24.16)') dqdt(p,ke)
+      end do
+    end do
+    close(fid)
+  end subroutine dump_dqdt_if_requested
 end program main

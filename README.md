@@ -141,24 +141,40 @@ An additional specialized fused variant is selected with
 DqdtKernel_Type = "CUDAFORTRAN_FUSED"
 ```
 
-For p=7, it evaluates the complete element tendency in one CUDA Fortran
-kernel. Each element uses one 256-thread block and every thread evaluates two
-volume nodes. The three pointwise volume fluxes and all six boundary fluxes
-are staged in shared memory before tensor-product differentiation, surface
-lifting, and assembly.
+An additional Tensor Core variant is selected with
 
-For p=255 (`Nq=256`), each element is decomposed into 16x16 CUDA blocks. A
-boundary kernel first generates all six face fluxes, followed by tiled
-x-, y-, and z-direction differentiation kernels. Each directional kernel also
-applies its corresponding surface lift, so full-volume derivative work arrays
-are not allocated. The block index includes the element number and therefore
-supports both the intended `Ne=1` case and `Ne>1`.
+```fortran
+DqdtKernel_Type = "CUDAFORTRAN_FUSED_TC"
+```
+
+It keeps the original fused CUDA Fortran kernels for comparison and launches
+FP64 Tensor Core (`mma.sync.aligned.m8n8k4.f64`) implementations from
+`cuda_dg_kernels_tc.cu`. Volume fluxes remain pointwise `q*u`, `q*v`, and `q*w`,
+and all six faces are evaluated. On GB200, compile the C++ kernels with
+`NVCCFLAGS=-O3 -std=c++17 -arch=sm_100` together with
+`GPUFLAGS=-gpu=cc100`. Hopper/Ampere FP64 Tensor Cores (`sm_80`/`sm_90`) are
+also valid targets. Example inputs are `input_large_fused_tc.conf` (p=7) and
+`input_large_ne1_tc.conf` (p=255).
+
+A cuBLAS GEMM variant is selected with
+
+```fortran
+DqdtKernel_Type = "CUDAFORTRAN_GEMM"
+CublasEmulation = .false.
+```
+
+Volume flux and numerical flux stay pointwise CUDA kernels. Tensor-product
+derivatives and the separable `Lift1D` operator are evaluated with `cublasDgemm`
+/ `cublasDgemmStridedBatched`. `CublasEmulation` switches cuBLAS floating-point
+emulation (Ozaki / BF16x9, when the installed toolkit supports it) on or off at
+run time without rebuilding. Example inputs are `input_p7_val_gemm.conf` and
+`input_p255_val_gemm.conf`.
 
 The p=255 Legendre-Gauss-Lobatto nodes and operators are generated at startup;
 no large `operator_data/p255.dat` file is needed. Its separable lifting
 operator is stored as `Lift1D(256,6)` instead of a dense
 `Lift_mat(256,256,256,6)`. The p=255 path currently requires
-`CUDAFORTRAN_FUSED`.
+`CUDAFORTRAN_FUSED`, `CUDAFORTRAN_FUSED_TC`, or `CUDAFORTRAN_GEMM`.
 
 The CUDA Fortran kernels are in `mod_cuda_dg_kernels.cuf`. OpenACC `host_data`
 regions pass the resident device arrays directly to CUDA Fortran, without
@@ -213,6 +229,7 @@ Simulation parameters are specified in `input.conf`, including
 - Polynomial order (`PolyOrder`),
 - DG operator optimization type (`DGOptrKernel_OptType`).
 - Tendency kernel type (`DqdtKernel_Type`).
+- cuBLAS floating-point emulation switch (`CublasEmulation`, used with `CUDAFORTRAN_GEMM`).
 - Time step (`dt`)
 - Number of time steps (`nstep`)
 

@@ -1,6 +1,7 @@
 !> CUDA Fortran implementation of the split tendency kernels.
 module mod_cuda_dg_kernels
   use cudafor
+  use, intrinsic :: iso_c_binding, only: c_int, c_double, c_long_long
   use mod_common, only: RP
   implicit none
   private
@@ -17,6 +18,15 @@ module mod_cuda_dg_kernels
   type(cudaEvent), save :: split_events(5)
   logical, save :: split_events_initialized = .false.
 
+  real(RP), device, allocatable, save :: gemm_pack_x(:,:)
+  real(RP), device, allocatable, save :: gemm_pack_y(:,:,:)
+  real(RP), device, allocatable, save :: gemm_lift_x(:,:)
+  real(RP), device, allocatable, save :: gemm_lift_y(:,:)
+  real(RP), device, allocatable, save :: gemm_lift_z(:,:)
+  integer, save :: gemm_alloc_nq = 0
+  integer, save :: gemm_alloc_ne = 0
+  logical, save :: gemm_inited = .false.
+
   public :: cuda_cal_volume_flux
   public :: cuda_cal_volume_deriv
   public :: cuda_cal_surface_lift
@@ -24,7 +34,66 @@ module mod_cuda_dg_kernels
   public :: cuda_cal_dqdt_split
   public :: cuda_cal_dqdt_fused
   public :: cuda_cal_dqdt_fused_p255
+  public :: cuda_cal_dqdt_fused_tc
+  public :: cuda_cal_dqdt_fused_p255_tc
+  public :: cuda_cal_dqdt_gemm
+  public :: cuda_gemm_setup
+  public :: cuda_gemm_finalize
   public :: cuda_cal_elembnd_flux
+
+  interface
+    subroutine launch_tendency_fused_p7_tc( &
+      dqdt, D1D, Lift_mat, q, u, v, w, VMapM, VMapP, &
+      normal_fn, Fscale, Escale, Ne) &
+      bind(C, name="launch_tendency_fused_p7_tc")
+      import
+      integer(c_int), value :: Ne
+      real(c_double), device :: dqdt(*), D1D(*), Lift_mat(*)
+      real(c_double), device :: q(*), u(*), v(*), w(*)
+      integer(c_int), device :: VMapM(*), VMapP(*)
+      real(c_double), device :: normal_fn(*), Fscale(*), Escale(*)
+    end subroutine launch_tendency_fused_p7_tc
+
+    subroutine launch_tendency_xyz_p255_tc( &
+      dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, Ne) &
+      bind(C, name="launch_tendency_xyz_p255_tc")
+      import
+      integer(c_int), value :: Ne
+      real(c_double), device :: dqdt(*), q(*), u(*), v(*), w(*)
+      real(c_double), device :: D1D(*), Lift1D(*), flux_bnd(*), Escale(*)
+    end subroutine launch_tendency_xyz_p255_tc
+
+    function cublas_gemm_init(emulate) bind(C, name="cublas_gemm_init")
+      import
+      integer(c_int), value :: emulate
+      integer(c_int) :: cublas_gemm_init
+    end function cublas_gemm_init
+
+    function cublas_gemm_finalize() bind(C, name="cublas_gemm_finalize")
+      import
+      integer(c_int) :: cublas_gemm_finalize
+    end function cublas_gemm_finalize
+
+    function cublas_dgemm_impl(transa, transb, m, n, k, alpha, A, lda, B, ldb, &
+      beta, C, ldc) bind(C, name="cublas_dgemm_impl")
+      import
+      integer(c_int), value :: transa, transb, m, n, k, lda, ldb, ldc
+      real(c_double), value :: alpha, beta
+      real(c_double), device :: A(*), B(*), C(*)
+      integer(c_int) :: cublas_dgemm_impl
+    end function cublas_dgemm_impl
+
+    function cublas_dgemm_strided_batched_impl(transa, transb, m, n, k, alpha, &
+      A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC, batch) &
+      bind(C, name="cublas_dgemm_strided_batched_impl")
+      import
+      integer(c_int), value :: transa, transb, m, n, k, lda, ldb, ldc, batch
+      integer(c_long_long), value :: strideA, strideB, strideC
+      real(c_double), value :: alpha, beta
+      real(c_double), device :: A(*), B(*), C(*)
+      integer(c_int) :: cublas_dgemm_strided_batched_impl
+    end function cublas_dgemm_strided_batched_impl
+  end interface
 
 contains
 
@@ -163,6 +232,272 @@ contains
     kernel_time(2) = 0.0_RP
   end subroutine cuda_cal_dqdt_fused_p255
 
+  subroutine cuda_cal_dqdt_fused_tc( &
+    dqdt, q, u, v, w, D1D, Lift_mat, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), device, intent(out) :: dqdt(Np,NeA)
+    real(RP), device, intent(in) :: q(Np,NeA)
+    real(RP), device, intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), device, intent(in) :: D1D(Nq,Nq)
+    real(RP), device, intent(in) :: Lift_mat(Nq,Nq,Nq,6)
+    integer, device, intent(in) :: VMapM(NfpTot,Ne)
+    integer, device, intent(in) :: VMapP(NfpTot,Ne)
+    real(RP), device, intent(in) :: normal_fn(NfpTot,Ne,3)
+    real(RP), device, intent(in) :: Fscale(NfpTot,Ne)
+    real(RP), device, intent(in) :: Escale(Np,Ne,3)
+    real(RP), intent(out) :: kernel_time(2)
+
+    integer :: istat, iev
+    real :: elapsed_ms
+
+    if (Nq /= 8) then
+      write(*,*) "CUDAFORTRAN_FUSED_TC currently requires PolyOrder=7"
+      error stop
+    end if
+    if (.not. split_events_initialized) then
+      do iev = 1, 5
+        istat = cudaEventCreate(split_events(iev))
+        if (istat /= cudaSuccess) call cuda_failure("cudaEventCreate",istat)
+      end do
+      split_events_initialized = .true.
+    end if
+
+    istat = cudaEventRecord(split_events(1),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call launch_tendency_fused_p7_tc( &
+      dqdt, D1D, Lift_mat, q, u, v, w, VMapM, VMapP, &
+      normal_fn, Fscale, Escale, int(Ne,c_int) )
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) call cuda_failure( &
+      "tendency_fused_p7_tc_kernel",istat)
+    istat = cudaEventRecord(split_events(2),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    istat = cudaEventSynchronize(split_events(2))
+    if (istat /= cudaSuccess) call cuda_failure("CUDA fused TC kernels",istat)
+
+    istat = cudaEventElapsedTime(elapsed_ms,split_events(1),split_events(2))
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventElapsedTime",istat)
+    kernel_time(1) = real(elapsed_ms,RP)*1.0e-3_RP
+    kernel_time(2) = 0.0_RP
+  end subroutine cuda_cal_dqdt_fused_tc
+
+  subroutine cuda_cal_dqdt_fused_p255_tc( &
+    dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, flux_bnd, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), device, intent(out) :: dqdt(Np,NeA)
+    real(RP), device, intent(in) :: q(Np,NeA)
+    real(RP), device, intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), device, intent(in) :: D1D(Nq,Nq)
+    real(RP), device, intent(in) :: Lift1D(Nq,6)
+    integer, device, intent(in) :: VMapM(NfpTot,Ne)
+    integer, device, intent(in) :: VMapP(NfpTot,Ne)
+    real(RP), device, intent(in) :: normal_fn(NfpTot,Ne,3)
+    real(RP), device, intent(in) :: Fscale(NfpTot,Ne)
+    real(RP), device, intent(in) :: Escale(Np,Ne,3)
+    real(RP), device, intent(out) :: flux_bnd(NfpTot,Ne)
+    real(RP), intent(out) :: kernel_time(2)
+
+    integer :: istat, iev, nface, nblock_face
+    real :: elapsed_ms
+
+    if (Nq /= CUDA_P255_NQ .or. Np /= CUDA_P255_NQ**3) then
+      error stop "cuda_cal_dqdt_fused_p255_tc requires PolyOrder=255"
+    end if
+    if (.not. split_events_initialized) then
+      do iev = 1, 5
+        istat = cudaEventCreate(split_events(iev))
+        if (istat /= cudaSuccess) call cuda_failure("cudaEventCreate",istat)
+      end do
+      split_events_initialized = .true.
+    end if
+
+    nface = NfpTot*Ne
+    nblock_face = (nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+
+    istat = cudaEventRecord(split_events(1),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE>>>( &
+      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    call launch_tendency_xyz_p255_tc( &
+      dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, int(Ne,c_int) )
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) call cuda_failure("p=255 TC tendency kernels",istat)
+    istat = cudaEventRecord(split_events(2),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    istat = cudaEventSynchronize(split_events(2))
+    if (istat /= cudaSuccess) call cuda_failure("p=255 TC tendency kernels",istat)
+
+    istat = cudaEventElapsedTime(elapsed_ms,split_events(1),split_events(2))
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventElapsedTime",istat)
+    kernel_time(1) = real(elapsed_ms,RP)*1.0e-3_RP
+    kernel_time(2) = 0.0_RP
+  end subroutine cuda_cal_dqdt_fused_p255_tc
+
+  subroutine cuda_gemm_setup(emulate)
+    implicit none
+    logical, intent(in) :: emulate
+    integer :: istat
+    integer(c_int) :: emulate_flag
+
+    emulate_flag = 0
+    if (emulate) emulate_flag = 1
+    istat = cublas_gemm_init(emulate_flag)
+    if (istat /= 0) call cuda_failure("cublas_gemm_init",istat)
+    gemm_inited = .true.
+  end subroutine cuda_gemm_setup
+
+  subroutine cuda_gemm_finalize()
+    implicit none
+    integer :: istat
+
+    if (allocated(gemm_pack_x)) deallocate(gemm_pack_x)
+    if (allocated(gemm_pack_y)) deallocate(gemm_pack_y)
+    if (allocated(gemm_lift_x)) deallocate(gemm_lift_x)
+    if (allocated(gemm_lift_y)) deallocate(gemm_lift_y)
+    if (allocated(gemm_lift_z)) deallocate(gemm_lift_z)
+    gemm_alloc_nq = 0
+    gemm_alloc_ne = 0
+    if (gemm_inited) then
+      istat = cublas_gemm_finalize()
+      if (istat /= 0) call cuda_failure("cublas_gemm_finalize",istat)
+      gemm_inited = .false.
+    end if
+  end subroutine cuda_gemm_finalize
+
+  subroutine ensure_gemm_workspace(Nq, Ne)
+    implicit none
+    integer, intent(in) :: Nq, Ne
+
+    if (gemm_alloc_nq == Nq .and. gemm_alloc_ne == Ne) return
+    if (allocated(gemm_pack_x)) deallocate(gemm_pack_x)
+    if (allocated(gemm_pack_y)) deallocate(gemm_pack_y)
+    if (allocated(gemm_lift_x)) deallocate(gemm_lift_x)
+    if (allocated(gemm_lift_y)) deallocate(gemm_lift_y)
+    if (allocated(gemm_lift_z)) deallocate(gemm_lift_z)
+    allocate(gemm_pack_x(2,Nq*Nq*Ne))
+    allocate(gemm_pack_y(Nq,2,Nq*Ne))
+    allocate(gemm_lift_x(Nq,2), gemm_lift_y(Nq,2), gemm_lift_z(Nq,2))
+    gemm_alloc_nq = Nq
+    gemm_alloc_ne = Ne
+  end subroutine ensure_gemm_workspace
+
+  subroutine cuda_cal_dqdt_gemm( &
+    dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, flux_bnd, &
+    flux_x, flux_y, flux_z, deriv_x, deriv_y, deriv_z, lift_out, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), device, intent(out) :: dqdt(Np,NeA)
+    real(RP), device, intent(in) :: q(Np,NeA)
+    real(RP), device, intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), device, intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
+    real(RP), device, intent(in) :: Lift1D(Nq,6)
+    integer, device, intent(in) :: VMapM(NfpTot,Ne), VMapP(NfpTot,Ne)
+    real(RP), device, intent(in) :: normal_fn(NfpTot,Ne,3)
+    real(RP), device, intent(in) :: Fscale(NfpTot,Ne)
+    real(RP), device, intent(in) :: Escale(Np,Ne,3)
+    real(RP), device, intent(out) :: flux_bnd(NfpTot,Ne)
+    real(RP), device, intent(out) :: flux_x(Np,Ne), flux_y(Np,Ne), flux_z(Np,Ne)
+    real(RP), device, intent(out) :: deriv_x(Np,Ne), deriv_y(Np,Ne), deriv_z(Np,Ne)
+    real(RP), device, intent(out) :: lift_out(Np,Ne)
+    real(RP), intent(out) :: kernel_time(2)
+
+    integer :: istat, iev, nface, npoint, nblock, nblock_face, nblock_pack
+    integer :: nq2, plane_batch
+    integer(c_long_long) :: stride_plane, stride_elem, stride_zero, stride_vol
+    real :: elapsed_ms
+
+    if (.not. gemm_inited) then
+      call cuda_gemm_setup(.false.)
+    end if
+    call ensure_gemm_workspace(Nq, Ne)
+
+    if (.not. split_events_initialized) then
+      do iev = 1, 5
+        istat = cudaEventCreate(split_events(iev))
+        if (istat /= cudaSuccess) call cuda_failure("cudaEventCreate",istat)
+      end do
+      split_events_initialized = .true.
+    end if
+
+    nq2 = Nq*Nq
+    nface = NfpTot*Ne
+    npoint = Np*Ne
+    nblock = (npoint+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    nblock_face = (nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    nblock_pack = (nq2*Ne+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    plane_batch = Nq*Ne
+    stride_plane = int(nq2,c_long_long)
+    stride_elem = int(NfpTot,c_long_long)
+    stride_zero = 0_c_long_long
+    stride_vol = int(Np,c_long_long)
+
+    istat = cudaEventRecord(split_events(1),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+
+    call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE>>>( &
+      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    call volume_flux_kernel<<<nblock,CUDA_BLOCK_SIZE>>>( &
+      flux_x, flux_y, flux_z, q, u, v, w, npoint )
+
+    istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
+      D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
+    if (istat /= 0) call cuda_failure("cublasDgemm x-deriv",istat)
+
+    istat = cublas_dgemm_strided_batched_impl(0, 0, Nq, Nq, Nq, 1.0_c_double, &
+      flux_y, Nq, stride_plane, D1D_tr, Nq, stride_zero, 0.0_c_double, &
+      deriv_y, Nq, stride_plane, plane_batch)
+    if (istat /= 0) call cuda_failure("cublasDgemm y-deriv",istat)
+
+    istat = cublas_dgemm_strided_batched_impl(0, 0, nq2, Nq, Nq, 1.0_c_double, &
+      flux_z, nq2, stride_vol, D1D_tr, Nq, stride_zero, 0.0_c_double, &
+      deriv_z, nq2, stride_vol, Ne)
+    if (istat /= 0) call cuda_failure("cublasDgemm z-deriv",istat)
+
+    call copy_lift1d_pairs_kernel<<<1,Nq>>>( &
+      gemm_lift_x, gemm_lift_y, gemm_lift_z, Lift1D, Nq )
+    call pack_lift_x_faces_kernel<<<nblock_pack,CUDA_BLOCK_SIZE>>>( &
+      gemm_pack_x, flux_bnd, Nq, Ne )
+    call pack_lift_y_faces_kernel<<<nblock_pack,CUDA_BLOCK_SIZE>>>( &
+      gemm_pack_y, flux_bnd, Nq, Ne )
+
+    istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, 2, 1.0_c_double, &
+      gemm_lift_x, Nq, gemm_pack_x, 2, 0.0_c_double, lift_out, Nq)
+    if (istat /= 0) call cuda_failure("cublasDgemm x-lift",istat)
+
+    istat = cublas_dgemm_strided_batched_impl(0, 1, Nq, Nq, 2, 1.0_c_double, &
+      gemm_pack_y, Nq, int(Nq*2,c_long_long), gemm_lift_y, Nq, stride_zero, &
+      1.0_c_double, lift_out, Nq, stride_plane, plane_batch)
+    if (istat /= 0) call cuda_failure("cublasDgemm y-lift",istat)
+
+    istat = cublas_dgemm_strided_batched_impl(0, 1, nq2, Nq, 2, 1.0_c_double, &
+      flux_bnd(4*nq2+1,1), nq2, stride_elem, gemm_lift_z, Nq, stride_zero, &
+      1.0_c_double, lift_out, nq2, stride_vol, Ne)
+    if (istat /= 0) call cuda_failure("cublasDgemm z-lift",istat)
+
+    call dqdt_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE>>>( &
+      dqdt, Escale, deriv_x, deriv_y, deriv_z, lift_out, npoint )
+
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) call cuda_failure("CUDAFORTRAN_GEMM kernels",istat)
+    istat = cudaEventRecord(split_events(2),0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    istat = cudaEventSynchronize(split_events(2))
+    if (istat /= cudaSuccess) call cuda_failure("CUDAFORTRAN_GEMM kernels",istat)
+
+    istat = cudaEventElapsedTime(elapsed_ms,split_events(1),split_events(2))
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventElapsedTime",istat)
+    kernel_time(1) = real(elapsed_ms,RP)*1.0e-3_RP
+    kernel_time(2) = 0.0_RP
+  end subroutine cuda_cal_dqdt_gemm
+
   subroutine cuda_cal_dqdt_split( &
     flux_x, flux_y, flux_z, deriv_x, deriv_y, deriv_z, lift_out, dqdt, &
     q, u, v, w, D1D, D1D_tr, Lift_mat, flux_bnd, Escale, &
@@ -241,6 +576,68 @@ contains
       kernel_time(iev) = real(elapsed_ms,RP)*1.0e-3_RP
     end do
   end subroutine cuda_cal_dqdt_split
+  attributes(global) subroutine copy_lift1d_pairs_kernel( &
+    lift_x, lift_y, lift_z, Lift1D, Nq )
+    implicit none
+    integer, value :: Nq
+    real(RP), device :: lift_x(Nq,2), lift_y(Nq,2), lift_z(Nq,2)
+    real(RP), device :: Lift1D(Nq,6)
+
+    integer :: i
+
+    i = threadIdx%x
+    if (i <= Nq) then
+      lift_x(i,1) = Lift1D(i,2)
+      lift_x(i,2) = Lift1D(i,4)
+      lift_y(i,1) = Lift1D(i,1)
+      lift_y(i,2) = Lift1D(i,3)
+      lift_z(i,1) = Lift1D(i,5)
+      lift_z(i,2) = Lift1D(i,6)
+    end if
+  end subroutine copy_lift1d_pairs_kernel
+
+  attributes(global) subroutine pack_lift_x_faces_kernel(pack_x, flux_bnd, Nq, Ne)
+    implicit none
+    integer, value :: Nq, Ne
+    real(RP), device :: pack_x(2,*), flux_bnd(*)
+
+    integer :: col, nq2, nfp, elem, jk, j, k, base
+
+    col = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    nq2 = Nq*Nq
+    nfp = 6*nq2
+    if (col <= nq2*Ne) then
+      elem = (col-1)/nq2
+      jk = mod(col-1,nq2)
+      j = mod(jk,Nq)
+      k = jk/Nq
+      base = elem*nfp
+      pack_x(1,col) = flux_bnd(base+nq2+j+k*Nq+1)
+      pack_x(2,col) = flux_bnd(base+3*nq2+j+k*Nq+1)
+    end if
+  end subroutine pack_lift_x_faces_kernel
+
+  attributes(global) subroutine pack_lift_y_faces_kernel(pack_y, flux_bnd, Nq, Ne)
+    implicit none
+    integer, value :: Nq, Ne
+    real(RP), device :: pack_y(Nq,2,*), flux_bnd(*)
+
+    integer :: idx, nq2, nfp, elem, plane, i, k, base
+
+    idx = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    nq2 = Nq*Nq
+    nfp = 6*nq2
+    if (idx <= nq2*Ne) then
+      elem = (idx-1)/nq2
+      plane = mod(idx-1,nq2)
+      i = mod(plane,Nq) + 1
+      k = plane/Nq
+      base = elem*nfp
+      pack_y(i,1,elem*Nq+k+1) = flux_bnd(base+i+k*Nq)
+      pack_y(i,2,elem*Nq+k+1) = flux_bnd(base+2*nq2+i+k*Nq)
+    end if
+  end subroutine pack_lift_y_faces_kernel
+
   attributes(global) subroutine volume_flux_kernel( &
     flux_x, flux_y, flux_z, q, u, v, w, npoint )
     implicit none
