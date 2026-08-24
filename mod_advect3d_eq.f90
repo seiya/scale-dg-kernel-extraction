@@ -13,7 +13,7 @@ module mod_advect3d_eq
     cuda_dg_kernels_available,  &
     cuda_cal_volume_flux, cuda_cal_volume_deriv, &
     cuda_cal_surface_lift, cuda_assemble_dqdt, cuda_cal_dqdt_split, &
-    cuda_cal_dqdt_fused, cuda_cal_elembnd_flux
+    cuda_cal_dqdt_fused, cuda_cal_dqdt_fused_p255, cuda_cal_elembnd_flux
   implicit none
   private
 
@@ -43,6 +43,7 @@ module mod_advect3d_eq
   real(RP), allocatable :: volume_deriv_y(:,:)
   real(RP), allocatable :: volume_deriv_z(:,:)
   real(RP), allocatable :: surface_lift(:,:)
+  real(RP), allocatable :: fused_flux_bnd(:,:)
 contains
   !> Setup
 !OCL SERIAL
@@ -71,8 +72,8 @@ contains
         write(*,*) "CUDAFORTRAN_FUSED requires a build with CUDA=1"
         error stop
       end if
-      if (Np /= 512) then
-        write(*,*) "CUDAFORTRAN_FUSED currently requires PolyOrder=7"
+      if (Np /= 512 .and. Np /= 256**3) then
+        write(*,*) "CUDAFORTRAN_FUSED requires PolyOrder=7 or 255"
         error stop
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_FUSED
@@ -82,9 +83,19 @@ contains
       error stop
     end select
 
+    if (Np == 256**3 .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED) then
+      error stop "PolyOrder=255 currently requires CUDAFORTRAN_FUSED"
+    end if
+
     if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED) then
       allocate(ebnd_flux(NfpTot,Ne))
       !$acc enter data create(ebnd_flux)
+    end if
+    if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
+        Np == 256**3) then
+      allocate(fused_flux_bnd(NfpTot,Ne))
+      !$acc enter data create(fused_flux_bnd)
     end if
 
     if (dqdt_kernel_typeid /= DQDT_KERNEL_OPENACC_ASIS .and. &
@@ -150,6 +161,10 @@ contains
       !$acc exit data delete(ebnd_flux)
       deallocate(ebnd_flux)
     end if
+    if (allocated(fused_flux_bnd)) then
+      !$acc exit data delete(fused_flux_bnd)
+      deallocate(fused_flux_bnd)
+    end if
     return
   end subroutine setup_advect3d_eq_finalize
 
@@ -157,7 +172,7 @@ contains
 !OCL SERIAL
   subroutine advect3d_eq_cal_tend( dqdt, & ! (out)
     q, u, v, w,                              & ! (in)
-    D1D, D1D_tr, Lift_mat,                   & ! (in)
+    D1D, D1D_tr, Lift_mat, Lift1D,           & ! (in)
     VMapM, VMapP, normal_fn, Escale, Fscale, & ! (in)
     Nq, Np, NfpTot, Ne, NeA )                  ! (in)
 
@@ -174,7 +189,8 @@ contains
     real(RP), intent(in) :: w(Np,NeA)
     real(RP), intent(in) :: D1D(Nq,Nq)
     real(RP), intent(in) :: D1D_tr(Nq,Nq)
-    real(RP), intent(in) :: Lift_mat(Nq,Nq,Nq,6)
+    real(RP), intent(in) :: Lift_mat(:,:,:,:)
+    real(RP), intent(in) :: Lift1D(Nq,6)
     integer, intent(in) :: VMapM(NfpTot,Ne)
     integer, intent(in) :: VMapP(NfpTot,Ne)
     real(RP), intent(in) :: normal_fn(NfpTot,Ne,3)
@@ -210,7 +226,7 @@ contains
     else
       call cal_dqdt_cudafortran_fused( dqdt, & ! (out)
          q, u, v, w,                         & ! (in)
-         D1D, D1D_tr, Lift_mat,             & ! (in)
+         D1D, D1D_tr, Lift_mat, Lift1D,     & ! (in)
          VMapM, VMapP, normal_fn, Fscale,   & ! (in)
          Escale, Nq, Np, NfpTot, Ne, NeA )    ! (in)
     end if
@@ -430,7 +446,7 @@ contains
 !OCL SERIAL
   subroutine cal_dqdt_cudafortran_fused( dqdt, & ! (out)
     q, u, v, w,                               & ! (in)
-    D1D, D1D_tr, Lift_mat,                    & ! (in)
+    D1D, D1D_tr, Lift_mat, Lift1D,            & ! (in)
     VMapM, VMapP, normal_fn, Fscale, Escale,  & ! (in)
     Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
     implicit none
@@ -439,20 +455,33 @@ contains
     real(RP), intent(in) :: q(Np,NeA)
     real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
     real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
-    real(RP), intent(in) :: Lift_mat(Nq,Nq,Nq,6)
+    real(RP), intent(in) :: Lift_mat(:,:,:,:)
+    real(RP), intent(in) :: Lift1D(Nq,6)
     real(RP), intent(in) :: Escale(Np,Ne,3)
     integer, intent(in) :: VMapM(NfpTot,Ne), VMapP(NfpTot,Ne)
     real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
     real(RP) :: kernel_time(2)
     !------------------------------------------------------------
 
-    !$acc host_data use_device(dqdt,q,u,v,w,D1D,D1D_tr,Lift_mat,Escale) &
-    !$acc& use_device(VMapM,VMapP,normal_fn,Fscale)
-    call cuda_cal_dqdt_fused( &
-      dqdt, q, u, v, w, D1D, D1D_tr, Lift_mat, Escale, &
-      VMapM, VMapP, normal_fn, Fscale, &
-      Nq, Np, NfpTot, Ne, NeA, kernel_time )
-    !$acc end host_data
+    if (Nq == 8) then
+      !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift_mat,VMapM,VMapP) &
+      !$acc& use_device(normal_fn,Fscale,Escale)
+      call cuda_cal_dqdt_fused( &
+        dqdt, q, u, v, w, D1D, Lift_mat, VMapM, VMapP, &
+        normal_fn, Fscale, Escale, &
+        Nq, Np, NfpTot, Ne, NeA, kernel_time )
+      !$acc end host_data
+    else if (Nq == 256) then
+      !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
+      !$acc& use_device(normal_fn,Fscale,Escale,fused_flux_bnd)
+      call cuda_cal_dqdt_fused_p255( &
+        dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+        normal_fn, Fscale, Escale, fused_flux_bnd, &
+        Nq, Np, NfpTot, Ne, NeA, kernel_time )
+      !$acc end host_data
+    else
+      error stop "CUDAFORTRAN_FUSED requires Nq=8 or Nq=256"
+    end if
 
     call Timer_add(timer_volume_deriv,kernel_time(1))
     call Timer_add(timer_surface_lift,kernel_time(2))

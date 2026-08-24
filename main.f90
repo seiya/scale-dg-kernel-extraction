@@ -16,7 +16,7 @@ program main
     rk_b => RK3s3oSSP_rk_b
   use mod_mesh, only: &
     PolyOrder, Nq, Np, NfpTot, Ne, NeA,  &
-    D1D, D1D_tr, Lift_mat, VMapM, VMapP, &
+    D1D, D1D_tr, Lift_mat, Lift1D, VMapM, VMapP, &
     normal_fn, Escale, Fscale, pos_en, update_halo
   use mod_advect3d_eq, only: &
     advect3d_eq_cal_tend
@@ -48,7 +48,7 @@ program main
 
   call init()
 
-  !$acc data copyin(q,u,v,w,D1D,D1D_tr,Lift_mat,VMapM,VMapP) &
+  !$acc data copyin(q,u,v,w,D1D,D1D_tr,Lift_mat,Lift1D,VMapM,VMapP) &
   !$acc& copyin(normal_fn,Escale,Fscale) create(q0,dqdt)
 
   call update_halo(u)
@@ -74,7 +74,7 @@ program main
       call Timer_start(timer_cal_tend)
       call advect3d_eq_cal_tend( dqdt,       & ! (out)
         q, u, v, w,                              & ! (in)
-        D1D, D1D_tr, Lift_mat,                   & ! (in)
+        D1D, D1D_tr, Lift_mat, Lift1D,           & ! (in)
         VMapM, VMapP, normal_fn, Escale, Fscale, & ! (in)
         Nq, Np, NfpTot, Ne, NeA )
       call Timer_stop(timer_cal_tend)

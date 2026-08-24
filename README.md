@@ -135,19 +135,30 @@ Select it at run time with
 DqdtKernel_Type = "CUDAFORTRAN_SPLIT"
 ```
 
-An additional p=7-only fused variant is selected with
+An additional specialized fused variant is selected with
 
 ```fortran
 DqdtKernel_Type = "CUDAFORTRAN_FUSED"
 ```
 
-It evaluates the complete element tendency in one CUDA Fortran kernel. Each
-p=7 element uses one 256-thread block: every thread evaluates two volume nodes,
-reusing their x/y contraction coefficients. Volume fluxes, boundary fluxes,
-and minus-side field values are staged in shared memory, after which the same
-kernel performs tensor-product differentiation, surface lifting, and final
-assembly. No intermediate volume-flux, derivative, lift, or boundary-flux
-array is required.
+For p=7, it evaluates the complete element tendency in one CUDA Fortran
+kernel. Each element uses one 256-thread block and every thread evaluates two
+volume nodes. The three pointwise volume fluxes and all six boundary fluxes
+are staged in shared memory before tensor-product differentiation, surface
+lifting, and assembly.
+
+For p=255 (`Nq=256`), each element is decomposed into 16x16 CUDA blocks. A
+boundary kernel first generates all six face fluxes, followed by tiled
+x-, y-, and z-direction differentiation kernels. Each directional kernel also
+applies its corresponding surface lift, so full-volume derivative work arrays
+are not allocated. The block index includes the element number and therefore
+supports both the intended `Ne=1` case and `Ne>1`.
+
+The p=255 Legendre-Gauss-Lobatto nodes and operators are generated at startup;
+no large `operator_data/p255.dat` file is needed. Its separable lifting
+operator is stored as `Lift1D(256,6)` instead of a dense
+`Lift_mat(256,256,256,6)`. The p=255 path currently requires
+`CUDAFORTRAN_FUSED`.
 
 The CUDA Fortran kernels are in `mod_cuda_dg_kernels.cuf`. OpenACC `host_data`
 regions pass the resident device arrays directly to CUDA Fortran, without
@@ -173,9 +184,10 @@ The split modes additionally print their component timings, so
 the implementations can be compared by changing only `DqdtKernel_Type` while
 keeping all other input values unchanged. The split mode allocates seven
 additional `Np`-by-`Ne` work arrays (about 896 MiB for p=7 and a 32-cubed mesh).
-The FUSED mode does not allocate any of these work arrays. It is specialized
-for this extraction program's spatially uniform, time-invariant velocity
-fields and uses one representative `u`, `v`, and `w` value in the kernel.
+The FUSED mode does not allocate any of these volume work arrays. Like the
+original implementation, it evaluates the pointwise `u`, `v`, `w`, and
+`Escale` arrays and the face-point `normal_fn` and `Fscale` arrays; it does not
+replace them with representative scalar values.
 
 The supplied `input_large.conf` is a representative p=7 GPU benchmark
 with 32 elements in each direction. It requires approximately a few GiB of GPU

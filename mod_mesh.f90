@@ -11,7 +11,7 @@ module mod_mesh
   !
   !++ Used modules
   !
-  use mod_common, only: RP
+  use mod_common, only: RP, PI
   implicit none
   private
 
@@ -42,6 +42,7 @@ module mod_mesh
   real(RP), public, allocatable :: D1D(:,:)          !< 1D differentiation matrix
   real(RP), public, allocatable :: D1D_tr(:,:)       !< Transpose of 1D differentiation matrix
   real(RP), public, allocatable :: Lift_mat(:,:,:,:) !< Lift matrix
+  real(RP), public, allocatable :: Lift1D(:,:)        !< Separable face lift coefficients
 
   !- Mesh
 
@@ -261,21 +262,34 @@ contains
     allocate(Fmask(Nfp,6))
 
     allocate(D1D(Nq,Nq), D1D_tr(Nq,Nq))
-    allocate(Lift_mat(Nq,Nq,Nq,6))
+    allocate(Lift1D(Nq,6))
 
     !----------------------------------------------------------
     ! Operator data
     !----------------------------------------------------------
 
-    write(fname,'(a,"/p",I0,".dat")') operator_data_dir, p
+    if (p == 255) then
+      allocate(Lift_mat(1,1,1,1))
+      call generate_lgl_operators_p255(x1D,D1D,Lift1D)
+    else
+      allocate(Lift_mat(Nq,Nq,Nq,6))
+      write(fname,'(a,"/p",I0,".dat")') operator_data_dir, p
 
-    fid = 20
-    open(fid,file=trim(fname),status='old',action='read')
+      fid = 20
+      open(fid,file=trim(fname),status='old',action='read')
 
-    read(fid,*) x1D
-    read(fid,*) D1D
-    read(fid,*) Lift_mat
-    close(fid)
+      read(fid,*) x1D
+      read(fid,*) D1D
+      read(fid,*) Lift_mat
+      close(fid)
+
+      Lift1D(:,1) = Lift_mat(1,:,1,1)
+      Lift1D(:,2) = Lift_mat(:,1,1,2)
+      Lift1D(:,3) = Lift_mat(1,:,1,3)
+      Lift1D(:,4) = Lift_mat(:,1,1,4)
+      Lift1D(:,5) = Lift_mat(1,1,:,5)
+      Lift1D(:,6) = Lift_mat(1,1,:,6)
+    end if
 
     D1D_tr = transpose(D1D)
 
@@ -342,6 +356,103 @@ contains
 
     return
   end subroutine element_init
+
+
+  !> Generate the p=255 Legendre-Gauss-Lobatto operators at startup.
+  !! Keeping this generated avoids a roughly multi-gigabyte text data file.
+  subroutine generate_lgl_operators_p255(nodes,deriv,lift1d)
+    implicit none
+    real(RP), intent(out) :: nodes(256), deriv(256,256)
+    real(RP), intent(out) :: lift1d(256,6)
+
+    integer, parameter :: degree = 255
+    integer :: i, j, iter
+    real(RP) :: x, xnew, pn_i, pnm1_i, pn_j, pnm1_j
+    real(RP) :: left_lift(256), right_lift(256)
+    real(RP), parameter :: tolerance = 32.0_RP*epsilon(1.0_RP)
+    !------------------------------------------------------------
+
+    nodes(1) = -1.0_RP
+    nodes(256) = 1.0_RP
+    do i = 2, 255
+      x = -cos(PI*real(i-1,RP)/real(degree,RP))
+      do iter = 1, 100
+        call eval_legendre_pair(degree,x,pn_i,pnm1_i)
+        xnew = x - (x*pn_i-pnm1_i)/(real(degree+1,RP)*pn_i)
+        if (abs(xnew-x) <= tolerance*max(1.0_RP,abs(xnew))) exit
+        x = xnew
+      end do
+      if (iter > 100) error stop "p=255 LGL node iteration did not converge"
+      nodes(i) = xnew
+    end do
+
+    ! Enforce the exact symmetry of the LGL grid.
+    do i = 1, 128
+      x = 0.5_RP*(nodes(257-i)-nodes(i))
+      nodes(i) = -x
+      nodes(257-i) = x
+    end do
+
+    do i = 1, 256
+      call eval_legendre_pair(degree,nodes(i),pn_i,pnm1_i)
+      do j = 1, 256
+        if (i == j) then
+          if (i == 1) then
+            deriv(i,j) = -0.25_RP*real(degree*(degree+1),RP)
+          else if (i == 256) then
+            deriv(i,j) = 0.25_RP*real(degree*(degree+1),RP)
+          else
+            deriv(i,j) = 0.0_RP
+          end if
+        else
+          call eval_legendre_pair(degree,nodes(j),pn_j,pnm1_j)
+          deriv(i,j) = pn_i/(pn_j*(nodes(i)-nodes(j)))
+        end if
+      end do
+
+      left_lift(i) = 0.5_RP*real(degree+1,RP)*pn_i*(-1.0_RP)
+      right_lift(i) = 0.5_RP*real(degree+1,RP)*pn_i
+    end do
+    left_lift(1) = left_lift(1) &
+      + 0.5_RP*real(degree*(degree+1),RP)
+    right_lift(256) = right_lift(256) &
+      + 0.5_RP*real(degree*(degree+1),RP)
+
+    lift1d(:,1) = left_lift
+    lift1d(:,2) = right_lift
+    lift1d(:,3) = right_lift
+    lift1d(:,4) = left_lift
+    lift1d(:,5) = left_lift
+    lift1d(:,6) = right_lift
+  end subroutine generate_lgl_operators_p255
+
+
+  !> Evaluate P_n(x) and P_{n-1}(x) by the stable three-term recurrence.
+  subroutine eval_legendre_pair(n,x,pn,pnm1)
+    implicit none
+    integer, intent(in) :: n
+    real(RP), intent(in) :: x
+    real(RP), intent(out) :: pn, pnm1
+
+    integer :: m
+    real(RP) :: p0, p1, p2
+    !------------------------------------------------------------
+
+    if (n == 0) then
+      pn = 1.0_RP
+      pnm1 = 1.0_RP
+      return
+    end if
+    p0 = 1.0_RP
+    p1 = x
+    do m = 2, n
+      p2 = (real(2*m-1,RP)*x*p1-real(m-1,RP)*p0)/real(m,RP)
+      p0 = p1
+      p1 = p2
+    end do
+    pn = p1
+    pnm1 = p0
+  end subroutine eval_legendre_pair
 
 
   !> Setup element coordinates
