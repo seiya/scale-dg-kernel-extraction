@@ -21,6 +21,7 @@ module mod_mesh
   !
 
   public :: mesh_setup
+  public :: mesh_finalize
   public :: update_halo
   
   !-----------------------------------------------------------------------------
@@ -189,8 +190,23 @@ contains
     end do
     end do
 
+    !$acc enter data copyin(halo_src_map)
+
     return
   end subroutine mesh_setup
+
+
+  !> Release device data owned by the mesh module
+!OCL SERIAL
+  subroutine mesh_finalize()
+    implicit none
+    !------------------------------------------------------------
+
+    !$acc exit data delete(halo_src_map)
+    deallocate(halo_src_map)
+
+    return
+  end subroutine mesh_finalize
 
 
   !> Update the halo values of a field variable
@@ -213,6 +229,7 @@ contains
     integer :: ibuf
     !------------------------------------------------------------
 
+    !$acc parallel loop gang vector present(f,halo_src_map)
     do ibuf = 1, NhaloNode
       f(Np*Ne+ibuf) = f(halo_src_map(ibuf))
     end do

@@ -83,6 +83,46 @@ make
 
 If the compilation has succeeded, the executable `scale-dg_extraction` will be generated in the current directory.
 
+### OpenACC GPU build
+
+The CPU/OpenMP build remains the default. To build the OpenACC version with
+NVIDIA HPC SDK, run the build on the GPU compute node:
+
+```bash
+make clean
+make ACC=1
+```
+
+The OpenACC build uses `nvfortran`, keeps the prognostic fields, mesh maps,
+geometry, and DG operators resident on the GPU throughout the time-stepping
+loop, and selects the native GPU architecture by default. The architecture
+flags can be overridden when cross-compiling or producing a binary for a
+specific GPU. For example, a Hopper build can be made with
+
+```bash
+make clean
+make ACC=1 GPUFLAGS=-gpu=cc90
+```
+
+Both `GENERAL` and `OPT1` kernels are supported. `OPT1` continues to be
+generated from `mod_dg_optr_kernel_opt1.F90.erb`; run `make` after changing the
+template to regenerate `mod_dg_optr_kernel_opt1.f90`.
+
+The supplied `input_gpu_benchmark.conf` is a representative p=7 GPU benchmark
+with 32 elements in each direction. It requires approximately a few GiB of GPU
+memory. Run it as
+
+```bash
+./scale-dg_extraction input_gpu_benchmark.conf
+```
+
+For profiling, the time-stepping region should not contain full-field host to
+device or device to host transfers. Only the scalar min/max reductions at the
+configured output interval are returned to the host. The reported `Cal_tend`,
+`Element boundary flux`, and `Volume derivate + surface lift` timers are
+synchronous GPU timings because the initial implementation does not use
+asynchronous OpenACC queues.
+
 
 ## Setting and Running
 

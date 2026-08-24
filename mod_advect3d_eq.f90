@@ -18,12 +18,16 @@ module mod_advect3d_eq
 
   type(Timer) :: timer_ebnd_flux
   type(Timer) :: timer_dqdt
+  real(RP), allocatable :: ebnd_flux(:,:)
 contains
   !> Setup
 !OCL SERIAL
-  subroutine setup_advect3d_eq_setup()
+  subroutine setup_advect3d_eq_setup(NfpTot, Ne)
     implicit none
+    integer, intent(in) :: NfpTot, Ne
     !------------------------------------------------------------------------------
+    allocate(ebnd_flux(NfpTot,Ne))
+    !$acc enter data create(ebnd_flux)
     return
   end subroutine setup_advect3d_eq_setup
   !> Finalize
@@ -33,6 +37,8 @@ contains
     !------------------------------------------------------------------------------
     write(*,'(A30,ES24.5)') "Element boundary flux:", Timer_elapsed(timer_ebnd_flux)
     write(*,'(A30,ES24.5)') "Volume derivate + surface lift:", Timer_elapsed(timer_dqdt)
+    !$acc exit data delete(ebnd_flux)
+    deallocate(ebnd_flux)
     return
   end subroutine setup_advect3d_eq_finalize
 
@@ -63,8 +69,6 @@ contains
     real(RP), intent(in) :: normal_fn(NfpTot,Ne,3)
     real(RP), intent(in) :: Escale(Np,Ne,3)
     real(RP), intent(in) :: Fscale(NfpTot,Ne)
-    real(RP) :: ebnd_flux(NfpTot,Ne)
-
     !------------------------------------------------------------
 
     call Timer_start(timer_ebnd_flux)
@@ -105,38 +109,38 @@ contains
     real(RP), intent(in) :: normal_fn(NfpTot,Ne,3)
     real(RP), intent(in) :: Fscale(NfpTot,Ne)
 
-    integer :: ke
-    integer :: iM(NfpTot), iP(NfpTot)
-    real(RP) :: qM(NfpTot), qP(NfpTot)
-    real(RP) :: VelM(NfpTot), VelP(NfpTot)
-    real(RP) :: alpha(NfpTot)
+    integer :: ke, fp
+    integer :: iM, iP
+    real(RP) :: qM, qP
+    real(RP) :: VelM, VelP
+    real(RP) :: alpha
 
     !------------------------------------------
 
-    !$omp parallel do private(iM,iP,qM,qP,VelM,VelP,alpha)
+    !$omp parallel do private(fp,iM,iP,qM,qP,VelM,VelP,alpha)
+    !$acc parallel loop gang vector collapse(2) &
+    !$acc& present(flux,q_,u_,v_,w_,VMapM,VMapP,normal_fn,Fscale)
     do ke = 1, Ne
-      iM(:) = VMapM(:,ke)
-      iP(:) = VMapP(:,ke)
+      do fp = 1, NfpTot
+        iM = VMapM(fp,ke)
+        iP = VMapP(fp,ke)
 
-      qM(:) = q_(iM(:))
-      qP(:) = q_(iP(:))
+        qM = q_(iM)
+        qP = q_(iP)
 
-      VelM(:) = &
-           u_(iM(:))*normal_fn(:,ke,1) &
-         + v_(iM(:))*normal_fn(:,ke,2) &
-         + w_(iM(:))*normal_fn(:,ke,3)
-     
-      VelP(:) = &
-           u_(iP(:))*normal_fn(:,ke,1) &
-         + v_(iP(:))*normal_fn(:,ke,2) &
-         + w_(iP(:))*normal_fn(:,ke,3)
+        VelM = u_(iM)*normal_fn(fp,ke,1) &
+             + v_(iM)*normal_fn(fp,ke,2) &
+             + w_(iM)*normal_fn(fp,ke,3)
 
-      alpha(:) = 0.5_RP * abs( VelP(:) + VelM(:) )
+        VelP = u_(iP)*normal_fn(fp,ke,1) &
+             + v_(iP)*normal_fn(fp,ke,2) &
+             + w_(iP)*normal_fn(fp,ke,3)
 
-      flux(:,ke) = 0.5_RP * Fscale(:,ke) * ( &
-           qP(:) * VelP(:)                   &
-         - qM(:) * VelM(:)                   &
-         - alpha(:) * ( qP(:) - qM(:) ) )
+        alpha = 0.5_RP * abs(VelP + VelM)
+
+        flux(fp,ke) = 0.5_RP * Fscale(fp,ke) * ( &
+             qP * VelP - qM * VelM - alpha * (qP - qM) )
+      end do
     end do
     return
   end subroutine cal_elembnd_flux
@@ -168,7 +172,7 @@ contains
     real(RP), intent(in) :: Lift_mat(Nq,Nq,Nq,6)
     real(RP), intent(in) :: Escale(Np,Ne,3)
 
-    integer :: ke
+    integer :: ke, p
 
     real(RP) :: flux_x(Np), flux_y(Np), flux_z(Np)
     real(RP) :: DxFlux(Np), DyFlux(Np), DzFlux(Np)
@@ -176,11 +180,17 @@ contains
     real(RP) :: LiftBndFlux(Np)
     !------------------------------------------------------------
 
-    !$omp parallel do private( flux_x, flux_y, flux_z, DxFlux, DyFlux, DzFlux, LiftBndFlux )
+    !$omp parallel do private( p, flux_x, flux_y, flux_z, DxFlux, DyFlux, DzFlux, LiftBndFlux )
+    !$acc parallel loop gang &
+    !$acc& private(flux_x,flux_y,flux_z,DxFlux,DyFlux,DzFlux,LiftBndFlux) &
+    !$acc& present(dqdt,q,u,v,w,flux_bnd,D1D,D1D_tr,Lift_mat,Escale)
     do ke = 1, Ne
-      flux_x(:) = q(:,ke) * u(:,ke)
-      flux_y(:) = q(:,ke) * v(:,ke)
-      flux_z(:) = q(:,ke) * w(:,ke)
+      !$acc loop vector
+      do p = 1, Np
+        flux_x(p) = q(p,ke) * u(p,ke)
+        flux_y(p) = q(p,ke) * v(p,ke)
+        flux_z(p) = q(p,ke) * w(p,ke)
+      end do
 
       call tensorprod_divlike_dirXYZ( &
         DxFlux, DyFlux, DzFlux,       & ! (out)
@@ -191,11 +201,14 @@ contains
         LiftBndFlux,                 & ! (out)
         Lift_mat, flux_bnd(:,ke), Nq ) ! (in)
 
-      dqdt(:,ke) = -( &
-           Escale(:,ke,1)*DxFlux(:) &
-         + Escale(:,ke,2)*DyFlux(:) &
-         + Escale(:,ke,3)*DzFlux(:) &
-         + LiftBndFlux(:) )
+      !$acc loop vector
+      do p = 1, Np
+        dqdt(p,ke) = -( &
+             Escale(p,ke,1)*DxFlux(p) &
+           + Escale(p,ke,2)*DyFlux(p) &
+           + Escale(p,ke,3)*DzFlux(p) &
+           + LiftBndFlux(p) )
+      end do
     end do
     return
   end subroutine cal_dqdt

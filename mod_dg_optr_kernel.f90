@@ -34,6 +34,7 @@ module mod_dg_optr_kernel
   !++ Private parameters & variables
   !
   integer :: eval_typeid !< The evaluation type ID for the tensor-product operations
+  !$acc declare create(eval_typeid)
 
   !> ID of the general tensor-product evaluation type for arbitrary p.
   integer, parameter :: DGOPTR_EVALTYPEID_TENSORPROD3D_GENERAL = 1
@@ -53,7 +54,9 @@ contains
       eval_typeid = DGOPTR_EVALTYPEID_TENSORPROD3D_OPT1
     case default
       write(*,*) "Unsupported dgoptr_evaltype: ", dgoptr_evaltype
+      error stop
     end select
+    !$acc update device(eval_typeid)
     return
   end subroutine dg_optr_kernel_setup
 
@@ -64,6 +67,7 @@ contains
     Mat, Mat_tr,                     &
     vec_in_x, vec_in_y, vec_in_z,    &
     Nq )
+    !$acc routine vector
     use mod_dg_optr_kernel_opt1
     implicit none
     integer, intent(in) :: Nq
@@ -139,6 +143,7 @@ contains
   subroutine tensorprod_Lift_hexahedral( &
     vec_out,         &
     Lift, vec_in, Nq )
+    !$acc routine vector
     use mod_dg_optr_kernel_opt1
     implicit none
     integer, intent(in) :: Nq
@@ -199,6 +204,7 @@ contains
     Mat, Mat_tr,                     &
     vec_in_x, vec_in_y, vec_in_z,    &
     Nq )
+    !$acc routine vector
     implicit none
     integer, intent(in) :: Nq
     real(RP), intent(in) :: Mat(Nq,Nq)
@@ -213,13 +219,11 @@ contains
     integer :: i,j,k,l,jk
     !----------------------------------------------------------
 
-    vec_out_x(:,:) = 0.0_RP
-    vec_out_y(:,:) = 0.0_RP
-    vec_out_z(:,:) = 0.0_RP
-
     !- x-direction
+    !$acc loop vector collapse(2)
     do jk = 1, Nq**2
       do i = 1, Nq
+        vec_out_x(i,jk) = 0.0_RP
         do l = 1, Nq
           vec_out_x(i,jk) = &
                vec_out_x(i,jk) &
@@ -229,10 +233,12 @@ contains
     end do
 
     !- y-direction
+    !$acc loop vector collapse(3)
     do k = 1, Nq
       do j = 1, Nq
-        jk = j + (k-1)*Nq
         do i = 1, Nq
+          jk = j + (k-1)*Nq
+          vec_out_y(i,jk) = 0.0_RP
           do l = 1, Nq
             vec_out_y(i,jk) = vec_out_y(i,jk) &
                + vec_in_y(i,l,k)*Mat_tr(l,j)
@@ -242,10 +248,12 @@ contains
     end do
 
     !- z-direction
+    !$acc loop vector collapse(3)
     do k = 1, Nq
       do j = 1, Nq
-        jk = j + (k-1)*Nq
         do i = 1, Nq
+          jk = j + (k-1)*Nq
+          vec_out_z(i,jk) = 0.0_RP
           do l = 1, Nq
             vec_out_z(i,jk) = vec_out_z(i,jk) &
                + vec_in_z(i,j,l)*Mat_tr(l,k)
@@ -262,6 +270,7 @@ contains
   subroutine tensorprod_Lift_hexahedral_general( &
     vec_out,         &
     Lift, vec_in, Nq )
+    !$acc routine vector
     implicit none
     integer, intent(in) :: Nq
     real(RP), intent(out) :: vec_out(Nq,Nq,Nq)
@@ -271,6 +280,7 @@ contains
     integer :: i,j,k
     !----------------------------------------------------------
 
+    !$acc loop vector collapse(3)
     do k = 1, Nq
     do j = 1, Nq
     do i = 1, Nq

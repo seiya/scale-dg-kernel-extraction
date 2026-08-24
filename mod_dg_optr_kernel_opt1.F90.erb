@@ -49,6 +49,7 @@ contains
 !!
 !OCL SERIAL
   subroutine element_operation_kernel_matvec_dirX_P<%=p%>( Mat_x, vec_in, vec_out )
+    !$acc routine vector
     implicit none
     real(RP), intent(in) :: Mat_x(<%=np%>,<%=np%>)
     real(RP), intent(in) :: vec_in(<%=np%>,<%=np%>**2)
@@ -57,6 +58,7 @@ contains
     integer :: i, jk
     !----------------------------------------------------------
 
+    !$acc loop vector collapse(2)
     do jk=1, <%=np%>**2
     do i=1, <%=np%>
         vec_out(i,jk) = Mat_x(i,1) * vec_in(1,jk) &
@@ -76,6 +78,7 @@ contains
 !!
 !OCL SERIAL
   subroutine element_operation_kernel_matvec_dirY_P<%=p%>( Mat_y_tr, vec_in, vec_out )
+    !$acc routine vector
     implicit none
     real(RP), intent(in) :: Mat_y_tr(<%=np%>,<%=np%>)
     real(RP), intent(in) :: vec_in(<%=np%>,<%=np%>,<%=np%>)
@@ -84,6 +87,7 @@ contains
     integer :: i, j, k
     !----------------------------------------------------------
 
+    !$acc loop vector collapse(3)
     do k=1, <%=np%>
     do j=1, <%=np%>
     do i=1, <%=np%>
@@ -105,6 +109,7 @@ contains
 !!
 !OCL SERIAL
   subroutine element_operation_kernel_matvec_dirZ_P<%=p%>( Mat_z_tr, vec_in, vec_out )
+    !$acc routine vector
     implicit none
     real(RP), intent(in) :: Mat_z_tr(<%=np%>,<%=np%>)
     real(RP), intent(in) :: vec_in(<%=np%>,<%=np%>,<%=np%>)
@@ -113,6 +118,7 @@ contains
     integer :: i, j, k
     !----------------------------------------------------------
 
+    !$acc loop vector collapse(3)
     do k=1, <%=np%>
     do j=1, <%=np%>
     do i=1, <%=np%>
@@ -132,6 +138,7 @@ contains
 !!
 !OCL SERIAL
   subroutine element_operation_kernel_matvec_Lift_hexahedral_P<%=p%>( Lift, vec_in, vec_out )
+    !$acc routine vector
     implicit none
     real(RP), intent(in) :: Lift(<%=np%>,<%=np%>,<%=np%>,6)
     real(RP), intent(in) :: vec_in(<%=np%>,<%=np%>,6)
@@ -140,6 +147,7 @@ contains
     integer :: i, j, k
     !----------------------------------------------------------
 
+    !$acc loop vector collapse(3)
     do k=1, <%=np%>
     do j=1, <%=np%>
     do i=1, <%=np%>
@@ -165,6 +173,7 @@ contains
 !OCL SERIAL
   subroutine element_operation_kernel_matvec_gradlike_dirXYZ_P<%=p%>( Mat, Mat_tr, vec_in, vec_in_, &
     vec_out_x, vec_out_y, vec_out_z  )
+    !$acc routine vector
     implicit none
     real(RP), intent(in) :: Mat(<%=np%>,<%=np%>)
     real(RP), intent(in) :: Mat_tr(<%=np%>,<%=np%>)
@@ -179,6 +188,7 @@ contains
 
     ! X-dir
 
+    !$acc loop vector collapse(2)
     do jk=1, <%=np%>**2
     do i=1, <%=np%>
         vec_out_x(i,jk) = Mat(i,1) * vec_in_(1,jk) &
@@ -190,6 +200,7 @@ contains
     end do
 
     ! Y-dir
+    !$acc loop vector collapse(3)
     do k=1, <%=np%>
     do j=1, <%=np%>
     do i=1, <%=np%>
@@ -203,6 +214,7 @@ contains
     end do
     
     ! Z-dir
+    !$acc loop vector collapse(3)
     do k=1, <%=np%>
     do j=1, <%=np%>
     do i=1, <%=np%>
@@ -228,6 +240,7 @@ contains
   subroutine element_operation_kernel_matvec_divlike_dirXYZ_P<%=p%>( &
     Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, &
     vec_out_x, vec_out_y, vec_out_z  )
+    !$acc routine vector
     implicit none
     real(RP), intent(in) :: Mat(<%=np%>,<%=np%>)
     real(RP), intent(in) :: Mat_tr(<%=np%>,<%=np%>)
@@ -246,6 +259,7 @@ contains
 
     ! X-dir
 
+    !$acc loop vector collapse(2)
     do jk=1, <%=np%>**2
     do i=1, <%=np%>
 % if p <= 7
@@ -276,10 +290,11 @@ contains
     end do
 
     ! Y-dir
+    !$acc loop vector collapse(3)
     do k=1, <%=np%>
     do j=1, <%=np%>
-      jk = j + (k-1)*<%=np%>
       do i=1, <%=np%>
+        jk = j + (k-1)*<%=np%>
 % if p <= 7
         vec_out_y(i,jk) = vec_in_y(i,1,k) * Mat_tr(1,j) &
 %   for jj in 2..np-1
@@ -309,10 +324,11 @@ contains
     end do
     
     ! Z-dir
+    !$acc loop vector collapse(3)
     do k=1, <%=np%>
     do j=1, <%=np%>
-      jk = j + (k-1)*<%=np%>
       do i=1, <%=np%>
+        jk = j + (k-1)*<%=np%>
 % if p <= 7
         vec_out_z(i,jk) = vec_in_z(i,j,1) * Mat_tr(1,k) &
 %   for kk in 2..np-1
@@ -347,6 +363,7 @@ contains
   subroutine element_operation_kernel_matvec_divlike_dirXYZ_var5_P<%=p%>( &
     Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, &
     vec_out_x, vec_out_y, vec_out_z  )
+    !$acc routine vector
     implicit none
     real(RP), intent(in) :: Mat(<%=np%>,<%=np%>)
     real(RP), intent(in) :: Mat_tr(<%=np%>,<%=np%>)
@@ -365,6 +382,7 @@ contains
 
     ! X-dir
 
+    !$acc loop vector collapse(2)
     do jkv=1, <%=np%>**2*5
     do i=1, <%=np%>
 % if p <= 7
@@ -395,10 +413,11 @@ contains
     end do
 
     ! Y-dir
+    !$acc loop vector collapse(3)
     do kv=1, <%=np%>*5
     do j=1, <%=np%>
-      jkv = j + (kv-1)*<%=np*5%>
       do i=1, <%=np%>
+        jkv = j + (kv-1)*<%=np*5%>
 % if p <= 7
         vec_out_y(i,jkv) = vec_in_y(i,1,kv) * Mat_tr(1,j) &
 %   for jj in 2..np-1
@@ -428,11 +447,12 @@ contains
     end do
     
     ! Z-dir
+    !$acc loop vector collapse(4)
     do v=1, 5
     do k=1, <%=np%>
     do j=1, <%=np%>
-      jk = j + (k-1)*<%=np%>
       do i=1, <%=np%>
+        jk = j + (k-1)*<%=np%>
 % if p <= 7
         vec_out_z(i,jk,v) = vec_in_z(i,j,1,v) * Mat_tr(1,k) &
 %   for kk in 2..np-1

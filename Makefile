@@ -1,7 +1,17 @@
+ACC ?= 0
+
+ifeq ($(ACC),1)
 ifeq ($(origin FC), default)
-FC      = gfortran
+FC       = nvfortran
 endif
-FFLAGS ?= -O3 -fopenmp
+GPUFLAGS ?= -gpu=ccnative
+FFLAGS  ?= -O3 -acc=gpu $(GPUFLAGS) -Minfo=accel
+else
+ifeq ($(origin FC), default)
+FC       = gfortran
+endif
+FFLAGS  ?= -O3 -fopenmp
+endif
 
 TARGET = scale-dg_extraction
 OBJS   = mod_common.o         \
@@ -18,7 +28,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(FC) $(FFLAGS) -o $@ $^
 
-%.f90 : %.F90.erb
+%.f90: %.F90.erb
 	erb $< > $@
 
 .SUFFIXES:

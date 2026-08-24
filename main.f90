@@ -38,7 +38,8 @@ program main
   real(RP), allocatable :: v(:,:)
   real(RP), allocatable :: w(:,:)
 
-  integer :: kelem
+  integer :: kelem, pnode
+  real(RP) :: q_min, q_max
 
   type(Timer) :: timer_main
   type(Timer) :: timer_cal_tend
@@ -47,12 +48,24 @@ program main
 
   call init()
 
+  !$acc data copyin(q,u,v,w,D1D,D1D_tr,Lift_mat,VMapM,VMapP) &
+  !$acc& copyin(normal_fn,Escale,Fscale) create(q0,dqdt)
+
+  call update_halo(u)
+  call update_halo(v)
+  call update_halo(w)
+
+  call Timer_start(timer_main)
+
   !- Loop for time integration
   do istep = 1, nstep
 
-    !$omp parallel do
-    do kelem=1, Ne 
-      q0(:,kelem) = q(:,kelem)
+    !$omp parallel do private(pnode)
+    !$acc parallel loop gang vector collapse(2) present(q0,q)
+    do kelem=1, Ne
+      do pnode=1, Np
+        q0(pnode,kelem) = q(pnode,kelem)
+      end do
     end do
 
     do stage = 1, RK_nstage
@@ -66,18 +79,32 @@ program main
         Nq, Np, NfpTot, Ne, NeA )
       call Timer_stop(timer_cal_tend)
 
-      !$omp parallel do
+      !$omp parallel do private(pnode)
+      !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt)
       do kelem=1, Ne
-        q(:,kelem) = rk_a(stage) * q0(:,kelem) &
-                   + rk_b(stage) * ( q(:,kelem) + dt * dqdt(:,kelem) )
+        do pnode=1, Np
+          q(pnode,kelem) = rk_a(stage) * q0(pnode,kelem) &
+                         + rk_b(stage) * ( q(pnode,kelem) + dt * dqdt(pnode,kelem) )
+        end do
       end do
     end do
 
     if (mod(istep,output_interval) == 0) then
-      write(*,'(I8,2ES24.15)') &
-           istep, minval(q(:,1:Ne)), maxval(q(:,1:Ne))
+      q_min = huge(q_min)
+      q_max = -huge(q_max)
+      !$acc parallel loop gang vector collapse(2) present(q) &
+      !$acc& reduction(min:q_min) reduction(max:q_max)
+      do kelem=1, Ne
+        do pnode=1, Np
+          q_min = min(q_min,q(pnode,kelem))
+          q_max = max(q_max,q(pnode,kelem))
+        end do
+      end do
+      write(*,'(I8,2ES24.15)') istep, q_min, q_max
     end if
   end do
+
+  !$acc end data
 
   call final()
 contains
@@ -139,11 +166,11 @@ contains
     call dg_optr_kernel_setup( DGOptrKernel_OptType )
 
     !- Initialize a advection equation module
-    call setup_advect3d_eq_setup()
+    call setup_advect3d_eq_setup(NfpTot, Ne)
 
     !- Set initial condition
 
-    !$omp parallel do
+    !$omp parallel do private(p)
     do ke = 1, Ne
     do p = 1, Np
       q(p,ke) = sin( 2.0_RP*PI*pos_en(p,ke,1) ) &
@@ -156,18 +183,13 @@ contains
     end do
     end do
 
-    call update_halo(q)
-    call update_halo(u)
-    call update_halo(v)
-    call update_halo(w)
-
-    call Timer_start(timer_main)
     return
   end subroutine init
 
 !OCL SERIAL
   subroutine final()
     use mod_advect3d_eq, only: setup_advect3d_eq_finalize
+    use mod_mesh, only: mesh_finalize
     implicit none
     !-----------------------------------------------------------------------------
 
@@ -177,6 +199,7 @@ contains
     write(*,'(A30,ES24.5)') "Cal_tend:", Timer_elapsed(timer_cal_tend)
 
     call setup_advect3d_eq_finalize()
+    call mesh_finalize()
     return
   end subroutine final
 end program main
