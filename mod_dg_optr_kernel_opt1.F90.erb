@@ -33,8 +33,10 @@ module mod_dg_optr_kernel_opt1
   public :: element_operation_kernel_matvec_dirY_P<%=p%>  
   public :: element_operation_kernel_matvec_dirZ_P<%=p%>
   public :: element_operation_kernel_matvec_Lift_hexahedral_P<%=p%>
+  public :: element_operation_kernel_matvec_Lift_hexahedral_all_P<%=p%>
   public :: element_operation_kernel_matvec_gradlike_dirXYZ_P<%=p%>
   public :: element_operation_kernel_matvec_divlike_dirXYZ_P<%=p%>
+  public :: element_operation_kernel_matvec_divlike_dirXYZ_all_P<%=p%>
 % end
 
 contains
@@ -483,6 +485,61 @@ contains
     end do
     return
   end subroutine element_operation_kernel_matvec_divlike_dirXYZ_var5_P<%=p%>
+
+!> Apply the optimized divergence-like tensor product to all elements
+!OCL SERIAL
+  subroutine element_operation_kernel_matvec_divlike_dirXYZ_all_P<%=p%>( &
+    Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, &
+    vec_out_x, vec_out_y, vec_out_z, Ne )
+    implicit none
+    integer, intent(in) :: Ne
+    real(RP), intent(in) :: Mat(<%=np%>,<%=np%>)
+    real(RP), intent(in) :: Mat_tr(<%=np%>,<%=np%>)
+    real(RP), intent(in) :: vec_in_x(<%=np%>**3,Ne)
+    real(RP), intent(in) :: vec_in_y(<%=np%>**3,Ne)
+    real(RP), intent(in) :: vec_in_z(<%=np%>**3,Ne)
+    real(RP), intent(out) :: vec_out_x(<%=np%>**3,Ne)
+    real(RP), intent(out) :: vec_out_y(<%=np%>**3,Ne)
+    real(RP), intent(out) :: vec_out_z(<%=np%>**3,Ne)
+
+    integer :: ke
+    !----------------------------------------------------------
+
+    !$omp parallel do
+    !$acc parallel loop gang &
+    !$acc& present(Mat,Mat_tr,vec_in_x,vec_in_y,vec_in_z) &
+    !$acc& present(vec_out_x,vec_out_y,vec_out_z)
+    do ke = 1, Ne
+      call element_operation_kernel_matvec_divlike_dirXYZ_P<%=p%>( &
+        Mat, Mat_tr, vec_in_x(:,ke), vec_in_y(:,ke), vec_in_z(:,ke), &
+        vec_out_x(:,ke), vec_out_y(:,ke), vec_out_z(:,ke) )
+    end do
+
+    return
+  end subroutine element_operation_kernel_matvec_divlike_dirXYZ_all_P<%=p%>
+
+!> Apply the optimized surface lifting tensor product to all elements
+!OCL SERIAL
+  subroutine element_operation_kernel_matvec_Lift_hexahedral_all_P<%=p%>( &
+    Lift, vec_in, vec_out, Ne )
+    implicit none
+    integer, intent(in) :: Ne
+    real(RP), intent(in) :: Lift(<%=np%>,<%=np%>,<%=np%>,6)
+    real(RP), intent(in) :: vec_in(6*<%=np%>**2,Ne)
+    real(RP), intent(out) :: vec_out(<%=np%>**3,Ne)
+
+    integer :: ke
+    !----------------------------------------------------------
+
+    !$omp parallel do
+    !$acc parallel loop gang present(Lift,vec_in,vec_out)
+    do ke = 1, Ne
+      call element_operation_kernel_matvec_Lift_hexahedral_P<%=p%>( &
+        Lift, vec_in(:,ke), vec_out(:,ke) )
+    end do
+
+    return
+  end subroutine element_operation_kernel_matvec_Lift_hexahedral_all_P<%=p%>
 
 % end
 

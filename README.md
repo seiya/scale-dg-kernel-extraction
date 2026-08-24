@@ -108,12 +108,30 @@ Both `GENERAL` and `OPT1` kernels are supported. `OPT1` continues to be
 generated from `mod_dg_optr_kernel_opt1.F90.erb`; run `make` after changing the
 template to regenerate `mod_dg_optr_kernel_opt1.f90`.
 
-The supplied `input_gpu_benchmark.conf` is a representative p=7 GPU benchmark
+Two OpenACC implementations of the volume derivative and surface lifting are
+available in the same executable and can be selected in the input file:
+
+- `DqdtKernel_Type = "OPENACC_ASIS"` runs the original single `cal_dqdt`
+  accelerator region with element-private temporary arrays. Its `ke` loop is
+  parallelized above the element-level DG operator routines.
+- `DqdtKernel_Type = "OPENACC_SPLIT"` uses persistent work arrays and separate
+  kernels for volume-flux generation, tensor-product differentiation, surface
+  lifting, and final tendency assembly. The differentiation and lifting
+  kernels are launched by the all-element DG operator routines themselves;
+  their lowest layer owns the `ke` loop and the element-internal vector loops.
+
+The total `Volume derivate + surface lift` timing is printed for both modes.
+The split mode additionally prints one timing for each of its four kernels, so
+the implementations can be compared by changing only `DqdtKernel_Type` while
+keeping all other input values unchanged. The split mode allocates seven
+additional `Np`-by-`Ne` work arrays (about 896 MiB for p=7 and a 32-cubed mesh).
+
+The supplied `input_large.conf` is a representative p=7 GPU benchmark
 with 32 elements in each direction. It requires approximately a few GiB of GPU
 memory. Run it as
 
 ```bash
-./scale-dg_extraction input_gpu_benchmark.conf
+./scale-dg_extraction input_large.conf
 ```
 
 For profiling, the time-stepping region should not contain full-field host to
@@ -131,6 +149,7 @@ Simulation parameters are specified in `input.conf`, including
 - Number of mesh elements in each direction (`NeX`, `NeY`, `NeZ`),
 - Polynomial order (`PolyOrder`),
 - DG operator optimization type (`DGOptrKernel_OptType`).
+- OpenACC tendency kernel type (`DqdtKernel_Type`).
 - Time step (`dt`)
 - Number of time steps (`nstep`)
 

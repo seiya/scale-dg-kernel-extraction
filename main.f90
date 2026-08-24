@@ -126,12 +126,14 @@ contains
     real(RP) :: vel_y = 1.0_RP
     real(RP) :: vel_z = 1.0_RP
     character(len=8) :: DGOptrKernel_OptType = "OPT1" ! GENERAL or OPT1
+    character(len=16) :: DqdtKernel_Type = "OPENACC_SPLIT"
 
     namelist /PARAM_ADVECT3D/ &
       NeX, NeY, NeZ, PolyOrder,   &
       dt, nstep, output_interval, &
       vel_x, vel_y, vel_z,        &
-      DGOptrKernel_OptType
+      DGOptrKernel_OptType,        &
+      DqdtKernel_Type
 
     integer :: fid
     integer :: ke, p
@@ -166,7 +168,7 @@ contains
     call dg_optr_kernel_setup( DGOptrKernel_OptType )
 
     !- Initialize a advection equation module
-    call setup_advect3d_eq_setup(NfpTot, Ne)
+    call setup_advect3d_eq_setup(NfpTot, Np, Ne, DqdtKernel_Type)
 
     !- Set initial condition
 

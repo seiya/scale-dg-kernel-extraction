@@ -24,6 +24,8 @@ module mod_dg_optr_kernel
   public :: dg_optr_kernel_setup
   public :: tensorprod_divlike_dirXYZ
   public :: tensorprod_Lift_hexahedral
+  public :: tensorprod_divlike_dirXYZ_all
+  public :: tensorprod_Lift_hexahedral_all
 
   !-----------------------------------------------------------------------------
   !
@@ -194,6 +196,150 @@ contains
     return
   end subroutine tensorprod_Lift_hexahedral
 
+  !> Tensor-product differentiation over all elements
+!OCL SERIAL
+  subroutine tensorprod_divlike_dirXYZ_all( &
+    vec_out_x, vec_out_y, vec_out_z, &
+    Mat, Mat_tr,                     &
+    vec_in_x, vec_in_y, vec_in_z,    &
+    Nq, Ne )
+    use mod_dg_optr_kernel_opt1
+    implicit none
+    integer, intent(in) :: Nq, Ne
+    real(RP), intent(in) :: Mat(Nq,Nq), Mat_tr(Nq,Nq)
+    real(RP), intent(in) :: vec_in_x(Nq**3,Ne)
+    real(RP), intent(in) :: vec_in_y(Nq**3,Ne)
+    real(RP), intent(in) :: vec_in_z(Nq**3,Ne)
+    real(RP), intent(out) :: vec_out_x(Nq**3,Ne)
+    real(RP), intent(out) :: vec_out_y(Nq**3,Ne)
+    real(RP), intent(out) :: vec_out_z(Nq**3,Ne)
+    !--------------------------------------------------
+
+    if (eval_typeid == DGOPTR_EVALTYPEID_TENSORPROD3D_GENERAL) then
+      call tensorprod_divlike_dirXYZ_all_general( &
+        vec_out_x, vec_out_y, vec_out_z, &
+        Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, Nq, Ne )
+    else
+      select case (Nq-1)
+      case (1)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P1( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (2)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P2( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (3)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P3( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (4)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P4( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (5)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P5( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (6)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P6( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (7)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P7( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (8)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P8( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (9)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P9( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (10)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P10( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (11)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P11( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (12)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P12( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (13)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P13( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (14)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P14( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case (15)
+        call element_operation_kernel_matvec_divlike_dirXYZ_all_P15( &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      end select
+    end if
+
+    return
+  end subroutine tensorprod_divlike_dirXYZ_all
+
+  !> Tensor-product surface lifting over all elements
+!OCL SERIAL
+  subroutine tensorprod_Lift_hexahedral_all( &
+    vec_out, Lift, vec_in, Nq, Ne )
+    use mod_dg_optr_kernel_opt1
+    implicit none
+    integer, intent(in) :: Nq, Ne
+    real(RP), intent(out) :: vec_out(Nq**3,Ne)
+    real(RP), intent(in) :: Lift(Nq,Nq,Nq,6)
+    real(RP), intent(in) :: vec_in(6*Nq**2,Ne)
+    !--------------------------------------------------
+
+    if (eval_typeid == DGOPTR_EVALTYPEID_TENSORPROD3D_GENERAL) then
+      call tensorprod_Lift_hexahedral_all_general( &
+        vec_out, Lift, vec_in, Nq, Ne )
+    else
+      select case (Nq-1)
+      case (1)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P1( &
+          Lift, vec_in, vec_out, Ne )
+      case (2)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P2( &
+          Lift, vec_in, vec_out, Ne )
+      case (3)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P3( &
+          Lift, vec_in, vec_out, Ne )
+      case (4)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P4( &
+          Lift, vec_in, vec_out, Ne )
+      case (5)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P5( &
+          Lift, vec_in, vec_out, Ne )
+      case (6)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P6( &
+          Lift, vec_in, vec_out, Ne )
+      case (7)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P7( &
+          Lift, vec_in, vec_out, Ne )
+      case (8)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P8( &
+          Lift, vec_in, vec_out, Ne )
+      case (9)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P9( &
+          Lift, vec_in, vec_out, Ne )
+      case (10)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P10( &
+          Lift, vec_in, vec_out, Ne )
+      case (11)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P11( &
+          Lift, vec_in, vec_out, Ne )
+      case (12)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P12( &
+          Lift, vec_in, vec_out, Ne )
+      case (13)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P13( &
+          Lift, vec_in, vec_out, Ne )
+      case (14)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P14( &
+          Lift, vec_in, vec_out, Ne )
+      case (15)
+        call element_operation_kernel_matvec_Lift_hexahedral_all_P15( &
+          Lift, vec_in, vec_out, Ne )
+      end select
+    end if
+
+    return
+  end subroutine tensorprod_Lift_hexahedral_all
+
   !------------------------------------------------------------------
 
   !--------------------------------------------------
@@ -296,4 +442,60 @@ contains
     end do
     return
   end subroutine tensorprod_Lift_hexahedral_general
+
+  !> General tensor-product differentiation over all elements
+!OCL SERIAL
+  subroutine tensorprod_divlike_dirXYZ_all_general( &
+    vec_out_x, vec_out_y, vec_out_z, &
+    Mat, Mat_tr,                     &
+    vec_in_x, vec_in_y, vec_in_z,    &
+    Nq, Ne )
+    implicit none
+    integer, intent(in) :: Nq, Ne
+    real(RP), intent(in) :: Mat(Nq,Nq), Mat_tr(Nq,Nq)
+    real(RP), intent(in) :: vec_in_x(Nq**3,Ne)
+    real(RP), intent(in) :: vec_in_y(Nq**3,Ne)
+    real(RP), intent(in) :: vec_in_z(Nq**3,Ne)
+    real(RP), intent(out) :: vec_out_x(Nq**3,Ne)
+    real(RP), intent(out) :: vec_out_y(Nq**3,Ne)
+    real(RP), intent(out) :: vec_out_z(Nq**3,Ne)
+
+    integer :: ke
+    !--------------------------------------------------
+
+    !$omp parallel do
+    !$acc parallel loop gang &
+    !$acc& present(Mat,Mat_tr,vec_in_x,vec_in_y,vec_in_z) &
+    !$acc& present(vec_out_x,vec_out_y,vec_out_z)
+    do ke = 1, Ne
+      call tensorprod_divlike_dirXYZ_general( &
+        vec_out_x(:,ke), vec_out_y(:,ke), vec_out_z(:,ke), &
+        Mat, Mat_tr, vec_in_x(:,ke), vec_in_y(:,ke), vec_in_z(:,ke), Nq )
+    end do
+
+    return
+  end subroutine tensorprod_divlike_dirXYZ_all_general
+
+  !> General tensor-product surface lifting over all elements
+!OCL SERIAL
+  subroutine tensorprod_Lift_hexahedral_all_general( &
+    vec_out, Lift, vec_in, Nq, Ne )
+    implicit none
+    integer, intent(in) :: Nq, Ne
+    real(RP), intent(out) :: vec_out(Nq**3,Ne)
+    real(RP), intent(in) :: Lift(Nq,Nq,Nq,6)
+    real(RP), intent(in) :: vec_in(6*Nq**2,Ne)
+
+    integer :: ke
+    !--------------------------------------------------
+
+    !$omp parallel do
+    !$acc parallel loop gang present(vec_out,Lift,vec_in)
+    do ke = 1, Ne
+      call tensorprod_Lift_hexahedral_general( &
+        vec_out(:,ke), Lift, vec_in(:,ke), Nq )
+    end do
+
+    return
+  end subroutine tensorprod_Lift_hexahedral_all_general
 end module mod_dg_optr_kernel
