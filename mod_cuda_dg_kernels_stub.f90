@@ -16,6 +16,8 @@ module mod_cuda_dg_kernels
   public :: cuda_cal_dqdt_fused_tc
   public :: cuda_cal_dqdt_fused_p255_tc
   public :: cuda_cal_dqdt_gemm
+  public :: cuda_cal_dqdt_gemm_fused
+  public :: cuda_cal_dqdt_gemm_cute
   public :: cuda_gemm_setup
   public :: cuda_gemm_finalize
   public :: cuda_cal_elembnd_flux
@@ -139,6 +141,48 @@ contains
     real(RP), intent(out) :: kernel_time(2)
     error stop "CUDA Fortran kernels are not available in this build"
   end subroutine cuda_cal_dqdt_gemm
+
+  subroutine cuda_cal_dqdt_gemm_cute( &
+    dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, flux_bnd, &
+    flux_x, flux_y, flux_z, deriv_x, deriv_y, deriv_z, lift_out, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(in) :: q(Np,NeA), u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq), Lift1D(Nq,6)
+    integer, intent(in) :: VMapM(NfpTot,Ne), VMapP(NfpTot,Ne)
+    real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+    real(RP), intent(in) :: Escale(Np,Ne,3)
+    real(RP), intent(out) :: flux_bnd(NfpTot,Ne)
+    real(RP), intent(out) :: flux_x(Np,Ne), flux_y(Np,Ne), flux_z(Np,Ne)
+    real(RP), intent(out) :: deriv_x(Np,Ne), deriv_y(Np,Ne), deriv_z(Np,Ne)
+    real(RP), intent(out) :: lift_out(Np,Ne)
+    real(RP), intent(out) :: kernel_time(2)
+    error stop "CUDA Fortran kernels are not available in this build"
+  end subroutine cuda_cal_dqdt_gemm_cute
+
+  subroutine cuda_cal_dqdt_gemm_fused( &
+    dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, flux_bnd, &
+    flux_x, flux_y, flux_z, deriv_x, deriv_y, lift_out, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(in) :: q(Np,NeA), u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq), Lift1D(Nq,6)
+    integer, intent(in) :: VMapM(NfpTot,Ne), VMapP(NfpTot,Ne)
+    real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+    real(RP), intent(in) :: Escale(Np,Ne,3)
+    real(RP), intent(out) :: flux_bnd(NfpTot,Ne)
+    real(RP), intent(out) :: flux_x(Np,Ne), flux_y(Np,Ne), flux_z(Np,Ne)
+    real(RP), intent(out) :: deriv_x(Np,Ne), deriv_y(Np,Ne)
+    real(RP), intent(out) :: lift_out(Np,Ne)
+    real(RP), intent(out) :: kernel_time(2)
+    error stop "CUDA Fortran kernels are not available in this build"
+  end subroutine cuda_cal_dqdt_gemm_fused
 
   subroutine cuda_cal_dqdt_split( &
     flux_x, flux_y, flux_z, deriv_x, deriv_y, deriv_z, lift_out, dqdt, &

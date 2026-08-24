@@ -15,7 +15,8 @@ module mod_advect3d_eq
     cuda_cal_surface_lift, cuda_assemble_dqdt, cuda_cal_dqdt_split, &
     cuda_cal_dqdt_fused, cuda_cal_dqdt_fused_p255, &
     cuda_cal_dqdt_fused_tc, cuda_cal_dqdt_fused_p255_tc, &
-    cuda_cal_dqdt_gemm, cuda_gemm_setup, cuda_gemm_finalize, &
+    cuda_cal_dqdt_gemm, cuda_cal_dqdt_gemm_fused, cuda_cal_dqdt_gemm_cute, &
+    cuda_gemm_setup, cuda_gemm_finalize, &
     cuda_cal_elembnd_flux
   implicit none
   private
@@ -37,6 +38,8 @@ module mod_advect3d_eq
   integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_FUSED = 4
   integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_FUSED_TC = 5
   integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_GEMM = 6
+  integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED = 7
+  integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE = 8
   integer :: dqdt_kernel_typeid
   character(len=24) :: dqdt_kernel_name
   logical :: cublas_emulation_enabled = .false.
@@ -106,21 +109,49 @@ contains
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM
       dqdt_kernel_name = "CUDAFORTRAN_GEMM"
       call cuda_gemm_setup(cublas_emulation_enabled)
+    case ("CUDAFORTRAN_GEMM_FUSED")
+      if (.not. cuda_dg_kernels_available) then
+        write(*,*) "CUDAFORTRAN_GEMM_FUSED requires a build with CUDA=1"
+        error stop
+      end if
+      if (Np /= 256**3) then
+        write(*,*) "CUDAFORTRAN_GEMM_FUSED currently requires PolyOrder=255"
+        error stop
+      end if
+      dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED
+      dqdt_kernel_name = "CUDAFORTRAN_GEMM_FUSED"
+      call cuda_gemm_setup(cublas_emulation_enabled)
+    case ("CUDAFORTRAN_GEMM_CUTE")
+      if (.not. cuda_dg_kernels_available) then
+        write(*,*) "CUDAFORTRAN_GEMM_CUTE requires a build with CUDA=1"
+        error stop
+      end if
+      if (Np /= 256**3) then
+        write(*,*) "CUDAFORTRAN_GEMM_CUTE currently requires PolyOrder=255"
+        error stop
+      end if
+      dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE
+      dqdt_kernel_name = "CUDAFORTRAN_GEMM_CUTE"
+      call cuda_gemm_setup(cublas_emulation_enabled)
     case default
       write(*,*) "Unsupported dqdt_kernel_type: ", trim(dqdt_kernel_type)
       error stop
     end select
 
     if (cublas_emulation_enabled .and. &
-        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM) then
-      write(*,*) "CublasEmulation is ignored unless DqdtKernel_Type=CUDAFORTRAN_GEMM"
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
+      write(*,*) "CublasEmulation is ignored unless DqdtKernel_Type uses GEMM"
     end if
 
     if (Np == 256**3 .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .and. &
-        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM) then
-      error stop "PolyOrder=255 currently requires CUDAFORTRAN_FUSED, CUDAFORTRAN_FUSED_TC, or CUDAFORTRAN_GEMM"
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
+      error stop "PolyOrder=255 currently requires CUDAFORTRAN_FUSED, CUDAFORTRAN_FUSED_TC, CUDAFORTRAN_GEMM, CUDAFORTRAN_GEMM_FUSED, or CUDAFORTRAN_GEMM_CUTE"
     end if
 
     if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
@@ -138,8 +169,13 @@ contains
     if (dqdt_kernel_typeid /= DQDT_KERNEL_OPENACC_ASIS .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC) then
-      allocate(volume_deriv_x(Np,Ne), volume_deriv_y(Np,Ne), volume_deriv_z(Np,Ne))
-      !$acc enter data create(volume_deriv_x,volume_deriv_y,volume_deriv_z)
+      if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED) then
+        allocate(volume_deriv_x(Np,Ne), volume_deriv_y(Np,Ne))
+        !$acc enter data create(volume_deriv_x,volume_deriv_y)
+      else
+        allocate(volume_deriv_x(Np,Ne), volume_deriv_y(Np,Ne), volume_deriv_z(Np,Ne))
+        !$acc enter data create(volume_deriv_x,volume_deriv_y,volume_deriv_z)
+      end if
     end if
     if (dqdt_kernel_typeid /= DQDT_KERNEL_OPENACC_ASIS .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
@@ -149,7 +185,9 @@ contains
     end if
     if (dqdt_kernel_typeid == DQDT_KERNEL_OPENACC_SPLIT .or. &
         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_SPLIT .or. &
-        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM) then
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM .or. &
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .or. &
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
       allocate(volume_flux_x(Np,Ne), volume_flux_y(Np,Ne), volume_flux_z(Np,Ne))
       !$acc enter data create(volume_flux_x,volume_flux_y,volume_flux_z)
     end if
@@ -162,7 +200,9 @@ contains
     implicit none
     !------------------------------------------------------------------------------
     write(*,'(A30,A24)') "Dqdt kernel type:", trim(dqdt_kernel_name)
-    if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM) then
+    if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM .or. &
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .or. &
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
       if (cublas_emulation_enabled) then
         write(*,'(A30,A24)') "Cublas FP emulation:", "on"
       else
@@ -172,7 +212,9 @@ contains
     if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED .or. &
         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_TC) then
       write(*,'(A30,1X,A23)') "Element boundary flux:", "included in fused kernel"
-    else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM) then
+    else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM .or. &
+             dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .or. &
+             dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
       write(*,'(A30,1X,A23)') "Element boundary flux:", "included in GEMM path"
     else
       write(*,'(A30,ES24.5)') "Element boundary flux:", Timer_elapsed(timer_ebnd_flux)
@@ -190,6 +232,12 @@ contains
         write(*,'(A30,ES24.5)') "  CUDA device fused tendency:", Timer_elapsed(timer_volume_deriv)
       else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM) then
         write(*,'(A30,ES24.5)') "  CUDA device GEMM tendency:", Timer_elapsed(timer_volume_deriv)
+      else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED) then
+        write(*,'(A30,ES24.5)') "  CUDA device GEMM fused:", Timer_elapsed(timer_volume_deriv)
+        write(*,'(A30,ES24.5)') "  FUSED volume GEMM only:", Timer_elapsed(timer_surface_lift)
+      else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
+        write(*,'(A30,ES24.5)') "  CUDA device GEMM CUTE:", Timer_elapsed(timer_volume_deriv)
+        write(*,'(A30,ES24.5)') "  CUTE volume GEMM only:", Timer_elapsed(timer_volume_flux)
       else
         write(*,'(A30,ES24.5)') "  Volume flux:", Timer_elapsed(timer_volume_flux)
         write(*,'(A30,ES24.5)') "  Tensor-product derivative:", Timer_elapsed(timer_volume_deriv)
@@ -201,8 +249,13 @@ contains
         deallocate(volume_flux_x, volume_flux_y, volume_flux_z)
       end if
       if (allocated(volume_deriv_x)) then
-        !$acc exit data delete(volume_deriv_x,volume_deriv_y,volume_deriv_z)
-        deallocate(volume_deriv_x, volume_deriv_y, volume_deriv_z)
+        if (allocated(volume_deriv_z)) then
+          !$acc exit data delete(volume_deriv_x,volume_deriv_y,volume_deriv_z)
+          deallocate(volume_deriv_x, volume_deriv_y, volume_deriv_z)
+        else
+          !$acc exit data delete(volume_deriv_x,volume_deriv_y)
+          deallocate(volume_deriv_x, volume_deriv_y)
+        end if
       end if
       if (allocated(surface_lift)) then
         !$acc exit data delete(surface_lift)
@@ -218,7 +271,9 @@ contains
       !$acc exit data delete(fused_flux_bnd)
       deallocate(fused_flux_bnd)
     end if
-    if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM) then
+    if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM .or. &
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .or. &
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
       call cuda_gemm_finalize()
     end if
     return
@@ -257,7 +312,9 @@ contains
     call Timer_start(timer_ebnd_flux)
     if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .and. &
-        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM) then
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
       call cal_elembnd_flux( ebnd_flux,   & ! (out)
          q, u, v, w,                      & ! (in)
          VMapM, VMapP, normal_fn, Fscale, & ! (in)
@@ -289,6 +346,18 @@ contains
          Escale, Nq, Np, NfpTot, Ne, NeA )    ! (in)
     else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM) then
       call cal_dqdt_cudafortran_gemm( dqdt, & ! (out)
+         q, u, v, w,                         & ! (in)
+         D1D, D1D_tr, Lift1D,               & ! (in)
+         VMapM, VMapP, normal_fn, Fscale,   & ! (in)
+         Escale, Nq, Np, NfpTot, Ne, NeA )    ! (in)
+    else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED) then
+      call cal_dqdt_cudafortran_gemm_fused( dqdt, & ! (out)
+         q, u, v, w,                         & ! (in)
+         D1D, D1D_tr, Lift1D,               & ! (in)
+         VMapM, VMapP, normal_fn, Fscale,   & ! (in)
+         Escale, Nq, Np, NfpTot, Ne, NeA )    ! (in)
+    else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
+      call cal_dqdt_cudafortran_gemm_cute( dqdt, & ! (out)
          q, u, v, w,                         & ! (in)
          D1D, D1D_tr, Lift1D,               & ! (in)
          VMapM, VMapP, normal_fn, Fscale,   & ! (in)
@@ -643,6 +712,82 @@ contains
 
     return
   end subroutine cal_dqdt_cudafortran_gemm
+
+  !> Same pipeline as CUDAFORTRAN_GEMM, but volume derivatives use the tiled GEMM.
+!OCL SERIAL
+  subroutine cal_dqdt_cudafortran_gemm_cute( dqdt, & ! (out)
+    q, u, v, w,                               & ! (in)
+    D1D, D1D_tr, Lift1D,                      & ! (in)
+    VMapM, VMapP, normal_fn, Fscale, Escale,  & ! (in)
+    Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(in) :: q(Np,NeA)
+    real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
+    real(RP), intent(in) :: Lift1D(Nq,6)
+    real(RP), intent(in) :: Escale(Np,Ne,3)
+    integer, intent(in) :: VMapM(NfpTot,Ne), VMapP(NfpTot,Ne)
+    real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+    real(RP) :: kernel_time(2)
+    !------------------------------------------------------------
+
+    !$acc host_data use_device(dqdt,q,u,v,w,D1D,D1D_tr,Lift1D,VMapM,VMapP) &
+    !$acc& use_device(normal_fn,Fscale,Escale,ebnd_flux) &
+    !$acc& use_device(volume_flux_x,volume_flux_y,volume_flux_z) &
+    !$acc& use_device(volume_deriv_x,volume_deriv_y,volume_deriv_z,surface_lift)
+    call cuda_cal_dqdt_gemm_cute( &
+      dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &
+      normal_fn, Fscale, Escale, ebnd_flux, &
+      volume_flux_x, volume_flux_y, volume_flux_z, &
+      volume_deriv_x, volume_deriv_y, volume_deriv_z, surface_lift, &
+      Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    !$acc end host_data
+
+    call Timer_add(timer_volume_deriv,kernel_time(1))
+    call Timer_add(timer_volume_flux,kernel_time(2))
+
+    return
+  end subroutine cal_dqdt_cudafortran_gemm_cute
+
+  !> Tendency path with volume-flux GEMM prologue and z-GEMM assembly epilogue.
+!OCL SERIAL
+  subroutine cal_dqdt_cudafortran_gemm_fused( dqdt, & ! (out)
+    q, u, v, w,                               & ! (in)
+    D1D, D1D_tr, Lift1D,                      & ! (in)
+    VMapM, VMapP, normal_fn, Fscale, Escale,  & ! (in)
+    Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(in) :: q(Np,NeA)
+    real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
+    real(RP), intent(in) :: Lift1D(Nq,6)
+    real(RP), intent(in) :: Escale(Np,Ne,3)
+    integer, intent(in) :: VMapM(NfpTot,Ne), VMapP(NfpTot,Ne)
+    real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+    real(RP) :: kernel_time(2)
+    !------------------------------------------------------------
+
+    !$acc host_data use_device(dqdt,q,u,v,w,D1D,D1D_tr,Lift1D,VMapM,VMapP) &
+    !$acc& use_device(normal_fn,Fscale,Escale,ebnd_flux) &
+    !$acc& use_device(volume_flux_x,volume_flux_y,volume_flux_z) &
+    !$acc& use_device(volume_deriv_x,volume_deriv_y,surface_lift)
+    call cuda_cal_dqdt_gemm_fused( &
+      dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &
+      normal_fn, Fscale, Escale, ebnd_flux, &
+      volume_flux_x, volume_flux_y, volume_flux_z, &
+      volume_deriv_x, volume_deriv_y, surface_lift, &
+      Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    !$acc end host_data
+
+    call Timer_add(timer_volume_deriv,kernel_time(1))
+    call Timer_add(timer_surface_lift,kernel_time(2))
+
+    return
+  end subroutine cal_dqdt_cudafortran_gemm_fused
 
   !> Calculate Cartesian volume fluxes
 !OCL SERIAL

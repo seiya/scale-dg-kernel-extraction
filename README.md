@@ -170,11 +170,33 @@ emulation (Ozaki / BF16x9, when the installed toolkit supports it) on or off at
 run time without rebuilding. Example inputs are `input_p7_val_gemm.conf` and
 `input_p255_val_gemm.conf`.
 
+A fused-volume GEMM variant keeps `volume_flux` materialization and the same
+lift `cublasDgemm` calls as `CUDAFORTRAN_GEMM_CUTE`. Volume x/y derivatives use
+the CUTLASS d884 TensorOp GEMMs unchanged. The z GEMM uses the same Tensor Core
+mainloop, then a custom epilogue that forms
+`dqdt = -(Ex*Dx + Ey*Dy + Ez*Dz + lift)` so the separate assembly kernel is not
+launched. Pointwise `q*velocity` is not fused into the GEMM mainloop.
+
+```fortran
+DqdtKernel_Type = "CUDAFORTRAN_GEMM_FUSED"
+```
+
+It is limited to `PolyOrder = 255`. Example input: `input_p255_val_gemm_fused.conf`.
+The unfused `CUDAFORTRAN_GEMM` path is unchanged so the two can be timed side by
+side.
+
+`CUDAFORTRAN_GEMM_CUTE` keeps flux, lift, and assembly identical to
+`CUDAFORTRAN_GEMM`, but replaces only the three volume `cublasDgemm` calls with
+the same tiled GEMM used by the fused path (no prologue/epilogue). Use it to
+measure tiled-GEMM quality against cuBLAS. Example:
+`input_p255_val_gemm_cute.conf`.
+
 The p=255 Legendre-Gauss-Lobatto nodes and operators are generated at startup;
 no large `operator_data/p255.dat` file is needed. Its separable lifting
 operator is stored as `Lift1D(256,6)` instead of a dense
 `Lift_mat(256,256,256,6)`. The p=255 path currently requires
-`CUDAFORTRAN_FUSED`, `CUDAFORTRAN_FUSED_TC`, or `CUDAFORTRAN_GEMM`.
+`CUDAFORTRAN_FUSED`, `CUDAFORTRAN_FUSED_TC`, `CUDAFORTRAN_GEMM`,
+`CUDAFORTRAN_GEMM_FUSED`, or `CUDAFORTRAN_GEMM_CUTE`.
 
 The CUDA Fortran kernels are in `mod_cuda_dg_kernels.cuf`. OpenACC `host_data`
 regions pass the resident device arrays directly to CUDA Fortran, without
