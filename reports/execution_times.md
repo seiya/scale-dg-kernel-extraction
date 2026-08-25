@@ -74,6 +74,23 @@ ncu はリプレイごとに L2 を流すため実運用より遅く出る（実
 359 µs → 284 µs）ので、両者を混ぜないこと。
 経緯・不採用案・残作業は `tc_paper_survey_2407.09621.md` §7 にある。
 
+### 追記 3: CUDA core 版も occupancy 100% にした（未コミットの作業ツリー）
+
+`tendency_fused_p7_kernel` はレジスタ 42 本で `Block Limit Registers = 5`、
+theoretical occupancy 62.5% だった。`Lift1D` 化と
+`attributes(global) launch_bounds(256,8)` で 32 レジスタ / 100% occupancy に
+なる。ncu は Slurm job `44039`。同一入力、login node、各 3 回。
+
+| `DqdtKernel_Type` | Main | Cal_tend | CUDA device |
+|---|---:|---:|---:|
+| `CUDAFORTRAN_FUSED_TC` | **1.415** | **0.890** | fused **0.852** |
+| `CUDAFORTRAN_FUSED` | 1.549 | 1.024 | fused 0.986 |
+
+CUDA core 版は `e971ba5` 比 1.17×。両者を 100% occupancy で揃えると
+TC 版の優位は 1.35× から **1.16×** に縮む。p=7 の最速は
+`CUDAFORTRAN_FUSED_TC` のままである。詳細は
+`tc_paper_survey_2407.09621.md` §8。
+
 `CUDAFORTRAN_GEMM` with `CublasEmulation=.true.` did not produce a
 timing. The run printed that cuBLAS floating-point emulation APIs are
 unavailable and that native FP64 GEMM would be used, then hit the 180 s

@@ -531,3 +531,88 @@ ncu 単発カーネル（`-s 5 -c 1`、`--set full`）:
 - §6.3 の異常（wavefront 減 = 遅くなる）と §7.4 最終行の異常は、
   どちらも「命令数・wavefront 数を減らしたのに遅い」形をしている。
   マイクロベンチで shared ストアと発行スケジューリングを単独測定するのが早い。
+
+---
+
+## 8. §7 の知見を CUDA core 版に適用する
+
+実施日: 2026-08-25。§7 の 3 つの変更のうち 2 つは Tensor Core と無関係で、
+`tendency_fused_p7_kernel`（CUDA core 版、`mod_cuda_dg_kernels.cuf`）にも
+そのまま効く。測定は Slurm job `44039` と login node の `nstep=1000` 実測、
+条件は §5 と同一。
+
+### 8.1 適用可否
+
+| §7 の変更 | CUDA core 版への適用 |
+|---|---|
+| `sD*` の `sFlux*` への in-place 化 | **不要**。CUDA core 版は微分和をレジスタ（`sum_x1` 等）に貯めるので `sDx/sDy/sDz` を持たず、既に smem 15.87 KB で `Block Limit Shared Mem = 8` に達していた。 |
+| occupancy 100% 化 | **適用可**。ただし律速していたのは smem ではなく**レジスタ 42 本**で、`Block Limit Registers = 5`、theoretical occupancy 62.5% だった。 |
+| `Lift_mat` → `Lift1D` | **適用可**。epilogue の形は TC 版と同一。 |
+
+### 8.2 CUDA Fortran での launch bounds
+
+`attributes(global,launch_bounds(256,8))` は nvfortran 26.3 で構文エラーになる。
+正しい書き方は**属性リストの外**に置く形:
+
+```fortran
+attributes(global) launch_bounds(256,8) subroutine tendency_fused_p7_kernel( &
+```
+
+`-gpu=maxregcount:32` でも同じ 32 レジスタになるが、こちらは**コンパイル単位
+全体**に効く。実測すると p=255 の `CUDAFORTRAN_GEMM` が 0.403 → 0.425 秒
+（+5.5%）と悪化したので採用しない。per-kernel の `launch_bounds` では
+p=255 の 4 経路すべてが測定誤差内で不変であることを確認した。
+
+### 8.3 測定結果
+
+`nstep=1000`, `Ne=32^3` の `CUDA device fused`（秒、各 3 回）:
+
+| 版 | device 時間 |
+|---|---:|
+| `e971ba5`（基準） | 1.153 |
+| `-gpu=maxregcount:32` のみ | 1.024 |
+| `Lift1D` のみ（レジスタ 42 → 40、5 → 6 ブロック） | 1.010 |
+| **`Lift1D` + `launch_bounds(256,8)`** | **0.986** |
+
+ncu 単発カーネル（job `44039`）:
+
+| | `e971ba5` | +`Lift1D`+`launch_bounds` |
+|---|---:|---:|
+| duration | 550.1 µs | 509.5 µs |
+| registers / thread | 42 | 32（spill 0）|
+| static smem / block | 15.87 KB | 16.26 KB |
+| Block Limit Registers | 5 | 8 |
+| Theoretical occupancy | 62.5% | **100%** |
+| Achieved occupancy | 60.04% | **96.58%** |
+| global load sectors | 120,717,312 | 95,944,704 |
+| L1/TEX throughput | 88.54% | 95.49% |
+| Compute (SM) throughput | 38.52% | 41.42% |
+
+- device 時間で **1.17×**。
+- 数値検証: `SCALE_DG_VARYING_COEFF=1` で `Ne=8^3, nstep=3` と
+  `Ne=16^3, nstep=5` の両方について `CUDAFORTRAN_SPLIT` と
+  `dqdt(:,1:Ne)` 全点が**ビット一致**した。変更前の `CUDAFORTRAN_FUSED` とも一致。
+- 非 CUDA ビルドも通ることを確認した。
+
+### 8.4 p=7 の順位
+
+| `DqdtKernel_Type` | Main | Cal_tend | CUDA device |
+|---|---:|---:|---:|
+| `CUDAFORTRAN_FUSED_TC` | **1.415** | **0.890** | **0.852** |
+| `CUDAFORTRAN_FUSED` | 1.549 | 1.024 | 0.986 |
+
+TC 版が最速という §7 の結論は変わらないが、差は 1.35× から **1.16×** に縮んだ。
+§7 で「TC 版が CUDA core 版より 1.35× 速い」と書いた部分は、
+CUDA core 版が occupancy 60% の状態と比べたものである。
+**両者を 100% occupancy で揃えた比較が上表であり、以後はこちらを使うこと。**
+
+### 8.5 一般化できる教訓
+
+- **occupancy を先に確認する。** 本リポジトリの p=7 カーネルは 2 つとも
+  「shared / L1 が 90% 前後だから L1 律速だ」と読める状態でありながら、
+  実際にはどちらも occupancy（TC 版は smem とレジスタ、CUDA core 版は
+  レジスタ単独）で 60〜75% に抑えられていた。
+  ncu の `Block Limit *` 行を読まずに Memory Workload Analysis だけを見ると
+  この診断を落とす。§6.4 で「次は global load」と書いたのがその例。
+- **L1 削減の評価は occupancy を上げた後で行う。** `Lift1D` 化は
+  6 ブロックの TC 版では 1.3% 遅く、8 ブロックでは 2.2% 速い（§7.4）。

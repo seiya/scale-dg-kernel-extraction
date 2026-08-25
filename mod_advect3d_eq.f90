@@ -603,10 +603,10 @@ contains
     !------------------------------------------------------------
 
     if (Nq == 8) then
-      !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift_mat,VMapM,VMapP) &
+      !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
       !$acc& use_device(normal_fn,Fscale,Escale)
       call cuda_cal_dqdt_fused( &
-        dqdt, q, u, v, w, D1D, Lift_mat, VMapM, VMapP, &
+        dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
         normal_fn, Fscale, Escale, &
         Nq, Np, NfpTot, Ne, NeA, kernel_time )
       !$acc end host_data

@@ -37,7 +37,7 @@ contains
   end subroutine cuda_cal_elembnd_flux
 
   subroutine cuda_cal_dqdt_fused( &
-    dqdt, q, u, v, w, D1D, Lift_mat, VMapM, VMapP, &
+    dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
     normal_fn, Fscale, Escale, &
     Nq, Np, NfpTot, Ne, NeA, kernel_time )
     implicit none
@@ -45,7 +45,7 @@ contains
     real(RP), intent(out) :: dqdt(Np,NeA), kernel_time(2)
     real(RP), intent(in) :: q(Np,NeA), u(Np,NeA), v(Np,NeA), w(Np,NeA)
     real(RP), intent(in) :: D1D(Nq,Nq)
-    real(RP), intent(in) :: Lift_mat(Nq,Nq,Nq,6)
+    real(RP), intent(in) :: Lift1D(Nq,6)
     integer, intent(in) :: VMapM(NfpTot,Ne)
     integer, intent(in) :: VMapP(NfpTot,Ne)
     real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)

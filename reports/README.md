@@ -16,7 +16,9 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 - **p=7, `Ne=32^3`**: `CUDAFORTRAN_FUSED_TC` が最速（commit `e22dda1` 以降）。
   それ以前は `CUDAFORTRAN_FUSED` が最速だった。
   さらに occupancy を 100% に上げる作業（`tc_paper_survey_2407.09621.md` §7）で
-  device 時間 1.076 → 0.851 秒、CUDA core 版比 1.35× になっている。
+  device 時間 1.076 → 0.851 秒。同じ知見を CUDA core 版にも適用すると
+  そちらも 1.153 → 0.986 秒になり（§8）、両者を 100% occupancy で揃えた
+  TC 版の優位は 1.16× である。
 - **p=255, `Ne=1`**: `CUDAFORTRAN_GEMM_FUSED` が最速。手書きの Tensor Core 経路は
   CUTLASS / cuBLAS の multistage mainloop に大きく負ける。
 - 同じ体積 DOF 数でも、p=7 と p=255 で最適戦略は逆転する。

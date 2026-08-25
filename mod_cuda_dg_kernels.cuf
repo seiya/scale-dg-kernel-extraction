@@ -149,7 +149,7 @@ contains
   end subroutine cuda_cal_elembnd_flux
 
   subroutine cuda_cal_dqdt_fused( &
-    dqdt, q, u, v, w, D1D, Lift_mat, VMapM, VMapP, &
+    dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
     normal_fn, Fscale, Escale, &
     Nq, Np, NfpTot, Ne, NeA, kernel_time )
     implicit none
@@ -158,7 +158,7 @@ contains
     real(RP), device, intent(in) :: q(Np,NeA)
     real(RP), device, intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
     real(RP), device, intent(in) :: D1D(Nq,Nq)
-    real(RP), device, intent(in) :: Lift_mat(Nq,Nq,Nq,6)
+    real(RP), device, intent(in) :: Lift1D(Nq,6)
     integer, device, intent(in) :: VMapM(NfpTot,Ne)
     integer, device, intent(in) :: VMapP(NfpTot,Ne)
     real(RP), device, intent(in) :: normal_fn(NfpTot,Ne,3)
@@ -184,7 +184,7 @@ contains
     istat = cudaEventRecord(split_events(1),0)
     if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
     call tendency_fused_p7_kernel<<<Ne,CUDA_FUSED_P7_BLOCK_SIZE>>>( &
-      dqdt, D1D, Lift_mat, q, u, v, w, VMapM, VMapP, &
+      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
       normal_fn, Fscale, Escale, Ne )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure( &
@@ -1202,17 +1202,18 @@ contains
   !> Complete p=7 element tendency for pointwise velocity and geometry fields.
   !! The three volume fluxes and all six face fluxes are staged in shared
   !! memory before differentiation, lifting, and pointwise metric assembly.
-  attributes(global) subroutine tendency_fused_p7_kernel( &
-    dqdt, D1D, Lift_mat, q, u, v, w, VMapM, VMapP, &
+  attributes(global) launch_bounds(256,8) subroutine tendency_fused_p7_kernel( &
+    dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
     normal_fn, Fscale, Escale, Ne )
     implicit none
     integer, value :: Ne
     real(RP), device :: dqdt(*), D1D(*)
-    real(RP), device :: Lift_mat(*), q(*), u(*), v(*), w(*)
+    real(RP), device :: Lift1D(*), q(*), u(*), v(*), w(*)
     integer, device :: VMapM(*), VMapP(*)
     real(RP), device :: normal_fn(*), Fscale(*), Escale(*)
 
     real(RP), shared :: sD1D(64)
+    real(RP), shared :: sLift(48)
     real(RP), shared :: sflux_bnd(384)
     real(RP), shared :: sFluxX(512), sFluxY(512), sFluxZ(512)
     integer :: elem, elem_offset, face_offset, tid, node1, node2
@@ -1237,6 +1238,8 @@ contains
 
     if (tid <= 64) then
       sD1D(tid) = D1D(tid)
+    else if (tid <= 112) then
+      sLift(tid-64) = Lift1D(tid-64)
     end if
     idx1 = elem_offset + node1
     idx2 = elem_offset + node2
@@ -1317,18 +1320,18 @@ contains
     face24 = 192 + j + (k2-1)*8
     face25 = face15
     face26 = face16
-    lift1 = Lift_mat(node1)*sflux_bnd(face11) &
-      + Lift_mat(node1+512)*sflux_bnd(face12) &
-      + Lift_mat(node1+1024)*sflux_bnd(face13) &
-      + Lift_mat(node1+1536)*sflux_bnd(face14) &
-      + Lift_mat(node1+2048)*sflux_bnd(face15) &
-      + Lift_mat(node1+2560)*sflux_bnd(face16)
-    lift2 = Lift_mat(node2)*sflux_bnd(face21) &
-      + Lift_mat(node2+512)*sflux_bnd(face22) &
-      + Lift_mat(node2+1024)*sflux_bnd(face23) &
-      + Lift_mat(node2+1536)*sflux_bnd(face24) &
-      + Lift_mat(node2+2048)*sflux_bnd(face25) &
-      + Lift_mat(node2+2560)*sflux_bnd(face26)
+    lift1 = sLift(j)*sflux_bnd(face11) &
+      + sLift(i+8)*sflux_bnd(face12) &
+      + sLift(j+16)*sflux_bnd(face13) &
+      + sLift(i+24)*sflux_bnd(face14) &
+      + sLift(k1+32)*sflux_bnd(face15) &
+      + sLift(k1+40)*sflux_bnd(face16)
+    lift2 = sLift(j)*sflux_bnd(face21) &
+      + sLift(i+8)*sflux_bnd(face22) &
+      + sLift(j+16)*sflux_bnd(face23) &
+      + sLift(i+24)*sflux_bnd(face24) &
+      + sLift(k2+32)*sflux_bnd(face25) &
+      + sLift(k2+40)*sflux_bnd(face26)
 
     dqdt(idx1) = -(Escale(idx1)*sum_x1 + Escale(idx1+npoint)*sum_y1 &
       + Escale(idx1+2*npoint)*sum_z1 + lift1)
