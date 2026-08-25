@@ -66,6 +66,12 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   p=7 `CUDAFORTRAN_SPLIT` 2.7172 → **2.6440** 秒で、旧実装と**ビット一致**。
   `q` だけをレジスタに退避した版は効かない。詳細は
   `overall_summary_report.md` §8.6 と `execution_times.md` 追記 10。
+- **TMA は FP64 では既製品が無い（2026-08-25、調査のみ）**: CuTe は `double` の
+  tensor map を作れる（`copy_sm90_desc.hpp:220`）が、CUTLASS 4.7 の collective
+  builder に FP64 特殊化は 1 つも無く、SM90 の builder が前提にする wgmma に
+  FP64 が無い。TMA + DMMA の mainloop は手書きなら書けるが、x/y GEMM は既に
+  FP64 ピークの 86–88% なので天井は上がらない。狙えるとすれば z GEMM の
+  レジスタ圧だけ。詳細は `overall_summary_report.md` §12.9。
 - **tendency 以外（その 2）**: 時間発展ループの OpenACC 領域を `async` にし、
   CUDA / cuBLAS / CUTLASS のカーネルを同じストリームに載せて、カーネル間の
   GPU アイドルを 139 → 50 µs/step にした（2026-08-25）。Main は p=7 `FUSED_TC` で

@@ -809,6 +809,61 @@ z GEMM の SM throughput は lift を載せたことで 79.8 → 72.5%、レジ�
 最優先は性能ではなく、`D(q*velocity)` と 6 面数値流束という
 元実装の意味を守り続けることである。
 
+### 12.9 補足: TMA（Tensor Memory Accelerator）は使えるか（調査メモ、2026-08-25）
+
+結論から言うと**使えるが、既製品は無い**。CUTLASS のテンプレート引数を
+`arch::Sm80` から `Sm90` / `Sm100` に替えれば TMA になる、という話ではない。
+
+| 項目 | 状況 |
+|---|---|
+| ハードウェア / toolchain | GB200 = sm_100、`nvcc 13.1`。TMA は sm_90 以降なので利用可 |
+| FP64 データ型 | **対応**。`third_party/cutlass/include/cute/arch/copy_sm90_desc.hpp:220` に `is_same_v<T,double> -> CU_TENSOR_MAP_DATA_TYPE_FLOAT64` があり、`make_tma_copy` は double で通る |
+| CUTLASS の collective builder | **FP64 の特殊化が 1 つも無い**（`include/cutlass/gemm/collective/builders/` を `double` で grep して 0 件）。SM90 の builder は wgmma 前提で、**wgmma に FP64 は無い** |
+| FP64 tensor core 命令 | 今も `mma.sync` 系（DMMA）。CuTe には `MMA_16x8x{4,8,16}_F64F64F64F64_TN`（`include/cute/arch/mma_sm90.hpp:52,85,118`）がある |
+
+TMA はコピーエンジンであって MMA とは直交しているので、
+**TMA で global→shared を運び DMMA で回す mainloop は原理的に書ける**。
+ただし CUTLASS 4.7 にその組み合わせは無く、`CollectiveMma` の手書きになる。
+傍証として、GB200 上で cuBLAS 自身が DGEMM に投げてくるのは現在も
+`cutlass_80_tensorop_d884gemm_*`、すなわち cp.async 世代の SM80 カーネルである
+（§5.1）。NVIDIA も FP64 に TMA 版を出していない。
+
+期待値は、§8.6 で採り直した時間を §7 の理論 FLOP で割ると見積もれる。
+
+| kernel | nsys | 実効 FP64 | 対 40.1 TFLOP/s |
+|---|---:|---:|---:|
+| x GEMM | 249.7 µs | 34.4 TFLOP/s | **85.8%** |
+| y GEMM | 243.5 µs | 35.3 TFLOP/s | **88.0%** |
+| z GEMM（assembly + lift epilogue 込み） | 339.1 µs | 25.3 TFLOP/s | 63.2% |
+| volume 3 本合計 | 832.3 µs | 31.0 TFLOP/s | 77.3% |
+
+- **x/y GEMM に入れる意味はほぼ無い。** 既に FP64 ピークの 86–88% で、GB200 では
+  TC ピーク = CUDA core ピークだから TMA は天井を上げない（§7）。
+- **z GEMM には一応の筋がある。** 63.2%、レジスタ 254 本、occupancy 12.2% で、
+  lift を epilogue に入れた代償として SM throughput が 79.8 → 72.5% に落ちている
+  （§8.6）。SM80 multistage mainloop は `PredicatedTileIterator` のアドレス状態と
+  cp.async のポインタをレジスタに持つが、**TMA はディスクリプタ駆動でレジスタを
+  ほぼ消費しない**。epilogue に押されているレジスタを mainloop 側から返せる、
+  というのがこの方向の唯一の具体的な狙いである。
+- **p=7 `FUSED_TC`。** `tc_paper_survey` §12.4 の不採用理由は「レジスタ 32 本
+  ちょうどで先行ロードを保持する余地が構造的に無い」だった。TMA は
+  レジスタを使わない先行ロードで、データ経路も L2→SMEM で L1/TEX を通らない
+  （同 §12.5 は残る律速を「L1/TEX 90% 張り付き」と結論づけている）。ただし
+  TMA は矩形タイルしか運べないので `VMapM`/`VMapP` の face gather は対象外で、
+  TMA 化できるのは volume の `q,u,v,w` だけ。加えて smem が 28.2 KB × 8 ブロック
+  = 225 KB で 228 KB をほぼ使い切っており、ステージングバッファは occupancy を
+  削る。CUDA core 版の `FUSED` は 15.9 KB × 8 = 127 KB で余裕があるが、そちらは
+  CUDA Fortran で、**nvfortran は TMA を公開していない**ので `.cu` への移植が要る。
+
+実務上の条件: `cuTensorMapEncodeTiled` は global ベースアドレス 16 B 境界と
+最内 stride 16 B 倍数を要求する。`flux_x`(lda=256→2048 B)、`flux_y`(256)、
+`flux_z`(ld=65536) はいずれも満たす。ディスクリプタは 1 回作って使い回せる。
+未確認なのは、8 B 要素で CUTLASS の 128B swizzle atom がそのまま噛むかどうか。
+
+優先度としては項目 7（2 本目のストリームによる重ね合わせ、約 110 µs/call）の
+ほうが測定で裏が取れている。TMA を試すなら z GEMM に絞り、先に
+`ncu --set full` でレジスタ起因の stall を確認してから mainloop を書くこと。
+
 ---
 
 ## 13. 関連ファイル
