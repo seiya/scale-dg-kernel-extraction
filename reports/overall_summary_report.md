@@ -457,6 +457,42 @@ OpenACC 領域を使う `OPENACC_ASIS` / `OPENACC_SPLIT` / `CUDAFORTRAN_SPLIT` �
 
 ---
 
+### 8.4 追記: p=255 の separable lift を 1 本のカーネルにした（2026-08-25）
+
+§5.1 の内訳で lift は 176 µs / tendency call、§6 の ncu では
+`d884gemm_*`（lift）の SM throughput が 27.8–37.1% しかない。これは
+`K=2` の rank-2 更新を d884 TensorOp mainloop に載せていたためで、実体は
+`lift_out`（`Ne=1`, `Np=256³` で 134 MB）への往復である。3 本の GEMM は
+`beta=1` で累積するので write 134 + rw 268 + rw 268 = **670 MB**、
+176 µs に対して約 3.8 TB/s、つまり帯域律速だった。
+
+面データは 6 × `nq2` × 8 B = 3 MB しかないので、
+
+```
+lift(i,j,k) = Lift1D(i,2)*fb2(j,k) + Lift1D(i,4)*fb4(j,k)
+            + Lift1D(j,1)*fb1(i,k) + Lift1D(j,3)*fb3(i,k)
+            + Lift1D(k,5)*fb5(i,j) + Lift1D(k,6)*fb6(i,j)
+```
+
+を 1 スレッドでまとめて評価し `lift_out` を 1 回だけ書く
+`separable_lift_kernel` に置き換えた。GEMM 3 本と pack/copy 3 本が消え、
+lift 側の DRAM は 670 → 134 MB になる。加算順は GEMM と同じ `(x+y)+z` に
+そろえたので、**旧実装とビット一致**する（`execution_times.md` 追記 8）。
+
+| `DqdtKernel_Type` | 変更前（`514853f`） | 変更後 | |
+|---|---:|---:|---:|
+| `CUDAFORTRAN_GEMM_FUSED` | 3.971 | **3.635** | −8.5% |
+| `CUDAFORTRAN_GEMM_CUTE` | 4.279 | 3.954 | −7.6% |
+| `CUDAFORTRAN_GEMM` | 4.241 | 3.962 | −6.6% |
+
+`nstep=1000`、`UseCudaGraph = .false.`、login node。
+**§5.1 と §6 の lift 行は変更前の値である。**
+
+残っているのは z-epilogue が `lift_out` を読む 134 MB で、これは lift を
+epilogue 内で面から直接評価すれば消える（§12-6）。
+
+---
+
 ## 9. 試して不採用にした最適化と、その理由
 
 | 試行 | 結果 | 判断 |
@@ -629,8 +665,12 @@ OpenACC 領域を使う `OPENACC_ASIS` / `OPENACC_SPLIT` / `CUDAFORTRAN_SPLIT` �
    3.9730 → 3.8545 秒（−119 µs/step）。namelist の `UseCudaGraph` で選ぶ。
    再生時は tendency の CUDA event 時間が採れないので、device 時間を見たい
    測定では off にすること。
-6. **p=255 の lift と z GEMM の overlap**、および assembly 以外の独立カーネル削減。
-   `q*vel` の mainloop 融合はやり直さない。
+6. **p=255 の lift の epilogue 融合。** → **半分完了（2026-08-25、§8.4）**。
+   lift の 3 本の `K=2` GEMM を 1 本の `separable_lift_kernel` に置き換え、
+   lift 側の DRAM を 670 → 134 MB にした（`GEMM_FUSED` で −8.5%）。
+   残るのは z-epilogue が `lift_out` を読む 134 MB で、これを消すには
+   epilogue 内で出力タイルの `(i,j,k)` を復元して 6 面から直接
+   lift を評価する必要がある。`q*vel` の mainloop 融合はやり直さない。
 7. **全パスの point-varying 係数回帰の自動化**（CI 化）。
 
 最優先は性能ではなく、`D(q*velocity)` と 6 面数値流束という

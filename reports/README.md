@@ -43,6 +43,14 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   保持する余地が構造的に無い。加えて occupancy 96.9% では
   スレッド内 MLP を増やす意味がなく、残る余地は L1 トランザクション数の
   削減側だけ（その方向は §9 / §10 で不採用済み）。
+- **p=255 の separable lift（2026-08-25）**: lift の `K=2` cuBLAS GEMM 3 本
+  （`lift_out` に `beta=1` で累積するため 670 MB を往復していた）を、
+  1 スレッドで 3 つの rank-2 項をまとめて評価する
+  `separable_lift_kernel` 1 本に置き換えた。旧実装と**ビット一致**。
+  Main は `GEMM_FUSED` 3.971 → **3.635** 秒（−8.5%）、
+  `GEMM_CUTE` 4.279 → 3.954、`GEMM` 4.241 → 3.962（いずれも
+  `nstep=1000`, graph off）。詳細は `overall_summary_report.md` §8.4 と
+  `execution_times.md` 追記 8。
 - **tendency 以外（その 2）**: 時間発展ループの OpenACC 領域を `async` にし、
   CUDA / cuBLAS / CUTLASS のカーネルを同じストリームに載せて、カーネル間の
   GPU アイドルを 139 → 50 µs/step にした（2026-08-25）。Main は p=7 `FUSED_TC` で

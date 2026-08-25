@@ -338,3 +338,47 @@ p=255 は `Ne=1` と `Ne=2` の両方で、`CUDAFORTRAN_FUSED` /
 `CUDAFORTRAN_FUSED_TC` / `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_FUSED` /
 `CUDAFORTRAN_GEMM_CUTE` の 5 経路とも graph on / off で `q` の min / max が
 完全一致した。
+
+### 追記 8: p=255 の separable lift を 1 本のカーネルにした（2026-08-25）
+
+p=255 の lift は `Lift1D(Nq,6)` と 6 枚の面から作る 3 つの rank-2 項の和で、
+これまでは pack 2 本 + copy 1 本のカーネルと `K=2` の cuBLAS GEMM 3 本で
+組んでいた。3 本の GEMM は `beta=1` で `lift_out` に**累積**するため、
+`Ne=1`, `Np=256³`（`lift_out` = 134 MB）では
+
+| | traffic |
+|---|---:|
+| x-lift GEMM（write） | 134 MB |
+| y-lift GEMM（read+write） | 268 MB |
+| z-lift GEMM（read+write） | 268 MB |
+| **lift GEMM 群 計** | **670 MB** |
+
+を流していた。176 µs / tendency call に対して約 3.8 TB/s であり、
+このカーネル群は演算ではなく `lift_out` の往復そのものが律速だった。
+面データは 6 × `nq2` × 8 B = 3 MB しかないので、3 項を 1 スレッドで
+まとめて評価して `lift_out` を **1 回だけ書く** `separable_lift_kernel` に
+置き換えた（write 134 MB のみ）。加算順は GEMM 3 本と同じ `(x+y)+z` に
+そろえてある。
+
+測定は login node、`nstep=1000`、`UseCudaGraph = .false.`、
+`bench_runs/p255_*.conf`（`Ne=1`, `PolyOrder=255`, `dt=1.0e-7`, `OPT1`）、
+各 2–3 回の代表値。
+
+| `DqdtKernel_Type` | 変更前（`514853f`） | 変更後 | |
+|---|---:|---:|---:|
+| `CUDAFORTRAN_GEMM_FUSED` | 3.971 | **3.635** | −8.5% |
+| `CUDAFORTRAN_GEMM_CUTE` | 4.279 | 3.954 | −7.6% |
+| `CUDAFORTRAN_GEMM` | 4.241 | 3.962 | −6.6% |
+
+数値検証: `SCALE_DG_VARYING_COEFF=1` で `dqdt` 全点を比較（`SCALE_DG_DUMP_DQDT`）。
+
+| 比較 | max_abs_diff |
+|---|---:|
+| p=7 `Ne=8³` `CUDAFORTRAN_GEMM` 変更後 vs 変更前 | 0（ビット一致）|
+| p=7 `Ne=8³` `CUDAFORTRAN_GEMM` 変更後 vs `CUDAFORTRAN_SPLIT` | 0（ビット一致）|
+| p=255 `Ne=1` `CUDAFORTRAN_GEMM_FUSED` 変更後 vs 変更前 | 0（ビット一致）|
+| p=255 `Ne=1` `CUDAFORTRAN_GEMM_FUSED` 変更後 vs `CUDAFORTRAN_FUSED_TC` | 3.553e-15 |
+
+`§5.1` の内訳表（job 43219）は変更前の値である。lift 176 µs と
+pack/copy 9.8 µs がこの変更の対象で、`lift_out` を読む z-epilogue 側の
+134 MB はまだ残っている。
