@@ -55,6 +55,7 @@ program main
 
   integer :: kelem, pnode
   real(RP) :: q_min, q_max
+  real(RP) :: a_rk, b_rk
 
   type(Timer) :: timer_main
   type(Timer) :: timer_cal_tend
@@ -293,32 +294,14 @@ contains
         call dump_dqdt_if_requested(dqdt, Np, Ne)
       end if
 
-      if (stage == 1) then
-        !- At the first stage q0 is by definition the current q, so the
-        !  SSP-RK save is fused into the update kernel. This removes a
-        !  separate q0 <- q pass over the field without changing either the
-        !  arithmetic or the lifetime of q0.
-        !$omp parallel do private(pnode)
-        !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt) &
-        !$acc& async(ACC_QUEUE)
-        do kelem=1, Ne
-          do pnode=1, Np
-            q0(pnode,kelem) = q(pnode,kelem)
-            q(pnode,kelem) = rk_a(stage) * q0(pnode,kelem) &
-                           + rk_b(stage) * ( q(pnode,kelem) + dt * dqdt(pnode,kelem) )
-          end do
-        end do
-      else
-        !$omp parallel do private(pnode)
-        !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt) &
-        !$acc& async(ACC_QUEUE)
-        do kelem=1, Ne
-          do pnode=1, Np
-            q(pnode,kelem) = rk_a(stage) * q0(pnode,kelem) &
-                           + rk_b(stage) * ( q(pnode,kelem) + dt * dqdt(pnode,kelem) )
-          end do
-        end do
-      end if
+      !- rk_a and rk_b are indexed by the runtime stage, so left in the loop
+      !  body they become one global load each per thread: ncu measured 5
+      !  global load instructions per warp where the three fields need 3.
+      !  Read once on the host and they are scalars in the kernel.
+      a_rk = rk_a(stage)
+      b_rk = rk_b(stage)
+
+      call rk_update_stage( q, q0, dqdt, Np*Ne, a_rk, b_rk, dt, stage == 1 )
     end do
 
     return
@@ -327,6 +310,45 @@ contains
   !> Write the owned q field after the last step, for regressions that have
   !! to compare a complete field rather than its extrema.  The dqdt dump is
   !! taken at the first step, which a CUDA graph replay never runs.
+  !> One SSP-RK stage update over the owned points.
+  !!
+  !! The owned part of q, q0 and dqdt is the contiguous first Np*Ne elements,
+  !! so the update is a flat one-dimensional loop.  Written as a collapse(2)
+  !! loop over (Np, Ne) instead, the compiler has to recover both indices from
+  !! the flattened thread number by dividing by the runtime value Np.
+  !!
+  !! At stage 1 q0 is by definition the current q, so the SSP-RK save is fused
+  !! into the update.  This removes a separate q0 <- q pass over the field
+  !! without changing either the arithmetic or the lifetime of q0.
+  subroutine rk_update_stage( qq, qq0, dq, npoint, a, b, dtl, save_q0 )
+    implicit none
+    integer, intent(in) :: npoint
+    real(RP), intent(inout) :: qq(npoint), qq0(npoint)
+    real(RP), intent(in) :: dq(npoint)
+    real(RP), intent(in) :: a, b, dtl
+    logical, intent(in) :: save_q0
+
+    integer :: i
+    !-----------------------------------------------------------------------------
+
+    if (save_q0) then
+      !$omp parallel do
+      !$acc parallel loop gang vector present(qq,qq0,dq) async(ACC_QUEUE)
+      do i = 1, npoint
+        qq0(i) = qq(i)
+        qq(i) = a * qq0(i) + b * ( qq(i) + dtl * dq(i) )
+      end do
+    else
+      !$omp parallel do
+      !$acc parallel loop gang vector present(qq,qq0,dq) async(ACC_QUEUE)
+      do i = 1, npoint
+        qq(i) = a * qq0(i) + b * ( qq(i) + dtl * dq(i) )
+      end do
+    end if
+
+    return
+  end subroutine rk_update_stage
+
   subroutine dump_q_if_requested()
     implicit none
     character(len=256) :: dump_file

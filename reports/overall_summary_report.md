@@ -647,6 +647,60 @@ volume GEMM は 8×8 の 24 launch なので、隠す先の窓より隠すもの
 帯域律速カーネルの大きさは、GEMM が SM あたりに残すレジスタ本数で決まる。**
 DRAM に空きがあることは必要条件でしかない。
 
+### 8.8 追記: 全カーネルのロード監査と SSP-RK 更新の 1 次元化（2026-08-25）
+
+§8.6 で `volume_flux_kernel` が 1 warp あたり 6 命令の global load を出していた
+ことが分かったので、同じ欠陥が他に無いかを**全カーネルで測った**。指標は
+`smsp__inst_executed_op_global_ld.sum ÷ warp 数` と、ソース上の相異なる
+ロード数の突き合わせである（job 46402 / 46417）。
+
+**CUDA Fortran / CUDA C++ のカーネルはすべて最小だった。**
+`elembnd_flux_kernel` 14.00（最小 14）、`separable_lift_kernel` 12.00（12）、
+`dqdt_assembly_kernel` 7.00（7）、`surface_lift_p7_kernel` 12.00（12）、
+`tendency_fused_p7_kernel` 35.50（35.5）、`tendency_fused_p7_tc_kernel` 32.50
+（32.5）、`update_halo` 2.00（2）。`volume_deriv_p7_kernel` だけ 5.00 対 3.25 だが、
+差は述語化された `D1D`/`D1D_tr` が全 warp で発行されるためで、sector は 26/warp
+＝理論どおり、メモリトラフィックは無い。
+
+なお `tendency_fused_p7_kernel` は `q(idx1)*u(idx1)`, `q(idx1)*v(idx1)`,
+`q(idx1)*w(idx1)` と `volume_flux_kernel` と同じ書き方をしているのに最小である。
+違いは間に挟まるストアが **shared** であることで、§8.6 の再ロードは
+global ストアが assumed-size dummy の別配列に当たるかもしれない、という
+エイリアス解析の保守性から来ていたと分かる。
+
+**外れたのは時間発展ループ側の OpenACC カーネル 2 本だけだった**
+（SSP-RK 更新、stage 1 が 4.00 対 2、stage≥2 が 5.00 対 3）。余分な 2 本は
+`rk_a(stage)` / `rk_b(stage)` で、`stage` が実行時値なので配列参照が
+1 スレッド 1 ロードになる。ところが**それをスカラーに読み出しても
+−0.2〜0.5% にしかならない**。2 本とも全スレッドが同じアドレスを読むので
+L1 に当たり、費やしているのは発行スロットだけだからである。
+
+**本当の律速は `collapse(2)` だった。** DRAM 41.7% に対し SM throughput が
+62.7% と高く、3 ロード 1 ストア 3 演算のカーネルとしては説明がつかない。
+`collapse(2)` は平坦化したスレッド番号から 2 つの添字を復元するのに
+**実行時値 `Np` による整数除算**を要求する（§8.5 で z-epilogue に対して得た
+のと同じ罠）。owned 領域 `q(:,1:Ne)` は連続なので 1 次元ループに書き直せば
+除算は消える。
+
+| | `collapse(2)` | 1 次元 |
+|---|---:|---:|
+| ld/warp（stage 1 / stage≥2） | 4.00 / 5.00 | **2.00 / 3.00** |
+| ncu duration | 152.5 / 154.1 µs | **91.2 / 86.7 µs** |
+| SM throughput | 62.7% | **35.3%** |
+| DRAM throughput | 41.7% | **74.2%** |
+| DRAM バイト | 479.7 / 509.4 MB | 479.2 / 509.8 MB（不変）|
+
+演算律速から帯域律速に変わり、カーネル時間は約 321 → 185 µs/step になった。
+**tendency に触っていないので全パスが同じだけ得をする。** Main は p=7
+`FUSED_TC` 1.208 → **1.131** 秒（graph on では 1.171 → **1.083**）、
+p=7 `FUSED` 1.345 → 1.250、p=255 `GEMM_FUSED` 3.329 → **3.232**（graph on
+3.289 → **3.192**）、`OPENACC_ASIS` でも 3.50 → 3.41。旧実装と**ビット一致**
+（`execution_times.md` 追記 12）。
+
+これで §8 の「非 tendency は削り代が小さい」という見立ては更新された。
+`main_87` を 5.06 TB/s と評価して「HBM3e 実効としてはかなり良い」と書いたが、
+**それは実効帯域ではなく整数除算で頭打ちになっていた値**である。
+
 ## 9. 試して不採用にした最適化と、その理由
 
 | 試行 | 結果 | 判断 |
@@ -659,6 +713,7 @@ DRAM に空きがあることは必要条件でしかない。
 | epilogue loop のフルアンロール | maxabs 3.6e-15（可）、3.60 → **3.69 s** | 不採用。register / code-size で不利 |
 | 代表スカラー特殊化（`Escale(1,1,1)*u(1,1)` 等） | 高速だが**数値契約違反** | 撤回（`03551c7`）。速度に関係なく即 revert |
 | cuBLAS FP emulation（Ozaki / BF16x9） | 導入 toolkit に API が無く native FP64 へ fallback → timeout | 現環境では評価不能 |
+| SSP-RK 更新の `rk_a(stage)` / `rk_b(stage)` だけをスカラー化 | −0.2〜0.5% | 単独では**ほぼ無意味**（§8.8）。全スレッドが同一アドレスを読むので L1 に当たり、発行スロットしか消費していない。同じ関数の 1 次元化と併せて採用 |
 | p=7 の grid-stride loop 除去（1 thread / 1 point） | 全体の律速は解消せず | 不採用。launch 構造と中間配列トラフィックが本体 |
 | p=7 TC の face gather 前倒し（`VMapM`/`VMapP` の先行ロード） | 版 A（index だけ前倒し）0.850 → **0.868 s**（+2.1%）、版 B（セクションごと入れ替え）0.849 s（±0） | **不採用**（2026-08-25）。カーネルはレジスタ 32 本ちょうどで余裕がゼロなので、ptxas が先行ロードを元の位置へ押し戻す。詳細は `tc_paper_survey_2407.09621.md` §12 |
 
@@ -675,22 +730,30 @@ DRAM に空きがあることは必要条件でしかない。
    （`SCALE_DG_VARYING_COEFF=1`）を全パスで自動化する。
 3. **同じ DOF 数は同じ GPU 問題を意味しない。** 多項式次数と要素数で
    並列構造・行列次数・launch 数・再利用量が変わり、最適戦略が逆転する。
-4. **「DRAM %」だけを見て帯域律速と判定しない。** どのユニットも飽和していない
+4. **ロード命令数を数える。** `smsp__inst_executed_op_global_ld.sum ÷ warp 数`
+   をソース上の相異なるロード数と比べるだけで、コンパイラが再ロードしている
+   カーネルが 1 回の ncu で分かる（§8.8）。ただし**差分が時間になるとは
+   限らない**: 全スレッド同一アドレスのロードは L1 に当たるので発行スロット
+   しか食わない。原因を突き止める手掛かりであって、それ自体が答えではない。
+5. **実行時値による整数除算を疑う。** `collapse(2)` も epilogue の
+   `p % Nq` も、実行時値で割る点は同じで、帯域律速に見えるカーネルを
+   演算律速にしていた（§8.5 / §8.8）。連続領域を 1 次元ループで回れば消える。
+6. **「DRAM %」だけを見て帯域律速と判定しない。** どのユニットも飽和していない
    （最大でも 66%）カーネルはレイテンシ律速であり、トラフィックが理論最小でも
    まだ速くなる。`volume_flux_kernel` は 1 行の書き方（ロードをストアより前に
    まとめる）で −16.4%、DRAM 83.4% になった（§8.6）。
-5. **カーネル数削減は常に正義ではない。** 融合の得は「消せる DRAM トラフィック」で
+7. **カーネル数削減は常に正義ではない。** 融合の得は「消せる DRAM トラフィック」で
    上限が決まる。GEMM mainloop を壊す融合はそれを大きく超えて損をする。
-6. **中間配列は必ずしも無駄ではない。** p=255 の volume flux 配列は
+8. **中間配列は必ずしも無駄ではない。** p=255 の volume flux 配列は
    高効率 dense GEMM のための materialized input / cacheable preprocessing である。
-7. **occupancy 単独で判断しない。** register、shared bank conflict、L1 throughput、
+9. **occupancy 単独で判断しない。** register、shared bank conflict、L1 throughput、
    instruction mix を同時に見る（p=7 TC 版は occupancy 97% で 1.28× 遅い）。
-8. **理論 FLOP/byte と NCU 実測を分けて示す。** tile 再計算・cache hit・FMA 化で
+10. **理論 FLOP/byte と NCU 実測を分けて示す。** tile 再計算・cache hit・FMA 化で
    両者は一致しない。
-9. **device-event と wall time を混ぜない。** 表に「launch/sync を含むか」を明記する。
-10. **profiling は同一 input・同一 commit で行う。** 過去の scalar 特殊化版の
+11. **device-event と wall time を混ぜない。** 表に「launch/sync を含むか」を明記する。
+12. **profiling は同一 input・同一 commit で行う。** 過去の scalar 特殊化版の
    プロファイルを現行版に適用しない。
-11. **速くなったものだけ残す。数値不一致は速度に関係なく即 revert。**
+13. **速くなったものだけ残す。数値不一致は速度に関係なく即 revert。**
 
 ---
 

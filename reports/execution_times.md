@@ -557,3 +557,77 @@ p=7 の `CUDAFORTRAN_GEMM` では side stream を使わない。そこでは ele
 
 非 CUDA ビルド（`make clean && make`）も通ることを確認した
 （stub に `cuda_dg_set_side_stream` を追加）。
+
+### 追記 12: 全カーネルのロード命令数を監査し、SSP-RK 更新を 1 次元ループにした（2026-08-25）
+
+追記 10 で `volume_flux_kernel` が 1 warp あたり 6 命令の global load を出して
+いた（あるべきは 4）ことが分かったので、**同じ欠陥が他に無いかを全カーネルで
+測った**。指標は `smsp__inst_executed_op_global_ld.sum ÷ warp 数` で、これを
+ソース上の相異なるロード数と突き合わせる（job 46402 / 46417）。
+
+| kernel | 実測 ld/warp | ソース最小 | 判定 |
+|---|---:|---:|---|
+| `volume_flux_kernel`（追記 10 後） | 4.00 | 4 | ○ |
+| `elembnd_flux_kernel` | 14.00 | 14 | ○（`normal_fn` の 3 本は VelM/VelP で共有されている）|
+| `separable_lift_kernel` | 12.00 | 12 | ○ |
+| `dqdt_assembly_kernel` | 7.00 | 7 | ○ |
+| `volume_deriv_p7_kernel` | 5.00 | 3.25 | 述語化された `D1D`/`D1D_tr` の 2 命令が全 warp で発行される。sector は 26/warp = 理論どおりで**メモリトラフィックは無い** |
+| `surface_lift_p7_kernel` | 12.00 | 12 | ○ |
+| `tendency_fused_p7_kernel` | 35.50 | 35.5 | ○（`q(idx1)` を 3 回書いても shared store を挟むだけなので CSE される）|
+| `tendency_fused_p7_tc_kernel` | 32.50 | 32.5 | ○（`Escale` が `double2`）|
+| `update_halo` | 2.00 | 2 | ○ |
+| **SSP-RK 更新 stage 1** | **4.00** | 2 | **×** |
+| **SSP-RK 更新 stage≥2** | **5.00** | 3 | **×** |
+
+CUDA Fortran のカーネルはすべて最小だった。**外れたのは時間発展ループ側の
+OpenACC カーネル 2 本だけ**である。余分な 2 本は `rk_a(stage)` と `rk_b(stage)`
+で、`stage` が実行時値なので配列参照が 1 スレッドあたり 1 ロードになっていた。
+
+ところが**それをホスト側でスカラーに読み出しても −0.2〜0.5% にしかならない**
+（p=255 `GEMM_FUSED` 3.329 → 3.324、p=7 `FUSED_TC` 1.208 → 1.201）。
+2 本とも全スレッドが同じアドレスを読むので L1 に当たり、費やしているのは
+発行スロットだけだからである。
+
+**本当の律速は `collapse(2)` だった。** ncu では DRAM 41.7% に対し
+SM throughput が 62.7% と高く、3 ロード 1 ストア 3 演算のカーネルとしては
+説明がつかない。`collapse(2)` は平坦化したスレッド番号から 2 つの添字を
+復元するために**実行時値 `Np` による整数除算**を要求する（追記 9 で
+z-epilogue に対して得たのと同じ罠である）。owned 領域 `q(:,1:Ne)` は連続なので、
+1 次元ループに書き直せば除算そのものが消える。
+
+| | 変更前（`collapse(2)`） | 変更後（1 次元） |
+|---|---:|---:|
+| ld/warp（stage 1 / stage≥2） | 4.00 / 5.00 | **2.00 / 3.00** |
+| ncu duration（stage 1 / stage≥2） | 152.5 / 154.1 µs | **91.2 / 86.7 µs** |
+| SM throughput | 62.7% | **35.3%** |
+| DRAM throughput | 41.7% | **74.2%** |
+| DRAM バイト | 479.7 / 509.4 MB | 479.2 / 509.8 MB（不変）|
+
+演算律速から帯域律速に変わった。1 step あたり stage 1 が 1 回、stage≥2 が
+2 回なので、カーネル時間は約 321 → 185 µs/step になる。
+
+`nstep=1000`、login node、3 ラウンド交互測定の代表値。**tendency に手を
+入れていないので、全パスが同じだけ得をする。**
+
+| path | graph | 変更前 | 変更後 | |
+|---|---|---:|---:|---:|
+| p=7 `CUDAFORTRAN_FUSED_TC` | off | 1.208 | **1.131** | −6.4% |
+| p=7 `CUDAFORTRAN_FUSED_TC` | on | 1.171 | **1.083** | −7.5% |
+| p=7 `CUDAFORTRAN_FUSED` | off | 1.345 | 1.250 | −7.0% |
+| p=7 `CUDAFORTRAN_SPLIT` | off | 2.65 | 2.55 | −3.6% |
+| p=7 `OPENACC_ASIS` | off | 3.50 | 3.41 | −2.6% |
+| p=255 `CUDAFORTRAN_GEMM_FUSED` | off | 3.329 | **3.232** | −2.9% |
+| p=255 `CUDAFORTRAN_GEMM_FUSED` | on | 3.289 | **3.192** | −3.0% |
+| p=255 `CUDAFORTRAN_GEMM` | off | 3.861 | 3.763 | −2.5% |
+| p=255 `CUDAFORTRAN_GEMM_CUTE` | off | 3.837 | 3.741 | −2.5% |
+| p=255 `CUDAFORTRAN_FUSED_TC` | off | 13.56 | 13.57 | ±0（自カーネルが 13 秒）|
+
+数値検証: `SCALE_DG_VARYING_COEFF=1` で `q` 全点を比較（`SCALE_DG_DUMP_Q`）。
+
+| 比較 | 結果 |
+|---|---|
+| p=255 `Ne=1` `GEMM_FUSED` 変更後 vs 変更前 | ビット一致 |
+| p=7 `Ne=8³` `FUSED_TC` / `FUSED` / `GEMM` 変更後 vs 変更前 | ビット一致 |
+| p=7 `Ne=8³` `FUSED_TC` `nstep=200` 変更後 vs 変更前 | ビット一致 |
+| 同上 graph on vs graph off | ビット一致 |
+| CPU/OpenMP ビルド（`OPENACC_ASIS`）vs GPU | max_abs_diff 2.7e-20 |
