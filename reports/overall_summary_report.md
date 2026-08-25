@@ -509,8 +509,15 @@ min/max reduction（1.16 TB/s、`output_interval` ごと）と halo 更新であ
    更新に融合してカーネルごと削除した。非 tendency は約 422 → 320 µs/step。
    次に残るのは min/max reduction（1.16 TB/s）と halo 更新だが、
    前者は `output_interval` ごとなので現行入力での寄与は小さい。
-4. **p=7 と p=255 の間の crossover point 測定。** 要素並列性と GEMM 化の
-   損益分岐がどの多項式次数で起きるか（p=15, 31, 63, 127 など）。
+4. ~~**p=7 と p=255 の間の crossover point 測定。**~~ → **成立しないので取り下げ
+   （2026-08-25）**。CUDA Fortran の専用カーネルは `Nq == 8`（p=7）と
+   `Nq == 256`（p=255）にしか存在せず、それ以外は
+   `error stop "CUDAFORTRAN_FUSED requires Nq=8 or Nq=256"` になる
+   （`mod_advect3d_eq.f90:605,613,622` および `:652,660`）。
+   p=15/31/63/127 で走るのは汎用の OpenACC パスだけなので、測っても
+   「要素並列カーネル vs GEMM 化」の比較にはならず、汎用パス同士の比較にしか
+   ならない。損益分岐を知りたいなら、まず中間次数の専用カーネルを書く
+   必要がある。それは測定ではなく実装の作業であり、現時点で優先度は低い。
 5. **p=255 の lift と z GEMM の overlap**、および assembly 以外の独立カーネル削減。
    `q*vel` の mainloop 融合はやり直さない。
 6. **全パスの point-varying 係数回帰の自動化**（CI 化）。
