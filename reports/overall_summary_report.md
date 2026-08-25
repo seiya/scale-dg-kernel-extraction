@@ -441,6 +441,7 @@ wall 時間ではない**（host が同期しなくなったため、キュー�
 | 代表スカラー特殊化（`Escale(1,1,1)*u(1,1)` 等） | 高速だが**数値契約違反** | 撤回（`03551c7`）。速度に関係なく即 revert |
 | cuBLAS FP emulation（Ozaki / BF16x9） | 導入 toolkit に API が無く native FP64 へ fallback → timeout | 現環境では評価不能 |
 | p=7 の grid-stride loop 除去（1 thread / 1 point） | 全体の律速は解消せず | 不採用。launch 構造と中間配列トラフィックが本体 |
+| p=7 TC の face gather 前倒し（`VMapM`/`VMapP` の先行ロード） | 版 A（index だけ前倒し）0.850 → **0.868 s**（+2.1%）、版 B（セクションごと入れ替え）0.849 s（±0） | **不採用**（2026-08-25）。カーネルはレジスタ 32 本ちょうどで余裕がゼロなので、ptxas が先行ロードを元の位置へ押し戻す。詳細は `tc_paper_survey_2407.09621.md` §12 |
 
 現在 z-epilogue に残しているのは、iteration あたり 2 sync、6 operand のまとめ読み、
 `#pragma unroll(1)` の構成。
@@ -567,6 +568,17 @@ wall 時間ではない**（host が同期しなくなったため、キュー�
    その版で残る律速は **global load のレイテンシ**（`long scoreboard`
    25.5 → 35.0）であり、sector 数・L2・DRAM は不変である。
    詳細は `tc_paper_survey_2407.09621.md` §11。
+   → **さらに §12 で決着（2026-08-25）**。§11.6 が挙げた「face gather の
+   前倒し」も**外れ**である。`VMapM`/`VMapP` の先行ロードは 2.1% 遅く、
+   セクションごとの入れ替えは ±0 だった。原因は 8 ブロック/SM を保つための
+   レジスタ 32 本という枠で、ptxas に先行ロードを保持する余地が構造的に無い。
+   加えて occupancy 96.9%・64 warp/SM では、そもそもスレッド内の
+   memory-level parallelism を増やしても意味がない。`long scoreboard` の
+   増加は「発行できるロードが足りない」ではなく **L1 で待たされている**
+   という意味であり、残る余地は **L1 トランザクション数の削減**側にしかない。
+   その方向の案（§9 の M 側 gather shared 化、§10 のレイアウト探索）は
+   すでに実測で不採用になっている。**p=7 の tendency カーネルは打ち止めに
+   近い。**
    あわせて、ncu 単発 launch と実運用 launch では最適化の優劣が逆転しうる
    ことが分かった（同 §10.5、§11.5）。ncu で絞った候補は
    必ず `nstep=1000` の end-to-end で確認すること。
