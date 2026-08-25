@@ -220,6 +220,19 @@ polynomial orders use the general CUDA kernels;
 OpenACC implementations. A build made without `CUDA=1` rejects
 both CUDA Fortran modes at startup.
 
+`UseCudaGraph = .true.` captures one Runge-Kutta step from the kernel stream
+and replays it for every later step, instead of launching its nine kernels one
+by one. The kernels, their order, and their arguments are unchanged; what it
+removes is the host-side launch turnaround between them. The first step is
+always launched directly and the second is the one captured, because a capture
+executes nothing. A replay does not run the Fortran wrappers, so the per-kernel
+device times cannot be collected in this mode and the report says so; only the
+wall time is measured. The option is ignored, with a message, for the tendency
+paths whose kernels are OpenACC regions on the default queue
+(`OPENACC_ASIS`, `OPENACC_SPLIT`, `CUDAFORTRAN_SPLIT`), which a capture of the
+kernel stream would not see. `MeasureKernelTime = .false.` turns the CUDA event
+timing off on its own, without capturing anything.
+
 The total `Volume derivate + surface lift` timing is printed for every mode.
 The split modes additionally print their component timings, so
 the implementations can be compared by changing only `DqdtKernel_Type` while
@@ -255,6 +268,8 @@ Simulation parameters are specified in `input.conf`, including
 - DG operator optimization type (`DGOptrKernel_OptType`).
 - Tendency kernel type (`DqdtKernel_Type`).
 - cuBLAS floating-point emulation switch (`CublasEmulation`, used with `CUDAFORTRAN_GEMM`).
+- CUDA graph replay of a time step (`UseCudaGraph`, default `.false.`).
+- Per-kernel CUDA event timing (`MeasureKernelTime`, default `.true.`).
 - Time step (`dt`)
 - Number of time steps (`nstep`)
 

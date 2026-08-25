@@ -18,19 +18,37 @@ module mod_advect3d_eq
     cuda_cal_dqdt_gemm, cuda_cal_dqdt_gemm_fused, cuda_cal_dqdt_gemm_cute, &
     cuda_gemm_setup, cuda_gemm_finalize, &
     cuda_cal_elembnd_flux, cuda_dg_bind_acc_stream, &
-    cuda_dg_flush_kernel_time
+    cuda_dg_flush_kernel_time, cuda_dg_set_event_timing, &
+    cuda_dg_graph_capture_begin, cuda_dg_graph_capture_end, &
+    cuda_dg_graph_launch, cuda_dg_graph_is_ready, cuda_dg_graph_finalize
   implicit none
   private
 
   public :: setup_advect3d_eq_setup
   public :: setup_advect3d_eq_finalize
   public :: advect3d_eq_cal_tend
+  public :: advect3d_eq_graph_supported
+  public :: advect3d_eq_set_time_reporting
+
+  !- Re-exported so that the time-stepping loop does not have to know which
+  !  backend module it is built against.
+  public :: cuda_dg_set_event_timing
+  public :: cuda_dg_graph_capture_begin
+  public :: cuda_dg_graph_capture_end
+  public :: cuda_dg_graph_launch
+  public :: cuda_dg_graph_is_ready
 
   !> .true. for the paths whose tendency is computed by OpenACC kernels.
   !! Those kernels run on the default OpenACC queue, so the device work that
   !! the time-stepping loop queued on ACC_QUEUE must be complete before they
   !! start.
   logical :: tend_uses_acc_kernels = .true.
+
+  !> .false. when the host-side timers of a tendency call no longer see every
+  !! call, which is what a CUDA graph replay does.  The elapsed times are then
+  !! reported as not measured instead of as a number that counts only the
+  !! steps the host actually walked through.
+  logical :: tend_time_is_measured = .true.
 
   type(Timer) :: timer_ebnd_flux
   type(Timer) :: timer_dqdt
@@ -208,6 +226,33 @@ contains
 
     return
   end subroutine setup_advect3d_eq_setup
+
+  !> .true. when every kernel of a tendency call is queued on ACC_QUEUE, so
+  !! that a whole time step can be captured from that one stream.  The
+  !! OpenACC tendency paths launch on the default queue instead, which a
+  !! capture of ACC_QUEUE would not see.
+  logical function advect3d_eq_graph_supported()
+    implicit none
+    !------------------------------------------------------------
+
+    advect3d_eq_graph_supported = &
+      cuda_dg_kernels_available .and. (.not. tend_uses_acc_kernels)
+
+    return
+  end function advect3d_eq_graph_supported
+
+  !> Tell the module whether its host-side timers still see every tendency
+  !! call.  See tend_time_is_measured.
+  subroutine advect3d_eq_set_time_reporting(measured)
+    implicit none
+    logical, intent(in) :: measured
+    !------------------------------------------------------------
+
+    tend_time_is_measured = measured
+
+    return
+  end subroutine advect3d_eq_set_time_reporting
+
   !> Finalize
 !OCL SERIAL
   subroutine setup_advect3d_eq_finalize()
@@ -221,6 +266,8 @@ contains
     call cuda_dg_flush_kernel_time(kernel_time)
     call accumulate_kernel_time(kernel_time)
 
+    call cuda_dg_graph_finalize()
+
     write(*,'(A30,A24)') "Dqdt kernel type:", trim(dqdt_kernel_name)
     if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM .or. &
         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .or. &
@@ -231,6 +278,13 @@ contains
         write(*,'(A30,A24)') "Cublas FP emulation:", "off"
       end if
     end if
+    if (.not. tend_time_is_measured) then
+      !- A CUDA graph replay runs no Fortran wrapper, so none of the timers
+      !  below saw the steps that were replayed.
+      write(*,'(A30,A24)') "Tendency breakdown:", "not measured (graph)"
+      return
+    end if
+
     if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED .or. &
         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_TC) then
       write(*,'(A30,1X,A23)') "Element boundary flux:", "included in fused kernel"

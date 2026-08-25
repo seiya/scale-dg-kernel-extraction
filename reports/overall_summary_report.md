@@ -427,6 +427,34 @@ device 時間は不変（p=7 TC 0.8523 → 0.8518 s）。残る 50 µs/step は 
 wall 時間ではない**（host が同期しなくなったため、キュー済みの device 仕事の
 待ち時間を含む）。カーネル単体は `CUDA device *`（CUDA event）を見ること。
 
+### 8.3 追記: 1 step を CUDA Graph にした（2026-08-25）
+
+§8.2 で残った 50 µs/step は 1 step 9 回の launch turnaround そのものなので、
+§12 の項目 5 に挙げていた **CUDA Graph 化**を実装した。SSP-RK3 の 1 step
+（halo 更新・tendency・RK 更新 × 3 stage）を `cudaStreamBeginCapture` /
+`cudaStreamEndCapture` で 1 回捕捉し、以降は `cudaGraphLaunch` で再生する。
+namelist の `UseCudaGraph = .true.` で有効。カーネル・引数・順序・データは
+一切変えていない。
+
+捕捉は 2 step 目で行う。capture 中は何も実行されないので、`dqdt` を host が
+読む 1 step 目は直接 launch する必要があるためである。再生は Fortran の
+ラッパを通らないので、**このモードでは tendency の CUDA event 時間を採れない**
+（`not measured (graph)` と表示される)。捕捉対象は ACC_QUEUE のストリームに
+すべてのカーネルが乗っている経路に限られるので、tendency が default queue の
+OpenACC 領域を使う `OPENACC_ASIS` / `OPENACC_SPLIT` / `CUDAFORTRAN_SPLIT` では
+警告を出して無効化する。
+
+| 入力 / パス | graph なし | graph あり | 差 | µs/step |
+|---|---:|---:|---:|---:|
+| p=7 `Ne=32^3` `CUDAFORTRAN_FUSED_TC` | 1.2038 | **1.1716** | −2.7% | −32 |
+| p=7 `Ne=32^3` `CUDAFORTRAN_FUSED` | 1.3441 | **1.3104** | −2.5% | −34 |
+| p=255 `Ne=1` `CUDAFORTRAN_GEMM_FUSED` | 3.9730 | **3.8545** | −3.0% | −119 |
+| p=255 `Ne=1` `CUDAFORTRAN_GEMM_CUTE` | 4.2646 | **4.1328** | −3.1% | −132 |
+| p=255 `Ne=1` `CUDAFORTRAN_FUSED` | 15.346 | **15.288** | −0.4% | −59 |
+
+削れた絶対量はどのパスでもほぼ同じで、相対利得の差はカーネル時間の差である。
+詳細・数値検証・イベント計測コストの分離は `execution_times.md` 追記 7。
+
 ---
 
 ## 9. 試して不採用にした最適化と、その理由
@@ -595,9 +623,12 @@ wall 時間ではない**（host が同期しなくなったため、キュー�
    「要素並列カーネル vs GEMM 化」の比較にはならず、汎用パス同士の比較にしか
    ならない。損益分岐を知りたいなら、まず中間次数の専用カーネルを書く
    必要がある。それは測定ではなく実装の作業であり、現時点で優先度は低い。
-5. **1 step あたりの launch 回数の削減（CUDA Graph）。** §8.2 で host 同期を
-   外した後も、9 回の launch turnaround で 50 µs/step が残っている。
-   カーネルを減らす余地が無い以上、次はグラフ化で launch そのものを減らす話になる。
+5. ~~**1 step あたりの launch 回数の削減（CUDA Graph）。**~~ → **完了
+   （2026-08-25、§8.3）**。1 step を捕捉して再生するようにし、p=7 `FUSED_TC` の
+   Main は 1.2038 → 1.1716 秒（−32 µs/step）、p=255 `GEMM_FUSED` は
+   3.9730 → 3.8545 秒（−119 µs/step）。namelist の `UseCudaGraph` で選ぶ。
+   再生時は tendency の CUDA event 時間が採れないので、device 時間を見たい
+   測定では off にすること。
 6. **p=255 の lift と z GEMM の overlap**、および assembly 以外の独立カーネル削減。
    `q*vel` の mainloop 融合はやり直さない。
 7. **全パスの point-varying 係数回帰の自動化**（CI 化）。

@@ -44,6 +44,22 @@ module mod_cuda_dg_kernels
   integer, save :: ev_pending_mode = 0
   real(RP), save :: dg_kernel_time(4) = 0.0_RP ! result of the last harvest
 
+  !> .false. suppresses the event records entirely.  A graph replay does not
+  !! run the Fortran wrapper that reads the events back, so the per-kernel
+  !! device time cannot be reported in graph mode; recording events that
+  !! nobody reads would only add nodes to the graph.
+  logical, save :: dg_ev_enabled = .true.
+
+  !- CUDA Graph -------------------------------------------------------------
+  !
+  !  One Runge-Kutta step is captured from dg_stream once and replayed for
+  !  every later step.  All the step's work is queued on that one stream, so
+  !  the capture is a plain linear graph; what it removes is the per-launch
+  !  turnaround the host pays nine times a step, not any device work.
+  type(cudaGraph), save :: dg_graph
+  type(cudaGraphExec), save :: dg_graph_exec
+  logical, save :: dg_graph_ready = .false.
+
   real(RP), device, allocatable, save :: gemm_pack_x(:,:)
   real(RP), device, allocatable, save :: gemm_pack_y(:,:,:)
   real(RP), device, allocatable, save :: gemm_lift_x(:,:)
@@ -70,6 +86,12 @@ module mod_cuda_dg_kernels
   public :: cuda_cal_elembnd_flux
   public :: cuda_dg_bind_acc_stream
   public :: cuda_dg_flush_kernel_time
+  public :: cuda_dg_set_event_timing
+  public :: cuda_dg_graph_capture_begin
+  public :: cuda_dg_graph_capture_end
+  public :: cuda_dg_graph_launch
+  public :: cuda_dg_graph_is_ready
+  public :: cuda_dg_graph_finalize
 
   interface
     subroutine dg_set_cuda_stream(stream) &
@@ -181,6 +203,33 @@ contains
     return
   end subroutine cuda_dg_bind_acc_stream
 
+  !> Turn the per-kernel CUDA event timing on or off.
+  subroutine cuda_dg_set_event_timing(on)
+    implicit none
+    logical, intent(in) :: on
+    !------------------------------------------------------------
+
+    dg_ev_enabled = on
+
+    return
+  end subroutine cuda_dg_set_event_timing
+
+  !> Record one measurement boundary on the kernel stream.
+  subroutine dg_ev_record(iev)
+    implicit none
+    integer, intent(in) :: iev
+
+    integer :: istat
+    !------------------------------------------------------------
+
+    if (.not. dg_ev_enabled) return
+
+    istat = cudaEventRecord(split_events(iev,ev_buf),dg_stream)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+
+    return
+  end subroutine dg_ev_record
+
   !> Start a measurement: create the events on first use, read back the
   !! measurement of the previous call and switch to the other event buffer.
   subroutine dg_ev_begin()
@@ -188,6 +237,8 @@ contains
 
     integer :: istat, iev, ibuf
     !------------------------------------------------------------
+
+    if (.not. dg_ev_enabled) return
 
     if (.not. split_events_initialized) then
       do ibuf = 1, 2
@@ -210,6 +261,8 @@ contains
     implicit none
     integer, intent(in) :: mode
     !------------------------------------------------------------
+
+    if (.not. dg_ev_enabled) return
 
     ev_pending = ev_buf
     ev_pending_mode = mode
@@ -280,6 +333,87 @@ contains
     return
   end subroutine cuda_dg_flush_kernel_time
 
+  !> Begin capturing the kernel stream into a CUDA graph.  Nothing queued
+  !! between here and cuda_dg_graph_capture_end() executes; it becomes graph
+  !! nodes instead.
+  !!
+  !! The capture is relaxed rather than thread-local because the OpenACC
+  !! regions of the step are queued through the OpenACC runtime, which is not
+  !! written with capture in mind and would otherwise have to be audited for
+  !! every call it makes while a capture of this thread is open.  What the
+  !! stricter modes buy is a diagnostic, not correctness: the step queues
+  !! nothing but kernels on this one stream, and the captured result is
+  !! checked against the directly launched one field by field.
+  subroutine cuda_dg_graph_capture_begin()
+    implicit none
+
+    integer :: istat
+    !------------------------------------------------------------
+
+    istat = cudaStreamBeginCapture(dg_stream,cudaStreamCaptureModeRelaxed)
+    if (istat /= cudaSuccess) &
+      call cuda_failure("cudaStreamBeginCapture",istat)
+
+    return
+  end subroutine cuda_dg_graph_capture_begin
+
+  !> End the capture and instantiate the executable graph.
+  subroutine cuda_dg_graph_capture_end()
+    implicit none
+
+    integer :: istat
+    !------------------------------------------------------------
+
+    istat = cudaStreamEndCapture(dg_stream,dg_graph)
+    if (istat /= cudaSuccess) call cuda_failure("cudaStreamEndCapture",istat)
+
+    istat = cudaGraphInstantiate(dg_graph_exec,dg_graph,0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaGraphInstantiate",istat)
+
+    dg_graph_ready = .true.
+
+    return
+  end subroutine cuda_dg_graph_capture_end
+
+  !> Replay the captured step on the kernel stream.
+  subroutine cuda_dg_graph_launch()
+    implicit none
+
+    integer :: istat
+    !------------------------------------------------------------
+
+    istat = cudaGraphLaunch(dg_graph_exec,dg_stream)
+    if (istat /= cudaSuccess) call cuda_failure("cudaGraphLaunch",istat)
+
+    return
+  end subroutine cuda_dg_graph_launch
+
+  logical function cuda_dg_graph_is_ready()
+    implicit none
+    !------------------------------------------------------------
+
+    cuda_dg_graph_is_ready = dg_graph_ready
+
+    return
+  end function cuda_dg_graph_is_ready
+
+  subroutine cuda_dg_graph_finalize()
+    implicit none
+
+    integer :: istat
+    !------------------------------------------------------------
+
+    if (.not. dg_graph_ready) return
+
+    istat = cudaGraphExecDestroy(dg_graph_exec)
+    if (istat /= cudaSuccess) call cuda_failure("cudaGraphExecDestroy",istat)
+    istat = cudaGraphDestroy(dg_graph)
+    if (istat /= cudaSuccess) call cuda_failure("cudaGraphDestroy",istat)
+    dg_graph_ready = .false.
+
+    return
+  end subroutine cuda_dg_graph_finalize
+
   subroutine cuda_cal_elembnd_flux( &
     flux, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, &
     Np, NfpTot, Ne, NeA )
@@ -325,16 +459,14 @@ contains
     end if
     call dg_ev_begin()
 
-    istat = cudaEventRecord(split_events(1,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(1)
     call tendency_fused_p7_kernel<<<Ne,CUDA_FUSED_P7_BLOCK_SIZE,0,dg_stream>>>( &
       dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
       normal_fn, Fscale, Escale, Ne )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure( &
       "tendency_fused_p7_kernel",istat)
-    istat = cudaEventRecord(split_events(2,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(2)
     call dg_ev_end(DG_EV_SINGLE)
 
     kernel_time(1) = dg_kernel_time(1)
@@ -375,8 +507,7 @@ contains
     nblock_deriv = CUDA_P255_BLOCKS_PER_ELEMENT*Ne
     tile_threads = dim3(CUDA_P255_TILE,CUDA_P255_TILE,1)
 
-    istat = cudaEventRecord(split_events(1,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(1)
     call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
     call tendency_x_p255_kernel<<<nblock_deriv,tile_threads,0,dg_stream>>>( &
@@ -387,8 +518,7 @@ contains
       dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, Ne )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("p=255 tendency kernels",istat)
-    istat = cudaEventRecord(split_events(2,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(2)
     call dg_ev_end(DG_EV_SINGLE)
 
     kernel_time(1) = dg_kernel_time(1)
@@ -421,16 +551,14 @@ contains
     end if
     call dg_ev_begin()
 
-    istat = cudaEventRecord(split_events(1,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(1)
     call launch_tendency_fused_p7_tc( &
       dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
       normal_fn, Fscale, Escale, int(Ne,c_int) )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure( &
       "tendency_fused_p7_tc_kernel",istat)
-    istat = cudaEventRecord(split_events(2,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(2)
     call dg_ev_end(DG_EV_SINGLE)
 
     kernel_time(1) = dg_kernel_time(1)
@@ -466,16 +594,14 @@ contains
     nface = NfpTot*Ne
     nblock_face = (nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
 
-    istat = cudaEventRecord(split_events(1,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(1)
     call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
     call launch_tendency_xyz_p255_tc( &
       dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, int(Ne,c_int) )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("p=255 TC tendency kernels",istat)
-    istat = cudaEventRecord(split_events(2,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(2)
     call dg_ev_end(DG_EV_SINGLE)
 
     kernel_time(1) = dg_kernel_time(1)
@@ -575,8 +701,7 @@ contains
     stride_zero = 0_c_long_long
     stride_vol = int(Np,c_long_long)
 
-    istat = cudaEventRecord(split_events(1,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(1)
 
     call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
@@ -623,8 +748,7 @@ contains
 
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("CUDAFORTRAN_GEMM kernels",istat)
-    istat = cudaEventRecord(split_events(2,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(2)
     call dg_ev_end(DG_EV_SINGLE)
 
     kernel_time(1) = dg_kernel_time(1)
@@ -679,23 +803,20 @@ contains
     stride_zero = 0_c_long_long
     stride_vol = int(Np,c_long_long)
 
-    istat = cudaEventRecord(split_events(1,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(1)
 
     call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
     call volume_flux_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       flux_x, flux_y, flux_z, q, u, v, w, npoint )
 
-    istat = cudaEventRecord(split_events(2,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(2)
 
     istat = launch_volume_gemm_cute( &
       deriv_x, deriv_y, deriv_z, flux_x, flux_y, flux_z, D1D, D1D_tr, Nq, Ne )
     if (istat /= 0) call cuda_failure("launch_volume_gemm_cute",istat)
 
-    istat = cudaEventRecord(split_events(3,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(3)
 
     call copy_lift1d_pairs_kernel<<<1,Nq,0,dg_stream>>>( &
       gemm_lift_x, gemm_lift_y, gemm_lift_z, Lift1D, Nq )
@@ -723,8 +844,7 @@ contains
 
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("CUDAFORTRAN_GEMM_CUTE kernels",istat)
-    istat = cudaEventRecord(split_events(4,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(4)
     call dg_ev_end(DG_EV_CUTE)
 
     kernel_time(1) = dg_kernel_time(1)
@@ -779,23 +899,20 @@ contains
     stride_zero = 0_c_long_long
     stride_vol = int(Np,c_long_long)
 
-    istat = cudaEventRecord(split_events(1,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(1)
 
     call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
     call volume_flux_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       flux_x, flux_y, flux_z, q, u, v, w, npoint )
 
-    istat = cudaEventRecord(split_events(2,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(2)
 
     istat = launch_volume_gemm_xy( &
       deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, Nq, Ne )
     if (istat /= 0) call cuda_failure("launch_volume_gemm_xy",istat)
 
-    istat = cudaEventRecord(split_events(3,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(3)
 
     call copy_lift1d_pairs_kernel<<<1,Nq,0,dg_stream>>>( &
       gemm_lift_x, gemm_lift_y, gemm_lift_z, Lift1D, Nq )
@@ -818,8 +935,7 @@ contains
       1.0_c_double, lift_out, nq2, stride_vol, Ne)
     if (istat /= 0) call cuda_failure("cublasDgemm z-lift",istat)
 
-    istat = cudaEventRecord(split_events(4,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(4)
 
     istat = launch_z_gemm_assembly( &
       dqdt, flux_z, D1D_tr, deriv_x, deriv_y, lift_out, Escale, Nq, Ne )
@@ -827,8 +943,7 @@ contains
 
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("CUDAFORTRAN_GEMM_FUSED kernels",istat)
-    istat = cudaEventRecord(split_events(5,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(5)
     call dg_ev_end(DG_EV_GEMM_FUSED)
 
     kernel_time(1) = dg_kernel_time(1)
@@ -856,15 +971,13 @@ contains
 
     npoint = Np*Ne
     nblock = (npoint+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
-    istat = cudaEventRecord(split_events(1,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(1)
 
     call volume_flux_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       flux_x, flux_y, flux_z, q, u, v, w, npoint )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("volume_flux_kernel",istat)
-    istat = cudaEventRecord(split_events(2,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(2)
 
     if (Nq == 8) then
       call volume_deriv_p7_kernel<<<Ne,CUDA_P7_BLOCK_SIZE,0,dg_stream>>>( &
@@ -876,8 +989,7 @@ contains
     end if
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("volume_deriv_kernel",istat)
-    istat = cudaEventRecord(split_events(3,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(3)
 
     if (Nq == 8) then
       call surface_lift_p7_kernel<<<Ne,CUDA_P7_BLOCK_SIZE,0,dg_stream>>>( &
@@ -888,15 +1000,13 @@ contains
     end if
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("surface_lift_kernel",istat)
-    istat = cudaEventRecord(split_events(4,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(4)
 
     call dqdt_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       dqdt, Escale, deriv_x, deriv_y, deriv_z, lift_out, npoint )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("dqdt_assembly_kernel",istat)
-    istat = cudaEventRecord(split_events(5,ev_buf),dg_stream)
-    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
+    call dg_ev_record(5)
     call dg_ev_end(DG_EV_SPLIT)
 
     kernel_time(1:4) = dg_kernel_time(1:4)

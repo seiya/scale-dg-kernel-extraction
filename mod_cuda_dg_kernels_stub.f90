@@ -23,6 +23,12 @@ module mod_cuda_dg_kernels
   public :: cuda_cal_elembnd_flux
   public :: cuda_dg_bind_acc_stream
   public :: cuda_dg_flush_kernel_time
+  public :: cuda_dg_set_event_timing
+  public :: cuda_dg_graph_capture_begin
+  public :: cuda_dg_graph_capture_end
+  public :: cuda_dg_graph_launch
+  public :: cuda_dg_graph_is_ready
+  public :: cuda_dg_graph_finalize
 
 contains
   !> No-op counterpart of the CUDA Fortran routine: without CUDA kernels the
@@ -43,6 +49,50 @@ contains
 
     return
   end subroutine cuda_dg_flush_kernel_time
+
+  !> No CUDA events are recorded in this build, so the switch does nothing.
+  subroutine cuda_dg_set_event_timing(on)
+    implicit none
+    logical, intent(in) :: on
+
+    return
+  end subroutine cuda_dg_set_event_timing
+
+  !- No-op counterparts of the CUDA graph routines.  Without CUDA Fortran
+  !  there is no stream to capture, and cuda_dg_graph_is_ready() stays
+  !  .false. so that callers keep launching the step directly.
+
+  subroutine cuda_dg_graph_capture_begin()
+    implicit none
+
+    return
+  end subroutine cuda_dg_graph_capture_begin
+
+  subroutine cuda_dg_graph_capture_end()
+    implicit none
+
+    return
+  end subroutine cuda_dg_graph_capture_end
+
+  subroutine cuda_dg_graph_launch()
+    implicit none
+
+    return
+  end subroutine cuda_dg_graph_launch
+
+  logical function cuda_dg_graph_is_ready()
+    implicit none
+
+    cuda_dg_graph_is_ready = .false.
+
+    return
+  end function cuda_dg_graph_is_ready
+
+  subroutine cuda_dg_graph_finalize()
+    implicit none
+
+    return
+  end subroutine cuda_dg_graph_finalize
 
   subroutine cuda_cal_elembnd_flux( &
     flux, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, &

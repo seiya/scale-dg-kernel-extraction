@@ -20,7 +20,10 @@ program main
     D1D, D1D_tr, Lift_mat, Lift1D, VMapM, VMapP, &
     normal_fn, Escale, Fscale, pos_en, update_halo
   use mod_advect3d_eq, only: &
-    advect3d_eq_cal_tend
+    advect3d_eq_cal_tend, advect3d_eq_graph_supported, &
+    advect3d_eq_set_time_reporting, &
+    cuda_dg_set_event_timing, cuda_dg_graph_capture_begin, &
+    cuda_dg_graph_capture_end, cuda_dg_graph_launch, cuda_dg_graph_is_ready
   implicit none
 
   !-----------------------------------------------------------------------------
@@ -31,6 +34,16 @@ program main
   integer :: nstep, output_interval
   integer :: istep, stage
   real(RP) :: dt
+
+  !> Replay one captured Runge-Kutta step instead of launching its kernels
+  !! one by one.  Set from the namelist; see the note above the time loop.
+  logical :: UseCudaGraph = .false.
+
+  !> Bracket the tendency kernels with CUDA events to report their device
+  !! time.  Turning it off drops "CUDA device ..." from the report and leaves
+  !! only the wall time; a CUDA graph replay cannot report it either, so
+  !! UseCudaGraph turns it off as well.
+  logical :: MeasureKernelTime = .true.
 
   real(RP), allocatable :: q(:,:)
   real(RP), allocatable :: q0(:,:)
@@ -56,53 +69,41 @@ program main
   call update_halo(v)
   call update_halo(w)
 
+  !- A time step is nine kernel launches on one stream, and section 8.2 of
+  !  reports/overall_summary_report.md measured 50 us/step of GPU idle left in
+  !  their turnaround after the host synchronization was removed.  Capturing
+  !  the step once and replaying the graph removes the per-launch host work
+  !  without changing which kernels run, in which order, or on what data.
+  !
+  !  The capture has to happen on a step whose result the host does not read,
+  !  because a capture executes nothing: step 1 is therefore always launched
+  !  directly, step 2 is captured and replayed, and every later step is a
+  !  replay.  A replay does not run the Fortran wrappers, so the per-kernel
+  !  CUDA event timing is switched off for the whole run in this mode; only
+  !  the wall time is reported.
+  if (UseCudaGraph) then
+    MeasureKernelTime = .false.
+    call advect3d_eq_set_time_reporting(.false.)
+  end if
+  if (.not. MeasureKernelTime) then
+    call cuda_dg_set_event_timing(.false.)
+  end if
+
   call Timer_start(timer_main)
 
   !- Loop for time integration
   do istep = 1, nstep
 
-    do stage = 1, RK_nstage
-      call update_halo(q)
-
-      call Timer_start(timer_cal_tend)
-      call advect3d_eq_cal_tend( dqdt,       & ! (out)
-        q, u, v, w,                              & ! (in)
-        D1D, D1D_tr, Lift_mat, Lift1D,           & ! (in)
-        VMapM, VMapP, normal_fn, Escale, Fscale, & ! (in)
-        Nq, Np, NfpTot, Ne, NeA )
-      call Timer_stop(timer_cal_tend)
-
-      if (istep == 1 .and. stage == 1) then
-        call dump_dqdt_if_requested(dqdt, Np, Ne)
+    if (UseCudaGraph .and. istep >= 2) then
+      if (.not. cuda_dg_graph_is_ready()) then
+        call cuda_dg_graph_capture_begin()
+        call advance_step()
+        call cuda_dg_graph_capture_end()
       end if
-
-      if (stage == 1) then
-        !- At the first stage q0 is by definition the current q, so the
-        !  SSP-RK save is fused into the update kernel. This removes a
-        !  separate q0 <- q pass over the field without changing either the
-        !  arithmetic or the lifetime of q0.
-        !$omp parallel do private(pnode)
-        !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt) &
-        !$acc& async(ACC_QUEUE)
-        do kelem=1, Ne
-          do pnode=1, Np
-            q0(pnode,kelem) = q(pnode,kelem)
-            q(pnode,kelem) = rk_a(stage) * q0(pnode,kelem) &
-                           + rk_b(stage) * ( q(pnode,kelem) + dt * dqdt(pnode,kelem) )
-          end do
-        end do
-      else
-        !$omp parallel do private(pnode)
-        !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt) &
-        !$acc& async(ACC_QUEUE)
-        do kelem=1, Ne
-          do pnode=1, Np
-            q(pnode,kelem) = rk_a(stage) * q0(pnode,kelem) &
-                           + rk_b(stage) * ( q(pnode,kelem) + dt * dqdt(pnode,kelem) )
-          end do
-        end do
-      end if
-    end do
+      call cuda_dg_graph_launch()
+    else
+      call advance_step()
+    end if
 
     if (mod(istep,output_interval) == 0) then
       q_min = huge(q_min)
@@ -121,6 +122,8 @@ program main
       write(*,'(I8,2ES24.15)') istep, q_min, q_max
     end if
   end do
+
+  call dump_q_if_requested()
 
   !$acc wait(ACC_QUEUE)
 
@@ -155,7 +158,9 @@ contains
       vel_x, vel_y, vel_z,        &
       DGOptrKernel_OptType,        &
       DqdtKernel_Type,             &
-      CublasEmulation
+      CublasEmulation,             &
+      UseCudaGraph,                &
+      MeasureKernelTime
 
     integer :: fid
     integer :: ke, p
@@ -192,6 +197,12 @@ contains
 
     !- Initialize a advection equation module
     call setup_advect3d_eq_setup(NfpTot, Np, Ne, DqdtKernel_Type, CublasEmulation)
+
+    if (UseCudaGraph .and. .not. advect3d_eq_graph_supported()) then
+      write(*,*) "UseCudaGraph is ignored: ", trim(DqdtKernel_Type), &
+        " launches kernels outside the captured stream"
+      UseCudaGraph = .false.
+    end if
 
     !- Set initial condition
 
@@ -242,12 +253,96 @@ contains
     call Timer_stop(timer_main)
     write(*,'(A)') "= Report of execution time [sec]"
     write(*,'(A30,ES24.5)') "Main:", Timer_elapsed(timer_main)
-    write(*,'(A30,ES24.5)') "Cal_tend:", Timer_elapsed(timer_cal_tend)
+    if (UseCudaGraph) then
+      write(*,'(A30,A24)') "CUDA graph replay:", "on"
+      write(*,'(A30,A24)') "Cal_tend:", "not measured (graph)"
+    else
+      write(*,'(A30,ES24.5)') "Cal_tend:", Timer_elapsed(timer_cal_tend)
+    end if
 
     call setup_advect3d_eq_finalize()
     call mesh_finalize()
     return
   end subroutine final
+
+  !> One SSP-RK3 step: three stages of halo update, tendency, and update.
+  !! Kept as its own procedure so that the whole step can be handed to the
+  !! CUDA graph capture unchanged.
+  subroutine advance_step()
+    implicit none
+    !------------------------------------------------------------
+
+    do stage = 1, RK_nstage
+      call update_halo(q)
+
+      call Timer_start(timer_cal_tend)
+      call advect3d_eq_cal_tend( dqdt,       & ! (out)
+        q, u, v, w,                              & ! (in)
+        D1D, D1D_tr, Lift_mat, Lift1D,           & ! (in)
+        VMapM, VMapP, normal_fn, Escale, Fscale, & ! (in)
+        Nq, Np, NfpTot, Ne, NeA )
+      call Timer_stop(timer_cal_tend)
+
+      if (istep == 1 .and. stage == 1) then
+        call dump_dqdt_if_requested(dqdt, Np, Ne)
+      end if
+
+      if (stage == 1) then
+        !- At the first stage q0 is by definition the current q, so the
+        !  SSP-RK save is fused into the update kernel. This removes a
+        !  separate q0 <- q pass over the field without changing either the
+        !  arithmetic or the lifetime of q0.
+        !$omp parallel do private(pnode)
+        !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt) &
+        !$acc& async(ACC_QUEUE)
+        do kelem=1, Ne
+          do pnode=1, Np
+            q0(pnode,kelem) = q(pnode,kelem)
+            q(pnode,kelem) = rk_a(stage) * q0(pnode,kelem) &
+                           + rk_b(stage) * ( q(pnode,kelem) + dt * dqdt(pnode,kelem) )
+          end do
+        end do
+      else
+        !$omp parallel do private(pnode)
+        !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt) &
+        !$acc& async(ACC_QUEUE)
+        do kelem=1, Ne
+          do pnode=1, Np
+            q(pnode,kelem) = rk_a(stage) * q0(pnode,kelem) &
+                           + rk_b(stage) * ( q(pnode,kelem) + dt * dqdt(pnode,kelem) )
+          end do
+        end do
+      end if
+    end do
+
+    return
+  end subroutine advance_step
+
+  !> Write the owned q field after the last step, for regressions that have
+  !! to compare a complete field rather than its extrema.  The dqdt dump is
+  !! taken at the first step, which a CUDA graph replay never runs.
+  subroutine dump_q_if_requested()
+    implicit none
+    character(len=256) :: dump_file
+    integer :: ke, p, fid
+    !------------------------------------------------------------
+
+    dump_file = ''
+    call get_environment_variable('SCALE_DG_DUMP_Q', dump_file)
+    if (len_trim(dump_file) == 0) return
+    !$acc wait(ACC_QUEUE)
+    !$acc update host(q)
+    fid = 22
+    open(fid, file=trim(dump_file), status='replace', action='write')
+    do ke = 1, Ne
+      do p = 1, Np
+        write(fid,'(ES24.16)') q(p,ke)
+      end do
+    end do
+    close(fid)
+
+    return
+  end subroutine dump_q_if_requested
 
   subroutine dump_dqdt_if_requested(dqdt, Np, Ne)
     implicit none

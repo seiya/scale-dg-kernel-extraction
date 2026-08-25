@@ -27,6 +27,14 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   同じ調査で見つかった効く要因は global アクセスのキャッシュライン数で、
   x/y 導関数をレジスタに保持し mma 出力を転置して epilogue を coalesce
   させた版が device 0.8518 → 0.8488 秒。残る律速は global load レイテンシ。
+- **1 step の CUDA Graph 化（2026-08-25）**: SSP-RK3 の 1 step を 1 回だけ
+  捕捉して以降は再生するようにした（namelist `UseCudaGraph`）。カーネル・順序・
+  データは不変で、消えるのは launch turnaround だけ。Main は p=7 `FUSED_TC` で
+  1.2038 → 1.1716 秒、p=7 `FUSED` で 1.3441 → 1.3104 秒、p=255 `GEMM_FUSED` で
+  3.9730 → 3.8545 秒、p=255 `GEMM_CUTE` で 4.2646 → 4.1328 秒。
+  **再生中は Fortran のラッパを通らないので、このモードでは tendency の
+  CUDA event 時間が採れない**（`execution_times.md` 追記 7、
+  `overall_summary_report.md` §8.3）。
 - **p=7 TC の face gather 前倒し（2026-08-25）**: `tc_paper_survey` §11.6 が
   次の標的に挙げた「`VMapM`/`VMapP` の先行ロードで 2 段依存を volume の
   ロードと重ねる」案は**不採用**（同 §12）。index だけ前倒しした版は

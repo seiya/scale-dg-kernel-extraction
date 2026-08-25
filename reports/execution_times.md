@@ -250,3 +250,91 @@ global load レイテンシに移ったためである。
 
 数値検証: `SCALE_DG_VARYING_COEFF=1` で p=7 `Ne=3*4*5`（`Ne=60`）と `Ne=1` の
 `dqdt` 全点を `CUDAFORTRAN_SPLIT` と突き合わせ、相対差 1.25e-15 と 1.17e-16。
+
+### 追記 7: 1 step を CUDA Graph 化した（本追記を導入したコミット、2026-08-25）
+
+追記 5 でカーネル間の GPU アイドルを 139 → 50 µs/step まで下げた後、残りは
+1 step 9 回の launch turnaround そのものだった。`overall_summary_report.md`
+§12 の項目 5 に挙げていた **CUDA Graph 化**を実装した。
+
+SSP-RK3 の 1 step（halo 更新・tendency・RK 更新 × 3 stage）を
+`cudaStreamBeginCapture` / `cudaStreamEndCapture` で 1 回だけ捕捉し、以降の
+step は `cudaGraphLaunch` で再生する。**カーネル・引数・実行順序・データは
+一切変えていない**。捕捉は 2 step 目で行う（capture は何も実行しないので、
+host が結果を読む 1 step 目は直接 launch する）。namelist の
+`UseCudaGraph = .true.` で有効。
+
+再生は Fortran のラッパを通らないので、tendency の CUDA event による device
+時間はこのモードでは採れない。`Cal_tend` と内訳は `not measured (graph)` と
+表示され、測るのは wall 時間だけになる。
+
+測定は login node、GB200 1 枚、`nstep=1000`、`make CUDA=1`、
+graph on / off を交互に実行。値は `Main`（秒）。
+
+| 入力 / パス | graph なし | graph あり | 差 | µs/step |
+|---|---:|---:|---:|---:|
+| p=7 `Ne=32^3` `CUDAFORTRAN_FUSED_TC` | 1.2038 | **1.1716** | −2.7% | −32 |
+| p=7 `Ne=32^3` `CUDAFORTRAN_FUSED` | 1.3441 | **1.3104** | −2.5% | −34 |
+| p=255 `Ne=1` `CUDAFORTRAN_GEMM_FUSED` | 3.9730 | **3.8545** | −3.0% | −119 |
+| p=255 `Ne=1` `CUDAFORTRAN_GEMM_CUTE` | 4.2646 | **4.1328** | −3.1% | −132 |
+| p=255 `Ne=1` `CUDAFORTRAN_FUSED` | 15.346 | **15.288** | −0.4% | −59 |
+
+各ラウンドの生値（p=7 TC）: graph なし 1.2031 / 1.2109 / 1.2033 / 1.1978、
+graph あり 1.1742 / 1.1679 / 1.1729 / 1.1713。
+
+イベント計測自体のコストも分離できる。p=7 TC で graph なし・イベント off
+（`MeasureKernelTime = .false.`）は 1.199 秒で、graph なし・イベント on の
+1.204 秒との差 5 µs/step がイベントの host コストである。graph の利得
+32 µs/step のうち 27 µs/step はイベントとは無関係な launch turnaround の分。
+
+p=255 `CUDAFORTRAN_FUSED` の利得が小さいのは、この経路が 1 step 15.3 ms と
+カーネル時間に支配されていて、同じ 60 µs 前後の launch コストが相対的に
+埋もれるためである。**絶対量はどのパスでもほぼ同じ**で、削れた launch
+コストは 32〜132 µs/step の範囲にある。
+
+#### nsys で見たカーネル間の隙間（Slurm job `45686`, `nstep=60`, p=7 `FUSED_TC`）
+
+追記 5 と同じ手順で graph 無しの 1 stage を追うと、定常部 382 カーネル
+（約 42 step 分）の span 51.07 ms に対し busy 49.55 ms、隙間の合計 1.511 ms
+である。うち 0.211 ms は `output_interval` の min/max reduction 前後の 1 回
+限りの待ちなので、それを除くと **30.6 µs/step** が step ごとの launch
+turnaround になる。内訳は 1 stage あたり halo → tendency 3.97 µs、
+tendency → RK 更新 3.9〜4.1 µs、RK 更新 → 次の halo 2.3 µs である。
+
+end-to-end で測った graph の利得 32 µs/step は、この 30.6 µs/step とほぼ
+一致する。**CUDA Graph はカーネル間の隙間をほぼ全部消している。**
+
+graph 側のトレースは採れなかった。**この環境では nsys を graph 再生パスに
+当てるとハングする**（Slurm job `45707`, nsys 2026.1.1（NVHPC 26.3 同梱）, GB200）。
+`timeout` で囲んで 3 通り試した結果は次のとおりで、同じバイナリでも
+`UseCudaGraph = .false.` なら nsys は正常に採れる（job `45686`）。
+
+| 試行 | 結果 |
+|---|---|
+| プロファイラ無し | `rc=0`、30 step が 35 ms で完走 |
+| `nsys profile`（既定の graph 粒度）| **`rc=124`（180 s で timeout）**、プログラム出力なし |
+| `nsys profile --cuda-graph-trace=node` | **`rc=124`（180 s で timeout）**、同上 |
+
+いずれも `.nsys-rep` は生成されるが `nsys stats` は
+`PROCESSED (EMPTY RESULTS)` で GPU trace を含まない。したがって上の結論は、
+graph 無しの隙間 30.6 µs/step と end-to-end の利得 32 µs/step が一致すること
+による。graph 側の内訳が要るときは、nsys ではなく CUDA event を graph 内に
+仕込むなど別の手段が必要である。
+
+なお RIKYU で nsys を投げる際は `export DEBUGINFOD_URLS=` と
+`--resolve-symbols=false` の両方が必須で、欠けるとジョブが終わらない。
+
+数値検証: `SCALE_DG_VARYING_COEFF=1`（`u,v,w,Escale,normal_fn,Fscale` を全点で
+変化させる）、p=7 `Ne=4*5*3`（`Ne=60`, 30720 点）、`nstep=300` の後の `q`
+全点を比較（`SCALE_DG_DUMP_Q`）。
+
+| パス | graph on と off の最大差 | `FUSED_TC` との相対差 |
+|---|---:|---:|
+| `CUDAFORTRAN_FUSED_TC` | 0（ビット一致）| — |
+| `CUDAFORTRAN_FUSED` | 0（ビット一致）| 1.45e-15 |
+| `CUDAFORTRAN_SPLIT` | 0（ビット一致）| 1.45e-15 |
+
+p=255 は `Ne=1` と `Ne=2` の両方で、`CUDAFORTRAN_FUSED` /
+`CUDAFORTRAN_FUSED_TC` / `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_FUSED` /
+`CUDAFORTRAN_GEMM_CUTE` の 5 経路とも graph on / off で `q` の min / max が
+完全一致した。
