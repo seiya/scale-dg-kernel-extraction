@@ -24,16 +24,71 @@ __device__ __forceinline__ void mma_reset(double &c0, double &c1)
   c1 = 0.0;
 }
 
+// Shared-memory layouts for the p=7 fused Tensor Core kernel.
+//
+// ncu (Slurm job 43554) showed the previous natural layouts caused a 3.0-way
+// bank conflict on shared loads and a 5.8-way conflict on shared stores, so
+// 46% of all shared wavefronts were excess. FP64 shared accesses are serviced
+// in half-warp phases, so an access is conflict free when the 16 lanes of a
+// phase hit 16 distinct addresses modulo 16 doubles.
+//
+// sDfrag: the 1D derivative matrix in m8n8k4 fragment order,
+//   sDfrag[b*32 + r*4 + c] = D1D[r + (b*4 + c)*8],  b = 0,1.
+//   Lane L reads sDfrag[b*32 + (L>>2)*4 + (L&3)], so a half-warp covers 16
+//   consecutive doubles.
+// sFluxX / sFluxY: natural node order i + 8*j + 64*k permuted by sw_xy(),
+//   which folds bit 4 of the index into the otherwise unused bit 2 and turns
+//   the 2-way operand loads into conflict-free ones.
+// sFluxZ: natural node order permuted by sw_z(); the z contraction strides by
+//   64 doubles, so bits 6-7 of the index are folded into bits 2-3 to break a
+//   4-way conflict.
+// sDx / sDy: plane-transposed with an XOR on the fast index,
+//   idx_dxy(i,j,k) = 64*k + 8*i + (j ^ i).
+//   The m8n8k4 accumulator holds C[i][2c] and C[i][2c+1] with i = lane>>2, so
+//   the natural i + 8*j order made an accumulator store phase hit only 4
+//   distinct banks. This layout makes the epilogue read conflict free and
+//   leaves the store 2-way conflicting; see the note below.
+// sDz: natural node order permuted by sw_dz(), which folds bit 6 (the low bit
+//   of the accumulator row) into bit 3 for the same reason.
+//
+// Two measured results kept this kernel away from a fully conflict-free store.
+// Writing the accumulator pair with one 16-byte store removes the store
+// conflicts entirely but is slower (597 us against 504 us, MIO throttle 11.16
+// against 1.73). A permutation that also makes the 8-byte stores conflict free
+// lowers the store wavefronts from 15.0 M to 11.5 M and is likewise slower
+// (596 us). Both are recorded in tc_paper_survey_2407.09621.md section 5.
+
+
+__device__ __forceinline__ int sw_xy(int idx)
+{
+  return idx ^ (((idx >> 4) & 1) << 2);
+}
+
+__device__ __forceinline__ int sw_z(int idx)
+{
+  return idx ^ (((idx >> 6) & 3) << 2);
+}
+
+__device__ __forceinline__ int sw_dz(int idx)
+{
+  return idx ^ (((idx >> 6) & 1) << 3);
+}
+
+__device__ __forceinline__ int idx_dxy(int i, int j, int k)
+{
+  return (k << 6) + (i << 3) + (j ^ i);
+}
+
 __global__ void tendency_fused_p7_tc_kernel(
     double *dqdt, const double *D1D, const double *Lift_mat, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
     const double *Escale, int Ne)
 {
-  __shared__ double sD1D[64];
-  __shared__ double sflux_bnd[384];
-  __shared__ double sFluxX[512], sFluxY[512], sFluxZ[512];
-  __shared__ double sDx[512], sDy[512], sDz[512];
+  __shared__ __align__(16) double sDfrag[64];
+  __shared__ __align__(16) double sflux_bnd[384];
+  __shared__ __align__(16) double sFluxX[512], sFluxY[512], sFluxZ[512];
+  __shared__ __align__(16) double sDx[512], sDy[512], sDz[512];
 
   const int elem = (int)blockIdx.x;
   if (elem >= Ne) {
@@ -50,16 +105,19 @@ __global__ void tendency_fused_p7_tc_kernel(
   const int nface = 384 * Ne;
 
   if (tid < 64) {
-    sD1D[tid] = D1D[tid];
+    const int r = (tid >> 2) & 7;
+    const int c = tid & 3;
+    const int b = tid >> 5;
+    sDfrag[tid] = D1D[r + (b * 4 + c) * 8];
   }
   const int idx1 = elem_offset + node1;
   const int idx2 = elem_offset + node2;
-  sFluxX[node1] = q[idx1] * u[idx1];
-  sFluxY[node1] = q[idx1] * v[idx1];
-  sFluxZ[node1] = q[idx1] * w[idx1];
-  sFluxX[node2] = q[idx2] * u[idx2];
-  sFluxY[node2] = q[idx2] * v[idx2];
-  sFluxZ[node2] = q[idx2] * w[idx2];
+  sFluxX[sw_xy(node1)] = q[idx1] * u[idx1];
+  sFluxY[sw_xy(node1)] = q[idx1] * v[idx1];
+  sFluxZ[sw_z(node1)] = q[idx1] * w[idx1];
+  sFluxX[sw_xy(node2)] = q[idx2] * u[idx2];
+  sFluxY[sw_xy(node2)] = q[idx2] * v[idx2];
+  sFluxZ[sw_z(node2)] = q[idx2] * w[idx2];
 
   int fp = tid;
   int fidx = face_offset + fp;
@@ -95,59 +153,51 @@ __global__ void tendency_fused_p7_tc_kernel(
   const int coln = lane >> 2;
   const int rowk = lane & 3;
   const int k = warp;
+  const int j0_c = (lane & 3) * 2;
 
   // Dx = D * Fx  on this k-plane
   double c0, c1;
   mma_reset(c0, c1);
   for (int k0 = 0; k0 < 8; k0 += 4) {
-    const double a = sD1D[row + (k0 + colk) * 8];
-    const double b = sFluxX[(k0 + rowk) + coln * 8 + k * 64];
+    const double a = sDfrag[(k0 << 3) + (row << 2) + colk];
+    const double b = sFluxX[sw_xy((k0 + rowk) + (coln << 3) + (k << 6))];
     mma_m8n8k4_f64(c0, c1, a, b, c0, c1);
   }
-  const int i_c = row;
-  const int j0_c = (lane & 3) * 2;
-  sDx[i_c + j0_c * 8 + k * 64] = c0;
-  sDx[i_c + (j0_c + 1) * 8 + k * 64] = c1;
+  sDx[idx_dxy(row, j0_c, k)] = c0;
+  sDx[idx_dxy(row, j0_c + 1, k)] = c1;
 
   // Dy = Fy * D^T
   mma_reset(c0, c1);
   for (int k0 = 0; k0 < 8; k0 += 4) {
-    const double a = sFluxY[row + (k0 + colk) * 8 + k * 64];
-    const double b = sD1D[coln + (k0 + rowk) * 8];
+    const double a = sFluxY[sw_xy(row + ((k0 + colk) << 3) + (k << 6))];
+    const double b = sDfrag[(k0 << 3) + (coln << 2) + rowk];
     mma_m8n8k4_f64(c0, c1, a, b, c0, c1);
   }
-  sDy[i_c + j0_c * 8 + k * 64] = c0;
-  sDy[i_c + (j0_c + 1) * 8 + k * 64] = c1;
+  sDy[idx_dxy(row, j0_c, k)] = c0;
+  sDy[idx_dxy(row, j0_c + 1, k)] = c1;
 
   __syncthreads();
 
   // Dz = D * Fz_panel; warp owns 8 (i,j) columns, all k
   mma_reset(c0, c1);
   for (int k0 = 0; k0 < 8; k0 += 4) {
-    const int ij0 = warp * 8 + coln;
-    const int ii = ij0 & 7;
-    const int jj = ij0 >> 3;
-    const double a = sD1D[row + (k0 + colk) * 8];
-    const double b = sFluxZ[ii + jj * 8 + (k0 + rowk) * 64];
+    const int ij = (warp << 3) + coln;
+    const double a = sDfrag[(k0 << 3) + (row << 2) + colk];
+    const double b = sFluxZ[sw_z(ij + ((k0 + rowk) << 6))];
     mma_m8n8k4_f64(c0, c1, a, b, c0, c1);
   }
-  {
-    const int ij0 = warp * 8 + j0_c;
-    const int ij1 = ij0 + 1;
-    const int k_out = row;
-    int ii = ij0 & 7;
-    int jj = ij0 >> 3;
-    sDz[ii + jj * 8 + k_out * 64] = c0;
-    ii = ij1 & 7;
-    jj = ij1 >> 3;
-    sDz[ii + jj * 8 + k_out * 64] = c1;
-  }
+  sDz[sw_dz(((warp << 3) + j0_c) + (row << 6))] = c0;
+  sDz[sw_dz(((warp << 3) + j0_c + 1) + (row << 6))] = c1;
   __syncthreads();
 
   const int i = node1 & 7;
   const int j = (node1 >> 3) & 7;
   const int k1 = node1 >> 6;
   const int k2 = k1 + 4;
+  const int dxy1 = idx_dxy(i, j, k1);
+  const int dxy2 = idx_dxy(i, j, k2);
+  const int dz1 = sw_dz(node1);
+  const int dz2 = sw_dz(node2);
   const int face11 = i + k1 * 8;
   const int face12 = 64 + j + k1 * 8;
   const int face13 = 128 + i + k1 * 8;
@@ -171,10 +221,10 @@ __global__ void tendency_fused_p7_tc_kernel(
                        Lift_mat[node2 + 2048] * sflux_bnd[face15] +
                        Lift_mat[node2 + 2560] * sflux_bnd[face16];
 
-  dqdt[idx1] = -(Escale[idx1] * sDx[node1] + Escale[idx1 + npoint] * sDy[node1] +
-                 Escale[idx1 + 2 * npoint] * sDz[node1] + lift1);
-  dqdt[idx2] = -(Escale[idx2] * sDx[node2] + Escale[idx2 + npoint] * sDy[node2] +
-                 Escale[idx2 + 2 * npoint] * sDz[node2] + lift2);
+  dqdt[idx1] = -(Escale[idx1] * sDx[dxy1] + Escale[idx1 + npoint] * sDy[dxy1] +
+                 Escale[idx1 + 2 * npoint] * sDz[dz1] + lift1);
+  dqdt[idx2] = -(Escale[idx2] * sDx[dxy2] + Escale[idx2 + npoint] * sDy[dxy2] +
+                 Escale[idx2 + 2 * npoint] * sDz[dz2] + lift2);
 }
 
 __global__ void tendency_x_p255_tc_kernel(
