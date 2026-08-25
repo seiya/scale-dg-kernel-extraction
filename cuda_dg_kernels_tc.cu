@@ -42,14 +42,12 @@ __device__ __forceinline__ void mma_reset(double &c0, double &c1)
 // sFluxZ: natural node order permuted by sw_z(); the z contraction strides by
 //   64 doubles, so bits 6-7 of the index are folded into bits 2-3 to break a
 //   4-way conflict.
-// sDx / sDy: plane-transposed with an XOR on the fast index,
-//   idx_dxy(i,j,k) = 64*k + 8*i + (j ^ i).
-//   The m8n8k4 accumulator holds C[i][2c] and C[i][2c+1] with i = lane>>2, so
-//   the natural i + 8*j order made an accumulator store phase hit only 4
-//   distinct banks. This layout makes the epilogue read conflict free and
-//   leaves the store 2-way conflicting; see the note below.
 // sDz: natural node order permuted by sw_dz(), which folds bit 6 (the low bit
-//   of the accumulator row) into bit 3 for the same reason.
+//   of the accumulator row) into bit 3, because the m8n8k4 accumulator holds
+//   C[r][2c] and C[r][2c+1] with r = lane>>2, so the natural order would make
+//   an accumulator store phase hit only 4 distinct banks. The x and y
+//   derivatives no longer pass through shared memory at all; see the note on
+//   the transposed accumulators in the kernel.
 //
 // sLift: the separable face lift coefficients Lift1D(Nq,6). Lift_mat(i,j,k,f)
 //   varies in one volume index only (j for faces 1 and 3, i for faces 2 and 4,
@@ -61,15 +59,12 @@ __device__ __forceinline__ void mma_reset(double &c0, double &c1)
 //   slower, because the epilogue is bound by L1/TEX, which serves the shared
 //   loads and the global loads alike.
 //
-// sDx / sDy / sDz alias sFluxX / sFluxY / sFluxZ. Warp k reads only plane k of
-// sFluxX and sFluxY and writes only plane k of sDx and sDy, and both sw_xy()
-// and idx_dxy() stay inside a plane, so a __syncwarp() is enough there. The z
-// panel is different: sw_z() and sw_dz() move indices across the 8-column
+// sDz aliases sFluxZ. sw_z() and sw_dz() move indices across the 8-column
 // range a warp owns, so the z accumulators need a block-wide barrier before
-// they overwrite the flux. Halving the 28.16 KB of shared memory is what lets
-// __launch_bounds__(256, 8) reach 8 blocks per SM; ncu (Slurm job 43734)
-// showed the kernel held at 6 blocks and 72% achieved occupancy, limited by
-// both registers and shared memory at once.
+// they overwrite the flux. Reusing the flux buffer is what keeps the block at
+// 15.87 KB instead of 20 KB and lets __launch_bounds__(256, 8) reach 8 blocks
+// per SM; ncu (Slurm job 43734) showed the kernel held at 6 blocks and 72%
+// achieved occupancy, limited by both registers and shared memory at once.
 //
 // Two measured results kept this kernel away from a fully conflict-free store.
 // Writing the accumulator pair with one 16-byte store removes the store
@@ -94,11 +89,6 @@ __device__ __forceinline__ int sw_dz(int idx)
   return idx ^ (((idx >> 6) & 1) << 3);
 }
 
-__device__ __forceinline__ int idx_dxy(int i, int j, int k)
-{
-  return (k << 6) + (i << 3) + (j ^ i);
-}
-
 __global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
@@ -109,10 +99,8 @@ __global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
   __shared__ __align__(16) double sLift[48];
   __shared__ __align__(16) double sflux_bnd[384];
   __shared__ __align__(16) double sFluxX[512], sFluxY[512], sFluxZ[512];
-  // The derivative planes overwrite the flux planes they consume, so the
-  // block needs 15.87 KB instead of 28.16 KB. See the aliasing note above.
-  double *const sDx = sFluxX;
-  double *const sDy = sFluxY;
+  // The z derivative overwrites the z flux it consumes, so the block needs
+  // 15.87 KB instead of 20 KB. See the aliasing note above.
   double *const sDz = sFluxZ;
 
   const int elem = (int)blockIdx.x;
@@ -177,84 +165,118 @@ __global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
 
   const int row = lane >> 2;
   const int colk = lane & 3;
-  const int coln = lane >> 2;
-  const int rowk = lane & 3;
   const int k = warp;
-  const int j0_c = (lane & 3) * 2;
+  const int j0_c = colk * 2;
+  // The A operand of the z contraction and the D1D operand of the x and y
+  // contractions are the same fragment element, D1D[row][colk].
+  const int frag = (row << 2) + colk;
 
-  // Dx = D * Fx  on this k-plane
+  // Every paired shared access below derives the second address from the first
+  // with one XOR by a constant, instead of swizzling a second index.  The
+  // k0 = 4 operand differs from the k0 = 0 one in a single index bit that no
+  // swizzle here reads, and the c1 accumulator element is one node away from
+  // the c0 one, which sw_dz() leaves in place. Section 11 of
+  // reports/tc_paper_survey_2407.09621.md records what this bought.
+
+  // Dz = D * Fz_panel; warp owns 8 (i,j) columns, all k.  k0 = 4 sets bit 8 of
+  // the node index, above the bits sw_z() folds.  The z panel is contracted
+  // first because it is the only derivative that has to travel through shared
+  // memory: its two barriers then sit before the x and y accumulators exist.
   double c0, c1;
-  mma_reset(c0, c1);
-  for (int k0 = 0; k0 < 8; k0 += 4) {
-    const double a = sDfrag[(k0 << 3) + (row << 2) + colk];
-    const double b = sFluxX[sw_xy((k0 + rowk) + (coln << 3) + (k << 6))];
-    mma_m8n8k4_f64(c0, c1, a, b, c0, c1);
+  {
+    const int fz = sw_z(((warp << 3) + row) + (colk << 6));
+    mma_reset(c0, c1);
+    mma_m8n8k4_f64(c0, c1, sDfrag[frag], sFluxZ[fz], c0, c1);
+    mma_m8n8k4_f64(c0, c1, sDfrag[frag + 32], sFluxZ[fz ^ 256], c0, c1);
   }
-  __syncwarp();
-  sDx[idx_dxy(row, j0_c, k)] = c0;
-  sDx[idx_dxy(row, j0_c + 1, k)] = c1;
-
-  // Dy = Fy * D^T
-  mma_reset(c0, c1);
-  for (int k0 = 0; k0 < 8; k0 += 4) {
-    const double a = sFluxY[sw_xy(row + ((k0 + colk) << 3) + (k << 6))];
-    const double b = sDfrag[(k0 << 3) + (coln << 2) + rowk];
-    mma_m8n8k4_f64(c0, c1, a, b, c0, c1);
-  }
-  __syncwarp();
-  sDy[idx_dxy(row, j0_c, k)] = c0;
-  sDy[idx_dxy(row, j0_c + 1, k)] = c1;
-
-  // Dz = D * Fz_panel; warp owns 8 (i,j) columns, all k
-  mma_reset(c0, c1);
-  for (int k0 = 0; k0 < 8; k0 += 4) {
-    const int ij = (warp << 3) + coln;
-    const double a = sDfrag[(k0 << 3) + (row << 2) + colk];
-    const double b = sFluxZ[sw_z(ij + ((k0 + rowk) << 6))];
-    mma_m8n8k4_f64(c0, c1, a, b, c0, c1);
-  }
-  // sw_z() and sw_dz() permute across warp boundaries, so unlike the x and y
-  // planes the z panel needs a block-wide barrier before it is overwritten.
+  // sw_z() and sw_dz() permute across warp boundaries, so the z panel needs a
+  // block-wide barrier before it overwrites the flux it was read from.
   __syncthreads();
-  sDz[sw_dz(((warp << 3) + j0_c) + (row << 6))] = c0;
-  sDz[sw_dz(((warp << 3) + j0_c + 1) + (row << 6))] = c1;
+  const int dz_c = sw_dz(((warp << 3) + j0_c) + (row << 6));
+  sDz[dz_c] = c0;
+  sDz[dz_c ^ 1] = c1;
   __syncthreads();
 
-  const int i = node1 & 7;
-  const int j = (node1 >> 3) & 7;
-  const int k1 = node1 >> 6;
-  const int k2 = k1 + 4;
-  const int dxy1 = idx_dxy(i, j, k1);
-  const int dxy2 = idx_dxy(i, j, k2);
-  const int dz1 = sw_dz(node1);
-  const int dz2 = sw_dz(node2);
-  const int face11 = i + k1 * 8;
-  const int face12 = 64 + j + k1 * 8;
-  const int face13 = 128 + i + k1 * 8;
-  const int face14 = 192 + j + k1 * 8;
-  const int face15 = 256 + i + j * 8;
-  const int face16 = 320 + i + j * 8;
-  const int face21 = i + k2 * 8;
-  const int face22 = 64 + j + k2 * 8;
-  const int face23 = 128 + i + k2 * 8;
-  const int face24 = 192 + j + k2 * 8;
-  const double lf1 = sLift[j];
-  const double lf2 = sLift[i + 8];
-  const double lf3 = sLift[j + 16];
-  const double lf4 = sLift[i + 24];
-  const double lift1 = lf1 * sflux_bnd[face11] + lf2 * sflux_bnd[face12] +
-                       lf3 * sflux_bnd[face13] + lf4 * sflux_bnd[face14] +
-                       sLift[k1 + 32] * sflux_bnd[face15] +
-                       sLift[k1 + 40] * sflux_bnd[face16];
-  const double lift2 = lf1 * sflux_bnd[face21] + lf2 * sflux_bnd[face22] +
-                       lf3 * sflux_bnd[face23] + lf4 * sflux_bnd[face24] +
-                       sLift[k2 + 32] * sflux_bnd[face15] +
-                       sLift[k2 + 40] * sflux_bnd[face16];
+  // The x and y derivatives never go through shared memory: the thread that
+  // computes them is the thread that assembles them.  That removes four shared
+  // stores and four shared loads per thread together with their address
+  // arithmetic, and it leaves sFluxX and sFluxY read-only for the whole
+  // kernel, so the two __syncwarp() calls that used to guard the in-place
+  // overwrite are gone.
+  //
+  // Both contractions are evaluated transposed, C = (D*Fx)^T and C = (Fy*D^T)^T,
+  // which costs nothing: with m8n8k4 the transpose is the same two operand
+  // values passed in the opposite order.  It is what makes the epilogue
+  // coalesce.  The accumulator holds C[lane>>2][2*(lane&3)] and its neighbour,
+  // so the untransposed form gave thread lane the nodes
+  //   (lane>>2) + 16*(lane&3) + 64*warp  and  + 8,
+  // whose warp footprint is four 64-byte runs spread over 448 bytes: same
+  // sectors as a contiguous access but twice the cache lines, and measurably
+  // slower on a kernel that sits at 95% L1/TEX.  Transposed, the same thread
+  // owns nodes 2*tid and 2*tid + 1, so a warp covers 64 consecutive nodes and
+  // each of q's neighbours in the epilogue is one aligned 16-byte access.
+  const int n0 = tid << 1;
+  const int nidx0 = elem_offset + n0;
 
-  dqdt[idx1] = -(Escale[idx1] * sDx[dxy1] + Escale[idx1 + npoint] * sDy[dxy1] +
-                 Escale[idx1 + 2 * npoint] * sDz[dz1] + lift1);
-  dqdt[idx2] = -(Escale[idx2] * sDx[dxy2] + Escale[idx2 + npoint] * sDy[dxy2] +
-                 Escale[idx2 + 2 * npoint] * sDz[dz2] + lift2);
+  // Dx^T = (D * Fx)^T on this k-plane.  sw_xy() flips bit 2 as a function of
+  // bit 4, and k0 = 4 sets bit 2 of the node index, so the operands are fx and
+  // fx^4.
+  double acc0, acc1;
+  {
+    const int fx = sw_xy(colk + (row << 3) + (k << 6));
+    const double2 es = *reinterpret_cast<const double2 *>(Escale + nidx0);
+    mma_reset(c0, c1);
+    mma_m8n8k4_f64(c0, c1, sFluxX[fx], sDfrag[frag], c0, c1);
+    mma_m8n8k4_f64(c0, c1, sFluxX[fx ^ 4], sDfrag[frag + 32], c0, c1);
+    acc0 = es.x * c0;
+    acc1 = es.y * c1;
+  }
+
+  // Dy^T = (Fy * D^T)^T.  k0 = 4 sets bit 5 of the node index here, again a
+  // bit sw_xy() does not read.
+  {
+    const int fy = sw_xy(row + (colk << 3) + (k << 6));
+    const double2 es =
+        *reinterpret_cast<const double2 *>(Escale + nidx0 + npoint);
+    mma_reset(c0, c1);
+    mma_m8n8k4_f64(c0, c1, sDfrag[frag], sFluxY[fy], c0, c1);
+    mma_m8n8k4_f64(c0, c1, sDfrag[frag + 32], sFluxY[fy ^ 32], c0, c1);
+    acc0 += es.x * c0;
+    acc1 += es.y * c1;
+  }
+
+  // sw_dz() folds bit 6 into bit 3 and n0 is even, so the second node of the
+  // pair is the neighbour of the first in sDz as well.
+  {
+    const double2 dz = *reinterpret_cast<const double2 *>(sDz + sw_dz(n0));
+    const double2 es =
+        *reinterpret_cast<const double2 *>(Escale + nidx0 + 2 * npoint);
+    acc0 += es.x * dz.x;
+    acc1 += es.y * dz.y;
+  }
+
+  // The node pair differs in i only, so faces 2 and 4 (which vary in j) and
+  // the lift coefficients that go with them are shared between the two, while
+  // faces 1, 3, 5 and 6 shift by one face point.
+  const int i0 = colk * 2;
+  const int face1 = i0 + (k << 3);
+  const int face2 = 64 + row + (k << 3);
+  const int face5 = 256 + (n0 & 63);
+  const double lf1 = sLift[row];
+  const double lf3 = sLift[row + 16];
+  const double lf5 = sLift[k + 32];
+  const double lf6 = sLift[k + 40];
+  const double fb2 = sflux_bnd[face2];
+  const double fb4 = sflux_bnd[face2 + 128];
+  const double lift0 = lf1 * sflux_bnd[face1] + sLift[i0 + 8] * fb2 +
+                       lf3 * sflux_bnd[face1 + 128] + sLift[i0 + 24] * fb4 +
+                       lf5 * sflux_bnd[face5] + lf6 * sflux_bnd[face5 + 64];
+  const double lift1 = lf1 * sflux_bnd[face1 + 1] + sLift[i0 + 9] * fb2 +
+                       lf3 * sflux_bnd[face1 + 129] + sLift[i0 + 25] * fb4 +
+                       lf5 * sflux_bnd[face5 + 1] + lf6 * sflux_bnd[face5 + 65];
+
+  *reinterpret_cast<double2 *>(dqdt + nidx0) =
+      make_double2(-(acc0 + lift0), -(acc1 + lift1));
 }
 
 __global__ void tendency_x_p255_tc_kernel(

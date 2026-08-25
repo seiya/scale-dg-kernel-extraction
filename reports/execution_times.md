@@ -228,3 +228,25 @@ was.  At p=255 the fused kernel is dominated by the large operators, and
 `CUDAFORTRAN_GEMM` is the fastest of the three paths measured here
 (`CUDAFORTRAN_GEMM_FUSED`, added later, is faster still; see
 `overall_summary_report.md` §5).
+
+### 追記 6: p=7 TC の整数・アドレス演算削減と epilogue の転置（本追記を導入したコミット、2026-08-25）
+
+`tc_paper_survey_2407.09621.md` §11 の実測。`tendency_fused_p7_tc_kernel` の
+x / y 導関数を shared に置かずアキュムレータのまま使い、`m8n8k4` の出力を
+転置して thread が担当するノードを `2*tid`, `2*tid + 1` にした。
+SASS の整数命令 176 → 134 本、shared load 36 → 23 本、store 16 → 11 本。
+レジスタ 32 本・8 ブロック / SM は維持。
+
+測定は login node、空き GPU 1 枚に固定、`nstep=1000`、版を交互に 12 ラウンド。
+
+| 入力 / パス | CUDA device（前） | CUDA device（後） | 差 |
+|---|---:|---:|---:|
+| p=7 `Ne=32^3` `CUDAFORTRAN_FUSED_TC` | 0.8518 | **0.8488** | −0.35% |
+
+ncu 単発 launch（job `44819`）では 434.6 → 405.5 µs（−6.7%）と出るが、
+実運用の利得はその 1/20 である。理由は §11.5 に記した通りで、
+`long scoreboard` stall が 25.5 → 35.0 に増え、律速が発行スロットから
+global load レイテンシに移ったためである。
+
+数値検証: `SCALE_DG_VARYING_COEFF=1` で p=7 `Ne=3*4*5`（`Ne=60`）と `Ne=1` の
+`dqdt` 全点を `CUDAFORTRAN_SPLIT` と突き合わせ、相対差 1.25e-15 と 1.17e-16。

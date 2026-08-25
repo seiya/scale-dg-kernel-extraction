@@ -22,6 +22,11 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 - **p=255, `Ne=1`**: `CUDAFORTRAN_GEMM_FUSED` が最速。手書きの Tensor Core 経路は
   CUTLASS / cuBLAS の multistage mainloop に大きく負ける。
 - 同じ体積 DOF 数でも、p=7 と p=255 で最適戦略は逆転する。
+- **p=7 TC の整数・アドレス演算削減（2026-08-25）**: `tc_paper_survey` §10 が
+  次の標的に挙げた整数演算は、単独で削っても end-to-end では効かない（§11）。
+  同じ調査で見つかった効く要因は global アクセスのキャッシュライン数で、
+  x/y 導関数をレジスタに保持し mma 出力を転置して epilogue を coalesce
+  させた版が device 0.8518 → 0.8488 秒。残る律速は global load レイテンシ。
 - **tendency 以外（その 2）**: 時間発展ループの OpenACC 領域を `async` にし、
   CUDA / cuBLAS / CUTLASS のカーネルを同じストリームに載せて、カーネル間の
   GPU アイドルを 139 → 50 µs/step にした（2026-08-25）。Main は p=7 `FUSED_TC` で
