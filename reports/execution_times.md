@@ -52,6 +52,28 @@ CUDA core 版 549.8 µs に対して **1.11×** 速い。
 `CUDAFORTRAN_FUSED_TC` に変わった**。経緯と測定値は
 `tc_paper_survey_2407.09621.md` §5-6 にある。
 
+### 追記 2: occupancy 100% 化と分離可能 lift（未コミットの作業ツリー）
+
+`e971ba5` の TC カーネルは theoretical occupancy が 75% しかなく
+（レジスタ 40 本と smem 28.16 KB がどちらも 6 ブロックで頭打ち）、
+`sD*` を `sFlux*` に in-place 化して smem を 15.87 KB に落とし、
+`__launch_bounds__(256, 8)` でレジスタを 32 本に抑え、さらに
+`Lift_mat`(512×6) を `Lift1D`(8×6) に置き換えた。
+測定は login node、同一入力（`Ne=32^3`, `nstep=1000`, `dt=1.0e-5`, `OPT1`）、
+各 3 回。ncu は Slurm job `43954` / `43959`。
+
+| `DqdtKernel_Type` | Main | Cal_tend | CUDA device |
+|---|---:|---:|---:|
+| `CUDAFORTRAN_FUSED_TC`（本追記の変更後） | **1.415** | **0.890** | fused **0.851** |
+| `CUDAFORTRAN_FUSED_TC`（`e971ba5`） | 1.646 | 1.128 | fused 1.076 |
+| `CUDAFORTRAN_FUSED`（同条件の対照） | 1.714 | 1.190 | fused 1.153 |
+
+device 時間で `e971ba5` 比 **1.26×**、CUDA core 版比 **1.35×**。
+ncu 単発カーネル時間は 501.1 µs → 433.1 µs。
+ncu はリプレイごとに L2 を流すため実運用より遅く出る（実測は 1 launch
+359 µs → 284 µs）ので、両者を混ぜないこと。
+経緯・不採用案・残作業は `tc_paper_survey_2407.09621.md` §7 にある。
+
 `CUDAFORTRAN_GEMM` with `CublasEmulation=.true.` did not produce a
 timing. The run printed that cuBLAS floating-point emulation APIs are
 unavailable and that native FP64 GEMM would be used, then hit the 180 s

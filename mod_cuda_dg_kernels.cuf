@@ -45,12 +45,12 @@ module mod_cuda_dg_kernels
 
   interface
     subroutine launch_tendency_fused_p7_tc( &
-      dqdt, D1D, Lift_mat, q, u, v, w, VMapM, VMapP, &
+      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
       normal_fn, Fscale, Escale, Ne) &
       bind(C, name="launch_tendency_fused_p7_tc")
       import
       integer(c_int), value :: Ne
-      real(c_double), device :: dqdt(*), D1D(*), Lift_mat(*)
+      real(c_double), device :: dqdt(*), D1D(*), Lift1D(*)
       real(c_double), device :: q(*), u(*), v(*), w(*)
       integer(c_int), device :: VMapM(*), VMapP(*)
       real(c_double), device :: normal_fn(*), Fscale(*), Escale(*)
@@ -265,7 +265,7 @@ contains
   end subroutine cuda_cal_dqdt_fused_p255
 
   subroutine cuda_cal_dqdt_fused_tc( &
-    dqdt, q, u, v, w, D1D, Lift_mat, VMapM, VMapP, &
+    dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
     normal_fn, Fscale, Escale, &
     Nq, Np, NfpTot, Ne, NeA, kernel_time )
     implicit none
@@ -274,7 +274,7 @@ contains
     real(RP), device, intent(in) :: q(Np,NeA)
     real(RP), device, intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
     real(RP), device, intent(in) :: D1D(Nq,Nq)
-    real(RP), device, intent(in) :: Lift_mat(Nq,Nq,Nq,6)
+    real(RP), device, intent(in) :: Lift1D(Nq,6)
     integer, device, intent(in) :: VMapM(NfpTot,Ne)
     integer, device, intent(in) :: VMapP(NfpTot,Ne)
     real(RP), device, intent(in) :: normal_fn(NfpTot,Ne,3)
@@ -300,7 +300,7 @@ contains
     istat = cudaEventRecord(split_events(1),0)
     if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord",istat)
     call launch_tendency_fused_p7_tc( &
-      dqdt, D1D, Lift_mat, q, u, v, w, VMapM, VMapP, &
+      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
       normal_fn, Fscale, Escale, int(Ne,c_int) )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure( &

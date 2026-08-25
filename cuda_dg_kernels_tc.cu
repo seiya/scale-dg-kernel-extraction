@@ -51,6 +51,26 @@ __device__ __forceinline__ void mma_reset(double &c0, double &c1)
 // sDz: natural node order permuted by sw_dz(), which folds bit 6 (the low bit
 //   of the accumulator row) into bit 3 for the same reason.
 //
+// sLift: the separable face lift coefficients Lift1D(Nq,6). Lift_mat(i,j,k,f)
+//   varies in one volume index only (j for faces 1 and 3, i for faces 2 and 4,
+//   k for faces 5 and 6), which is how mod_mesh.f90 already derives Lift1D for
+//   the p=255 and GEMM paths. The 512x6 dense form cost 12 global loads per
+//   thread, 768 of the 3684 global sectors an element moves; the 48 distinct
+//   values live in shared memory instead. This only pays off once the kernel
+//   reaches 8 blocks per SM: at 6 blocks the same substitution measured 1.3%
+//   slower, because the epilogue is bound by L1/TEX, which serves the shared
+//   loads and the global loads alike.
+//
+// sDx / sDy / sDz alias sFluxX / sFluxY / sFluxZ. Warp k reads only plane k of
+// sFluxX and sFluxY and writes only plane k of sDx and sDy, and both sw_xy()
+// and idx_dxy() stay inside a plane, so a __syncwarp() is enough there. The z
+// panel is different: sw_z() and sw_dz() move indices across the 8-column
+// range a warp owns, so the z accumulators need a block-wide barrier before
+// they overwrite the flux. Halving the 28.16 KB of shared memory is what lets
+// __launch_bounds__(256, 8) reach 8 blocks per SM; ncu (Slurm job 43734)
+// showed the kernel held at 6 blocks and 72% achieved occupancy, limited by
+// both registers and shared memory at once.
+//
 // Two measured results kept this kernel away from a fully conflict-free store.
 // Writing the accumulator pair with one 16-byte store removes the store
 // conflicts entirely but is slower (597 us against 504 us, MIO throttle 11.16
@@ -79,16 +99,21 @@ __device__ __forceinline__ int idx_dxy(int i, int j, int k)
   return (k << 6) + (i << 3) + (j ^ i);
 }
 
-__global__ void tendency_fused_p7_tc_kernel(
-    double *dqdt, const double *D1D, const double *Lift_mat, const double *q,
+__global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
     const double *Escale, int Ne)
 {
   __shared__ __align__(16) double sDfrag[64];
+  __shared__ __align__(16) double sLift[48];
   __shared__ __align__(16) double sflux_bnd[384];
   __shared__ __align__(16) double sFluxX[512], sFluxY[512], sFluxZ[512];
-  __shared__ __align__(16) double sDx[512], sDy[512], sDz[512];
+  // The derivative planes overwrite the flux planes they consume, so the
+  // block needs 15.87 KB instead of 28.16 KB. See the aliasing note above.
+  double *const sDx = sFluxX;
+  double *const sDy = sFluxY;
+  double *const sDz = sFluxZ;
 
   const int elem = (int)blockIdx.x;
   if (elem >= Ne) {
@@ -109,6 +134,8 @@ __global__ void tendency_fused_p7_tc_kernel(
     const int c = tid & 3;
     const int b = tid >> 5;
     sDfrag[tid] = D1D[r + (b * 4 + c) * 8];
+  } else if (tid < 112) {
+    sLift[tid - 64] = Lift1D[tid - 64];
   }
   const int idx1 = elem_offset + node1;
   const int idx2 = elem_offset + node2;
@@ -163,6 +190,7 @@ __global__ void tendency_fused_p7_tc_kernel(
     const double b = sFluxX[sw_xy((k0 + rowk) + (coln << 3) + (k << 6))];
     mma_m8n8k4_f64(c0, c1, a, b, c0, c1);
   }
+  __syncwarp();
   sDx[idx_dxy(row, j0_c, k)] = c0;
   sDx[idx_dxy(row, j0_c + 1, k)] = c1;
 
@@ -173,10 +201,9 @@ __global__ void tendency_fused_p7_tc_kernel(
     const double b = sDfrag[(k0 << 3) + (coln << 2) + rowk];
     mma_m8n8k4_f64(c0, c1, a, b, c0, c1);
   }
+  __syncwarp();
   sDy[idx_dxy(row, j0_c, k)] = c0;
   sDy[idx_dxy(row, j0_c + 1, k)] = c1;
-
-  __syncthreads();
 
   // Dz = D * Fz_panel; warp owns 8 (i,j) columns, all k
   mma_reset(c0, c1);
@@ -186,6 +213,9 @@ __global__ void tendency_fused_p7_tc_kernel(
     const double b = sFluxZ[sw_z(ij + ((k0 + rowk) << 6))];
     mma_m8n8k4_f64(c0, c1, a, b, c0, c1);
   }
+  // sw_z() and sw_dz() permute across warp boundaries, so unlike the x and y
+  // planes the z panel needs a block-wide barrier before it is overwritten.
+  __syncthreads();
   sDz[sw_dz(((warp << 3) + j0_c) + (row << 6))] = c0;
   sDz[sw_dz(((warp << 3) + j0_c + 1) + (row << 6))] = c1;
   __syncthreads();
@@ -208,18 +238,18 @@ __global__ void tendency_fused_p7_tc_kernel(
   const int face22 = 64 + j + k2 * 8;
   const int face23 = 128 + i + k2 * 8;
   const int face24 = 192 + j + k2 * 8;
-  const double lift1 = Lift_mat[node1] * sflux_bnd[face11] +
-                       Lift_mat[node1 + 512] * sflux_bnd[face12] +
-                       Lift_mat[node1 + 1024] * sflux_bnd[face13] +
-                       Lift_mat[node1 + 1536] * sflux_bnd[face14] +
-                       Lift_mat[node1 + 2048] * sflux_bnd[face15] +
-                       Lift_mat[node1 + 2560] * sflux_bnd[face16];
-  const double lift2 = Lift_mat[node2] * sflux_bnd[face21] +
-                       Lift_mat[node2 + 512] * sflux_bnd[face22] +
-                       Lift_mat[node2 + 1024] * sflux_bnd[face23] +
-                       Lift_mat[node2 + 1536] * sflux_bnd[face24] +
-                       Lift_mat[node2 + 2048] * sflux_bnd[face15] +
-                       Lift_mat[node2 + 2560] * sflux_bnd[face16];
+  const double lf1 = sLift[j];
+  const double lf2 = sLift[i + 8];
+  const double lf3 = sLift[j + 16];
+  const double lf4 = sLift[i + 24];
+  const double lift1 = lf1 * sflux_bnd[face11] + lf2 * sflux_bnd[face12] +
+                       lf3 * sflux_bnd[face13] + lf4 * sflux_bnd[face14] +
+                       sLift[k1 + 32] * sflux_bnd[face15] +
+                       sLift[k1 + 40] * sflux_bnd[face16];
+  const double lift2 = lf1 * sflux_bnd[face21] + lf2 * sflux_bnd[face22] +
+                       lf3 * sflux_bnd[face23] + lf4 * sflux_bnd[face24] +
+                       sLift[k2 + 32] * sflux_bnd[face15] +
+                       sLift[k2 + 40] * sflux_bnd[face16];
 
   dqdt[idx1] = -(Escale[idx1] * sDx[dxy1] + Escale[idx1 + npoint] * sDy[dxy1] +
                  Escale[idx1 + 2 * npoint] * sDz[dz1] + lift1);
@@ -380,13 +410,13 @@ static void check_cuda(const char *what)
 }
 
 extern "C" void launch_tendency_fused_p7_tc(
-    double *dqdt, const double *D1D, const double *Lift_mat, const double *q,
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
     const double *Escale, int Ne)
 {
   tendency_fused_p7_tc_kernel<<<Ne, 256>>>(
-      dqdt, D1D, Lift_mat, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
+      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
       Ne);
   check_cuda("tendency_fused_p7_tc_kernel");
 }

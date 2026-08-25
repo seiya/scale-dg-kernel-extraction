@@ -382,3 +382,152 @@ ncu の見積りを単純合成すると 1.3〜1.5× 程度で、
 - グローバルロードが uncoalesced（1 セクタ 32 B のうち平均 25.4 B しか使用）で
   `long scoreboard` stall が 23.59 と最大の stall 要因になっている。
   次の一手はここ。
+
+---
+
+## 7. 実装結果: occupancy を 100% にする shared 削減と、分離可能 lift
+
+実施日: 2026-08-25。§6 の続き。対象は同じ `tendency_fused_p7_tc_kernel`。
+測定は Slurm job `43734`（§6 実装後 = commit `e971ba5` の状態）/ `43954` / `43959`、
+および login node 上の `nstep=1000` 実測。条件は §5 と同一
+（p=7, `NeX=NeY=NeZ=32`, `dt=1.0D-5`, `OPT1`）。
+プロファイル用に `cuda_dg_kernels_tc.cu` のみ `-lineinfo` を足してビルドした
+（生成コードは変わらない）。生成物は `output/*_glob*_{metrics.csv,full.ncu-rep}`。
+
+### 7.1 §6.4 の「次の一手」を測った結果
+
+§6.4 は global load が uncoalesced（1 セクタ 25.4 B）で `long scoreboard` が
+最大の stall だから次はそこだ、と書いていた。job `43734` で内訳を取ると、
+**その診断は的を外していた**。
+
+| | `e971ba5` の TC カーネル |
+|---|---:|
+| global load 命令数 | 12,582,912 |
+| global load requests | 12,386,304 |
+| global load sectors | 120,717,312 |
+| sectors / request | **9.75**（完全 coalesce の FP64 warp ロードは 8.0）|
+| bytes per sector | 79.48% |
+| DRAM read | 1.461 GB = **44.6 KB / element** |
+| L1/TEX throughput | 90.92% |
+| **Theoretical occupancy** | **75%**（Block Limit Registers 6 / Block Limit Shared Mem 6）|
+| Achieved occupancy | 72.11% |
+
+- 1 要素あたりの DRAM 読み出し 44.6 KB は、契約上必ず読む量
+  （`q,u,v,w` 16 KB + `Escale` 12 KB + `normal_fn` 9 KB + `Fscale` 3 KB +
+  `VMapM/P` 3 KB ≒ 43 KB）とほぼ一致する。**データ量はすでに下限**で、
+  減らす余地は無い。
+- sectors/request は 9.75 で、理想の 8.0 に対し 1.22× でしかない。
+  gather（`VMapM/VMapP` 経由の 96 命令）は 1 命令あたり約 16 セクタだが、
+  全体に占める超過は 772/3684 セクタ ≒ 21% にとどまる。
+  §6.4 が言うほど支配的ではない。
+- **見落としていた本命は occupancy だった。** §6.2 は「レジスタ 32 本 /
+  smem 28160 B は変更前と同じ」と書いたが、これは §5 の**変更前**カーネルの
+  値である。`e22dda1` 後の実機値は **40 レジスタ**で、しかも
+  shared memory carveout が 200.70 KB なので
+  smem 28.16 + driver 1.02 = 29.18 KB → 6 ブロック、
+  レジスタも 65536/(40×256) → 6 ブロック。
+  両方が同時に 6 で頭打ちし、theoretical occupancy は 75% しかなかった。
+  ncu 自身も `Est. Speedup: 9.245%` を出していた。
+
+### 7.2 採用した変更
+
+1. **`sDx/sDy/sDz` を `sFluxX/sFluxY/sFluxZ` に in-place 化**（§2 B-2）。
+   warp `k` は `sFluxX`/`sFluxY` の平面 `k` しか読まず、`sw_xy()` も
+   `idx_dxy()` も平面をまたがないので、mma ループとストアの間の
+   `__syncwarp()` で足りる。z だけは `sw_z()` と `sw_dz()` が warp の担当列を
+   またぐので `__syncthreads()` が要る。
+   smem 28160 B → **15872 B**。
+2. **`__launch_bounds__(256, 8)`**。レジスタが 32 本に収まり
+   （spill 0）、1 と合わせて **8 ブロック / SM = theoretical occupancy 100%** になる。
+3. **`Lift_mat`(512×6) を `Lift1D`(8×6) に置き換え、shared に 48 個だけ置く**。
+   `Lift_mat(i,j,k,f)` は 1 つの体積添字だけに依存する（face 1,3 は j、
+   face 2,4 は i、face 5,6 は k）。`mod_mesh.f90` は既にこの形の `Lift1D` を
+   p=255 と GEMM 経路向けに作っている。global load 命令が 12.58 M → 9.31 M、
+   sectors が 120.7 M → 95.9 M（**-20.5%**）になる。
+
+### 7.3 測定結果
+
+ncu 単発カーネル（`-s 5 -c 1`、`--set full`）:
+
+| | `e971ba5` | +in-place +launch_bounds | +`Lift1D` | CUDA core 版 |
+|---|---:|---:|---:|---:|
+| duration | 501.1 µs | 441.8 µs | **433.1 µs** | 546.9 µs |
+| registers / thread | 40 | 32 | 32 | — |
+| static smem / block | 28.16 KB | 15.87 KB | 16.26 KB | — |
+| Block Limit Registers | 6 | 8 | 8 | — |
+| Block Limit Shared Mem | 6 | 8 | 9 | 8 |
+| Theoretical occupancy | 75% | **100%** | **100%** | — |
+| Achieved occupancy | 72.11% | 96.47% | **96.85%** | 59.98% |
+| global load sectors | 120,717,312 | 120,717,312 | **95,944,704** | 120,717,312 |
+| L2 read sectors | 137,480,874 | 128,210,645 | 122,654,563 | 123,637,124 |
+| L1/TEX throughput | 90.92% | 96.29% | 95.85% | 88.59% |
+| DRAM read | 1.461 GB | 1.464 GB | 1.465 GB | 1.462 GB |
+| long scoreboard stall | 23.65 | 27.00 | 25.39 | 21.14 |
+
+`nstep=1000`, `Ne=32^3` の end-to-end（login node、各 3 回、ばらつきは
+最終桁で ±0.3%）:
+
+| `DqdtKernel_Type` | Main | Cal_tend | CUDA device fused |
+|---|---:|---:|---:|
+| `CUDAFORTRAN_FUSED_TC`（本節の変更後） | **1.415** | **0.890** | **0.851** |
+| `CUDAFORTRAN_FUSED_TC`（`e971ba5`） | 1.646 | 1.128 | 1.076 |
+| `CUDAFORTRAN_FUSED`（対照） | 1.714 | 1.190 | 1.153 |
+
+- device 時間で `e971ba5` 比 **1.26×**、CUDA core 版比 **1.35×**。
+- ncu 単発時間（501 → 433 µs、1.16×）より end-to-end の改善が大きい。
+  ncu はリプレイのたびに L2 を流すので、RK ステージ間で `q,u,v,w` が L2 に
+  残る実運用より DRAM 側を重く見積もる。実測の 1 launch = 359 µs（変更前）
+  → 284 µs（変更後）に対し、ncu は 501 → 433 µs である。
+  **この 2 つは別物として扱うこと。**
+- 数値検証: `SCALE_DG_VARYING_COEFF=1` で `u,v,w,Escale,normal_fn,Fscale` を
+  point-varying にし、`CUDAFORTRAN_SPLIT` と `dqdt(:,1:Ne)` 全点を比較。
+  `Ne=8^3, nstep=3` で max abs diff `5.618e-14`（`max|dqdt|=8.52`）、
+  相対 L2 `4.70e-16`。`Ne=16^3, nstep=5` で max abs diff `1.119e-13`、
+  相対 L2 `1.03e-15`。いずれも変更前の TC カーネルと同じ差であり、
+  in-place 化と `Lift1D` 化は当該入力で**変更前とビット一致**した。
+- 非 CUDA ビルド（`make clean && make`）も通ることを確認した。
+
+### 7.4 効かなかった / 逆効果だった案（実測値）
+
+いずれも `nstep=1000`, `Ne=32^3` の `CUDA device fused`（秒）。
+
+| 版 | device 時間 |
+|---|---:|
+| `e971ba5`（基準） | 1.076 |
+| `Lift1D` を shared に置く**だけ**（occupancy 6 ブロックのまま） | 1.090（**1.3% 遅い**）|
+| `Lift1D` を global から直接読む（`Lift1D[j]` など） | 1.318 |
+| `Lift_mat` のまま、face 1-4 の係数を node1 のものと共用（12→8 ロード） | 1.369 |
+| in-place + `__launch_bounds__` | 0.870 |
+| in-place + `__launch_bounds__` + `Lift1D` | **0.851** |
+
+読み取れること:
+
+- **global セクタを 20% 減らしても、6 ブロックのままでは遅くなる。**
+  epilogue は L1/TEX で律速しており、L1/TEX は shared ロードと global ロードを
+  同じパイプで捌く。global を shared に移し替えても総量は減らない。
+  同じ置き換えが 8 ブロックでは 2.2% の利得になるので、
+  **この最適化は occupancy を上げた後でなければ評価できない**。
+- `Lift1D` を global から直読みすると warp 内で添字 `j` が 8 通りに散り、
+  coalesce していた 12 本のロードが gather 12 本に化ける。
+  `Lift_mat` 側は `node1 = tid` で完全 coalesce だったので、
+  「行列を小さくする」こと自体には価値がない。
+- 12→8 ロードに減らすだけの版が 27% 遅くなった理由は未解明。
+  ロード本数ではなくスケジューリングが効いている。
+
+### 7.5 残っている作業
+
+- 現在の律速は L1/TEX 95.9%、`long scoreboard` 25.39、
+  DRAM は 46.5%（3.69 TB/s）。実運用では 1 launch 284 µs で
+  必須トラフィック約 1.54 GB を動かしており、実効 5.4 TB/s。
+  GB200 の HBM ピーク（約 8 TB/s）に対し 68% で、ここから先は
+  帯域効率の勝負になる。
+- M 側の gather（`q,u,v,w[iM]`、96 gather 命令のうち 48 本）は、
+  `iM` が自要素内のノードなので `q,u,v,w` を shared に置けば消える。
+  ただし +16 KB で 8 ブロックを維持できない（16.26 → 32 KB 超）。
+  §7.4 の教訓どおり、**occupancy を落とす形での L1 削減は評価に値しない**。
+  やるなら `sflux_bnd` の圧縮など、他で smem を取り戻してから。
+- §2 B-1（`m16n8k*` FP64 mma）は未着手。ただし `Compute (SM)` は 32% で、
+  演算パイプは余っている。優先度は低い。
+- §6.3 の異常（wavefront 減 = 遅くなる）と §7.4 最終行の異常は、
+  どちらも「命令数・wavefront 数を減らしたのに遅い」形をしている。
+  マイクロベンチで shared ストアと発行スケジューリングを単独測定するのが早い。
