@@ -24,6 +24,12 @@ module mod_common
   integer, public, parameter :: IP = int64
   real(RP), public, parameter :: PI = 4.0_RP*atan(1.0_RP)
 
+  ! OpenACC queue used by every device region of the time-stepping loop.
+  ! In a CUDA Fortran build this queue is bound to the stream of the CUDA
+  ! kernels (see cuda_dg_bind_acc_stream), so that the launches keep their
+  ! order without the host synchronizing after each of them.
+  integer, public, parameter :: ACC_QUEUE = 1
+
   ! 3-stage third-order SSP Runge-Kutta method
   integer, public, parameter :: RK3s3oSSP_nstage = 3
   real(RP), public, parameter :: RK3s3oSSP_rk_a(RK3s3oSSP_nstage) = [ 0.0_RP, 0.75_RP, 1.0_RP/3.0_RP ]

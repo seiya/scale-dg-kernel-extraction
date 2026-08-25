@@ -409,13 +409,24 @@ static void check_cuda(const char *what)
   }
 }
 
+//- Stream that every kernel of the CUDA path is launched on.  The Fortran
+//  side sets it to the stream of the OpenACC queue used by the time-stepping
+//  loop, so that the two kinds of kernels keep their order without the host
+//  synchronizing in between.  Zero (the default stream) until it is set.
+cudaStream_t dg_cuda_stream = 0;
+
+extern "C" void dg_set_cuda_stream(void *stream)
+{
+  dg_cuda_stream = static_cast<cudaStream_t>(stream);
+}
+
 extern "C" void launch_tendency_fused_p7_tc(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
     const double *Escale, int Ne)
 {
-  tendency_fused_p7_tc_kernel<<<Ne, 256>>>(
+  tendency_fused_p7_tc_kernel<<<Ne, 256, 0, dg_cuda_stream>>>(
       dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
       Ne);
   check_cuda("tendency_fused_p7_tc_kernel");
@@ -428,11 +439,11 @@ extern "C" void launch_tendency_xyz_p255_tc(
 {
   const int nblock_xy = 256 * 32 * 32 * Ne;
   const int nblock_z = 8192 * 32 * Ne;
-  tendency_x_p255_tc_kernel<<<nblock_xy, 32>>>(
+  tendency_x_p255_tc_kernel<<<nblock_xy, 32, 0, dg_cuda_stream>>>(
       dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, Ne);
-  tendency_y_p255_tc_kernel<<<nblock_xy, 32>>>(
+  tendency_y_p255_tc_kernel<<<nblock_xy, 32, 0, dg_cuda_stream>>>(
       dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, Ne);
-  tendency_z_p255_tc_kernel<<<nblock_z, 32>>>(
+  tendency_z_p255_tc_kernel<<<nblock_z, 32, 0, dg_cuda_stream>>>(
       dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, Ne);
   check_cuda("p255 tensor-core tendency kernels");
 }

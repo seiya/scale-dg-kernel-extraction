@@ -1,6 +1,10 @@
 #include <cublas_v2.h>
+#include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+
+//- Defined in cuda_dg_kernels_tc.cu; the stream shared by the whole CUDA path.
+extern cudaStream_t dg_cuda_stream;
 
 static cublasHandle_t g_handle = nullptr;
 static int g_inited = 0;
@@ -86,6 +90,7 @@ extern "C" int cublas_dgemm_impl(int transa, int transb, int m, int n, int k,
 {
   const cublasOperation_t opA = transa ? CUBLAS_OP_T : CUBLAS_OP_N;
   const cublasOperation_t opB = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
+  cublasSetStream(g_handle, dg_cuda_stream);
   return static_cast<int>(cublasDgemm(g_handle, opA, opB, m, n, k, &alpha, A,
                                       lda, B, ldb, &beta, C, ldc));
 }
@@ -97,6 +102,7 @@ extern "C" int cublas_dgemm_strided_batched_impl(
 {
   const cublasOperation_t opA = transa ? CUBLAS_OP_T : CUBLAS_OP_N;
   const cublasOperation_t opB = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
+  cublasSetStream(g_handle, dg_cuda_stream);
   return static_cast<int>(cublasDgemmStridedBatched(
       g_handle, opA, opB, m, n, k, &alpha, A, lda, strideA, B, ldb, strideB,
       &beta, C, ldc, strideC, batch));

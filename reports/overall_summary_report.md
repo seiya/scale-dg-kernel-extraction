@@ -40,6 +40,9 @@ nsys / ncu 測定結果（Slurm job `43219`、`job_all.sh`）を横断して
    87.2% → 79.8% に下げるだけで mainloop 自体は保たれることを確認した。
 6. **tendency を速くした結果、tendency 以外が無視できなくなった。** p=7 FUSED では
    GPU 時間の **約 27%** が `q0←q` コピー・RK 更新・halo 更新である（p=255 GEMM_FUSED では約 11%）。
+   さらに、カーネルの間で GPU が空く時間も 139 µs/step あった。`q0←q` の融合（§8.1）と
+   OpenACC 領域の async 化・ストリーム統一（§8.2）で、p=7 `FUSED_TC` の Main は
+   1.4146 → 1.2072 s になった。
 7. `output/` の測定は `nstep=10` のため、**cuBLAS/CUTLASS 経路のアプリタイマは
    ライブラリ初期化の一回性コストを含む**。定常性能は nsys のカーネル総和、
    および `nstep=1000` の `execution_times.md` を見ること。
@@ -380,6 +383,50 @@ p=7 `CUDAFORTRAN_FUSED_TC` での非 tendency 比率は 33% → **27%** に下�
 これは既に 5.06 TB/s に達しているため、次の削り代は
 min/max reduction（1.16 TB/s、`output_interval` ごと）と halo 更新である。
 
+### 8.2 追記: カーネル間の GPU アイドルを消した（2026-08-25）
+
+§8.1 の後も、非 tendency の wall 時間（`Main - Cal_tend` = 422 µs/step）が
+非 tendency カーネルの device 時間（約 336 µs/step）より 86 µs/step 大きかった。
+nsys（Slurm job `44070`, `nstep=60`, p=7 `FUSED_TC`）で 1 stage を追うと、
+差はカーネルの**間**にあった。
+
+```
+tendency 279 µs │ 18 µs │ RK 更新 107 µs │ 14 µs │ halo 5 µs │ 14 µs │ 次の tendency
+                 ↑ 空き            ↑ 空き           ↑ 空き        = 46 µs/stage = 139 µs/step
+```
+
+host は 1 stage に 4 回ブロックしていた。`!$acc parallel loop` に `async` が
+無いので nvfortran が launch ごとに `cuStreamSynchronize` を出し、さらに
+tendency ラッパが device 時間を読むために毎 stage `cudaEventSynchronize` していた。
+どちらも次の launch を前のカーネル完了後まで遅らせるので、launch レイテンシが
+毎回むき出しになる。
+
+対策は 3 つで、いずれも演算と launch 順序を変えない。
+
+1. 時間発展ループの OpenACC 領域を `async(ACC_QUEUE)` にし、host が値を読む
+   直前だけ `wait`。
+2. CUDA Fortran / C++ / cuBLAS / CUTLASS の全カーネルを、その OpenACC キューの
+   ストリーム（`acc_get_cuda_stream`）に載せる。同一ストリームなので順序は不変。
+3. tendency の CUDA event を同じ呼び出しで読まず、1 回後ろの呼び出しで読む
+   （イベント 2 面持ち）。
+
+| | 変更前 | 変更後 |
+|---|---:|---:|
+| stage あたりの gap 合計 | 46.3 µs | 16.8 µs |
+| step あたりの gap | 138.9 µs | 50.4 µs |
+| `cuStreamSynchronize` 回数（`nstep=60`）| 733 | 9 |
+| Main: p=7 `FUSED_TC` | 1.3099 s | **1.2072 s** |
+| Main: p=7 `FUSED` | 1.4412 s | **1.3444 s** |
+| Main: p=255 `GEMM_FUSED` | 4.0890 s | **3.9601 s** |
+
+device 時間は不変（p=7 TC 0.8523 → 0.8518 s）。残る 50 µs/step は 1 step
+9 回の launch turnaround で、減らすには CUDA Graph 化のように launch 自体を
+減らすしかない。詳細・検証・失敗した最初の方針は `execution_times.md` 追記 5。
+
+**この変更以降、`Cal_tend` と `Volume derivate + surface lift` は tendency の
+wall 時間ではない**（host が同期しなくなったため、キュー済みの device 仕事の
+待ち時間を含む）。カーネル単体は `CUDA device *`（CUDA event）を見ること。
+
 ---
 
 ## 9. 試して不採用にした最適化と、その理由
@@ -518,9 +565,12 @@ min/max reduction（1.16 TB/s、`output_interval` ごと）と halo 更新であ
    「要素並列カーネル vs GEMM 化」の比較にはならず、汎用パス同士の比較にしか
    ならない。損益分岐を知りたいなら、まず中間次数の専用カーネルを書く
    必要がある。それは測定ではなく実装の作業であり、現時点で優先度は低い。
-5. **p=255 の lift と z GEMM の overlap**、および assembly 以外の独立カーネル削減。
+5. **1 step あたりの launch 回数の削減（CUDA Graph）。** §8.2 で host 同期を
+   外した後も、9 回の launch turnaround で 50 µs/step が残っている。
+   カーネルを減らす余地が無い以上、次はグラフ化で launch そのものを減らす話になる。
+6. **p=255 の lift と z GEMM の overlap**、および assembly 以外の独立カーネル削減。
    `q*vel` の mainloop 融合はやり直さない。
-6. **全パスの point-varying 係数回帰の自動化**（CI 化）。
+7. **全パスの point-varying 係数回帰の自動化**（CI 化）。
 
 最優先は性能ではなく、`D(q*velocity)` と 6 面数値流束という
 元実装の意味を守り続けることである。

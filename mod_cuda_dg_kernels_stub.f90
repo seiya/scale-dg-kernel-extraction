@@ -21,8 +21,29 @@ module mod_cuda_dg_kernels
   public :: cuda_gemm_setup
   public :: cuda_gemm_finalize
   public :: cuda_cal_elembnd_flux
+  public :: cuda_dg_bind_acc_stream
+  public :: cuda_dg_flush_kernel_time
 
 contains
+  !> No-op counterpart of the CUDA Fortran routine: without CUDA kernels the
+  !! OpenACC queue does not have to share a stream with anything.
+  subroutine cuda_dg_bind_acc_stream(queue)
+    implicit none
+    integer, intent(in) :: queue
+
+    return
+  end subroutine cuda_dg_bind_acc_stream
+
+  !> No CUDA events are recorded in this build, so there is nothing to read.
+  subroutine cuda_dg_flush_kernel_time(kernel_time)
+    implicit none
+    real(RP), intent(out) :: kernel_time(4)
+
+    kernel_time(:) = 0.0_RP
+
+    return
+  end subroutine cuda_dg_flush_kernel_time
+
   subroutine cuda_cal_elembnd_flux( &
     flux, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, &
     Np, NfpTot, Ne, NeA )

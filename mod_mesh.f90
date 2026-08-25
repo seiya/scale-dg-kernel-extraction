@@ -11,7 +11,7 @@ module mod_mesh
   !
   !++ Used modules
   !
-  use mod_common, only: RP, PI
+  use mod_common, only: RP, PI, ACC_QUEUE
   implicit none
   private
 
@@ -230,7 +230,7 @@ contains
     integer :: ibuf
     !------------------------------------------------------------
 
-    !$acc parallel loop gang vector present(f,halo_src_map)
+    !$acc parallel loop gang vector present(f,halo_src_map) async(ACC_QUEUE)
     do ibuf = 1, NhaloNode
       f(Np*Ne+ibuf) = f(halo_src_map(ibuf))
     end do

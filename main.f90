@@ -11,6 +11,7 @@ program main
     RP,                                     &
     Timer,                                  &
     Timer_start, Timer_stop, Timer_elapsed, &
+    ACC_QUEUE,                              &
     RK_nstage => RK3s3oSSP_nstage,          &
     rk_a => RK3s3oSSP_rk_a,                 &
     rk_b => RK3s3oSSP_rk_b
@@ -81,7 +82,8 @@ program main
         !  separate q0 <- q pass over the field without changing either the
         !  arithmetic or the lifetime of q0.
         !$omp parallel do private(pnode)
-        !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt)
+        !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt) &
+        !$acc& async(ACC_QUEUE)
         do kelem=1, Ne
           do pnode=1, Np
             q0(pnode,kelem) = q(pnode,kelem)
@@ -91,7 +93,8 @@ program main
         end do
       else
         !$omp parallel do private(pnode)
-        !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt)
+        !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt) &
+        !$acc& async(ACC_QUEUE)
         do kelem=1, Ne
           do pnode=1, Np
             q(pnode,kelem) = rk_a(stage) * q0(pnode,kelem) &
@@ -104,6 +107,9 @@ program main
     if (mod(istep,output_interval) == 0) then
       q_min = huge(q_min)
       q_max = -huge(q_max)
+      !- The reduction result is read on the host, so the queued device work
+      !  has to be complete first.
+      !$acc wait(ACC_QUEUE)
       !$acc parallel loop gang vector collapse(2) present(q) &
       !$acc& reduction(min:q_min) reduction(max:q_max)
       do kelem=1, Ne
@@ -115,6 +121,8 @@ program main
       write(*,'(I8,2ES24.15)') istep, q_min, q_max
     end if
   end do
+
+  !$acc wait(ACC_QUEUE)
 
   !$acc end data
 
@@ -250,6 +258,7 @@ contains
     dump_file = ''
     call get_environment_variable('SCALE_DG_DUMP_DQDT', dump_file)
     if (len_trim(dump_file) == 0) return
+    !$acc wait(ACC_QUEUE)
     !$acc update host(dqdt)
     fid = 21
     open(fid, file=trim(dump_file), status='replace', action='write')

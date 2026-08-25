@@ -129,6 +129,76 @@ stage 1 の更新カーネルの中に移した。式の形は変えていない
   最初に `( q0 + dt*dqdt )` と書いた版は 1000 step 後に相対 1e-14 の差が出た。
   **`( q + dt*dqdt )` のまま残すこと**が bit 一致の条件である。
 
+### 追記 5: OpenACC 領域を async にして CUDA カーネルと同じストリームに載せた（本追記を導入したコミット、2026-08-25）
+
+`Main` と `Cal_tend` の差（非 tendency の wall 時間、追記 4 の時点で 422 µs/step）が
+非 tendency カーネルの device 時間の合計（約 336 µs/step）より 86 µs/step 大きい
+理由を nsys で調べた（Slurm job `44070`、`nstep=60`、p=7 `Ne=32^3`,
+`CUDAFORTRAN_FUSED_TC`、`nsys profile --trace=cuda --sample=none --cpuctxsw=none`）。
+原因は数値でも帯域でもなく、**カーネルの間で GPU が空いていること**だった。
+
+| stage 内の区間 | 変更前の平均 gap | 変更後 |
+|---|---:|---:|
+| tendency → RK 更新 | 18.1 µs | 3.9 µs |
+| RK 更新 → halo | 13.8 µs | 2.5 µs |
+| halo → tendency | 14.4 µs | 3.9 µs |
+| **stage 合計** | **46.3 µs** | **10.3–16.8 µs** |
+| **1 step (3 stage)** | **138.9 µs** | **50.4 µs** |
+
+変更前の host 側は 1 stage の間に 4 回ブロックしていた。`!$acc parallel loop` に
+`async` が無いため nvfortran は launch ごとに `cuStreamSynchronize` を出し
+（1000 step で 733 回 → 9 回に減少）、さらに tendency ラッパが device 時間を読むために
+毎 stage `cudaEventSynchronize` していた。どちらも「前のカーネルが終わってから
+次を launch する」形になるので、launch レイテンシ（API 2–4 µs + launch→開始 3–5 µs）が
+毎回むき出しになる。
+
+変更点（数値演算・launch 順序は不変）:
+
+- 時間発展ループの OpenACC 領域（RK 更新、`update_halo`）を `async(ACC_QUEUE)` にし、
+  host が結果を読む直前（min/max 出力、`dqdt` ダンプ、ループ終了）だけ `wait` する。
+- CUDA Fortran / C++ / cuBLAS / CUTLASS の全カーネルを、その OpenACC キューの
+  ストリーム（`acc_get_cuda_stream`）に載せる。同一ストリームなので順序は
+  従来と同一に保たれる。
+- tendency の device 時間計測（CUDA event）は、同じ呼び出しでは読まず
+  **1 回後ろの呼び出しで読む**（イベントを 2 面持ちにした）。値の意味は変わらない。
+- OpenACC カーネルで tendency を計算する経路（`OPENACC_ASIS`, `OPENACC_SPLIT`,
+  `CUDAFORTRAN_SPLIT`）だけは、その OpenACC 領域が既定キューにあるので
+  `advect3d_eq_cal_tend` の先頭で `!$acc wait(ACC_QUEUE)` する。
+
+測定は login node、`nstep=1000`、各 3 回平均。参照は同一ノードで測り直した
+`43fe5f2` のビルド。
+
+| 入力 / パス | Main（変更前） | Main（変更後） | 差 | CUDA device（前 → 後）|
+|---|---:|---:|---:|---|
+| p=7 `Ne=32^3` `CUDAFORTRAN_FUSED_TC` | 1.3099 | **1.2072** | -0.1027（-103 µs/step）| 0.8523 → 0.8518 |
+| p=7 `Ne=32^3` `CUDAFORTRAN_FUSED` | 1.4412 | **1.3444** | -0.0968（-97 µs/step）| 0.9845 → 0.9874 |
+| p=255 `Ne=1` `CUDAFORTRAN_GEMM_FUSED` | 4.0890 | **3.9601** | -0.1289（-129 µs/step）| 3.6085 → 3.5965 |
+
+device 時間は変わらない（カーネルには触れていない）。残る 50 µs/step は
+1 step あたり 9 回の launch の turnaround で、これを消すには CUDA Graph 化のように
+launch 自体を減らす必要がある。
+
+**タイマの意味の変化**: host はもう stage ごとに同期しないので、`Cal_tend` と
+`Volume derivate + surface lift` は「tendency の wall 時間」ではなく
+「host がキューに積んだ device 仕事を待った時間」を含む。カーネル単体の時間は
+`CUDA device *`（CUDA event）を見ること。`Main` の意味は変わらない
+（ループ直後に `!$acc wait` を入れてある）。
+
+数値検証: `SCALE_DG_VARYING_COEFF=1` で p=7 `Ne=8^3`, `nstep=100` の 5 経路
+（`CUDAFORTRAN_FUSED_TC` / `FUSED` / `SPLIT` / `OPENACC_SPLIT` / `OPENACC_ASIS`）と
+p=255 `Ne=1`, `nstep=20` の 4 経路（`GEMM_FUSED` / `FUSED_TC` / `GEMM` / `GEMM_CUTE`）で、
+stage 1 の `dqdt` 全点ダンプと min/max 系列の**全 18 比較が `43fe5f2` とビット一致**。
+非 CUDA ビルド（`make ACC=1` と CPU/OpenMP）も同一結果でビルド・実行できる。
+
+途中で踏んだ失敗も記録しておく。最初は逆向きに
+`acc_set_cuda_stream(queue, 0)` で OpenACC キューを CUDA の既定ストリームに
+束ねようとしたが、nvfortran は独自のストリームを使い続け（nsys で stream 7 と 14 に
+分かれ、halo が tendency の終了 9 µs 前に走っていた）、結果が run ごとに揺れた。
+さらに CUTLASS の device 級 GEMM は `gemm_op(args)` の既定引数が
+`stream = nullptr` なので、明示的に渡すまで p=255 の GEMM 経路だけ既定ストリームに
+残り、5 step 後に 1e-11 のずれとして現れた。**「全部同じストリームに載った」ことは
+nsys の stream 列で確認すること。**
+
 `CUDAFORTRAN_GEMM` with `CublasEmulation=.true.` did not produce a
 timing. The run printed that cuBLAS floating-point emulation APIs are
 unavailable and that native FP64 GEMM would be used, then hit the 180 s

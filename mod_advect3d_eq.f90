@@ -7,7 +7,7 @@
 !! @author Yuta Kawai, Xuanzhengbo Ren, Team SCALE
 !<
 module mod_advect3d_eq
-  use mod_common, only: RP, &
+  use mod_common, only: RP, ACC_QUEUE, &
   Timer, Timer_start, Timer_stop, Timer_add, Timer_elapsed
   use mod_cuda_dg_kernels, only: &
     cuda_dg_kernels_available,  &
@@ -17,13 +17,20 @@ module mod_advect3d_eq
     cuda_cal_dqdt_fused_tc, cuda_cal_dqdt_fused_p255_tc, &
     cuda_cal_dqdt_gemm, cuda_cal_dqdt_gemm_fused, cuda_cal_dqdt_gemm_cute, &
     cuda_gemm_setup, cuda_gemm_finalize, &
-    cuda_cal_elembnd_flux
+    cuda_cal_elembnd_flux, cuda_dg_bind_acc_stream, &
+    cuda_dg_flush_kernel_time
   implicit none
   private
 
   public :: setup_advect3d_eq_setup
   public :: setup_advect3d_eq_finalize
   public :: advect3d_eq_cal_tend
+
+  !> .true. for the paths whose tendency is computed by OpenACC kernels.
+  !! Those kernels run on the default OpenACC queue, so the device work that
+  !! the time-stepping loop queued on ACC_QUEUE must be complete before they
+  !! start.
+  logical :: tend_uses_acc_kernels = .true.
 
   type(Timer) :: timer_ebnd_flux
   type(Timer) :: timer_dqdt
@@ -138,6 +145,13 @@ contains
       error stop
     end select
 
+    tend_uses_acc_kernels = &
+      dqdt_kernel_typeid == DQDT_KERNEL_OPENACC_ASIS .or. &
+      dqdt_kernel_typeid == DQDT_KERNEL_OPENACC_SPLIT .or. &
+      dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_SPLIT
+
+    call cuda_dg_bind_acc_stream(ACC_QUEUE)
+
     if (cublas_emulation_enabled .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
@@ -198,7 +212,15 @@ contains
 !OCL SERIAL
   subroutine setup_advect3d_eq_finalize()
     implicit none
+
+    real(RP) :: kernel_time(4)
     !------------------------------------------------------------------------------
+
+    !- The CUDA device time of a tendency call is read back on the next call,
+    !  so the measurement of the last call is still pending here.
+    call cuda_dg_flush_kernel_time(kernel_time)
+    call accumulate_kernel_time(kernel_time)
+
     write(*,'(A30,A24)') "Dqdt kernel type:", trim(dqdt_kernel_name)
     if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM .or. &
         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .or. &
@@ -279,6 +301,31 @@ contains
     return
   end subroutine setup_advect3d_eq_finalize
 
+  !> Add one device-time measurement to the timers of the active path.
+!OCL SERIAL
+  subroutine accumulate_kernel_time(kernel_time)
+    implicit none
+    real(RP), intent(in) :: kernel_time(:)
+    !------------------------------------------------------------
+
+    select case (dqdt_kernel_typeid)
+    case (DQDT_KERNEL_CUDAFORTRAN_SPLIT)
+      call Timer_add(timer_volume_flux,kernel_time(1))
+      call Timer_add(timer_volume_deriv,kernel_time(2))
+      call Timer_add(timer_surface_lift,kernel_time(3))
+      call Timer_add(timer_dqdt_assemble,kernel_time(4))
+    case (DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE)
+      call Timer_add(timer_volume_deriv,kernel_time(1))
+      call Timer_add(timer_volume_flux,kernel_time(2))
+    case (DQDT_KERNEL_CUDAFORTRAN_FUSED, DQDT_KERNEL_CUDAFORTRAN_FUSED_TC, &
+          DQDT_KERNEL_CUDAFORTRAN_GEMM, DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED)
+      call Timer_add(timer_volume_deriv,kernel_time(1))
+      call Timer_add(timer_surface_lift,kernel_time(2))
+    end select
+
+    return
+  end subroutine accumulate_kernel_time
+
   !> Calculate the tendency of 3D advection equation
 !OCL SERIAL
   subroutine advect3d_eq_cal_tend( dqdt, & ! (out)
@@ -308,6 +355,13 @@ contains
     real(RP), intent(in) :: Escale(Np,Ne,3)
     real(RP), intent(in) :: Fscale(NfpTot,Ne)
     !------------------------------------------------------------
+
+    if (tend_uses_acc_kernels) then
+      !- The tendency kernels of these paths are OpenACC regions on the
+      !  default queue, so they are not ordered against ACC_QUEUE by the
+      !  stream binding.
+      !$acc wait(ACC_QUEUE)
+    end if
 
     call Timer_start(timer_ebnd_flux)
     if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
@@ -573,10 +627,7 @@ contains
       Nq, Np, NfpTot, Ne, NeA, kernel_time )
     !$acc end host_data
 
-    call Timer_add(timer_volume_flux,kernel_time(1))
-    call Timer_add(timer_volume_deriv,kernel_time(2))
-    call Timer_add(timer_surface_lift,kernel_time(3))
-    call Timer_add(timer_dqdt_assemble,kernel_time(4))
+    call accumulate_kernel_time(kernel_time)
 
     return
   end subroutine cal_dqdt_cudafortran_split
@@ -622,8 +673,7 @@ contains
       error stop "CUDAFORTRAN_FUSED requires Nq=8 or Nq=256"
     end if
 
-    call Timer_add(timer_volume_deriv,kernel_time(1))
-    call Timer_add(timer_surface_lift,kernel_time(2))
+    call accumulate_kernel_time(kernel_time)
 
     return
   end subroutine cal_dqdt_cudafortran_fused
@@ -669,8 +719,7 @@ contains
       error stop "CUDAFORTRAN_FUSED_TC requires Nq=8 or Nq=256"
     end if
 
-    call Timer_add(timer_volume_deriv,kernel_time(1))
-    call Timer_add(timer_surface_lift,kernel_time(2))
+    call accumulate_kernel_time(kernel_time)
 
     return
   end subroutine cal_dqdt_cudafortran_fused_tc
@@ -707,8 +756,7 @@ contains
       Nq, Np, NfpTot, Ne, NeA, kernel_time )
     !$acc end host_data
 
-    call Timer_add(timer_volume_deriv,kernel_time(1))
-    call Timer_add(timer_surface_lift,kernel_time(2))
+    call accumulate_kernel_time(kernel_time)
 
     return
   end subroutine cal_dqdt_cudafortran_gemm
@@ -745,8 +793,7 @@ contains
       Nq, Np, NfpTot, Ne, NeA, kernel_time )
     !$acc end host_data
 
-    call Timer_add(timer_volume_deriv,kernel_time(1))
-    call Timer_add(timer_volume_flux,kernel_time(2))
+    call accumulate_kernel_time(kernel_time)
 
     return
   end subroutine cal_dqdt_cudafortran_gemm_cute
@@ -783,8 +830,7 @@ contains
       Nq, Np, NfpTot, Ne, NeA, kernel_time )
     !$acc end host_data
 
-    call Timer_add(timer_volume_deriv,kernel_time(1))
-    call Timer_add(timer_surface_lift,kernel_time(2))
+    call accumulate_kernel_time(kernel_time)
 
     return
   end subroutine cal_dqdt_cudafortran_gemm_fused

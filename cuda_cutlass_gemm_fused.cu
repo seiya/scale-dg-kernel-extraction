@@ -16,6 +16,9 @@
 //   cutlass_80_tensorop_d884gemm_64x64_16x4_nn_align1
 //   cutlass_80_tensorop_d884gemm_64x32_16x4_nn_align1
 
+//- Defined in cuda_dg_kernels_tc.cu; the stream shared by the whole CUDA path.
+extern cudaStream_t dg_cuda_stream;
+
 namespace {
 
 using ColumnMajor = cutlass::layout::ColumnMajor;
@@ -63,7 +66,7 @@ int run_gemm_nn(int m, int n, int k, double const *A, int lda, double const *B,
   if (can != cutlass::Status::kSuccess) {
     return cutlass_error("can_implement", can);
   }
-  return cutlass_error("gemm", gemm_op(args));
+  return cutlass_error("gemm", gemm_op(args, nullptr, dg_cuda_stream));
 }
 
 template <class GemmBatched>
@@ -80,7 +83,7 @@ int run_gemm_batched_nn(int m, int n, int k, double const *A, int lda,
   if (can != cutlass::Status::kSuccess) {
     return cutlass_error("batched can_implement", can);
   }
-  return cutlass_error("batched gemm", gemm_op(args));
+  return cutlass_error("batched gemm", gemm_op(args, nullptr, dg_cuda_stream));
 }
 
 int run_volume_gemms_xy(double *deriv_x, double *deriv_y, const double *flux_x,
@@ -184,7 +187,7 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
   }
 
   cutlass::arch::synclog_setup();
-  cutlass::Kernel<Kernel><<<grid, block, smem_size, nullptr>>>(params);
+  cutlass::Kernel<Kernel><<<grid, block, smem_size, dg_cuda_stream>>>(params);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? 0 : 1;
 }
