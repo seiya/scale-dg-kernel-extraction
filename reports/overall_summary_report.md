@@ -493,6 +493,43 @@ epilogue 内で面から直接評価すれば消える（§12-6）。
 
 ---
 
+### 8.5 追記: p=255 の lift を z-epilogue に畳み込んだ（2026-08-25）
+
+§8.4 の後も z-epilogue は `lift_out`（134 MB）を読んでいた。z GEMM の
+ユーザ問題は `(m=Nq², n=Nq)` の column-major で、CUTLASS の
+`GemmBatched` は ColumnMajor C を A/B 入れ替えの row-major 問題として解く。
+したがって **epilogue タイルの row は z 添字 `k`、column は xy 面添字
+`p = i + j*Nq`** であり、6 枚の面（計 3 MB）から lift をその場で
+組み立てられる。`lift_out` は生成も読み出しも無くなった。
+
+ここで測定が教えたことが 1 つある。**素直に書いた版は −0.6% にしかならない。**
+出力 1 点ごとに `p % Nq` と `p / Nq` を計算していたためで、`Nq` は実行時値
+なので整数除算になる。z GEMM は SM throughput 79.8% の演算律速だから、
+epilogue に足した整数演算がそのまま効く。
+`PredicatedTileIterator::operator++` は `thread_start_row_` しか進めない
+ので、column に依存する量はすべて `kIterations` ループを通じて不変である。
+それをループ外に括り出すと −4.7% になった。
+
+| 版 | Main | `CUDA device GEMM fused` |
+|---|---:|---:|
+| `514853f`（3 本の lift GEMM） | 3.971 | — |
+| §8.4（`separable_lift_kernel`） | 3.635 | 3.266 |
+| lift を epilogue へ（除算そのまま） | 3.615 | 3.244 |
+| **lift を epilogue へ（column 不変量を hoist）** | **3.463** | **3.081** |
+
+`nstep=1000`、graph off、login node。3000 tendency call なので device は
+1089 → 1027 µs/call。`514853f` からの通算 Main **−12.8%**。
+旧実装と**ビット一致**（`execution_times.md` 追記 9）。
+
+**§5.1 と §6 の lift 行・z GEMM 行はいずれも変更前の値である。**
+z GEMM のレジスタ 242 本と SM throughput 79.8% は epilogue を厚くした分
+再測定が要る（§12-1）。
+
+これで §12-6 の「p=255 の lift」は完了である。GEMM 系に残る帯域律速の
+独立カーネルは `volume_flux_kernel`（150 µs、DRAM 66%）のみ。
+
+---
+
 ## 9. 試して不採用にした最適化と、その理由
 
 | 試行 | 結果 | 判断 |
@@ -665,12 +702,17 @@ epilogue 内で面から直接評価すれば消える（§12-6）。
    3.9730 → 3.8545 秒（−119 µs/step）。namelist の `UseCudaGraph` で選ぶ。
    再生時は tendency の CUDA event 時間が採れないので、device 時間を見たい
    測定では off にすること。
-6. **p=255 の lift の epilogue 融合。** → **半分完了（2026-08-25、§8.4）**。
-   lift の 3 本の `K=2` GEMM を 1 本の `separable_lift_kernel` に置き換え、
-   lift 側の DRAM を 670 → 134 MB にした（`GEMM_FUSED` で −8.5%）。
-   残るのは z-epilogue が `lift_out` を読む 134 MB で、これを消すには
-   epilogue 内で出力タイルの `(i,j,k)` を復元して 6 面から直接
-   lift を評価する必要がある。`q*vel` の mainloop 融合はやり直さない。
+6. ~~**p=255 の lift の epilogue 融合。**~~ → **完了（2026-08-25、§8.4 / §8.5）**。
+   3 本の `K=2` GEMM → 1 本のカーネル → z-epilogue 内で 6 面から直接評価、
+   の順に `lift_out` を消した。`GEMM_FUSED` の Main は 3.971 → 3.463 秒
+   （−12.8%）で、旧実装とビット一致する。残る独立カーネルは
+   `volume_flux_kernel`（150 µs、DRAM 66%）で、`q*vel` の mainloop 融合は
+   やり直さない。
+   ここで得た一般則: **epilogue に足した整数演算は、mainloop が SM
+   throughput 律速のとき end-to-end にそのまま出る。** 素直に書いた版
+   （出力 1 点ごとに `p % Nq` / `p / Nq`）は −0.6%、CUTLASS の
+   `operator++` が row しか進めないことを使って column 不変量を
+   ループ外に括り出した版が −4.7% である。
 7. **全パスの point-varying 係数回帰の自動化**（CI 化）。
 
 最優先は性能ではなく、`D(q*velocity)` と 6 面数値流束という

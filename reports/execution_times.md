@@ -382,3 +382,47 @@ p=255 の lift は `Lift1D(Nq,6)` と 6 枚の面から作る 3 つの rank-2 �
 `§5.1` の内訳表（job 43219）は変更前の値である。lift 176 µs と
 pack/copy 9.8 µs がこの変更の対象で、`lift_out` を読む z-epilogue 側の
 134 MB はまだ残っている。
+
+### 追記 9: p=255 の lift を z-epilogue に畳み込んだ（2026-08-25）
+
+追記 8 で `lift_out` の生成は 1 パスになったが、z-epilogue はまだその
+134 MB を読んでいた。z GEMM のユーザ問題は `(m=Nq², n=Nq)` の column-major
+なので CUTLASS は転置した row-major 問題として解く。つまり **epilogue タイルの
+row が z 添字 `k`、column が xy 面添字 `p = i + j*Nq`** であり、6 面
+（計 3 MB）から lift をその場で組み立てられる。`lift_out` は完全に消えた。
+
+素直に書いた最初の版は `Main 3.635 → 3.615` （−0.6%）にしかならなかった。
+epilogue が出力 1 点ごとに `p % Nq` / `p / Nq` の整数除算をしていたためで、
+z GEMM は SM throughput 79.8% の演算律速だからここが効く。
+`PredicatedTileIterator::operator++` は `thread_start_row_` しか進めない
+ので、column に依存する量（`i`, `j`, 除算、z 面の 2 値、`Lift1D` の 4 値）は
+`kIterations` ループを通じて不変である。これらをループ外に括り出した版が
+採用値である。
+
+測定は login node、`nstep=1000`、`bench_runs/p255_gemm_fused.conf`、
+graph off。GPU が共有のため外れ値が出るので最小値付近の代表値。
+
+| 版 | Main | `CUDA device GEMM fused` |
+|---|---:|---:|
+| `514853f`（3 本の lift GEMM） | 3.971 | — |
+| 追記 8（`separable_lift_kernel`） | 3.635 | 3.266 |
+| lift を epilogue へ（除算そのまま） | 3.615 | 3.244 |
+| **lift を epilogue へ（column 不変量を hoist）** | **3.463** | **3.081** |
+
+device 時間は 3000 tendency call あたりなので 1089 → 1027 µs/call。
+`514853f` からの通算は Main **−12.8%**。
+`CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_CUTE` は z-epilogue を使わないので
+追記 8 のまま（3.946 / 3.960）。
+
+`UseCudaGraph = .true.` でも動作する（Main 3.377）。
+
+数値検証: `SCALE_DG_VARYING_COEFF=1`、`dqdt` 全点比較。
+
+| 比較 | max_abs_diff |
+|---|---:|
+| p=255 `Ne=1` epilogue lift vs 追記 8 のカーネル lift | 0（ビット一致）|
+| p=255 `Ne=1` epilogue lift vs `CUDAFORTRAN_FUSED_TC` | 3.553e-15 |
+| p=255 `Ne=2` `GEMM_FUSED` vs `CUDAFORTRAN_FUSED_TC` | 3.553e-15 |
+| p=7 `Ne=8³` `CUDAFORTRAN_GEMM` vs `CUDAFORTRAN_SPLIT` | 0（ビット一致）|
+
+非 CUDA ビルド（`make clean && make`）も通ることを確認した。

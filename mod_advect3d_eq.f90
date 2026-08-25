@@ -875,12 +875,12 @@ contains
     !$acc host_data use_device(dqdt,q,u,v,w,D1D,D1D_tr,Lift1D,VMapM,VMapP) &
     !$acc& use_device(normal_fn,Fscale,Escale,ebnd_flux) &
     !$acc& use_device(volume_flux_x,volume_flux_y,volume_flux_z) &
-    !$acc& use_device(volume_deriv_x,volume_deriv_y,surface_lift)
+    !$acc& use_device(volume_deriv_x,volume_deriv_y)
     call cuda_cal_dqdt_gemm_fused( &
       dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &
       normal_fn, Fscale, Escale, ebnd_flux, &
       volume_flux_x, volume_flux_y, volume_flux_z, &
-      volume_deriv_x, volume_deriv_y, surface_lift, &
+      volume_deriv_x, volume_deriv_y, &
       Nq, Np, NfpTot, Ne, NeA, kernel_time )
     !$acc end host_data
 

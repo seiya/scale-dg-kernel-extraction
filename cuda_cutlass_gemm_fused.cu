@@ -126,7 +126,8 @@ int run_volume_gemms(double *deriv_x, double *deriv_y, double *deriv_z,
 
 int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr,
                         const double *deriv_x, const double *deriv_y,
-                        const double *lift, const double *escale, int Nq, int Ne)
+                        const double *flux_bnd, const double *lift1d,
+                        const double *escale, int Nq, int Ne)
 {
   const int nq2 = Nq * Nq;
   const int Np = nq2 * Nq;
@@ -169,7 +170,9 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
       uargs.batch_count);
   params.ptr_dx = deriv_x;
   params.ptr_dy = deriv_y;
-  params.ptr_lift = lift;
+  params.ptr_flux_bnd = flux_bnd;
+  params.ptr_lift1d = lift1d;
+  params.Nq = Nq;
   params.ptr_ex = escale;
   params.ptr_ey = escale + npoint;
   params.ptr_ez = escale + 2 * npoint;
@@ -219,12 +222,12 @@ extern "C" int launch_volume_gemm_xy(
 
 extern "C" int launch_z_gemm_assembly(
     double *dqdt, const double *flux_z, const double *D1D_tr,
-    const double *deriv_x, const double *deriv_y, const double *lift,
-    const double *escale, int Nq, int Ne)
+    const double *deriv_x, const double *deriv_y, const double *flux_bnd,
+    const double *lift1d, const double *escale, int Nq, int Ne)
 {
   if (Nq <= 0 || Ne <= 0) {
     return 1;
   }
-  return run_z_gemm_assembly(dqdt, flux_z, D1D_tr, deriv_x, deriv_y, lift,
-                             escale, Nq, Ne);
+  return run_z_gemm_assembly(dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd,
+                             lift1d, escale, Nq, Ne);
 }
