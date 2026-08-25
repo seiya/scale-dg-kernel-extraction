@@ -549,9 +549,13 @@ wall 時間ではない**（host が同期しなくなったため、キュー�
    −7.1 ポイント分である。過去に試した fragment 分割・フルアンロールは
    いずれも悪化しているため、`--set full` の Memory Workload Analysis /
    Scheduler Statistics / Warp State を取ってから判断する。
-2. **p=7 FUSED の L1 帯域律速の解消。** Mem% 88.6 / L1 89.6 が上限。
-   shared レイアウト（FP64 bank conflict）と、レジスタ 42 本による occupancy 62.5%
-   のトレードオフを ncu Memory Workload Analysis で詰める。
+2. **p=7 の L1 帯域律速の解消。** occupancy 側は §8 で解決済みで、
+   TC 版・CUDA core 版とも L1/TEX 95% 台が上限として残っている。
+   M 側 gather を shared に移す案は `tc_paper_survey_2407.09621.md` §9 で
+   実測し**不採用**（global sectors −26% に対し shared バンクコンフリクト 20 倍、
+   正味 3.7% 遅い）。残る筋は、contraction のアクセスと 6 面の face gather を
+   同時にコンフリクトフリーにする shared レイアウトが存在するかどうかで、
+   これはカーネル改造ではなくレイアウト探索の問題である。
 3. ~~**`q0 ← q` の改善。**~~ → **完了（2026-08-25、§8.1）**。stage 1 の RK
    更新に融合してカーネルごと削除した。非 tendency は約 422 → 320 µs/step。
    次に残るのは min/max reduction（1.16 TB/s）と halo 更新だが、
