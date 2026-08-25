@@ -358,6 +358,28 @@ tendency 以外になった。** RK 更新は既に 5.06 TB/s（HBM3e 実効と�
 なので削り代は小さい。`q0 ← q` は 3.05 TB/s と低く、alignment / vector load-store /
 他カーネルとの融合の余地がある。ただし **SSP-RK の意味と `q0` の寿命は変更不可**。
 
+### 8.1 追記: `q0 ← q` を stage 1 の RK 更新に融合した（2026-08-25）
+
+上の「他カーネルとの融合の余地」を実施した。SSP-RK の stage 1 では定義上
+`q0 == q` なので、独立していた `q0 ← q` カーネルを stage 1 の更新カーネルに
+畳み込める。`q0` の寿命も式の形も変えていない（`main.f90`）。
+
+| | 融合前 | 融合後 |
+|---|---:|---:|
+| `main_64`（`q0 ← q`）| 268.4 MB / 88 µs | **削除** |
+| stage 1 の RK 更新 | 536.9 MB | 671.1 MB（`q0` ストア +134.2 MB）|
+| 非 tendency / step | 約 422 µs | **約 320 µs**（実測差 92-103 µs）|
+
+実測の Main 時間は p=7 TC で 1.4146 → 1.3115 s、p=7 CUDA core で
+1.5473 → 1.4520 s、p=255 `GEMM_FUSED` で 4.1889 → 4.0968 s
+（`nstep=1000`, 各 3 回平均、login node）。`Cal_tend` と `CUDA device` は不変。
+全点ビット一致の検証を含む詳細は `execution_times.md` の追記 4 にある。
+
+p=7 `CUDAFORTRAN_FUSED_TC` での非 tendency 比率は 33% → **27%** に下がった
+（tendency 851 µs / step に対し約 320 µs）。残るのは RK 更新 3 回分で、
+これは既に 5.06 TB/s に達しているため、次の削り代は
+min/max reduction（1.16 TB/s、`output_interval` ごと）と halo 更新である。
+
 ---
 
 ## 9. 試して不採用にした最適化と、その理由
@@ -483,9 +505,10 @@ tendency 以外になった。** RK 更新は既に 5.06 TB/s（HBM3e 実効と�
 2. **p=7 FUSED の L1 帯域律速の解消。** Mem% 88.6 / L1 89.6 が上限。
    shared レイアウト（FP64 bank conflict）と、レジスタ 42 本による occupancy 62.5%
    のトレードオフを ncu Memory Workload Analysis で詰める。
-3. **`q0 ← q` の改善。** 3.05 TB/s は RK 更新の 5.06 TB/s に比べ低い。
-   alignment / vector load-store / 他カーネルとの融合を検討。
-   ただし SSP-RK の意味と `q0` の寿命は変えない。
+3. ~~**`q0 ← q` の改善。**~~ → **完了（2026-08-25、§8.1）**。stage 1 の RK
+   更新に融合してカーネルごと削除した。非 tendency は約 422 → 320 µs/step。
+   次に残るのは min/max reduction（1.16 TB/s）と halo 更新だが、
+   前者は `output_interval` ごとなので現行入力での寄与は小さい。
 4. **p=7 と p=255 の間の crossover point 測定。** 要素並列性と GEMM 化の
    損益分岐がどの多項式次数で起きるか（p=15, 31, 63, 127 など）。
 5. **p=255 の lift と z GEMM の overlap**、および assembly 以外の独立カーネル削減。

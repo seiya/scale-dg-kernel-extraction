@@ -22,6 +22,11 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 - **p=255, `Ne=1`**: `CUDAFORTRAN_GEMM_FUSED` が最速。手書きの Tensor Core 経路は
   CUTLASS / cuBLAS の multistage mainloop に大きく負ける。
 - 同じ体積 DOF 数でも、p=7 と p=255 で最適戦略は逆転する。
+- **tendency 以外**: `q0 ← q` を SSP-RK stage 1 の更新カーネルに融合し、
+  独立カーネルを削除した（2026-08-25）。非 tendency は約 422 → 320 µs/step、
+  Main 時間は p=7 TC で 1.415 → 1.312 秒、p=255 `GEMM_FUSED` で
+  4.189 → 4.097 秒。tendency 側の時間は不変。詳細は
+  `execution_times.md` 追記 4 と `overall_summary_report.md` §8.1。
 
 ## 読むときの注意
 

@@ -60,14 +60,6 @@ program main
   !- Loop for time integration
   do istep = 1, nstep
 
-    !$omp parallel do private(pnode)
-    !$acc parallel loop gang vector collapse(2) present(q0,q)
-    do kelem=1, Ne
-      do pnode=1, Np
-        q0(pnode,kelem) = q(pnode,kelem)
-      end do
-    end do
-
     do stage = 1, RK_nstage
       call update_halo(q)
 
@@ -83,14 +75,30 @@ program main
         call dump_dqdt_if_requested(dqdt, Np, Ne)
       end if
 
-      !$omp parallel do private(pnode)
-      !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt)
-      do kelem=1, Ne
-        do pnode=1, Np
-          q(pnode,kelem) = rk_a(stage) * q0(pnode,kelem) &
-                         + rk_b(stage) * ( q(pnode,kelem) + dt * dqdt(pnode,kelem) )
+      if (stage == 1) then
+        !- At the first stage q0 is by definition the current q, so the
+        !  SSP-RK save is fused into the update kernel. This removes a
+        !  separate q0 <- q pass over the field without changing either the
+        !  arithmetic or the lifetime of q0.
+        !$omp parallel do private(pnode)
+        !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt)
+        do kelem=1, Ne
+          do pnode=1, Np
+            q0(pnode,kelem) = q(pnode,kelem)
+            q(pnode,kelem) = rk_a(stage) * q0(pnode,kelem) &
+                           + rk_b(stage) * ( q(pnode,kelem) + dt * dqdt(pnode,kelem) )
+          end do
         end do
-      end do
+      else
+        !$omp parallel do private(pnode)
+        !$acc parallel loop gang vector collapse(2) present(q,q0,dqdt)
+        do kelem=1, Ne
+          do pnode=1, Np
+            q(pnode,kelem) = rk_a(stage) * q0(pnode,kelem) &
+                           + rk_b(stage) * ( q(pnode,kelem) + dt * dqdt(pnode,kelem) )
+          end do
+        end do
+      end if
     end do
 
     if (mod(istep,output_interval) == 0) then

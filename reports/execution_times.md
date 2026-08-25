@@ -52,7 +52,7 @@ CUDA core 版 549.8 µs に対して **1.11×** 速い。
 `CUDAFORTRAN_FUSED_TC` に変わった**。経緯と測定値は
 `tc_paper_survey_2407.09621.md` §5-6 にある。
 
-### 追記 2: occupancy 100% 化と分離可能 lift（未コミットの作業ツリー）
+### 追記 2: occupancy 100% 化と分離可能 lift（commit `103d13b`）
 
 `e971ba5` の TC カーネルは theoretical occupancy が 75% しかなく
 （レジスタ 40 本と smem 28.16 KB がどちらも 6 ブロックで頭打ち）、
@@ -74,7 +74,7 @@ ncu はリプレイごとに L2 を流すため実運用より遅く出る（実
 359 µs → 284 µs）ので、両者を混ぜないこと。
 経緯・不採用案・残作業は `tc_paper_survey_2407.09621.md` §7 にある。
 
-### 追記 3: CUDA core 版も occupancy 100% にした（未コミットの作業ツリー）
+### 追記 3: CUDA core 版も occupancy 100% にした（commit `0c65b87`）
 
 `tendency_fused_p7_kernel` はレジスタ 42 本で `Block Limit Registers = 5`、
 theoretical occupancy 62.5% だった。`Lift1D` 化と
@@ -90,6 +90,44 @@ CUDA core 版は `e971ba5` 比 1.17×。両者を 100% occupancy で揃えると
 TC 版の優位は 1.35× から **1.16×** に縮む。p=7 の最速は
 `CUDAFORTRAN_FUSED_TC` のままである。詳細は
 `tc_paper_survey_2407.09621.md` §8。
+
+### 追記 4: `q0 <- q` を stage 1 の RK 更新に融合（本追記を導入したコミット、2026-08-25）
+
+`main.f90` の time-stepping ループは step 先頭で `q0 <- q` の独立カーネルを
+launch していた（268.4 MB、`overall_summary_report.md` §8 では 88 µs、
+3.05 TB/s）。SSP-RK の stage 1 では定義上 `q0 == q` なので、この保存を
+stage 1 の更新カーネルの中に移した。式の形は変えていない
+（`rk_a*q0 + rk_b*(q + dt*dqdt)` のまま、`q0` へのストアを 1 行足しただけ）。
+
+- 削減トラフィック: 独立カーネル 268.4 MB/step が消え、既存の更新カーネルに
+  134.2 MB のストアが増える。差し引き **-134.2 MB/step**。
+- tendency カーネルには一切触れていないので `Cal_tend` と `CUDA device` は不変。
+
+測定は login node、`nstep=1000`、各 3 回の平均。ビルドは
+`make CUDA=1 GPUFLAGS=-gpu=cc100`、GB200 1 GPU。
+
+| 入力 / パス | Main（融合前） | Main（融合後） | 差 |
+|---|---:|---:|---:|
+| p=7 `Ne=32^3` `CUDAFORTRAN_FUSED_TC` | 1.4146 | **1.3115** | -0.1031（-103 µs/step）|
+| p=7 `Ne=32^3` `CUDAFORTRAN_FUSED` | 1.5473 | **1.4520** | -0.0953（-95 µs/step）|
+| p=255 `Ne=1` `CUDAFORTRAN_GEMM_FUSED` | 4.1889 | **4.0968** | -0.0921（-92 µs/step）|
+
+3 条件とも owned volume point 数は 256^3 で同じなので、削減量が
+92-103 µs/step で揃うのは期待どおりである。理論帯域から見積もった
+削減（134.2 MB を 5.06 TB/s で 27 µs、消えた 88 µs との差し引きで約 61 µs）
+より実測が大きいのは、独立カーネルの launch と、更新カーネルが `q` を
+読むときの L2 ヒットが効いているためと考えられる。
+
+数値検証:
+
+- `SCALE_DG_VARYING_COEFF=1`、`Ne=8^3`, `nstep=7`, `CUDAFORTRAN_FUSED_TC` で
+  最終 `q(:,1:Ne)` 262,144 点を全点ダンプし、融合前と**ビット一致**。
+- `nstep=1000` の min/max 出力（10 行）も、p=7 の 2 パスと p=255
+  `CUDAFORTRAN_GEMM_FUSED`、および非 CUDA ビルドの `OPENACC_ASIS`
+  （`Ne=8^3`, `nstep=20`, varying coeff）すべてで融合前と一致した。
+- 式の並びを変えると FMA の contraction が変わり 15 桁目でずれる。
+  最初に `( q0 + dt*dqdt )` と書いた版は 1000 step 後に相対 1e-14 の差が出た。
+  **`( q + dt*dqdt )` のまま残すこと**が bit 一致の条件である。
 
 `CUDAFORTRAN_GEMM` with `CublasEmulation=.true.` did not produce a
 timing. The run printed that cuBLAS floating-point emulation APIs are
