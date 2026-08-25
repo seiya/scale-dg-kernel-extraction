@@ -426,3 +426,61 @@ device 時間は 3000 tendency call あたりなので 1089 → 1027 µs/call。
 | p=7 `Ne=8³` `CUDAFORTRAN_GEMM` vs `CUDAFORTRAN_SPLIT` | 0（ビット一致）|
 
 非 CUDA ビルド（`make clean && make`）も通ることを確認した。
+
+### 追記 10: `volume_flux_kernel` のロードをストアより前にまとめた（2026-08-25）
+
+追記 9 の時点で GEMM 系に残る帯域律速の独立カーネルは `volume_flux_kernel`
+だけだった。commit `d7b1853` の実行ファイルを ncu で測ると、トラフィックは
+理論最小そのものだが**どのユニットも飽和していない**ことが分かった
+（job 46163、`p=255 Ne=1`、`CUDAFORTRAN_GEMM_FUSED`）。
+
+| 指標 | 実測 | 理論 |
+|---|---:|---:|
+| `dram__bytes_read.sum` | 536.9 MB | 536.9 MB（`q,u,v,w`）|
+| `dram__bytes_write.sum` | 364.2 MB | 402.7 MB（`flux_x/y/z`、差は L2 残留）|
+| ld / st セクタ効率 | 100% / 100% | |
+| `smsp__inst_executed_op_global_ld.sum` | 3.15 M = **6 / warp** | 2.10 M = 4 / warp |
+| DRAM / L1 / L2 / SM throughput | 65.7 / 52.5 / 36.8 / 33.7 % | |
+
+`flux_x(idx) = q(idx)*u(idx)` を 3 行並べた書き方だと、nvfortran はロードを
+ストアと交互に発行し、`q` を 3 回読み直していた。4 本のロードを
+**ストアより前にまとめて**発行させると次のようになる（job 46183）。
+
+| | 変更前 | 変更後 |
+|---|---:|---:|
+| global ld 命令 / warp | 6 | **4** |
+| ncu duration | 173.2 µs | **135.0 µs** |
+| DRAM throughput | 65.7% | **83.4%** |
+| L1 / SM throughput | 52.5 / 33.7% | 67.0 / 43.2% |
+| register / occupancy | 20 / 84.1% | 24 / 79.9% |
+| **nsys duration** | **150.6 µs** | **125.9 µs**（−16.4%）|
+
+893 MB / 125.9 µs = **7.09 TB/s**、参照ピーク 7.9 TB/s の **90%**。
+`q` だけをレジスタに退避した版は 3.080 s のままで**まったく効かない**。
+効くのはストアを挟まないロード窓のほうである。1 スレッド 2 / 4 / 8 点に
+増やす版も試したが、2 点は同値、4 / 8 点はわずかに悪化した。
+
+`nstep=1000`、login node、graph off。`CUDAFORTRAN_FUSED` 系はこのカーネルを
+使わないので変化しない。
+
+| path | 変更前 | 変更後 | |
+|---|---:|---:|---:|
+| p=255 `CUDAFORTRAN_GEMM_FUSED` | 3.4469 | **3.3702** | −2.2% |
+| p=255 `CUDAFORTRAN_GEMM` | 3.9403 | 3.8713 | −1.8% |
+| p=255 `CUDAFORTRAN_GEMM_CUTE` | 3.9539 | 3.8820 | −1.8% |
+| p=7 `CUDAFORTRAN_SPLIT` | 2.7172 | **2.6440** | −2.7% |
+| p=7 `CUDAFORTRAN_FUSED` / `FUSED_TC` | 1.3464 / 1.2036 | 1.3452 / 1.2043 | ±0 |
+
+device 時間（`CUDA device GEMM fused`、3000 call）は 3.0812 → 3.0058 s、
+1027 → 1002 µs/call。`FUSED volume GEMM only` は 2.541 s で不変なので、
+差分はすべてこのカーネルに帰属する。
+
+数値検証: `SCALE_DG_VARYING_COEFF=1`、`dqdt` 全点比較（`SCALE_DG_DUMP_DQDT`）。
+
+| 比較 | max_abs_diff |
+|---|---:|
+| p=255 `Ne=1` `GEMM_FUSED` 変更後 vs 変更前 | 0（ビット一致）|
+| p=255 `Ne=1` `GEMM` 変更後 vs 変更前 | 0（ビット一致）|
+| p=255 `Ne=1` `GEMM_CUTE` 変更後 vs 変更前 | 0（ビット一致）|
+| p=7 `Ne=8³` `GEMM` 変更後 vs 変更前 | 0（ビット一致）|
+| p=7 `Ne=8³` `CUDAFORTRAN_SPLIT` 変更後 vs 変更前 | 0（ビット一致）|

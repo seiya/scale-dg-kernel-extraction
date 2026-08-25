@@ -172,6 +172,12 @@ cuBLAS **3.881 s** / CUTE **3.914 s** / **z-epilogue FUSED 3.603 s**
 ※ cuBLAS 版は volume と lift の両方が同じ `cutlass_80_tensorop_d884gemm_*`
 カーネル群にディスパッチされ、nsys 上で分離できないため合算値のみ示す。
 
+**この表は job 43219（`514853f`）の値である。** その後 lift は z-epilogue に
+畳み込まれて行が消え（§8.4 / §8.5）、`volume_flux_kernel` は 150.1 → 125.9 µs に
+なった（§8.6）。commit `d7b1853` + §8.6 での `GEMM_FUSED` の現行内訳は
+z GEMM 339.1 / x GEMM 249.7 / y GEMM 243.5 / `volume_flux` 125.9 /
+`elembnd_flux` 19.6 µs、合計約 978 µs/call である。
+
 読み取れること:
 
 - **CUTE と cuBLAS はほぼ同じ**（1259.8 vs 1249.7 µs、+0.8%）。
@@ -271,6 +277,9 @@ cuBLAS **3.881 s** / CUTE **3.914 s** / **z-epilogue FUSED 3.603 s**
   §5.1 の −8.3% と完全に整合する。
 - なお `dqdt_assembly_kernel` は DRAM 92.1%、`volume_flux_kernel` は 66–68% と
   どちらも帯域律速。**融合で得られる上限は、消せるカーネルの DRAM 時間そのもの**である。
+  （`volume_flux_kernel` の「帯域律速」は誤りだった。DRAM 66% で他のどのユニットも
+  飽和しておらず、実体はレイテンシ律速である。§8.6 でロードをまとめると
+  DRAM 83.4% / 125.9 µs になった。この表の値は変更前のものである。）
 
 ---
 
@@ -527,8 +536,72 @@ z GEMM のレジスタ 242 本と SM throughput 79.8% は epilogue を厚くし�
 
 これで §12-6 の「p=255 の lift」は完了である。GEMM 系に残る帯域律速の
 独立カーネルは `volume_flux_kernel`（150 µs、DRAM 66%）のみ。
+（→ §8.6 でこれも 125.9 µs / DRAM 83% になった。）
 
 ---
+
+### 8.6 追記: `volume_flux_kernel` のロードをストアより前にまとめた（2026-08-25）
+
+§8.5 の時点で GEMM 系に残る帯域律速の独立カーネルは `volume_flux_kernel`
+だけだった。「消せる DRAM トラフィックが融合の得の上限」（§6 末尾）という
+見立てからは、このカーネルはトラフィック最小なので手の付けようがない。
+実際 ncu で採ると `dram__bytes_read.sum` は理論値の **1.000 倍**、ld / st の
+セクタ効率はどちらも 100% で、無駄なトラフィックは 1 バイトも無かった
+（job 46163、`p=255 Ne=1`、`CUDAFORTRAN_GEMM_FUSED`、commit `d7b1853`）。
+
+同じ測定が別のことを示していた。**どのユニットも飽和していない**
+（DRAM 65.7%、L1 52.5%、L2 36.8%、SM 33.7%）。つまり帯域律速ではなく
+レイテンシ律速である。加えて `smsp__inst_executed_op_global_ld.sum` が
+1 warp あたり **6 命令**で、あるべき 4 命令より多かった。
+
+```fortran
+flux_x(idx) = q(idx)*u(idx)
+flux_y(idx) = q(idx)*v(idx)
+flux_z(idx) = q(idx)*w(idx)
+```
+
+この書き方だと nvfortran はロードとストアを交互に発行し、`q` を 3 回
+読み直す。余分な 2 回は L1/L2 に当たるので DRAM read は理論値のままだが、
+レイテンシ律速のカーネルでは発行スロットがそのまま時間になる。
+4 本のロードをストアより前にまとめて発行させると（job 46183）:
+
+| | 変更前 | 変更後 |
+|---|---:|---:|
+| global ld 命令 / warp | 6 | **4** |
+| ncu duration | 173.2 µs | **135.0 µs** |
+| DRAM throughput | 65.7% | **83.4%** |
+| L1 / SM throughput | 52.5 / 33.7% | 67.0 / 43.2% |
+| register / occupancy | 20 / 84.1% | 24 / 79.9% |
+| **nsys duration** | **150.6 µs** | **125.9 µs**（−16.4%）|
+
+893 MB / 125.9 µs = **7.09 TB/s**、参照ピーク 7.9 TB/s の **90%**。
+これはこのリポジトリのどのカーネルより高い実効帯域である
+（§8 の RK 更新 5.06 TB/s、`q0 ← q` 3.05 TB/s と比較のこと）。
+
+Main は p=255 `GEMM_FUSED` 3.4469 → **3.3702** 秒（−2.2%）、
+`GEMM` 3.9403 → 3.8713、`GEMM_CUTE` 3.9539 → 3.8820、
+p=7 `CUDAFORTRAN_SPLIT` 2.7172 → **2.6440** 秒（−2.7%）。
+`CUDAFORTRAN_FUSED` / `FUSED_TC` はこのカーネルを使わないので変化しない。
+旧実装と**ビット一致**（`execution_times.md` 追記 10）。
+
+**`q` だけをレジスタに退避した版はまったく効かない**（3.080 秒のまま）。
+効いているのは共通部分式の除去ではなく、ストアを挟まないロード窓のほうで
+ある。1 スレッド 2 / 4 / 8 点に増やして MLP を稼ぐ版も試したが、2 点は同値、
+4 / 8 点はわずかに悪化した。
+
+同じジョブで x/y/z GEMM も `d7b1853` で採り直した（§6 の z GEMM 行は lift を
+epilogue へ移す前の値なので、以下が現行値である）:
+
+| kernel | nsys | SM% | DRAM% | L1% | reg | occ% |
+|---|---:|---:|---:|---:|---:|---:|
+| x GEMM `Gemm<64,128,16>` | 249.7 µs | 87.9 | 10.1 | 34.3 | 212 | 12.2 |
+| y GEMM `GemmBatched<64,64,16>` | 243.5 µs | 89.2 | 6.3 | 47.9 | 130 | 18.5 |
+| z GEMM + assembly + lift | 339.1 µs | 72.5 | 20.1 | 56.5 | 254 | 12.2 |
+
+z GEMM の SM throughput は lift を載せたことで 79.8 → 72.5%、レジスタは
+242 → 254 本になった（§12-1 の再測定はこれで済んだ）。x/y GEMM が 493 µs の
+あいだ DRAM を 6–10% しか使っていないことは、§12 に挙げた
+「帯域律速カーネルを 2 本目のストリームで GEMM の裏に隠す」案の前提になる。
 
 ## 9. 試して不採用にした最適化と、その理由
 
@@ -557,18 +630,22 @@ z GEMM のレジスタ 242 本と SM throughput 79.8% は epilogue を厚くし�
    （`SCALE_DG_VARYING_COEFF=1`）を全パスで自動化する。
 3. **同じ DOF 数は同じ GPU 問題を意味しない。** 多項式次数と要素数で
    並列構造・行列次数・launch 数・再利用量が変わり、最適戦略が逆転する。
-4. **カーネル数削減は常に正義ではない。** 融合の得は「消せる DRAM トラフィック」で
+4. **「DRAM %」だけを見て帯域律速と判定しない。** どのユニットも飽和していない
+   （最大でも 66%）カーネルはレイテンシ律速であり、トラフィックが理論最小でも
+   まだ速くなる。`volume_flux_kernel` は 1 行の書き方（ロードをストアより前に
+   まとめる）で −16.4%、DRAM 83.4% になった（§8.6）。
+5. **カーネル数削減は常に正義ではない。** 融合の得は「消せる DRAM トラフィック」で
    上限が決まる。GEMM mainloop を壊す融合はそれを大きく超えて損をする。
-5. **中間配列は必ずしも無駄ではない。** p=255 の volume flux 配列は
+6. **中間配列は必ずしも無駄ではない。** p=255 の volume flux 配列は
    高効率 dense GEMM のための materialized input / cacheable preprocessing である。
-6. **occupancy 単独で判断しない。** register、shared bank conflict、L1 throughput、
+7. **occupancy 単独で判断しない。** register、shared bank conflict、L1 throughput、
    instruction mix を同時に見る（p=7 TC 版は occupancy 97% で 1.28× 遅い）。
-7. **理論 FLOP/byte と NCU 実測を分けて示す。** tile 再計算・cache hit・FMA 化で
+8. **理論 FLOP/byte と NCU 実測を分けて示す。** tile 再計算・cache hit・FMA 化で
    両者は一致しない。
-8. **device-event と wall time を混ぜない。** 表に「launch/sync を含むか」を明記する。
-9. **profiling は同一 input・同一 commit で行う。** 過去の scalar 特殊化版の
+9. **device-event と wall time を混ぜない。** 表に「launch/sync を含むか」を明記する。
+10. **profiling は同一 input・同一 commit で行う。** 過去の scalar 特殊化版の
    プロファイルを現行版に適用しない。
-10. **速くなったものだけ残す。数値不一致は速度に関係なく即 revert。**
+11. **速くなったものだけ残す。数値不一致は速度に関係なく即 revert。**
 
 ---
 
@@ -707,13 +784,27 @@ z GEMM のレジスタ 242 本と SM throughput 79.8% は epilogue を厚くし�
    の順に `lift_out` を消した。`GEMM_FUSED` の Main は 3.971 → 3.463 秒
    （−12.8%）で、旧実装とビット一致する。残る独立カーネルは
    `volume_flux_kernel`（150 µs、DRAM 66%）で、`q*vel` の mainloop 融合は
-   やり直さない。
+   やり直さない。→ その `volume_flux_kernel` も §8.6 で 125.9 µs / DRAM 83.4% に
+   なった（ロードをストアより前にまとめただけ。トラフィックは元から理論最小で、
+   実体は帯域律速ではなくレイテンシ律速だった）。
    ここで得た一般則: **epilogue に足した整数演算は、mainloop が SM
    throughput 律速のとき end-to-end にそのまま出る。** 素直に書いた版
    （出力 1 点ごとに `p % Nq` / `p / Nq`）は −0.6%、CUTLASS の
    `operator++` が row しか進めないことを使って column 不変量を
    ループ外に括り出した版が −4.7% である。
-7. **全パスの point-varying 係数回帰の自動化**（CI 化）。
+7. **帯域律速カーネルを GEMM の裏に隠す（2 本目のストリーム）。** §8.6 の
+   再測定で、x GEMM（249.7 µs）と y GEMM（243.5 µs）は SM 88–89% で回りながら
+   DRAM を 10.1% / 6.3% しか使っておらず、SM あたりのレジスタも 2 CTA ×
+   27,136 = 54,272 / 65,536 で約 11k 本空いている。x GEMM が要るのは `flux_x`
+   だけ、y GEMM が要るのは `flux_y` だけ、z GEMM が要るのは `flux_z` と
+   `flux_bnd` だけなので、`flux_y`/`flux_z` と `elembnd_flux_kernel`（19.6 µs）を
+   2 本目のストリームに逃がして event で join すれば、クリティカルパスから
+   約 110 µs / call（tendency 978 µs の 11%）を外せる可能性がある。
+   カーネル本体も演算順序も変わらないのでビット一致が期待でき、CUDA Graph
+   捕捉も fork/join を event で書けば通る。代償は `q` を 2 回読むこと
+   （+134 MB、ただし隠れる側）と、GEMM 側がどれだけ遅くなるかで、そこは
+   実測でしか決まらない。
+8. **全パスの point-varying 係数回帰の自動化**（CI 化）。
 
 最優先は性能ではなく、`D(q*velocity)` と 6 面数値流束という
 元実装の意味を守り続けることである。

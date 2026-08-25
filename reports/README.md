@@ -55,6 +55,17 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   column 不変量を `kIterations` ループ外に括り出して初めて −4.7% になる。
   詳細は `overall_summary_report.md` §8.4 / §8.5 と
   `execution_times.md` 追記 8 / 9。
+- **`volume_flux_kernel` のロードをまとめた（2026-08-25）**: GEMM 系に残る唯一の
+  独立カーネル（150 µs、ncu DRAM 66%）を ncu で測ると、DRAM read は理論値の
+  **1.000 倍**でセクタ効率も 100%、つまりトラフィックには一切無駄が無い一方、
+  **どのユニットも飽和していなかった**（DRAM 65.7 / L1 52.5 / SM 33.7%）。実体は
+  帯域律速ではなくレイテンシ律速で、`q(idx)*u(idx)` を 3 行並べた書き方のせいで
+  1 warp あたりの global load が 4 命令ではなく 6 命令になっていた。4 本の
+  ロードをストアより前にまとめると **150.6 → 125.9 µs（−16.4%、DRAM 83.4%、
+  7.09 TB/s = ピークの 90%）**。Main は p=255 `GEMM_FUSED` 3.4469 → **3.3702** 秒、
+  p=7 `CUDAFORTRAN_SPLIT` 2.7172 → **2.6440** 秒で、旧実装と**ビット一致**。
+  `q` だけをレジスタに退避した版は効かない。詳細は
+  `overall_summary_report.md` §8.6 と `execution_times.md` 追記 10。
 - **tendency 以外（その 2）**: 時間発展ループの OpenACC 領域を `async` にし、
   CUDA / cuBLAS / CUTLASS のカーネルを同じストリームに載せて、カーネル間の
   GPU アイドルを 139 → 50 µs/step にした（2026-08-25）。Main は p=7 `FUSED_TC` で
