@@ -37,6 +37,20 @@ module mod_cuda_dg_kernels
   !! synchronizing between them.  cudaforGetDefaultStream() until then.
   integer(kind=cuda_stream_kind), save :: dg_stream = 0
 
+  !> Second stream used to produce the operands the first GEMM does not need.
+  !! The x GEMM reads only flux_x, so flux_y, flux_z and the element boundary
+  !! flux can be computed while it runs: it holds the SM for 250 us at 88%
+  !! SM throughput but only 10% DRAM throughput, and leaves about 11k of the
+  !! 64k registers per SM free, so bandwidth-bound blocks co-schedule with it.
+  !! Fork and join are plain events, which stream capture turns into graph
+  !! edges, so the CUDA graph path keeps working.
+  !! Measured on a CUDA graph replay the same structure is a small loss
+  !! instead of a gain, so the host turns it off before capturing a step.
+  integer(kind=cuda_stream_kind), save :: dg_side_stream = 0
+  type(cudaEvent), save :: dg_side_fork_ev, dg_side_join_ev
+  logical, save :: dg_side_ready = .false.
+  logical, save :: dg_side_enabled = .true.
+
   type(cudaEvent), save :: split_events(5,2)
   logical, save :: split_events_initialized = .false.
   integer, save :: ev_buf = 2         ! buffer the current call records into
@@ -78,6 +92,7 @@ module mod_cuda_dg_kernels
   public :: cuda_gemm_finalize
   public :: cuda_cal_elembnd_flux
   public :: cuda_dg_bind_acc_stream
+  public :: cuda_dg_set_side_stream
   public :: cuda_dg_flush_kernel_time
   public :: cuda_dg_set_event_timing
   public :: cuda_dg_graph_capture_begin
@@ -197,6 +212,21 @@ contains
     return
   end subroutine cuda_dg_bind_acc_stream
 
+  !> Turn the second stream on or off.  Overlapping the element boundary flux
+  !! with the volume GEMMs is worth about 15 us per tendency call when the
+  !! kernels are launched one by one, but on a CUDA graph replay the same
+  !! structure costs about 5 us per call instead, so the host turns it off
+  !! before capturing.
+  subroutine cuda_dg_set_side_stream(on)
+    implicit none
+    logical, intent(in) :: on
+    !------------------------------------------------------------
+
+    dg_side_enabled = on
+
+    return
+  end subroutine cuda_dg_set_side_stream
+
   !> Turn the per-kernel CUDA event timing on or off.
   subroutine cuda_dg_set_event_timing(on)
     implicit none
@@ -207,6 +237,58 @@ contains
 
     return
   end subroutine cuda_dg_set_event_timing
+
+  !> Create the second stream and its two events on first use.
+  subroutine dg_side_stream_init()
+    implicit none
+
+    integer :: istat
+    !------------------------------------------------------------
+
+    if (dg_side_ready) return
+
+    istat = cudaStreamCreateWithFlags(dg_side_stream,cudaStreamNonBlocking)
+    if (istat /= cudaSuccess) call cuda_failure("cudaStreamCreateWithFlags",istat)
+    istat = cudaEventCreateWithFlags(dg_side_fork_ev,cudaEventDisableTiming)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventCreateWithFlags",istat)
+    istat = cudaEventCreateWithFlags(dg_side_join_ev,cudaEventDisableTiming)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventCreateWithFlags",istat)
+    dg_side_ready = .true.
+
+    return
+  end subroutine dg_side_stream_init
+
+  !> Let the second stream start on what the main stream has queued so far.
+  subroutine dg_side_fork()
+    implicit none
+
+    integer :: istat
+    !------------------------------------------------------------
+
+    call dg_side_stream_init()
+
+    istat = cudaEventRecord(dg_side_fork_ev,dg_stream)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord(fork)",istat)
+    istat = cudaStreamWaitEvent(dg_side_stream,dg_side_fork_ev,0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaStreamWaitEvent(fork)",istat)
+
+    return
+  end subroutine dg_side_fork
+
+  !> Hold the main stream until the second stream has finished its work.
+  subroutine dg_side_join()
+    implicit none
+
+    integer :: istat
+    !------------------------------------------------------------
+
+    istat = cudaEventRecord(dg_side_join_ev,dg_side_stream)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord(join)",istat)
+    istat = cudaStreamWaitEvent(dg_stream,dg_side_join_ev,0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaStreamWaitEvent(join)",istat)
+
+    return
+  end subroutine dg_side_join
 
   !> Record one measurement boundary on the kernel stream.
   subroutine dg_ev_record(iev)
@@ -651,6 +733,7 @@ contains
     integer :: istat, nface, npoint, nblock, nblock_face
     integer :: nq2, plane_batch
     integer(c_long_long) :: stride_plane, stride_elem, stride_zero, stride_vol
+    logical :: use_side
 
     if (.not. gemm_inited) then
       call cuda_gemm_setup(.false.)
@@ -671,10 +754,26 @@ contains
 
     call dg_ev_record(1)
 
-    call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    ! flux_bnd is not read until the lift, so the boundary flux can run on the
+    ! second stream underneath the volume GEMMs.  See cuda_cal_dqdt_gemm_fused.
+    ! At p=7 it must not: there the boundary flux is 181 us while the volume
+    ! GEMMs are 24 launches of 8x8 matrices, so it is far larger than the
+    ! window it would hide in and overlapping the two loses 3.1%.
+    use_side = dg_side_enabled .and. (Nq == CUDA_P255_NQ)
+
+    if (.not. use_side) then
+      call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    end if
+
     call launch_volume_flux( &
       flux_x, flux_y, flux_z, q, u, v, w, npoint )
+
+    if (use_side) then
+      call dg_side_fork()
+      call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    end if
 
     istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
       D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
@@ -689,6 +788,8 @@ contains
       flux_z, nq2, stride_vol, D1D_tr, Nq, stride_zero, 0.0_c_double, &
       deriv_z, nq2, stride_vol, Ne)
     if (istat /= 0) call cuda_failure("cublasDgemm z-deriv",istat)
+
+    if (use_side) call dg_side_join()
 
     call separable_lift_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       lift_out, flux_bnd, Lift1D, Nq, Np, npoint )
@@ -753,18 +854,34 @@ contains
 
     call dg_ev_record(1)
 
-    call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    ! flux_bnd is not read until the lift, so the boundary flux runs on the
+    ! second stream underneath the volume GEMMs.  See cuda_cal_dqdt_gemm_fused.
+    ! Keep the original order when the second stream is off: the boundary flux
+    ! reads q through VMapM / VMapP, and it is measurably cheaper before the
+    ! volume flux has streamed q, u, v and w past it through L2.
+    if (.not. dg_side_enabled) then
+      call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    end if
+
     call launch_volume_flux( &
       flux_x, flux_y, flux_z, q, u, v, w, npoint )
 
     call dg_ev_record(2)
+
+    if (dg_side_enabled) then
+      call dg_side_fork()
+      call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    end if
 
     istat = launch_volume_gemm_cute( &
       deriv_x, deriv_y, deriv_z, flux_x, flux_y, flux_z, D1D, D1D_tr, Nq, Ne )
     if (istat /= 0) call cuda_failure("launch_volume_gemm_cute",istat)
 
     call dg_ev_record(3)
+
+    if (dg_side_enabled) call dg_side_join()
 
     call separable_lift_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       lift_out, flux_bnd, Lift1D, Nq, Np, npoint )
@@ -828,18 +945,38 @@ contains
 
     call dg_ev_record(1)
 
-    call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    ! flux_bnd is not read until the z GEMM epilogue evaluates the lift, so the
+    ! element boundary flux runs on the second stream underneath the volume
+    ! GEMMs.  On nsys it lands entirely inside the x GEMM, which holds the SM
+    ! at 88% SM throughput but only 10% DRAM throughput: the boundary flux
+    ! slots into the tail of its block waves.  Splitting the volume flux the
+    ! same way does not work, see the note in the reports.
+    ! Keep the original order when the second stream is off: the boundary flux
+    ! reads q through VMapM / VMapP, and it is measurably cheaper before the
+    ! volume flux has streamed q, u, v and w past it through L2.
+    if (.not. dg_side_enabled) then
+      call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    end if
+
     call launch_volume_flux( &
       flux_x, flux_y, flux_z, q, u, v, w, npoint )
 
     call dg_ev_record(2)
+
+    if (dg_side_enabled) then
+      call dg_side_fork()
+      call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    end if
 
     istat = launch_volume_gemm_xy( &
       deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, Nq, Ne )
     if (istat /= 0) call cuda_failure("launch_volume_gemm_xy",istat)
 
     call dg_ev_record(3)
+
+    if (dg_side_enabled) call dg_side_join()
 
     call dg_ev_record(4)
 

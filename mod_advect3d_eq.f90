@@ -19,6 +19,7 @@ module mod_advect3d_eq
     cuda_gemm_setup, cuda_gemm_finalize, &
     cuda_cal_elembnd_flux, cuda_dg_bind_acc_stream, &
     cuda_dg_flush_kernel_time, cuda_dg_set_event_timing, &
+    cuda_dg_set_side_stream, &
     cuda_dg_graph_capture_begin, cuda_dg_graph_capture_end, &
     cuda_dg_graph_launch, cuda_dg_graph_is_ready, cuda_dg_graph_finalize
   implicit none
@@ -33,6 +34,7 @@ module mod_advect3d_eq
   !- Re-exported so that the time-stepping loop does not have to know which
   !  backend module it is built against.
   public :: cuda_dg_set_event_timing
+  public :: cuda_dg_set_side_stream
   public :: cuda_dg_graph_capture_begin
   public :: cuda_dg_graph_capture_end
   public :: cuda_dg_graph_launch

@@ -22,7 +22,8 @@ program main
   use mod_advect3d_eq, only: &
     advect3d_eq_cal_tend, advect3d_eq_graph_supported, &
     advect3d_eq_set_time_reporting, &
-    cuda_dg_set_event_timing, cuda_dg_graph_capture_begin, &
+    cuda_dg_set_event_timing, cuda_dg_set_side_stream, &
+    cuda_dg_graph_capture_begin, &
     cuda_dg_graph_capture_end, cuda_dg_graph_launch, cuda_dg_graph_is_ready
   implicit none
 
@@ -81,9 +82,14 @@ program main
   !  replay.  A replay does not run the Fortran wrappers, so the per-kernel
   !  CUDA event timing is switched off for the whole run in this mode; only
   !  the wall time is reported.
+  !  The second stream that overlaps the element boundary flux with the volume
+  !  GEMMs is also switched off in graph mode: on a replay the forked structure
+  !  measures as a small loss instead of the gain it is when the kernels are
+  !  launched one by one.
   if (UseCudaGraph) then
     MeasureKernelTime = .false.
     call advect3d_eq_set_time_reporting(.false.)
+    call cuda_dg_set_side_stream(.false.)
   end if
   if (.not. MeasureKernelTime) then
     call cuda_dg_set_event_timing(.false.)

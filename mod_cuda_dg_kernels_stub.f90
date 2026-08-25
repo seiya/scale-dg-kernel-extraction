@@ -24,6 +24,7 @@ module mod_cuda_dg_kernels
   public :: cuda_dg_bind_acc_stream
   public :: cuda_dg_flush_kernel_time
   public :: cuda_dg_set_event_timing
+  public :: cuda_dg_set_side_stream
   public :: cuda_dg_graph_capture_begin
   public :: cuda_dg_graph_capture_end
   public :: cuda_dg_graph_launch
@@ -57,6 +58,14 @@ contains
 
     return
   end subroutine cuda_dg_set_event_timing
+
+  subroutine cuda_dg_set_side_stream(on)
+    implicit none
+    logical, intent(in) :: on
+    !------------------------------------------------------------
+
+    return
+  end subroutine cuda_dg_set_side_stream
 
   !- No-op counterparts of the CUDA graph routines.  Without CUDA Fortran
   !  there is no stream to capture, and cuda_dg_graph_is_ready() stays

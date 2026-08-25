@@ -484,3 +484,76 @@ device 時間（`CUDA device GEMM fused`、3000 call）は 3.0812 → 3.0058 s�
 | p=255 `Ne=1` `GEMM_CUTE` 変更後 vs 変更前 | 0（ビット一致）|
 | p=7 `Ne=8³` `GEMM` 変更後 vs 変更前 | 0（ビット一致）|
 | p=7 `Ne=8³` `CUDAFORTRAN_SPLIT` 変更後 vs 変更前 | 0（ビット一致）|
+
+### 追記 11: 帯域律速カーネルを 2 本目のストリームで GEMM の裏に隠した（2026-08-25）
+
+`overall_summary_report.md` §12-7 の案を実測した。x GEMM（249.7 µs、SM 87.9%、
+DRAM 10.1%）と y GEMM（243.5 µs、SM 89.2%、DRAM 6.3%）が回っている 493 µs の
+あいだ DRAM は空いているので、そこに帯域律速のカーネルを流し込む。
+方向ごとの依存は独立で、x GEMM が要るのは `flux_x` だけ、z GEMM が要るのは
+`flux_z` と `flux_bnd` だけである。
+
+3 つの分け方を測った（`p255_gemm_fused.conf`、`nstep=1000`、graph off、
+login node、値は `CUDA device GEMM fused` 秒 / 3000 call の µs）。
+
+| 版 | main stream | side stream | join | device | µs/call |
+|---|---|---|---|---:|---:|
+| 変更前 | 全部 | — | — | 3.0058 | 1001.9 |
+| A | `flux_x` | `flux_y,z` + elembnd | y GEMM の前 | 3.0245 | 1008.2 |
+| A' | A の fork を `flux_x` の後ろへ | 同上 | 同上 | 3.0550 | 1018.3 |
+| B | `flux_x,y` | `flux_z` + elembnd | z GEMM の前 | 3.0034 | 1001.1 |
+| **C** | volume flux 全部 | **elembnd のみ** | z GEMM の前 | **2.9646** | **988.2** |
+
+**A と B が効かない理由はレジスタである。** x GEMM は 212 reg × 128 thread の
+CTA が 2 個/SM で 54,272 / 65,536 本を占め、**SM あたり 11,264 本しか空いていない**。
+24 reg の flux ブロック（256 スレッド = 6,144 本）は 1 個しか同居できないので、
+side stream 側の並列度は SM あたり 256 スレッド、単独実行時の約 1/8 になる。
+`flux_y,z` の 671 MB を 250 µs の窓で流すには 2.7 TB/s 要るが、その並列度では
+出ない。結果として隠れず、しかも DRAM を奪って GEMM 側を遅くする
+（A' は xy GEMM が +68 µs/call）。105 MB・19.6 µs の elembnd なら入る。
+
+C の重なりは nsys で直接確認した（job 46362、`nstep=20`）。
+
+```
+strm=14  start=3436141.0us  dur=253.0us  end=3436394.0us  x GEMM
+strm=15  start=3436359.3us  dur= 26.9us  end=3436386.2us  elembnd_flux_kernel
+```
+
+elembnd は x GEMM の区間に**完全に収まっている**。代償は elembnd 自身が
+19.6 → 26.9 µs（+37%）、x GEMM が 249.7 → 253.0 µs（+1.3%）で、差し引き
+−15 µs/call。開始が x GEMM の 218 µs 後であることから、ブロックは GEMM の
+最後の wave の隙間に入っていると分かる。
+
+**CUDA Graph の replay では逆に損になる。** 同じ構造を捕捉して再生すると
++5 µs/call で、graph on の Main は 3.2877 → 3.3104 と悪化した。そこで
+`UseCudaGraph` のときは `cuda_dg_set_side_stream(.false.)` で 1 本に戻す
+（`main.f90`）。無効時は elembnd を volume flux の**前**に戻すことも必要で、
+これを怠ると graph on が +0.6% になる。elembnd は `VMapM`/`VMapP` 経由で `q` を
+gather するので、volume flux が `q,u,v,w` を L2 に流し込む前のほうが安い。
+
+`nstep=1000`、login node。
+
+| path | 変更前 | 変更後 | |
+|---|---:|---:|---:|
+| p=255 `GEMM_FUSED`（graph off） | 3.3723 | **3.3293** | −1.3% |
+| p=255 `GEMM_CUTE` | 3.8820 | 3.8368 | −1.2% |
+| p=255 `GEMM` | 3.8713 | 3.8613 | −0.3% |
+| p=255 `GEMM_FUSED`（graph on） | 3.2877 | 3.2892 | ±0（無効化） |
+| p=7 `CUDAFORTRAN_GEMM` | 5.487 | 5.486 | ±0（無効） |
+
+p=7 の `CUDAFORTRAN_GEMM` では side stream を使わない。そこでは elembnd が
+181 µs、volume GEMM は 8×8 行列の 24 launch なので、隠す先の窓より隠すものの
+ほうが大きく、そのまま重ねると **+3.1%** になることを実測した
+（`Nq == CUDA_P255_NQ` で切り分けている）。
+
+数値検証: `SCALE_DG_VARYING_COEFF=1`、`dqdt` 全点比較。
+
+| 比較 | max_abs_diff |
+|---|---:|
+| p=255 `Ne=1` `GEMM_FUSED` 変更後 vs 変更前 | 0（ビット一致）|
+| p=255 `Ne=1` `GEMM_FUSED` graph on 変更後 vs 変更前 | 0（ビット一致）|
+| p=255 `Ne=1` `GEMM` / `GEMM_CUTE` 変更後 vs 変更前 | 0（ビット一致）|
+| p=7 `Ne=8³` `GEMM` 変更後 vs 変更前 | 0（ビット一致）|
+
+非 CUDA ビルド（`make clean && make`）も通ることを確認した
+（stub に `cuda_dg_set_side_stream` を追加）。

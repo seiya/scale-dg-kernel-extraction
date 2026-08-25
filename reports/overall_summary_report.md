@@ -603,11 +603,56 @@ z GEMM の SM throughput は lift を載せたことで 79.8 → 72.5%、レジ�
 あいだ DRAM を 6–10% しか使っていないことは、§12 に挙げた
 「帯域律速カーネルを 2 本目のストリームで GEMM の裏に隠す」案の前提になる。
 
+### 8.7 追記: 境界流束を 2 本目のストリームで GEMM の裏に隠した（2026-08-25）
+
+§12-7 に挙げた案を実測した。x GEMM（249.7 µs、SM 87.9%、DRAM 10.1%）と
+y GEMM（243.5 µs、SM 89.2%、DRAM 6.3%）の 493 µs のあいだ DRAM は空いており、
+方向ごとの依存も独立している。そこへ帯域律速のカーネルを流し込む。
+
+**採用できたのは `elembnd_flux_kernel`（19.6 µs、105 MB）だけである。**
+volume flux を方向で割って side stream に載せる版（`flux_y,z` を隠す、
+`flux_z` を隠す）はどちらも効かなかった。理由はレジスタで、x GEMM は
+212 reg × 128 thread の CTA を 2 個/SM 走らせて 54,272 / 65,536 本を占め、
+**SM あたり 11,264 本しか残さない**。24 reg の flux ブロック（256 スレッド =
+6,144 本）は 1 個しか同居できず、side 側の並列度は単独時の約 1/8 になる。
+`flux_y,z` の 671 MB を 250 µs の窓で流すには 2.7 TB/s 必要だが、その並列度では
+出ない。隠れないうえに DRAM を奪って GEMM を遅くする。
+
+C 案の重なりは nsys で直接確認した（job 46362）。
+
+```
+strm=14  start=3436141.0us  dur=253.0us  end=3436394.0us  x GEMM
+strm=15  start=3436359.3us  dur= 26.9us  end=3436386.2us  elembnd_flux_kernel
+```
+
+elembnd は x GEMM の区間に完全に収まる。代償は elembnd 自身が 19.6 → 26.9 µs、
+x GEMM が 249.7 → 253.0 µs で、差し引き **−15 µs/call**。開始が x GEMM の
+218 µs 後であることから、ブロックは GEMM の最後の wave の隙間に入っている。
+
+device 時間（`CUDA device GEMM fused`、3000 call）は 3.0058 → 2.9646 秒、
+1001.9 → 988.2 µs/call。Main は graph off で 3.3723 → **3.3293** 秒（−1.3%）、
+`GEMM_CUTE` 3.8820 → 3.8368、`GEMM` 3.8713 → 3.8613。旧実装と**ビット一致**。
+
+**CUDA Graph の replay では逆に +5 µs/call の損になる**ので、`UseCudaGraph` の
+ときは 1 本に戻す（`cuda_dg_set_side_stream(.false.)`、`main.f90`）。1 本に
+戻すときは elembnd を volume flux の**前**に置き直すことも必要で、これを怠ると
+graph on が +0.6% になる。elembnd は `VMapM`/`VMapP` で `q` を gather するので、
+volume flux が `q,u,v,w` を L2 に流す前のほうが安い。
+
+p=7 の `CUDAFORTRAN_GEMM` でも無効にしている。そこでは elembnd が 181 µs で
+volume GEMM は 8×8 の 24 launch なので、隠す先の窓より隠すものが大きく、
+重ねると +3.1% になる。
+
+これで §12-7 は完了である。**ここで得た一般則: SM 律速の GEMM の裏に隠せる
+帯域律速カーネルの大きさは、GEMM が SM あたりに残すレジスタ本数で決まる。**
+DRAM に空きがあることは必要条件でしかない。
+
 ## 9. 試して不採用にした最適化と、その理由
 
 | 試行 | 結果 | 判断 |
 |---|---|---|
 | `q*vel` を GEMM mainloop に融合（`MulPairIterator`） | p=255 で 3.91 s → **6.48 s**（1.66× 悪化） | **不採用**。消せる `volume_flux` は 0.45–0.5 s なのに、CTA ごとの `q`/`vel` 再読と dual `ld.global` で標準 global→shared パイプラインを壊し 2.5 s 以上を失う |
+| volume flux を方向で割って 2 本目のストリームへ（`flux_y,z` / `flux_z` を x/y GEMM の裏に） | device 3.0058 → 3.0245 / 3.0034 秒 | **不採用**（§8.7）。x GEMM は SM あたり 11,264 本しかレジスタを残さず、24 reg の flux ブロックは 1 個/SM しか同居できない。671 MB を 250 µs で流すには 2.7 TB/s 要るがその並列度では出ず、隠れないうえに GEMM を遅くする |
 | z-GEMM epilogue に assembly を融合 | 3.914 s → **3.603 s**（−8%） | **採用**。mainloop に触らず、DRAM 律速の独立カーネルだけを消す |
 | epilogue の barrier をまとめる | maxabs ≈ 500（数値不正）、改善なし | 不採用。CUTLASS 標準 epilogue は smem スロットを iteration ごとに再利用しており、tile 対応が壊れる |
 | auxiliary fragment の寿命短縮 | maxabs 2e-15（可）、3.60 → **3.70 s** | 不採用。load 直列化のレイテンシがレジスタ圧緩和を上回る |
@@ -792,7 +837,11 @@ z GEMM の SM throughput は lift を載せたことで 79.8 → 72.5%、レジ�
    （出力 1 点ごとに `p % Nq` / `p / Nq`）は −0.6%、CUTLASS の
    `operator++` が row しか進めないことを使って column 不変量を
    ループ外に括り出した版が −4.7% である。
-7. **帯域律速カーネルを GEMM の裏に隠す（2 本目のストリーム）。** §8.6 の
+7. ~~**帯域律速カーネルを GEMM の裏に隠す（2 本目のストリーム）。**~~ →
+   **完了（2026-08-25、§8.7）**。隠せたのは `elembnd_flux_kernel`（19.6 µs）
+   だけで、volume flux の分割は不採用。graph replay では損になるので graph
+   モードでは無効化している。Main は `GEMM_FUSED`（graph off）3.3723 →
+   3.3293 秒。以下は着手前の見立てである。§8.6 の
    再測定で、x GEMM（249.7 µs）と y GEMM（243.5 µs）は SM 88–89% で回りながら
    DRAM を 10.1% / 6.3% しか使っておらず、SM あたりのレジスタも 2 CTA ×
    27,136 = 54,272 / 65,536 で約 11k 本空いている。x GEMM が要るのは `flux_x`

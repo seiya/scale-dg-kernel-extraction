@@ -66,6 +66,15 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   p=7 `CUDAFORTRAN_SPLIT` 2.7172 → **2.6440** 秒で、旧実装と**ビット一致**。
   `q` だけをレジスタに退避した版は効かない。詳細は
   `overall_summary_report.md` §8.6 と `execution_times.md` 追記 10。
+- **境界流束を GEMM の裏に隠した（2026-08-25）**: x/y GEMM は SM 88–89% で
+  回りながら DRAM を 6–10% しか使わないので、その裏に帯域律速の
+  `elembnd_flux_kernel`（19.6 µs）を 2 本目のストリームで流し込んだ。nsys で
+  x GEMM の区間に完全に収まることを確認。Main は p=255 `GEMM_FUSED`（graph off）
+  3.3723 → **3.3293** 秒（−1.3%）、`GEMM_CUTE` 3.8820 → 3.8368。ビット一致。
+  **volume flux を方向で割って隠す案は不採用**で、理由は DRAM ではなく
+  レジスタ（x GEMM は SM あたり 11,264 本しか残さない）。**CUDA Graph の
+  replay では損になる**ので graph モードでは 1 本に戻している。詳細は
+  `overall_summary_report.md` §8.7 と `execution_times.md` 追記 11。
 - **TMA は FP64 では既製品が無い（2026-08-25、調査のみ）**: CuTe は `double` の
   tensor map を作れる（`copy_sm90_desc.hpp:220`）が、CUTLASS 4.7 の collective
   builder に FP64 特殊化は 1 つも無く、SM90 の builder が前提にする wgmma に
