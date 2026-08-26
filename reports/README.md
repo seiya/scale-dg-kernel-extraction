@@ -117,8 +117,8 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   追加し、`GEMM_CUTE` の 3 GEMM と `GEMM_FUSED` の融合 epilogue が従う。
   kK>4 の 2 形状は素の CUTLASS 2.x では**数値が壊れる**（64bit warp tile
   iterator が 4 深の K グループ前提）ので、kK=4 のイテレータを K 方向に
-  積み直す `cutlass_f64_kdeep_mma.h` を足した。4 形状とも `Ne=1` / `Ne=2` で
-  参照と一致する。
+  積み直す `cutlass_f64_kdeep_mma.h` を足した。4 形状とも GB200 の
+  `Ne=1` / `Ne=2` と H100 実機の DMMA の両方で参照と一致する。
   **GB200 では命令形状を変えても何も起きない**（4 形状が 0.1% 以内。ptxas が
   `mma.sync.m16n8k4/8/16.f64` を `DMMA.8x8x4` の 2 / 4 / 8 命令に展開するため。
   `sm_90` では 1 命令）。**H100 では逆に大きく効き、しかも効くのは cuBLAS が
