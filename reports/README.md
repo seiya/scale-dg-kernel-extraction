@@ -15,6 +15,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 ## 現時点の結論
 
 - **p=7, `Ne=32^3`**: `CUDAFORTRAN_FUSED_TC` が最速（commit `e22dda1` 以降）。
+  現時点の device 時間は 0.806 秒 / Main 1.066 秒（下の ±x 面の項目）。
   それ以前は `CUDAFORTRAN_FUSED` が最速だった。
   さらに occupancy を 100% に上げる作業（`tc_paper_survey_2407.09621.md` §7）で
   device 時間 1.076 → 0.851 秒。同じ知見を CUDA core 版にも適用すると
@@ -93,6 +94,30 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   レジスタ（x GEMM は SM あたり 11,264 本しか残さない）。**CUDA Graph の
   replay では損になる**ので graph モードでは 1 本に戻している。詳細は
   `overall_summary_report.md` §8.7 と `execution_times.md` 追記 11。
+- **p=7 の ±x 面 M 側 gather を shared 経由にした（2026-08-26）**: 全カーネルを
+  「何に律速され、上限に対してどこまで出ているか」で棚卸ししたところ
+  （`overall_summary_report.md` §13.1）、余地があるのは p=7 の tendency
+  （L1/TEX 91.8% 張り付き）だけだった。`-lineinfo` 付きの ncu Source ページで
+  超過セクタ 2477 万の帰属を命令単位に取ると、**6 面のうち ±x 面（面 2, 4）の
+  gather 8 本に全部乗っていた**。`Fmask` がその 2 面に `i0 + 8j + 64k` を
+  与えるので warp が 8 doubles 飛びになり、32 B セクタの 8 B しか使わない。
+  M 側は同じ要素の値で volume ロードが既にレジスタに持っているので、
+  4.6 KB の shared にステージングして読む。global load sectors
+  **95.9 M → 78.6 M（−18%）**、long scoreboard 35.1 → 24.0、device
+  **0.8497 → 0.8060 秒（−5.1%）**、Main 1.1092 → **1.0656**（graph on は
+  1.0738 → **1.0367**）。`63a4234` と**ビット一致**。
+  ここで一番高くついた誤りは `cudaSharedmemCarveoutMaxShared` を反射的に
+  足したことで、占有率は 1 ブロックも増えないまま L1 データキャッシュが削られ
+  **+31%** になった。詳細は `tc_paper_survey_2407.09621.md` §13。
+- **p=255 の RK 更新を z epilogue に融合するのは損（2026-08-26、不採用）**:
+  RK 更新カーネルは DRAM 79–87% で、削り代は転送量にしかない。`dqdt` の
+  往復 268 MB/stage を消すために z GEMM の epilogue で SSP-RK 更新まで
+  済ませたが、**オペランドを 3 本足すと z GEMM が 338.8 → 481.1 µs（+42%）**に
+  なり、RK カーネル 225.6 µs/step を消しても Main は 3.228 → 3.407 秒
+  （+5.5%）。帯域ではなく 4 ブロック/SM で隠せないロードレイテンシが実体で、
+  `tma_survey.md` §2 と同じ壁である。コードは差し戻した。p=7 側で同じことを
+  する案は、P 側 gather が隣接要素の `q` を読むためブロック間レースになり、
+  性能以前に成立しない。詳細は `overall_summary_report.md` §13.3。
 - **z GEMM の shared store バンクコンフリクトを消した（2026-08-26）**: 下の
   「未着手」項目の決着。**帰属が違っていて**、犯人は `MmaMultistage` ではなく
   **epilogue のアキュムレータ smem ステージング**だった（mainloop は `cp.async`

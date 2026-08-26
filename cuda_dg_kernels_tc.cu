@@ -89,6 +89,33 @@ __device__ __forceinline__ int sw_dz(int idx)
   return idx ^ (((idx >> 6) & 1) << 3);
 }
 
+// Stage the M-side fields of the two x-normal faces.  Node i + 8j + 64k lies
+// on face 2 when i == 7 and on face 4 when i == 0, and Fmask numbers both
+// faces by j + 8k, so the owning thread writes one face point of one plane.
+//
+// The fields are paired into two double2 arrays rather than kept field major.
+// Only eight lanes of a warp own an x-plane node, so the cost of this staging
+// is the number of shared instructions the whole warp issues, not the number
+// of values it writes: four 8-byte stores per node measured 2.8x the MIO
+// throttle of the version without staging.  Paired, one node costs two
+// stores and one face point two loads.  The plane stride of 68 double2 keeps
+// the two planes off the same banks, and consecutive face points read
+// consecutive double2, which is conflict free.
+#define XFACE_PLANE 72
+__device__ __forceinline__ void stage_xface(double *sM, int node, double q,
+                                            double u, double v, double w)
+{
+  const int i = node & 7;
+  if (i == 7 || i == 0) {
+    double *const m = sM + ((i == 7) ? 0 : XFACE_PLANE) + ((node >> 3) & 7) +
+                      ((node >> 6) << 3);
+    m[0] = q;
+    m[144] = u;
+    m[288] = v;
+    m[432] = w;
+  }
+}
+
 __global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
@@ -98,6 +125,18 @@ __global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
   __shared__ __align__(16) double sDfrag[64];
   __shared__ __align__(16) double sLift[48];
   __shared__ __align__(16) double sflux_bnd[384];
+  // M-side q, u, v and w of the two x-normal faces, indexed by face point.
+  // Fmask gives faces 2 and 4 the nodes 8j + 64k with i fixed, so a warp of
+  // consecutive face points gathers with a stride of 8 doubles and puts every
+  // lane in its own sector: 32 sectors per warp instruction where the y- and
+  // z-normal faces need 8.  ncu (job 49589, source page) attributed all
+  // 24.77 M excessive load sectors of this kernel to those four gathers.  The
+  // values are already in registers here, because the same element's volume
+  // loads produced them, so the two planes are staged instead of re-read.
+  // Field-major with a padded plane stride of 72, so that a face-point warp
+  // reads 32 consecutive doubles and the two planes of one store phase do not
+  // land on the same bank.
+  __shared__ __align__(16) double sMface[4 * 144];
   __shared__ __align__(16) double sFluxX[512], sFluxY[512], sFluxZ[512];
   // The z derivative overwrites the z flux it consumes, so the block needs
   // 15.87 KB instead of 20 KB. See the aliasing note above.
@@ -127,29 +166,53 @@ __global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
   }
   const int idx1 = elem_offset + node1;
   const int idx2 = elem_offset + node2;
-  sFluxX[sw_xy(node1)] = q[idx1] * u[idx1];
-  sFluxY[sw_xy(node1)] = q[idx1] * v[idx1];
-  sFluxZ[sw_z(node1)] = q[idx1] * w[idx1];
-  sFluxX[sw_xy(node2)] = q[idx2] * u[idx2];
-  sFluxY[sw_xy(node2)] = q[idx2] * v[idx2];
-  sFluxZ[sw_z(node2)] = q[idx2] * w[idx2];
+  {
+    const double q1 = q[idx1], u1 = u[idx1], v1 = v[idx1], w1 = w[idx1];
+    sFluxX[sw_xy(node1)] = q1 * u1;
+    sFluxY[sw_xy(node1)] = q1 * v1;
+    sFluxZ[sw_z(node1)] = q1 * w1;
+    stage_xface(sMface, node1, q1, u1, v1, w1);
+  }
+  {
+    const double q2 = q[idx2], u2 = u[idx2], v2 = v[idx2], w2 = w[idx2];
+    sFluxX[sw_xy(node2)] = q2 * u2;
+    sFluxY[sw_xy(node2)] = q2 * v2;
+    sFluxZ[sw_z(node2)] = q2 * w2;
+    stage_xface(sMface, node2, q2, u2, v2, w2);
+  }
+  // sMface is filled by whichever thread owns the node, which is not the
+  // thread that reads it as a face point.
+  __syncthreads();
 
   int fp = tid;
   int fidx = face_offset + fp;
-  int iM = VMapM[fidx] - 1;
+  // Face points 64-127 are face 2 and 192-255 are face 4, so bit 6 of fp
+  // selects the x-normal faces and bit 7 selects which of the two planes.
   int iP = VMapP[fidx] - 1;
-  double qM = q[iM];
+  const double fn1 = normal_fn[fidx];
+  const double fn2 = normal_fn[fidx + nface];
+  const double fn3 = normal_fn[fidx + 2 * nface];
+  double qM, VelM;
+  if ((fp & 64) != 0) {
+    const double *const m =
+        sMface + (((fp & 128) != 0) ? XFACE_PLANE : 0) + (fp & 63);
+    qM = m[0];
+    VelM = m[144] * fn1 + m[288] * fn2 + m[432] * fn3;
+  } else {
+    const int iM = VMapM[fidx] - 1;
+    qM = q[iM];
+    VelM = u[iM] * fn1 + v[iM] * fn2 + w[iM] * fn3;
+  }
   double qP = q[iP];
-  double VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
-                w[iM] * normal_fn[fidx + 2 * nface];
-  double VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
-                w[iP] * normal_fn[fidx + 2 * nface];
+  double VelP = u[iP] * fn1 + v[iP] * fn2 + w[iP] * fn3;
   double alpha = 0.5 * fabs(VelP + VelM);
   sflux_bnd[fp] = 0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
   if (tid < 128) {
+    // Faces 5 and 6 keep the global gather: Fmask gives them 32 consecutive
+    // nodes per warp, which is already the ideal sector count.
     fp = tid + 256;
     fidx = face_offset + fp;
-    iM = VMapM[fidx] - 1;
+    const int iM = VMapM[fidx] - 1;
     iP = VMapP[fidx] - 1;
     qM = q[iM];
     qP = q[iP];

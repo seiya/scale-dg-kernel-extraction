@@ -662,3 +662,60 @@ Slurm job `49543` / `49546`。
 | p=255 `Ne=1` `GEMM_FUSED` 変更後 vs 変更前（`SCALE_DG_DUMP_DQDT`） | ビット一致 |
 | p=255 `Ne=1` `GEMM_FUSED` vs `GEMM`（`SCALE_DG_VARYING_COEFF=1`） | 相対 4.16e-16 |
 | p=255 `Ne=2` `GEMM_FUSED` vs `GEMM`（同上） | 相対 4.16e-16 |
+
+---
+
+### 追記 14: p=7 の ±x 面 M 側 gather を shared 経由にした（2026-08-26）
+
+`cuda_dg_kernels_tc.cu` の `tendency_fused_p7_tc_kernel` で、面 2 と 4
+（±x 法線）の M 側 `q,u,v,w` を volume ロード時に shared へ退避し、
+face セクションから読む。global ロードセクタ 95.9 M → 78.6 M（−18%）。
+帰属の測り方と外した 3 版は `tc_paper_survey_2407.09621.md` §13、
+まとめは `overall_summary_report.md` §13.2。
+
+測定は login node、`nstep=1000`、版を交互に 4 ラウンド。ビルドは
+`make CUDA=1 GPUFLAGS=-gpu=cc100`。
+
+| path | graph | 変更前（`63a4234`）| 変更後 | |
+|---|---|---:|---:|---:|
+| p=7 `CUDAFORTRAN_FUSED_TC` Main | off | 1.1092 | **1.0656** | −3.9% |
+| p=7 `CUDAFORTRAN_FUSED_TC` Main | on | 1.0738 | **1.0367** | −3.5% |
+| p=7 `CUDA device fused tendency` | off | 0.8497 | **0.8060** | **−5.1%** |
+
+他のパスと p=255 は同じカーネルを通らないので不変
+（p=255 `GEMM_FUSED` の `q` はビット一致で確認）。
+
+数値検証（`SCALE_DG_VARYING_COEFF=1`）:
+
+| 比較 | 結果 |
+|---|---|
+| p=7 `Ne=2³` `FUSED_TC` 変更後 vs `63a4234`（owned `dqdt` 全点）| ビット一致 |
+| p=7 `Ne=4³` 同上 | ビット一致 |
+| p=7 `Ne=2³` `FUSED_TC` vs `CUDAFORTRAN_SPLIT` | max_abs_diff 1.78e-15 |
+| p=7 `Ne=4³` 同上 | max_abs_diff 2.86e-14 |
+| p=255 `Ne=1` `GEMM_FUSED` 変更後 vs 変更前（`q` 全点）| ビット一致 |
+
+CUDA ビルドと非 CUDA ビルドの両方が通ることを確認済み。
+
+### 追記 15: p=255 の RK 更新を z epilogue に融合するのは損（不採用、2026-08-26）
+
+`dqdt` のストアと読み戻し（ステージあたり 268 MB）を消すために、SSP-RK の
+ステージ更新を z GEMM の epilogue に入れた。namelist `FuseRKUpdate` で
+切り替える形で実装し、`nstep=1000` で測った（3 ラウンド）。
+
+| | Main |
+|---|---:|
+| `FuseRKUpdate = .false.` | **3.228 s** |
+| `FuseRKUpdate = .true.` | 3.407 s（**+5.5%**）|
+
+Slurm job `49674` の nsys でカーネル単位に分けると、z GEMM が
+338.8 → 481.1 µs（stage≥2）/ 452.0 µs（stage 1）に膨らみ、RK カーネル
+225.6 µs/step を消しても差し引き +172 µs/step になる。理由は帯域ではなく
+4 ブロック/SM で隠せないロードレイテンシで、`overall_summary_report.md`
+§13.3 に分解がある。**コードは差し戻した。**
+
+数値は融合版も正しく、`FuseRKUpdate` の on / off で `q` 全点が
+相対 2.22e-16（1 ulp）で一致した。ビット一致にはならず、更新式を
+4 通り（FMA を両向きに明示、契約なし）に書き分けても同じ 1 ulp だったので、
+差は更新の算術ではなく、epilogue の融合版・非融合版でテンデンシー式の
+スケジューリングが変わることに由来する。
