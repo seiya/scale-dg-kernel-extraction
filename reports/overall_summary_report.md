@@ -1024,6 +1024,51 @@ TMA はコピーエンジンであって MMA とは直交しているので、
 ほうが測定で裏が取れている。TMA を試すなら z GEMM に絞り、先に
 `ncu --set full` でレジスタ起因の stall を確認してから mainloop を書くこと。
 
+### 12.10 追記: 上の §12.9 を実測した結果、採用はゼロ（2026-08-26）
+
+§12.9 の最後の指示（「先に `ncu --set full` でレジスタ起因の stall を
+確認してから」）に従って実測した。**確認したら、狙いのほうが消えた。**
+詳細は `tma_survey.md`。以下は §12.9 の記述のうち訂正が要る箇所だけを挙げる。
+上の表と本文は 2026-08-25 時点の記録としてそのまま残す。
+
+1. **「狙えるとすれば z GEMM のレジスタ圧だけ」は成立しない。**
+   z GEMM は融合版・CUTE 版のどちらも `Block Limit Shared Mem` が **4** で、
+   CUTE 版はレジスタ 156 本（`Block Limit Registers` = 6）でも 4 ブロック/SM に
+   張り付いている。律速は dynamic shared memory 49.15 KB のほうなので、
+   **レジスタを mainloop から返しても occupancy は 12.5% から動かない**。
+   さらに、TMA が隠せる long scoreboard stall は融合版でも **11.33%** しかなく
+   （固定レイテンシ依存 36.64%、演算パイプ 20.44%）、融合 epilogue の増分時間の
+   実体は 5 本の追加オペランドの DRAM **701.7 MB/call**（理論 671.1 MB）である。
+   これはどのコピー機構でも減らない。
+
+2. **「p=7 は smem 28.2 KB × 8 = 225 KB でほぼ使い切っており余地が無い」は
+   `e22dda1` 以前の値である。** 現行の静的 smem は 16,256 B で、
+   `cudaOccupancyMaxActiveBlocksPerMultiprocessor` の実測では **+8,192 B まで
+   8 ブロック/SM を保てる**。ただし p=7 が不採用になった理由は予算ではなく
+   **レイアウト**で、TMA が 8 B 要素で符号化できる 4 通りのレイアウト全部で
+   x/y 収縮が 2-way バンクコンフリクトになる（`tma_survey.md` §3.2）。
+
+3. **「nvfortran は TMA を公開していないので `.cu` への移植が要る」は
+   `FUSED_TC` には当てはまらない**（最初から `.cu`）。CUDA core 版 `FUSED` には
+   当てはまる。
+
+4. **「8 B 要素で 128B swizzle atom が噛むかは未確認」→ 噛む。**
+   ただし swizzle を付けると最内 box 次元が 32B → 4、64B → 8、128B → 16 doubles に
+   固定される。加えて box の各次元は 256 要素以下、global ベースは 16 B 境界、
+   `globalStrides` は 16 B の倍数が必要である。
+
+5. **前提として、現行のビルドフラグでは TMA が有効になっていない。**
+   `Makefile:11` の `-arch=native` は sm_100 に解決され、CuTe の
+   `CUTE_ARCH_TMA_SM90_ENABLED` は sm_100 では定義されない（`sm_100a` / `sm_100f`
+   が要る）。
+
+6. **付随して見つかった、TMA より期待値の高い標的。** z GEMM は融合版・CUTE 版
+   ともに shared store が平均 8.3–8.5-way のバンクコンフリクトを起こしており、
+   全 store wavefronts の **52%**、ncu の推定改善余地は **28.8–30.5%** である。
+   両版で同値なので自作 epilogue ではなく **CUTLASS 標準の `MmaMultistage`** 側に
+   ある。p=255 最速パスの単独最大カーネル（nsys 340.0 µs、tendency の 31.6%）
+   なので、§12 の次の標的はここにすべきである。
+
 ---
 
 ## 13. 関連ファイル

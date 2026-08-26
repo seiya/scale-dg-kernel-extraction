@@ -10,6 +10,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`gpu_optimization_session_report.md`](gpu_optimization_session_report.md) | OpenACC → CUDA Fortran → Tensor Core / GEMM に至る実装の変遷と、途中で踏んだ誤り（代表スカラー特殊化）の記録 |
 | [`p255_gemm_fusion_session_report.md`](p255_gemm_fusion_session_report.md) | p=255 の volume GEMM と z-epilogue 融合の詳細実験 |
 | [`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) | arXiv:2407.09621 の取り込み調査と、p=7 Tensor Core カーネルの shared memory レイアウト刷新 |
+| [`tma_survey.md`](tma_survey.md) | TMA の適用可能性を候補ごとに実測した記録。採用ゼロだが、FP64 での受理条件・帯域・L1 挙動と、2 候補それぞれの構造的な不採用理由 |
 
 ## 現時点の結論
 
@@ -92,12 +93,33 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   レジスタ（x GEMM は SM あたり 11,264 本しか残さない）。**CUDA Graph の
   replay では損になる**ので graph モードでは 1 本に戻している。詳細は
   `overall_summary_report.md` §8.7 と `execution_times.md` 追記 11。
-- **TMA は FP64 では既製品が無い（2026-08-25、調査のみ）**: CuTe は `double` の
-  tensor map を作れる（`copy_sm90_desc.hpp:220`）が、CUTLASS 4.7 の collective
-  builder に FP64 特殊化は 1 つも無く、SM90 の builder が前提にする wgmma に
-  FP64 が無い。TMA + DMMA の mainloop は手書きなら書けるが、x/y GEMM は既に
-  FP64 ピークの 86–88% なので天井は上がらない。狙えるとすれば z GEMM の
-  レジスタ圧だけ。詳細は `overall_summary_report.md` §12.9。
+- **TMA は実測して採用ゼロ（2026-08-26、`tma_survey.md`）**: 前日の机上調査
+  （`overall_summary_report.md` §12.9）の続きを実測した。まず前提として、
+  現行の `-arch=native`(sm_100) では **CuTe の TMA は無効**で `sm_100a` が要る。
+  FP64 の tensor map は作れて転送も正しいが、**DRAM が飽和している限り
+  帯域の上積みは無い**（実形状 2 種で素のロードと 1.8% 以内）。TMA の正体は
+  「速い転送」ではなく**「L1/TEX とレジスタと発行スロットを使わない転送」**で、
+  同一バイトの対照実験で L1 wavefront −89%、global sector 1678 万 → **0**、
+  shared store コンフリクト 128 万 → **0**、レジスタ 30 → 16 になる。
+  そのうえで 2 候補とも不採用:
+  **p=255 z GEMM の epilogue** は、TMA が隠せる long scoreboard stall が
+  全体の **11.3%** しか無く（支配的なのは固定レイテンシ依存 36.6% と
+  演算パイプ 20.4%）、occupancy は **shared memory** で 4 ブロック/SM に
+  張り付いていてレジスタを返しても上がらない。増分時間の実体は
+  5 本の追加オペランドの **701.7 MB/call** で、これは減らせない。
+  **p=7 `FUSED_TC`** は L1/TEX 91.9%・long scoreboard 61.9% と理想的な標的
+  だったが、**TMA が 8 B 要素で符号化できる 4 通りのレイアウト全部で
+  x/y 収縮が 2-way バンクコンフリクト**になる。`sw_xy` が要求する
+  「ノード bit4 → アドレス bit2」を TMA の swizzle 語彙が表現できない
+  （行ビットは必ず最下位チャンクビットから当たるので bit4 は bit1 に落ち、
+  n1 自身の像と衝突する）。§12.9 の「smem に余地が無い」は古く、実際は
+  +8 KB まで 8 ブロック/SM を保てるが、落ちたのは予算ではなくレイアウトである。
+- **z GEMM の shared store に 8.5-way バンクコンフリクトがある（2026-08-26、未着手）**:
+  上の調査の副産物。p=255 最速パスの単独最大カーネル（nsys 340.0 µs、
+  tendency の 31.6%）で、shared store wavefronts の **52%** がコンフリクトで、
+  ncu の推定改善余地は **28.8–30.5%**。融合版と CUTE 版で同値なので、
+  自作 epilogue ではなく **CUTLASS 標準の `MmaMultistage`** 側にある。
+  **TMA より期待値が高い次の標的**（`tma_survey.md` §2.2）。
 - **tendency 以外（その 2）**: 時間発展ループの OpenACC 領域を `async` にし、
   CUDA / cuBLAS / CUTLASS のカーネルを同じストリームに載せて、カーネル間の
   GPU アイドルを 139 → 50 µs/step にした（2026-08-25）。Main は p=7 `FUSED_TC` で
