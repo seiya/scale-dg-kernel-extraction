@@ -3,7 +3,8 @@
 - 日付: 2026-08-26
 - 対象: `CUDAFORTRAN_GEMM_CUTE` / `CUDAFORTRAN_GEMM_FUSED` の volume GEMM
 - 測定環境: RIKYU NVIDIA GB200 1 GPU（login node で直接実行）、
-  `make CUDA=1 GPUFLAGS=-gpu=cc100`、nvcc は `-arch=native`（= `sm_100`）
+  `make CUDA=1 GPUFLAGS=-gpu=cc100`、nvcc は `-arch=native`（= `sm_100`）。
+  H100 側は TSUBAME job `8502531`（§8）
 - 測定した commit: 本レポートを追加したコミット（親 `9eed9e5`）と、
   K-deep 命令のイテレータを足したその次のコミット
 - 入力: `bench_runs/p255_gemm_cute.conf` / `bench_runs/p255_gemm_fused.conf`
@@ -41,8 +42,11 @@ ptxas が `mma.sync.m16n8k4/8/16.f64` を **`DMMA.8x8x4` の 2 / 4 / 8 命令に
 展開する**からである。Hopper が持っていた広い FP64 DMMA 命令は Blackwell の
 SM には無い。cuBLAS が GB200 で 8x8x4 のカーネルを選ぶのはこのためである。
 
-同じ理由で、H100 では意味がある変更でありうる。4 形状とも数値検証を通したので
-（§5）、TSUBAME ではそのまま測れる状態にしてある（§8）。
+**H100（`sm_90`）では逆に大きく効く。**同じコードを TSUBAME で測ると、volume
+GEMM だけの device 時間が `GEMM_CUTE` で **2.895 → 2.222 秒（−23%）**になる。
+ただし効いたのは cuBLAS が選ぶ **16x8x8 ではなく 16x8x4** で、H100 の最速は
+`GEMM_FUSED` + `16x8x4`（Main 5.711 秒、8x8x4 比 −7.2%、cuBLAS 比 −2.1%）
+だった。詳細は §8。
 
 ---
 
@@ -188,7 +192,7 @@ DMMA はすべて `DMMA.8x8x4` で、同じ仕事量あたりの本数も同じ�
 
 ---
 
-## 7. 性能（p=255 `Ne=1`, `nstep=1000`, 3 回の中央値）
+## 7. GB200 での性能（p=255 `Ne=1`, `nstep=1000`, 3 回の中央値）
 
 `Main` はホスト wall、`device` は `Volume derivate + surface lift` の
 CUDA event device 時間。3 回の測定はどれも ±0.3% 以内。**4 形状とも数値は
@@ -217,24 +221,68 @@ CUDA event device 時間。3 回の測定はどれも ±0.3% 以内。**4 形状
 
 ---
 
-## 8. 残っていること
+## 8. H100 での測定（TSUBAME、job `8502531`）
 
-- **H100 では未測定。** `sm_90` では 16x8x4 / 16x8x8 / 16x8x16 が本物の 1 命令に
-  なるので、TSUBAME で同じ namelist を振れば命令形状の効果がそのまま測れる。
-  4 形状すべてが数値検証を通っているので、追加の実装は要らない。
-  期待値の目安として、TSUBAME で採った既存の nsys から p=255 の volume GEMM
-  3 本の合計を拾うと:
+- GPU: NVIDIA H100 94 GB（`gpu_1=1`、host `r19n2`、driver 580.105.08、cc 9.0）
+- commit `f5794b7`、`nvfortran 26.1-0`、
+  `make CUDA=1 GPUFLAGS=-gpu=cc90 NVCCFLAGS='... -arch=sm_90 ...'`
+- 入力は GB200 と同じ p=255 `Ne=1` `nstep=1000`、`UseCudaGraph = .false.`
+- 投入は `job_tsubame_mma_shape.sh`（未コミットのジョブスクリプト）
 
-  | H100 | 3 本合計 |
-  |---|---:|
-  | cuBLAS（`tensor16x8x8`） | **34.1 ms** |
-  | 当時の CUTLASS（`d884`） | 57.4 ms |
+`Main` はホスト wall、`tendency` は tendency 全体の CUDA event device 時間、
+`volume GEMM` は volume GEMM だけの device 時間
+（`GEMM_FUSED` では融合 z epilogue を含む）。
 
-  **1.68 倍**の差がある。同じ比較を GB200 でやると 45.7 ms 対 45.4 ms で
-  ほぼ同着（`nsys_all_CUDAFORTRAN_GEMM_p255.sqlite` /
-  `..._GEMM_CUTE_p255.sqlite`）。ただしタイルが完全には揃っていない
-  （cuBLAS の z は 64x64x16、こちらは 64x32x16）ので純粋な切り分けではない。
-  今回の変更で、**同一タイルでの切り分けが H100 上でそのままできる**。
-- 16x8x16 は H100 でも K=32 タイル（shared 倍・occupancy 半分）が付いて回る。
-  cuBLAS も形状によってしか選んでいない（H100 の csv では
-  `tensor16x8x16` は `tilesize32x32x32`、`tensor16x8x8` は K=16）。
+| 経路 | 形状 | Main [s] | tendency [s] | volume GEMM [s] | 8x8x4 比 |
+|---|---|---:|---:|---:|---:|
+| cuBLAS（`CUDAFORTRAN_GEMM`） | — | 5.8324 | 4.9612 | — | — |
+| `GEMM_CUTE` | 8x8x4 | 6.9163 | 6.0110 | 2.8952 | 1.000 |
+| `GEMM_CUTE` | **16x8x4** | 6.1152 | 5.3388 | **2.2222** | **0.768** |
+| `GEMM_CUTE` | 16x8x8 | 6.3530 | 5.5762 | 2.4592 | 0.849 |
+| `GEMM_CUTE` | 16x8x16 | 8.3999 | 7.6219 | 4.5038 | 1.556 |
+| `GEMM_FUSED` | 8x8x4 | 6.1548 | 5.3902 | 4.0945 | 1.000 |
+| `GEMM_FUSED` | **16x8x4** | **5.7114** | **4.9048** | **3.6094** | **0.882** |
+| `GEMM_FUSED` | 16x8x8 | 6.1386 | 5.3735 | 4.0779 | 0.996 |
+| `GEMM_FUSED` | 16x8x16 | 12.7465 | 11.9644 | 10.6690 | 2.606 |
+
+### 8.1 読み取り
+
+1. **H100 では命令形状が効く。** GB200 では 4 形状が 0.1% 以内に並んだのに対し、
+   ここでは volume GEMM だけで最大 −23%。§6 の SASS の違いがそのまま出ている。
+2. **効くのは 16x8x4 で、cuBLAS が選ぶ 16x8x8 ではない。**
+   `GEMM_CUTE` で 16x8x4 が 0.768、16x8x8 が 0.849。DMMA の本数は 16x8x8 の方が
+   半分なのに遅い。GB200 でも 16x8x8 だけが 0.8〜1.8% 遅かったので、K を深くする
+   側に固有のコスト（K-deep イテレータの並べ替え、レジスタ圧、operand 供給）が
+   あると見るのが自然だが、**まだ切り分けていない**（§9）。
+3. **H100 の最速は `GEMM_FUSED` + `16x8x4`。** Main 6.1548 → 5.7114 秒（−7.2%）で、
+   cuBLAS の 5.8324 秒も下回る。**H100 では既定を 16x8x4 にする価値がある**
+   （GB200 では同着なので、既定を変えても損はしない）。
+4. `GEMM_FUSED` の比（0.882）が `GEMM_CUTE`（0.768）より 1 に近いのは、
+   この timer が帯域律速の融合 z epilogue を含むからで、GEMM 本体の改善が
+   薄まって見えているだけである。
+5. 16x8x16 は H100 でも大きく損。§4 の K=32 タイル（shared 倍・occupancy 半分）が
+   命令形状の利得を完全に食い潰す。
+
+### 8.2 このジョブで採れなかったもの
+
+- **カーネル単位の内訳（nsys）。** ジョブスクリプトの不具合で、cuBLAS 用の
+  プロファイル実行に `CutlassMmaShape = "cublas"` という不正な値を書き込んで
+  しまい、nsys 段の 1 本目で停止した（`nsys` 自身は成功を返すので気付きにくい）。
+  スクリプトは修正済み（ラベルと namelist 値を分離、`ERROR STOP` の検出、
+  `TIMING=0` で計測段を飛ばせる）。時間の表は別段階なので影響を受けていない。
+- **数値検証の出力。** 検証は 9 本とも走ったが（`run_logs/val_*.log`）、比較結果は
+  job の標準出力にしか出ていない。修正版は `validation.txt` にも残す。
+
+---
+
+## 9. 残っていること
+
+- **H100 で 16x8x8 が 16x8x4 に負ける理由の切り分け。** nsys でカーネル単位に
+  分けたうえで、`ncu` でレジスタ数・occupancy・stall 内訳を見る。候補は
+  K-deep イテレータの並べ替えコスト、operand レジスタの増加
+  （A が 2 → 4 本、B が 1 → 2 本）、`MmaMultistage` の k ループが
+  4 → 2 回に減ることによる待ちの露出。
+- **既定値をどうするか。** H100 で 16x8x4 が明確に速く、GB200 で同着である以上、
+  既定を `16x8x4` にする案がある。ただし `arch::Sm90` タグを既定にすることに
+  なるので、sm_80 以前で組む可能性を考えるならビルド時に分岐が要る。
+- 16x8x16 は K=32 タイルが必須である以上、このタイル構成では見込みが無い。

@@ -10,7 +10,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`gpu_optimization_session_report.md`](gpu_optimization_session_report.md) | OpenACC → CUDA Fortran → Tensor Core / GEMM に至る実装の変遷と、途中で踏んだ誤り（代表スカラー特殊化）の記録 |
 | [`p255_gemm_fusion_session_report.md`](p255_gemm_fusion_session_report.md) | p=255 の volume GEMM と z-epilogue 融合の詳細実験 |
 | [`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) | arXiv:2407.09621 の取り込み調査と、p=7 Tensor Core カーネルの shared memory レイアウト刷新 |
-| [`sm90_mma_shape_survey.md`](sm90_mma_shape_survey.md) | CUTLASS volume GEMM の MMA 命令形状（8x8x4 / 16x8x4 / 16x8x8 / 16x8x16）を namelist で選べるようにして実測した記録。GB200 では ptxas が SM90 の f64 MMA を `DMMA.8x8x4` に展開するため得るものが無い、という結論とその証拠。kK>4 を CUTLASS 2.x で正しく動かすための warp tile iterator も含む |
+| [`sm90_mma_shape_survey.md`](sm90_mma_shape_survey.md) | CUTLASS volume GEMM の MMA 命令形状（8x8x4 / 16x8x4 / 16x8x8 / 16x8x16）を namelist で選べるようにして実測した記録。GB200 では ptxas が SM90 の f64 MMA を `DMMA.8x8x4` に展開するため得るものが無く、H100 では 16x8x4 が最速（cuBLAS が選ぶ 16x8x8 ではない）。kK>4 を CUTLASS 2.x で正しく動かすための warp tile iterator も含む |
 | [`tma_survey.md`](tma_survey.md) | TMA の適用可能性を候補ごとに実測した記録。採用ゼロだが、FP64 での受理条件・帯域・L1 挙動と、2 候補それぞれの構造的な不採用理由 |
 
 ## 現時点の結論
@@ -115,15 +115,17 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   cuBLAS は `d884`（8x8x4）を選ぶ、という食い違いを実測で解決した。
   namelist `CutlassMmaShape`（`8x8x4` / `16x8x4` / `16x8x8` / `16x8x16`）を
   追加し、`GEMM_CUTE` の 3 GEMM と `GEMM_FUSED` の融合 epilogue が従う。
-  結論は**GB200 では命令形状を変えても何も起きない**で、理由は ptxas が
-  `mma.sync.m16n8k4/8/16.f64` を **`DMMA.8x8x4` の 2 / 4 / 8 命令に展開する**
-  こと（`sm_90` では 1 命令）。実測でも 16x8x4 は 8x8x4 と同時間
-  （device 3.7003 / 3.7028 秒）、16x8x8 は 0.8〜1.8% 遅い。
   kK>4 の 2 形状は素の CUTLASS 2.x では**数値が壊れる**（64bit warp tile
   iterator が 4 深の K グループ前提）ので、kK=4 のイテレータを K 方向に
-  積み直す `cutlass_f64_kdeep_mma.h` を足した。これで 4 形状とも `Ne=1` /
-  `Ne=2` で参照と一致し、**H100 で同一タイルの切り分けがそのままできる**
-  状態になっている。詳細は `sm90_mma_shape_survey.md`。
+  積み直す `cutlass_f64_kdeep_mma.h` を足した。4 形状とも `Ne=1` / `Ne=2` で
+  参照と一致する。
+  **GB200 では命令形状を変えても何も起きない**（4 形状が 0.1% 以内。ptxas が
+  `mma.sync.m16n8k4/8/16.f64` を `DMMA.8x8x4` の 2 / 4 / 8 命令に展開するため。
+  `sm_90` では 1 命令）。**H100 では逆に大きく効き、しかも効くのは cuBLAS が
+  選ぶ 16x8x8 ではなく 16x8x4**（TSUBAME job `8502531`）。volume GEMM の
+  device 時間は `GEMM_CUTE` で 2.895 → **2.222** 秒（−23%）、H100 の最速は
+  `GEMM_FUSED` + `16x8x4` で Main 6.155 → **5.711** 秒（cuBLAS 5.832 も下回る）。
+  詳細は `sm90_mma_shape_survey.md`。
 - **p=255 の RK 更新を z epilogue に融合するのは損（2026-08-26、不採用）**:
   RK 更新カーネルは DRAM 79–87% で、削り代は転送量にしかない。`dqdt` の
   往復 268 MB/stage を消すために z GEMM の epilogue で SSP-RK 更新まで
