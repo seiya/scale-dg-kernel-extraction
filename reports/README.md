@@ -10,6 +10,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`gpu_optimization_session_report.md`](gpu_optimization_session_report.md) | OpenACC → CUDA Fortran → Tensor Core / GEMM に至る実装の変遷と、途中で踏んだ誤り（代表スカラー特殊化）の記録 |
 | [`p255_gemm_fusion_session_report.md`](p255_gemm_fusion_session_report.md) | p=255 の volume GEMM と z-epilogue 融合の詳細実験 |
 | [`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) | arXiv:2407.09621 の取り込み調査と、p=7 Tensor Core カーネルの shared memory レイアウト刷新 |
+| [`h100_report.md`](h100_report.md) | H100（TSUBAME 4）で同じコードを走らせた記録。経路横断の GB200 比、FP64 Tensor Core ピークが 2 倍あることの帰結、H100 では `CutlassMmaShape = "16x8x4"` を選ぶこと |
 | [`sm90_mma_shape_survey.md`](sm90_mma_shape_survey.md) | CUTLASS volume GEMM の MMA 命令形状（8x8x4 / 16x8x4 / 16x8x8 / 16x8x16）を namelist で選べるようにして実測した記録。GB200 では ptxas が SM90 の f64 MMA を `DMMA.8x8x4` に展開するため得るものが無く、H100 では 16x8x4 が最速（cuBLAS が選ぶ 16x8x8 ではない）。kK>4 を CUTLASS 2.x で正しく動かすための warp tile iterator も含む |
 | [`tma_survey.md`](tma_survey.md) | TMA の適用可能性を候補ごとに実測した記録。採用ゼロだが、FP64 での受理条件・帯域・L1 挙動と、2 候補それぞれの構造的な不採用理由 |
 
@@ -123,7 +124,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   `mma.sync.m16n8k4/8/16.f64` を `DMMA.8x8x4` の 2 / 4 / 8 命令に展開するため。
   `sm_90` では 1 命令）。**H100 では逆に大きく効き、しかも効くのは cuBLAS が
   選ぶ 16x8x8 ではなく 16x8x4**（TSUBAME job `8502531`）。volume GEMM の
-  device 時間は `GEMM_CUTE` で 2.895 → **2.222** 秒（−23%）、H100 の最速は
+  device 時間は `GEMM_CUTE` で 2.907 → **2.225** 秒（−23%）、H100 の最速は
   `GEMM_FUSED` + `16x8x4` で Main 6.155 → **5.711** 秒（cuBLAS 5.832 も下回る）。
   カーネル単位では 16x8x8 の負けは **x GEMM 1 本に集中**（352.4 対 279.8 µs）。
   ncu によると原因は **レジスタ 255 本張り付きと 4.46 MB の spill**で、
@@ -132,7 +133,10 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   68.2 M → 56.2 M で解いている。volume GEMM 3 本の合計で
   cuBLAS との比は **1.68 → 1.27 倍**まで縮み、残りは mainloop の実装差
   （y GEMM は同一タイル・同一 stage でなお 1.23 倍）。
-  詳細は `sm90_mma_shape_survey.md`。
+  16x8x4 なら **H100 の volume GEMM は GB200 より 3% 速い**（741.7 対 765.3
+  µs/call）。**既定は GB200 の最速に合わせて `8x8x4` のまま**とし、H100 では
+  入力に `CutlassMmaShape = "16x8x4"` を足す。詳細は
+  `sm90_mma_shape_survey.md`、H100 全般は `h100_report.md`。
 - **p=255 の RK 更新を z epilogue に融合するのは損（2026-08-26、不採用）**:
   RK 更新カーネルは DRAM 79–87% で、削り代は転送量にしかない。`dqdt` の
   往復 268 MB/stage を消すために z GEMM の epilogue で SSP-RK 更新まで
