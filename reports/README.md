@@ -125,6 +125,10 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   選ぶ 16x8x8 ではなく 16x8x4**（TSUBAME job `8502531`）。volume GEMM の
   device 時間は `GEMM_CUTE` で 2.895 → **2.222** 秒（−23%）、H100 の最速は
   `GEMM_FUSED` + `16x8x4` で Main 6.155 → **5.711** 秒（cuBLAS 5.832 も下回る）。
+  カーネル単位では 16x8x8 の負けは **x GEMM 1 本に集中**（352.4 対 279.8 µs、
+  warp タイルが唯一 32x64x16 で accumulator 64 本）。volume GEMM 3 本の合計で
+  cuBLAS との比は **1.68 → 1.27 倍**まで縮み、残りは mainloop の実装差
+  （y GEMM は同一タイル・同一 stage でなお 1.23 倍）。
   詳細は `sm90_mma_shape_survey.md`。
 - **p=255 の RK 更新を z epilogue に融合するのは損（2026-08-26、不採用）**:
   RK 更新カーネルは DRAM 79–87% で、削り代は転送量にしかない。`dqdt` の
