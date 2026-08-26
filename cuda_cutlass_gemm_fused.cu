@@ -2,6 +2,9 @@
 #include <cstdio>
 
 #include "cutlass/cutlass.h"
+//- Must precede the device-level GEMM headers: it specializes
+//- DefaultMmaTensorOp for the K-deep f64 instruction shapes.
+#include "cutlass_f64_kdeep_mma.h"
 #include "cutlass/gemm/device/gemm.h"
 #include "cutlass/gemm/device/gemm_batched.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -26,9 +29,9 @@
 //
 // On sm_100 all four lower to the same DMMA.8x8x4 SASS instruction -- ptxas
 // expands m16n8k4/8/16 into 2/4/8 of them -- so none of this can be faster
-// there. Shapes 2 and 3 additionally do not reproduce the reference result:
-// the CUTLASS 2.x 64-bit warp tile iterator interleaves its k=4 groups across
-// the M/N atoms, which is not the operand order mma.sync.m16n8k8 expects.
+// there. On sm_90 each is a single instruction. Shapes 2 and 3 need the
+// warp-level iterators in cutlass_f64_kdeep_mma.h; the stock CUTLASS 2.x ones
+// only handle instructions four elements deep in K.
 // See reports/sm90_mma_shape_survey.md.
 
 //- Defined in cuda_dg_kernels_tc.cu; the stream shared by the whole CUDA path.

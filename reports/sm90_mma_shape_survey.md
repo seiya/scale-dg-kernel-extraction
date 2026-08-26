@@ -4,7 +4,8 @@
 - 対象: `CUDAFORTRAN_GEMM_CUTE` / `CUDAFORTRAN_GEMM_FUSED` の volume GEMM
 - 測定環境: RIKYU NVIDIA GB200 1 GPU（login node で直接実行）、
   `make CUDA=1 GPUFLAGS=-gpu=cc100`、nvcc は `-arch=native`（= `sm_100`）
-- 測定した commit: 本レポートを追加したコミット（親 `9eed9e5`）
+- 測定した commit: 本レポートを追加したコミット（親 `9eed9e5`）と、
+  K-deep 命令のイテレータを足したその次のコミット
 - 入力: `bench_runs/p255_gemm_cute.conf` / `bench_runs/p255_gemm_fused.conf`
   （p=255、`Ne=1`、`nstep=1000`、`UseCudaGraph` 未設定 = off）
 - 数値検証入力: `input_p255_val_gemm*.conf`（`nstep=1`）＋ `SCALE_DG_VARYING_COEFF=1`
@@ -40,7 +41,8 @@ ptxas が `mma.sync.m16n8k4/8/16.f64` を **`DMMA.8x8x4` の 2 / 4 / 8 命令に
 展開する**からである。Hopper が持っていた広い FP64 DMMA 命令は Blackwell の
 SM には無い。cuBLAS が GB200 で 8x8x4 のカーネルを選ぶのはこのためである。
 
-同じ理由で、H100 では意味がある変更でありうる（TSUBAME で測る価値は残る）。
+同じ理由で、H100 では意味がある変更でありうる。4 形状とも数値検証を通したので
+（§5）、TSUBAME ではそのまま測れる状態にしてある（§8）。
 
 ---
 
@@ -50,10 +52,12 @@ namelist `CutlassMmaShape` を追加した（既定 `"8x8x4"`）。
 
 | 値 | InstructionShape | ArchTag | tile K | 状態 |
 |---|---|---|---:|---|
-| `8x8x4` | `GemmShape<8,8,4>` | `Sm80` | 16 | 既定。参照と**ビット一致** |
-| `16x8x4` | `GemmShape<16,8,4>` | `Sm90` | 16 | 参照と**ビット一致** |
-| `16x8x8` | `GemmShape<16,8,8>` | `Sm90` | 16 | **数値が合わない**（§5）。計測用に残置 |
-| `16x8x16` | `GemmShape<16,8,16>` | `Sm90` | 32 | **数値が合わない**。加えてタイルが別（§4） |
+| `8x8x4` | `GemmShape<8,8,4>` | `Sm80` | 16 | 既定 |
+| `16x8x4` | `GemmShape<16,8,4>` | `Sm90` | 16 | 素の CUTLASS で通る |
+| `16x8x8` | `GemmShape<16,8,8>` | `Sm90` | 16 | `cutlass_f64_kdeep_mma.h` が要る（§5） |
+| `16x8x16` | `GemmShape<16,8,16>` | `Sm90` | 32 | 同上。加えてタイルが別（§4） |
+
+4 形状とも参照（cuBLAS）と**一致**する（§5.3）。
 
 threadblock / warp タイルと stage 数は 8x8x4 のものを据え置いた
 （x: 64x128x16 / 32x64x16 / 3 段、y: 64x64x16 / 32x32x16 / 4 段、
@@ -78,40 +82,82 @@ z assembly 融合 epilogue が同じ選択に従う。
 
 ---
 
-## 5. 数値検証
+## 5. K が 4 より深い命令は素の CUTLASS 2.x では動かない
+
+### 5.1 最初の測定（修正前）
 
 `SCALE_DG_VARYING_COEFF=1`、p=255 `Ne=1`、owned `dqdt` 全 16,777,216 点を
-`CUDAFORTRAN_GEMM`（cuBLAS）とフル比較した（`SCALE_DG_DUMP_DQDT`）。
-参照側の maxabs は 8.548。
+`CUDAFORTRAN_GEMM`（cuBLAS）とフル比較すると、参照の maxabs が 8.548 に対して
 
-| 経路 | 形状 | maxabs 差 |
-|---|---|---:|
-| `GEMM_CUTE` | 8x8x4 | **0.000e+00** |
-| `GEMM_CUTE` | 16x8x4 | **0.000e+00** |
-| `GEMM_CUTE` | 16x8x8 | 6.339e+02 |
-| `GEMM_CUTE` | 16x8x16 | 7.364e+02 |
-| `GEMM_FUSED` | 8x8x4 | 3.553e-15 |
-| `GEMM_FUSED` | 16x8x8 | 6.339e+02 |
+| 形状 | maxabs 差（修正前） |
+|---|---:|
+| 8x8x4 | 0.000e+00 |
+| 16x8x4 | 0.000e+00 |
+| 16x8x8 | **6.339e+02** |
+| 16x8x16 | **7.364e+02** |
 
-### なぜ k>4 で壊れるのか
+**kK = 4 の形状だけが通る**という結果だった。
+
+### 5.2 原因と修正
 
 CUTLASS 2.x の 64bit 用 warp tile iterator
-(`gemm/warp/mma_tensor_op_tile_iterator_sm80.h:86` ほか) は
-`Policy::Delta = PitchLinearShape<8,4>` で、**k を 4 ずつのグループに切って**
-`Iterations::kStrided = InstructionShape::kK / 4` 回ロードする。
-fragment のインデックスは `c + s * Iterations::kContiguous`、
-つまり **M/N の atom が内側、k グループが外側**に並ぶ。
-一方 `MmaTensorOp::operator()` は fragment を atom ごとの
-`ArchMmaOperator::FragmentA` の配列として reinterpret するので、
-atom は k を連続で持っていなければならない。
+(`gemm/warp/mma_tensor_op_tile_iterator_sm80.h`) は **4 深の K グループ**を前提に
+書かれている。
 
-- `kK = 4`（8x8x4、16x8x4）: k グループは 1 つだけなので順序問題は起きない。
-- `kK = 8, 16`（16x8x8、16x8x16）: 2 / 4 グループが atom 間に挟まって並び、
-  `mma.sync.m16n8k8` が期待する operand 順序と一致しない。
+- Congruous 版（`:86`）は `Policy::Delta = PitchLinearShape<8,4>` で
+  `access_idx = c + s * Iterations::kContiguous`。`c` が M/N のチャンク、
+  `s` が K グループなので、**K が外側**に並ぶ。atom ごとに K が連続していて
+  ほしい `mma.sync.m16n8k8` の operand 順序と食い違う。
+- Crosswise 版（`:841`）は順序自体は K が内側で合っているが、末尾の
+  64bit 入れ替え（`k_group_idx_ & 1`）と `operator++` の `byte_offset_ ^= 0x40`
+  が、**1 fragment = 1 個の 4 深グループ**という前提で書かれている。
+  kK=8 なら 1 fragment が 2 グループにまたがるので、片方は誤ったパリティで
+  読まれる。
 
-直すには f64 用の warp レベル演算子（fragment の並べ替え）を自作する必要がある。
-**GB200 では §2 のとおり見返りがゼロなので着手しない。**
-選択自体は計測のために残し、選ぶと setup で警告を出す。
+kK=4 ではグループが 1 つしかないので、どちらの問題も起きない。だから
+8x8x4 と 16x8x4 は通り、16x8x8 と 16x8x16 は壊れる。
+
+修正は `cutlass_f64_kdeep_mma.h`（新規）に置いた。swizzle を解き直すのではなく、
+**実績のある kK=4 のイテレータを kGroups 回まわして、atom ごとに連結する**:
+
+```
+KDeepMultiplicandTileIterator
+  Base = 同じ warp tile iterator を GroupInstructionShape（kK=4）で実体化
+  load()          : Base のコピーを kGroups 回 load / ++ し、
+                    dst[(atom * kGroups + g) * kRegsPerAtom + r]
+                      = src[atom * kRegsPerAtom + r]
+  operator++      : Base を kGroups 回進める
+  set_kgroup_index: Base には k_group * kGroups を渡す
+  add_tile_offset : K 方向の成分を kGroups 倍する
+```
+
+これがそのまま広い命令の operand 順序になる。f64 の `m16n8k8` の A は
+`m16n8k4` の A を K 方向に 2 つ積んだものであり（`cute/atom/mma_traits_sm90.hpp:67`
+の `ALayout` の value 側 stride が `(_8,_64)` = (M 半分, K 半分)）、B も同様、
+C は 3 形状で同一である。したがって epilogue には手を入れていない。
+
+差し込みは `cutlass::gemm::warp::DefaultMmaTensorOp` を
+（double、`GemmShape<16,8,8>` / `<16,8,16>`、`OpMultiplyAdd`）に対して特殊化し、
+`Type` を上のイテレータを使う `MmaTensorOpKDeep`（stock の `MmaTensorOp` から
+派生して IteratorA/B だけ差し替えたもの）にするだけである。`DefaultMmaCore`
+から下は自動的にこれを拾うので、`cuda_cutlass_gemm_fused.cu` 側は
+ヘッダを 1 行 include する以外そのままでよい。
+
+**SASS は増えていない。** 並べ替えはレジスタの割り当てが変わるだけで、
+DMMA 本数も LDS 本数も修正前と同じである（§6 の表）。
+
+### 5.3 修正後の数値検証
+
+`Ne=1` と `Ne=2`（スモーク）の両方、`GEMM_CUTE` と `GEMM_FUSED` の両方、
+4 形状すべてについて owned `dqdt` を全点比較した。
+
+| 経路 | 8x8x4 | 16x8x4 | 16x8x8 | 16x8x16 |
+|---|---:|---:|---:|---:|
+| `GEMM_CUTE`（`Ne=1`, `Ne=2`） | 0.000e+00 | 0.000e+00 | 0.000e+00 | 0.000e+00 |
+| `GEMM_FUSED`（`Ne=1`, `Ne=2`） | 3.553e-15 | 3.553e-15 | 3.553e-15 | 3.553e-15 |
+
+`GEMM_FUSED` の 3.553e-15 は融合 epilogue の加算順序による既存の差で、
+8x8x4 のときと同じ値である。
 
 ---
 
@@ -144,28 +190,27 @@ DMMA はすべて `DMMA.8x8x4` で、同じ仕事量あたりの本数も同じ�
 
 ## 7. 性能（p=255 `Ne=1`, `nstep=1000`, 3 回の中央値）
 
-`Main` はホスト wall、`dev` は `Volume derivate + surface lift` の
-CUDA event device 時間。3 回の測定はどれも ±0.3% 以内だったので中央値を載せる。
+`Main` はホスト wall、`device` は `Volume derivate + surface lift` の
+CUDA event device 時間。3 回の測定はどれも ±0.3% 以内。**4 形状とも数値は
+一致している**ので、そのまま比較してよい。
 
 | 経路 | 形状 | Main [s] | device [s] | 8x8x4 比 |
 |---|---|---:|---:|---:|
-| `GEMM_CUTE` | 8x8x4 | 3.7400 | 3.7013 | 1.000 |
-| `GEMM_CUTE` | 16x8x4 | 3.7402 | 3.7012 | **1.000** |
-| `GEMM_CUTE` | 16x8x8 †| 3.7583 | 3.7195 | 1.005 |
-| `GEMM_CUTE` | 16x8x16 †| 5.3848 | 5.3388 | 1.442 |
-| `GEMM_FUSED` | 8x8x4 | 3.2321 | 3.1943 | 1.000 |
-| `GEMM_FUSED` | 16x8x4 | 3.2310 | 3.1944 | **1.000** |
-| `GEMM_FUSED` | 16x8x8 †| 3.3138 | 3.2767 | 1.026 |
-| `GEMM_FUSED` | 16x8x16 †| 7.4703 | 7.4203 | 2.323 |
+| `GEMM_CUTE` | 8x8x4 | 3.7401 | 3.7028 | 1.000 |
+| `GEMM_CUTE` | 16x8x4 | 3.7388 | 3.7003 | **0.999** |
+| `GEMM_CUTE` | 16x8x8 | 3.7694 | 3.7306 | 1.008 |
+| `GEMM_CUTE` | 16x8x16 | 5.4156 | 5.3688 | 1.450 |
+| `GEMM_FUSED` | 8x8x4 | 3.2329 | 3.1981 | 1.000 |
+| `GEMM_FUSED` | 16x8x4 | 3.2307 | 3.1961 | **0.999** |
+| `GEMM_FUSED` | 16x8x8 | 3.2894 | 3.2550 | 1.018 |
+| `GEMM_FUSED` | 16x8x16 | 7.5262 | 7.4754 | 2.338 |
 
-† 数値が合わない版（§5）。仕事量と発行命令数は正しい版と同じなので、
-時間の比較材料としては意味がある。
-
-- **16x8x4 は 8x8x4 と完全に同じ**（差 0.0〜0.1%、測定ばらつきの範囲）。
-  §6 のとおり SASS が同一なのだから当然である。
-- 16x8x8 が 0.5〜2.6% 遅いのは、PTX 1 命令あたり 4 個の `DMMA.8x8x4` に
-  展開される際のレジスタ配置の都合と思われる。得るものは無い。
-- 16x8x16 が大きく遅いのは §4 のタイル（K=32、shared 倍、occupancy 半分）。
+- **16x8x4 は 8x8x4 と同じ**（差 0.1%、測定ばらつきの範囲）。§6 のとおり
+  SASS が同一なのだから当然である。
+- 16x8x8 が 0.8〜1.8% 遅いのは、PTX 1 命令が 4 個の `DMMA.8x8x4` に展開される
+  ときのレジスタ配置の都合と思われる（DMMA 本数も LDS 本数も同じ）。
+- 16x8x16 が大きく遅いのは §4 のタイル（K=32、shared 倍、occupancy 半分）で、
+  命令形状の効果ではない。
 
 命令形状で SASS が変わらない以上、nsys / ncu によるカーネル単位の分解は
 行っていない。分解すべき差が存在しない。
@@ -174,11 +219,22 @@ CUDA event device 時間。3 回の測定はどれも ±0.3% 以内だったの�
 
 ## 8. 残っていること
 
-- **H100 では未測定。** `sm_90` では 16x8x4 / 16x8x8 / 16x8x16 が本物の
-  1 命令になるので、TSUBAME で同じ namelist を振れば cuBLAS の選択
-  （`tensor16x8x8`）の妥当性をそのまま確かめられる。ただし 16x8x8 を
-  使うには先に §5 の operand 順序を直す必要がある。
-- **16x8x8 を正しくするには** f64 用の warp レベル演算子を自作して
-  fragment を並べ替えるか、CuTe（`SM90_16x8x8_F64F64F64F64_TN`、
-  `cute/atom/mma_traits_sm90.hpp:64`）で mainloop を書き直す必要がある。
-  GB200 では見返りがゼロなので着手していない。
+- **H100 では未測定。** `sm_90` では 16x8x4 / 16x8x8 / 16x8x16 が本物の 1 命令に
+  なるので、TSUBAME で同じ namelist を振れば命令形状の効果がそのまま測れる。
+  4 形状すべてが数値検証を通っているので、追加の実装は要らない。
+  期待値の目安として、TSUBAME で採った既存の nsys から p=255 の volume GEMM
+  3 本の合計を拾うと:
+
+  | H100 | 3 本合計 |
+  |---|---:|
+  | cuBLAS（`tensor16x8x8`） | **34.1 ms** |
+  | 当時の CUTLASS（`d884`） | 57.4 ms |
+
+  **1.68 倍**の差がある。同じ比較を GB200 でやると 45.7 ms 対 45.4 ms で
+  ほぼ同着（`nsys_all_CUDAFORTRAN_GEMM_p255.sqlite` /
+  `..._GEMM_CUTE_p255.sqlite`）。ただしタイルが完全には揃っていない
+  （cuBLAS の z は 64x64x16、こちらは 64x32x16）ので純粋な切り分けではない。
+  今回の変更で、**同一タイルでの切り分けが H100 上でそのままできる**。
+- 16x8x16 は H100 でも K=32 タイル（shared 倍・occupancy 半分）が付いて回る。
+  cuBLAS も形状によってしか選んでいない（H100 の csv では
+  `tensor16x8x16` は `tilesize32x32x32`、`tensor16x8x8` は K=16）。

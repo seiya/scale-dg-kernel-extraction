@@ -113,16 +113,6 @@ contains
         write(*,*) "Choose 8x8x4, 16x8x4, 16x8x8 or 16x8x16"
         error stop
       end select
-
-      if (cutlass_mma_shape_id >= 2) then
-        write(*,*) "WARNING: CutlassMmaShape=", trim(cutlass_mma_shape), &
-          " does not reproduce the reference dqdt."
-        write(*,*) "  The CUTLASS 2.x 64-bit warp tile iterator loads k in groups", &
-          " of 4 interleaved across the M/N atoms, which is not the operand order", &
-          " that mma.sync.m16n8k8 / m16n8k16 expect."
-        write(*,*) "  It is kept selectable for measurement only. On sm_100 these", &
-          " shapes are expanded to DMMA.8x8x4 by ptxas, so there is nothing to win."
-      end if
     end if
 
     select case (trim(dqdt_kernel_type))
