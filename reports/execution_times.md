@@ -631,3 +631,34 @@ z-epilogue に対して得たのと同じ罠である）。owned 領域 `q(:,1:N
 | p=7 `Ne=8³` `FUSED_TC` `nstep=200` 変更後 vs 変更前 | ビット一致 |
 | 同上 graph on vs graph off | ビット一致 |
 | CPU/OpenMP ビルド（`OPENACC_ASIS`）vs GPU | max_abs_diff 2.7e-20 |
+
+---
+
+### 追記 13: p=255 z GEMM の shared store バンクコンフリクトを消した（2026-08-26）
+
+`tma_survey.md` §2.2 が残していた標的。`cuda_cutlass_gemm_fused.cu` の z GEMM で
+epilogue のアキュムレータ smem タイルの padding を 4 → 8 doubles にし、
+行ストライドを 36 → 40 doubles（= バンク 16 本ぶん）にした。原因と帰属の訂正は
+`overall_summary_report.md` §8.9 を参照。
+
+測定は login node、`bench_runs/p255_gemm_fused.conf`（`nstep=1000`、graph off）、
+版を交互に 3 ラウンド。ビルドは `make CUDA=1 GPUFLAGS=-gpu=cc100`。
+
+| 版 | Main | `CUDA device GEMM fused` | `FUSED volume GEMM only` |
+|---|---:|---:|---:|
+| 前（`9eff7f8`） | 3.2315 | 2.9647 | 2.5559 |
+| 後 | 3.2313 | 2.9642 | 2.5551 |
+
+**時間は動かない**（差はラウンド間ばらつきの内側）。ncu では
+shared store のバンクコンフリクトが 1,165,739 → 136,379（−88%）、
+store wavefronts が 2.21 M → 1.18 M（理想 1.05 M）まで落ちているので、
+消えていないのではなく、このカーネルが shared 経路で律速されていない。
+Slurm job `49543` / `49546`。
+
+数値検証:
+
+| 比較 | 結果 |
+|---|---|
+| p=255 `Ne=1` `GEMM_FUSED` 変更後 vs 変更前（`SCALE_DG_DUMP_DQDT`） | ビット一致 |
+| p=255 `Ne=1` `GEMM_FUSED` vs `GEMM`（`SCALE_DG_VARYING_COEFF=1`） | 相対 4.16e-16 |
+| p=255 `Ne=2` `GEMM_FUSED` vs `GEMM`（同上） | 相対 4.16e-16 |

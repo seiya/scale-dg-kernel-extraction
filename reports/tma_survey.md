@@ -198,6 +198,82 @@ TMA とは無関係だが、A-0 の `--set full` が別の標的を見つけた�
 z GEMM は現行 p=255 最速パスの単独最大カーネル（nsys 340.0 µs、tendency の 31.6%）
 なので、TMA よりこちらのほうが期待値が高い。§5 に次の一手として残す。
 
+### 2.3 追記: 潰した。ただし帰属は `MmaMultistage` ではなく epilogue だった（2026-08-26）
+
+commit は本追記と同じもの。測定は Slurm job `49543` / `49546`、p=255 `Ne=1`、
+`-s 6 -c 3`、`UseCudaGraph = .false.`、凍結実行ファイル
+`scale-dg_extraction.zbank0`（`9eff7f8`）と `.zbank1`（修正後）。
+
+**§2.2 の「自作 epilogue ではなく CUTLASS 標準の `MmaMultistage` が
+`RegularTileAccessIterator` で A/B タイルを書くところにある」は誤りである。**
+根拠は 2 つある。
+
+1. **mainloop は STS を 1 命令も出さない。** sm80 multistage の global→smem は
+   `cp.async`（LDGSTS）で、`..._pipe_lsu_mem_shared_op_st` には計上されない。
+2. **命令数が epilogue と完全に一致する。** z GEMM は TB 64×32 / warp 32×32 /
+   inst 8×8×4 の 2 warp なので、`TensorOpPolicy<32×32, 8×8×4, RowMajor>` から
+   `kIterations = 4`、`TileIteratorTensorOp::store` は 1 回あたり
+   `OperatorCount::kColumn = 4` 本の STS.128。1 block = 2 warp × 4 × 4 =
+   **32 STS**、grid 8192 block で **262,144** となり、§2.2 の実測 requests と
+   一致する。wavefront も、STS.128 の理想 4/命令から 262,144 × 4 = 1,048,576 で、
+   実測 2,220,563 との差が 1,171,987 ≒ 実測コンフリクト 1,172,013 に一致する。
+   つまり実効 8.47 wavefront/命令 = **2-way** であり、§2.2 の「8.3–8.5-way」は
+   way 数ではなく wavefront/request の値だった。
+
+原因は `DefaultEpilogueTensorOp` の
+`Padding = MatrixShape<0, 64/sizeof_bits<ElementAccumulator> * 4>`
+（`default_epilogue_tensor_op.h:604`）で、`double` では 4。アキュムレータ
+ステージングタイルは 16 行 × 36 doubles、行ストライド 288 B = 72 word となり、
+`72 mod 32 = 8` なので連続 2 行のバンク集合（16 バンク幅）が 8 バンク重なる。
+Padding を **8** にすると行ストライド 40 doubles = 80 word、`80 mod 32 = 16` で
+2 行がちょうど 32 バンクを 1 回ずつ覆う。
+
+実装は `cutlass_z_gemm_assembly.h` の `RepadEpilogue`（既定 Epilogue の公開
+typedef から `Padding` だけ差し替えたエイリアス）で、`cuda_cutlass_gemm_fused.cu`
+の z GEMM だけに適用した。epilogue の smem は mainloop の 49,152 B と union
+なので確保量は不変、occupancy も不変。出力は旧実装と**ビット一致**。
+
+| z GEMM（`GemmBatchedDqdtAssembly`） | 前（`zbank0`） | 後（`zbank1`） |
+|---|---:|---:|
+| shared store wavefronts | 2,214,315 | **1,184,955** |
+| shared store バンクコンフリクト | 1,165,739 | **136,379** |
+| shared load バンクコンフリクト | 211,956 | 212,406 |
+| **LDGSTS バンクコンフリクト** | 3,869,027 | 3,824,290 |
+| L1/TEX throughput | 56.33% | 55.13% |
+| Compute (SM) throughput | 72.30% | 72.18% |
+| duration（ncu クロック） | 597.9 µs | 595.4 µs |
+
+**コンフリクトは狙いどおり消えたが、時間は動かなかった。** login node、
+`bench_runs/p255_gemm_fused.conf`（`nstep=1000`）で版を交互に 3 ラウンド
+測った Main は 3.2315 / 3.2313 秒（前 / 後）、`CUDA device GEMM fused` は
+2.9647 / 2.9642 秒で、いずれも差はラウンド間のばらつきの内側である。
+§2 の stall 内訳（wait 36.6% / math pipe 20.4% / long scoreboard 11.3%）が
+示していたとおり、このカーネルは shared 経路では律速されていない。
+**ncu の「推定改善余地 30.5%」は shared 経路単独の上限であって、
+カーネル時間の予測ではない。**
+
+### 2.4 副産物のさらに副産物: LDGSTS 側のほうがコンフリクトは大きい
+
+上の表の 4 行目のとおり、**mainloop の `cp.async` は STS の 3 倍以上の
+バンクコンフリクトを出している**（z で 3.87 M）。同じ job で x / y GEMM も
+測ると、3 本とも epilogue 側（STS）と mainloop 側（LDGSTS）の両方を持つ:
+
+| カーネル | duration | SM tput | STS コンフリクト | LDGSTS コンフリクト |
+|---|---:|---:|---:|---:|
+| x GEMM `Gemm` 64×128 | 462.0 µs | 88.15% | 1,092,914 | 632,474 |
+| y GEMM `GemmBatched` 64×64 | 472.3 µs | 88.20% | 1,122,049 | 2,092,773 |
+| z GEMM `DqdtAssembly` 64×32（修正前） | 597.9 µs | 72.30% | 1,165,739 | 3,869,027 |
+
+x / y は device 側 API（`cutlass::gemm::device::Gemm` / `GemmBatched`）を
+通しているので `Padding` を差し替えられず、今回は触っていない。どちらも
+SM 88% の演算律速で、z で時間が動かなかった以上、期待値は低い。
+
+LDGSTS 側は `MmaPolicy` の smem padding が `MatrixShape<0,0>` 固定
+（`default_mma_core_sm80.h:193` ほか）で、`TensorOpMultiplicandCongruous64b` /
+`TensorOpMultiplicand64bCrosswise` の swizzle も非テンプレートのハードコードなので、
+**CUTLASS 側に調整の余地が無い**。潰すには third_party の改変か mainloop の
+手書き（§5 の候補 C）が要る。z の結果から見て時間で報われる見込みは薄い。
+
 ---
 
 ## 3. 候補 B の標的確認: p=7 `FUSED_TC`（B-0）
@@ -336,6 +412,11 @@ TMA が減らすのは L1・レジスタ・発行スロットである。した�
 ncu 推定 28.8–30.5% と桁が違う。
 
 **次の一手として推奨するのは TMA ではなく §2.2 である。**
+
+（2026-08-26 追記: その §2.2 は実施済み。コンフリクトは −88% になったが
+カーネル時間は動かなかった。帰属の訂正も含めて §2.3 / §2.4 を参照。
+候補 C の前提も 1 つ増えた: mainloop の LDGSTS 側にはさらに大きな
+コンフリクトがあるが、CUTLASS 側に調整の余地が無い。）
 
 ---
 

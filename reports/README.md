@@ -93,6 +93,22 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   レジスタ（x GEMM は SM あたり 11,264 本しか残さない）。**CUDA Graph の
   replay では損になる**ので graph モードでは 1 本に戻している。詳細は
   `overall_summary_report.md` §8.7 と `execution_times.md` 追記 11。
+- **z GEMM の shared store バンクコンフリクトを消した（2026-08-26）**: 下の
+  「未着手」項目の決着。**帰属が違っていて**、犯人は `MmaMultistage` ではなく
+  **epilogue のアキュムレータ smem ステージング**だった（mainloop は `cp.async`
+  なので STS を 1 命令も出さない）。`DefaultEpilogueTensorOp` の
+  `Padding = <0,4>` が行ストライドを 36 doubles = 72 word にしていて
+  `72 mod 32 = 8`、連続 2 行のバンクが 8 本重なる 2-way。Padding を 8 にすると
+  行ストライド 40 doubles で 2 行が 32 バンクを 1 回ずつ覆う。
+  コンフリクト **1,165,739 → 136,379（−88%）**、store wavefronts
+  2.21 M → 1.18 M（理想 1.05 M）。smem は mainloop と union なので**コストゼロ**、
+  出力は**ビット一致**。ただし **Main は 3.2315 → 3.2313 秒で時間は動かない**。
+  このカーネルは wait 36.6% / math pipe 20.4% が支配的で shared 経路では
+  律速されていない。**ncu の「推定改善余地 30.5%」はその経路単独の上限であって
+  カーネル時間の予測ではない**、が本件の一番の知見。副産物として、
+  mainloop の LDGSTS 側にさらに大きなコンフリクト（z で 3.87 M）があるが、
+  CUTLASS 側に調整の余地が無い。詳細は `overall_summary_report.md` §8.9 と
+  `tma_survey.md` §2.3 / §2.4。
 - **TMA は実測して採用ゼロ（2026-08-26、`tma_survey.md`）**: 前日の机上調査
   （`overall_summary_report.md` §12.9）の続きを実測した。まず前提として、
   現行の `-arch=native`(sm_100) では **CuTe の TMA は無効**で `sm_100a` が要る。
@@ -114,7 +130,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   （行ビットは必ず最下位チャンクビットから当たるので bit4 は bit1 に落ち、
   n1 自身の像と衝突する）。§12.9 の「smem に余地が無い」は古く、実際は
   +8 KB まで 8 ブロック/SM を保てるが、落ちたのは予算ではなくレイアウトである。
-- **z GEMM の shared store に 8.5-way バンクコンフリクトがある（2026-08-26、未着手）**:
+- **z GEMM の shared store に 8.5-way バンクコンフリクトがある（2026-08-26、着手済み → 上の項目）**:
   上の調査の副産物。p=255 最速パスの単独最大カーネル（nsys 340.0 µs、
   tendency の 31.6%）で、shared store wavefronts の **52%** がコンフリクトで、
   ncu の推定改善余地は **28.8–30.5%**。融合版と CUTE 版で同値なので、

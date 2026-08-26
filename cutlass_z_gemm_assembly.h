@@ -214,6 +214,32 @@ public:
   }
 };
 
+// The accumulator tile is staged through shared memory before the epilogue
+// reads it back in the output layout. DefaultEpilogueTensorOp pads that tile by
+// 64 / sizeof_bits<double> * 4 = 4 doubles, so a row is 36 doubles = 72 words
+// wide. One STS.128 phase covers eight lanes, i.e. two consecutive rows, and
+// 72 mod 32 = 8, so the second row starts eight banks into the first row's
+// sixteen: every accumulator store is a 2-way conflict and costs eight
+// wavefronts instead of four.
+//
+// A row stride of 8 doubles mod 16 puts consecutive rows exactly sixteen banks
+// apart, so the two rows of a phase tile the 32 banks once. Padding by 8 gives
+// that for the 32-, 64- and 128-column threadblock tiles alike. The epilogue
+// tile shares a union with the mainloop's 48 KB, so this costs no shared
+// memory and no occupancy.
+template <typename Epilogue_, int PaddingColumn>
+using RepadEpilogue = cutlass::epilogue::threadblock::Epilogue<
+    typename Epilogue_::Shape,
+    typename Epilogue_::WarpMmaOperator,
+    Epilogue_::kPartitionsK,
+    typename Epilogue_::OutputTileIterator,
+    typename Epilogue_::AccumulatorFragmentIterator,
+    typename Epilogue_::WarpTileIterator,
+    typename Epilogue_::SharedLoadIterator,
+    typename Epilogue_::OutputOp,
+    cutlass::MatrixShape<0, PaddingColumn>,
+    Epilogue_::kFragmentsPerIteration>;
+
 template <typename Mma_, typename Epilogue_, typename ThreadblockSwizzle_>
 struct GemmBatchedDqdtAssembly {
   using Mma = Mma_;

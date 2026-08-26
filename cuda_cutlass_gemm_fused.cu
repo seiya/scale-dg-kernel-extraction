@@ -138,9 +138,11 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
   const int k = Nq;
 
   using GemmZ = GemmBatchedNN_64x32_4;
+  //- Same epilogue, with the accumulator staging tile padded so the stores are
+  //- bank-conflict free. See RepadEpilogue in cutlass_z_gemm_assembly.h.
+  using ZEpilogue = RepadEpilogue<typename GemmZ::GemmKernel::Epilogue, 8>;
   using Kernel = GemmBatchedDqdtAssembly<typename GemmZ::GemmKernel::Mma,
-                                         typename GemmZ::GemmKernel::Epilogue,
-                                         BatchedSwizzle>;
+                                         ZEpilogue, BatchedSwizzle>;
 
   cutlass::TensorRef<double const, ColumnMajor> ref_A(flux_z, m);
   cutlass::TensorRef<double const, ColumnMajor> ref_B(D1D_tr, k);
