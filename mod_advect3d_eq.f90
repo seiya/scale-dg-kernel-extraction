@@ -16,7 +16,7 @@ module mod_advect3d_eq
     cuda_cal_dqdt_fused, cuda_cal_dqdt_fused_p255, &
     cuda_cal_dqdt_fused_tc, cuda_cal_dqdt_fused_p255_tc, &
     cuda_cal_dqdt_gemm, cuda_cal_dqdt_gemm_fused, cuda_cal_dqdt_gemm_cute, &
-    cuda_gemm_setup, cuda_gemm_finalize, &
+    cuda_gemm_setup, cuda_cutlass_set_mma_shape, cuda_gemm_finalize, &
     cuda_cal_elembnd_flux, cuda_dg_bind_acc_stream, &
     cuda_dg_flush_kernel_time, cuda_dg_set_event_timing, &
     cuda_dg_set_side_stream, &
@@ -70,6 +70,9 @@ module mod_advect3d_eq
   integer :: dqdt_kernel_typeid
   character(len=24) :: dqdt_kernel_name
   logical :: cublas_emulation_enabled = .false.
+  !> MMA instruction shape of the CUTLASS volume GEMMs (GEMM_CUTE / GEMM_FUSED).
+  !! 0 = SM80 8x8x4, 1 = SM90 16x8x4, 2 = SM90 16x8x8, 3 = SM90 16x8x16.
+  integer :: cutlass_mma_shape_id = 0
 
   real(RP), allocatable :: ebnd_flux(:,:)
   real(RP), allocatable :: volume_flux_x(:,:)
@@ -83,14 +86,44 @@ module mod_advect3d_eq
 contains
   !> Setup
 !OCL SERIAL
-  subroutine setup_advect3d_eq_setup(NfpTot, Np, Ne, dqdt_kernel_type, cublas_emulation)
+  subroutine setup_advect3d_eq_setup(NfpTot, Np, Ne, dqdt_kernel_type, cublas_emulation, &
+    cutlass_mma_shape)
     implicit none
     integer, intent(in) :: NfpTot, Np, Ne
     character(len=*), intent(in) :: dqdt_kernel_type
     logical, intent(in), optional :: cublas_emulation
+    character(len=*), intent(in), optional :: cutlass_mma_shape
     !------------------------------------------------------------------------------
     cublas_emulation_enabled = .false.
     if (present(cublas_emulation)) cublas_emulation_enabled = cublas_emulation
+
+    cutlass_mma_shape_id = 0
+    if (present(cutlass_mma_shape)) then
+      select case (trim(cutlass_mma_shape))
+      case ("8x8x4", "")
+        cutlass_mma_shape_id = 0
+      case ("16x8x4")
+        cutlass_mma_shape_id = 1
+      case ("16x8x8")
+        cutlass_mma_shape_id = 2
+      case ("16x8x16")
+        cutlass_mma_shape_id = 3
+      case default
+        write(*,*) "Unsupported CutlassMmaShape: ", trim(cutlass_mma_shape)
+        write(*,*) "Choose 8x8x4, 16x8x4, 16x8x8 or 16x8x16"
+        error stop
+      end select
+
+      if (cutlass_mma_shape_id >= 2) then
+        write(*,*) "WARNING: CutlassMmaShape=", trim(cutlass_mma_shape), &
+          " does not reproduce the reference dqdt."
+        write(*,*) "  The CUTLASS 2.x 64-bit warp tile iterator loads k in groups", &
+          " of 4 interleaved across the M/N atoms, which is not the operand order", &
+          " that mma.sync.m16n8k8 / m16n8k16 expect."
+        write(*,*) "  It is kept selectable for measurement only. On sm_100 these", &
+          " shapes are expanded to DMMA.8x8x4 by ptxas, so there is nothing to win."
+      end if
+    end if
 
     select case (trim(dqdt_kernel_type))
     case ("OPENACC_ASIS")
@@ -148,6 +181,7 @@ contains
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED
       dqdt_kernel_name = "CUDAFORTRAN_GEMM_FUSED"
       call cuda_gemm_setup(cublas_emulation_enabled)
+      call cuda_cutlass_set_mma_shape(cutlass_mma_shape_id)
     case ("CUDAFORTRAN_GEMM_CUTE")
       if (.not. cuda_dg_kernels_available) then
         write(*,*) "CUDAFORTRAN_GEMM_CUTE requires a build with CUDA=1"
@@ -160,6 +194,7 @@ contains
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE
       dqdt_kernel_name = "CUDAFORTRAN_GEMM_CUTE"
       call cuda_gemm_setup(cublas_emulation_enabled)
+      call cuda_cutlass_set_mma_shape(cutlass_mma_shape_id)
     case default
       write(*,*) "Unsupported dqdt_kernel_type: ", trim(dqdt_kernel_type)
       error stop
@@ -177,6 +212,13 @@ contains
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
       write(*,*) "CublasEmulation is ignored unless DqdtKernel_Type uses GEMM"
+    end if
+
+    if (cutlass_mma_shape_id /= 0 .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
+      write(*,*) "CutlassMmaShape is ignored unless DqdtKernel_Type is ", &
+        "CUDAFORTRAN_GEMM_FUSED or CUDAFORTRAN_GEMM_CUTE"
     end if
 
     if (Np == 256**3 .and. &

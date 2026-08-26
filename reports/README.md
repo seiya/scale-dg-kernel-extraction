@@ -10,6 +10,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`gpu_optimization_session_report.md`](gpu_optimization_session_report.md) | OpenACC → CUDA Fortran → Tensor Core / GEMM に至る実装の変遷と、途中で踏んだ誤り（代表スカラー特殊化）の記録 |
 | [`p255_gemm_fusion_session_report.md`](p255_gemm_fusion_session_report.md) | p=255 の volume GEMM と z-epilogue 融合の詳細実験 |
 | [`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) | arXiv:2407.09621 の取り込み調査と、p=7 Tensor Core カーネルの shared memory レイアウト刷新 |
+| [`sm90_mma_shape_survey.md`](sm90_mma_shape_survey.md) | CUTLASS volume GEMM の MMA 命令形状（8x8x4 / 16x8x4 / 16x8x8 / 16x8x16）を namelist で選べるようにして実測した記録。GB200 では ptxas が SM90 の f64 MMA を `DMMA.8x8x4` に展開するため得るものが無い、という結論とその証拠 |
 | [`tma_survey.md`](tma_survey.md) | TMA の適用可能性を候補ごとに実測した記録。採用ゼロだが、FP64 での受理条件・帯域・L1 挙動と、2 候補それぞれの構造的な不採用理由 |
 
 ## 現時点の結論
@@ -109,6 +110,18 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   ここで一番高くついた誤りは `cudaSharedmemCarveoutMaxShared` を反射的に
   足したことで、占有率は 1 ブロックも増えないまま L1 データキャッシュが削られ
   **+31%** になった。詳細は `tc_paper_survey_2407.09621.md` §13。
+- **CUTLASS volume GEMM の MMA 命令形状を選べるようにした（2026-08-26）**:
+  H100 の cuBLAS が同じ問題形状に `tensor16x8x8` を選ぶのに対し GB200 の
+  cuBLAS は `d884`（8x8x4）を選ぶ、という食い違いを実測で解決した。
+  namelist `CutlassMmaShape`（`8x8x4` / `16x8x4` / `16x8x8` / `16x8x16`）を
+  追加し、`GEMM_CUTE` の 3 GEMM と `GEMM_FUSED` の融合 epilogue が従う。
+  結論は**GB200 では命令形状を変えても何も起きない**で、理由は
+  ptxas が `mma.sync.m16n8k4/8/16.f64` を **`DMMA.8x8x4` の 2 / 4 / 8 命令に
+  展開する**こと（`sm_90` では 1 命令）。16x8x4 は参照と**ビット一致**かつ
+  時間も 8x8x4 と同一（device 3.7013 / 3.7012 秒）。16x8x8・16x8x16 は
+  CUTLASS 2.x の 64bit warp tile iterator が k を 4 ずつのグループに切って
+  M/N atom の間に挟むため **operand 順序が合わず数値が壊れる**（計測用に
+  選択は残置、選ぶと警告）。詳細は `sm90_mma_shape_survey.md`。
 - **p=255 の RK 更新を z epilogue に融合するのは損（2026-08-26、不採用）**:
   RK 更新カーネルは DRAM 79–87% で、削り代は転送量にしかない。`dqdt` の
   往復 268 MB/stage を消すために z GEMM の epilogue で SSP-RK 更新まで

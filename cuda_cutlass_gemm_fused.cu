@@ -11,10 +11,25 @@
 
 #include "cutlass_z_gemm_assembly.h"
 
-// Volume GEMMs match the cuBLAS nsys kernels:
+// Volume GEMM tiles match the cuBLAS nsys kernels:
 //   cutlass_80_tensorop_d884gemm_64x128_16x3_nn_align1
 //   cutlass_80_tensorop_d884gemm_64x64_16x4_nn_align1
 //   cutlass_80_tensorop_d884gemm_64x32_16x4_nn_align1
+//
+// The MMA instruction shape is selectable at run time (mma_shape argument):
+//   0 = SM80 8x8x4   (d884, what cuBLAS picks on GB200)
+//   1 = SM90 16x8x4
+//   2 = SM90 16x8x8  (what cuBLAS picks on H100 for these same shapes)
+//   3 = SM90 16x8x16 (needs a K=32 tile, see VolumeGemmSet)
+// Shapes 0, 1 and 2 share the same threadblock tile, warp tile and stage
+// count, so comparing them isolates the instruction shape.
+//
+// On sm_100 all four lower to the same DMMA.8x8x4 SASS instruction -- ptxas
+// expands m16n8k4/8/16 into 2/4/8 of them -- so none of this can be faster
+// there. Shapes 2 and 3 additionally do not reproduce the reference result:
+// the CUTLASS 2.x 64-bit warp tile iterator interleaves its k=4 groups across
+// the M/N atoms, which is not the operand order mma.sync.m16n8k8 expects.
+// See reports/sm90_mma_shape_survey.md.
 
 //- Defined in cuda_dg_kernels_tc.cu; the stream shared by the whole CUDA path.
 extern cudaStream_t dg_cuda_stream;
@@ -23,28 +38,44 @@ namespace {
 
 using ColumnMajor = cutlass::layout::ColumnMajor;
 using TensorOp = cutlass::arch::OpClassTensorOp;
-using Sm80 = cutlass::arch::Sm80;
 using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
 using BatchedSwizzle = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
 using EpilogueOp = cutlass::epilogue::thread::LinearCombination<double, 1, double, double>;
 
-using GemmNN_64x128_3 = cutlass::gemm::device::Gemm<
-    double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-    TensorOp, Sm80, cutlass::gemm::GemmShape<64, 128, 16>,
-    cutlass::gemm::GemmShape<32, 64, 16>, cutlass::gemm::GemmShape<8, 8, 4>,
-    EpilogueOp, Swizzle, 3>;
+template <int M, int N, int K>
+using GS = cutlass::gemm::GemmShape<M, N, K>;
 
-using GemmBatchedNN_64x64_4 = cutlass::gemm::device::GemmBatched<
-    double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-    TensorOp, Sm80, cutlass::gemm::GemmShape<64, 64, 16>,
-    cutlass::gemm::GemmShape<32, 32, 16>, cutlass::gemm::GemmShape<8, 8, 4>,
-    EpilogueOp, BatchedSwizzle, 4>;
+//- One set of volume GEMMs for a given MMA instruction shape. Only InstShape,
+//- ArchTag and the tile K depth vary; the M/N tiles, warp counts and stage
+//- counts below are the ones the 8x8x4 path has always used.
+//-
+//- TileK must satisfy WarpShape::kK / InstShape::kK >= 2 and even, which
+//- MmaBase asserts (mma_base.h:128,132). That is why 16x8x16 needs TileK = 32:
+//- with TileK = 16 it would leave a single warp-level GEMM per stage and the
+//- software pipeline degenerates. The deeper tile doubles the shared memory
+//- per CTA, so its occupancy is not comparable with the other two shapes.
+template <class InstShape, class ArchTag, int TileK>
+struct VolumeGemmSet {
+  using GemmX = cutlass::gemm::device::Gemm<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, ArchTag, GS<64, 128, TileK>, GS<32, 64, TileK>, InstShape,
+      EpilogueOp, Swizzle, 3>;
 
-using GemmBatchedNN_64x32_4 = cutlass::gemm::device::GemmBatched<
-    double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-    TensorOp, Sm80, cutlass::gemm::GemmShape<64, 32, 16>,
-    cutlass::gemm::GemmShape<32, 32, 16>, cutlass::gemm::GemmShape<8, 8, 4>,
-    EpilogueOp, BatchedSwizzle, 4>;
+  using GemmY = cutlass::gemm::device::GemmBatched<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, ArchTag, GS<64, 64, TileK>, GS<32, 32, TileK>, InstShape,
+      EpilogueOp, BatchedSwizzle, 4>;
+
+  using GemmZ = cutlass::gemm::device::GemmBatched<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, ArchTag, GS<64, 32, TileK>, GS<32, 32, TileK>, InstShape,
+      EpilogueOp, BatchedSwizzle, 4>;
+};
+
+using MmaSet_884 = VolumeGemmSet<GS<8, 8, 4>, cutlass::arch::Sm80, 16>;
+using MmaSet_1688 = VolumeGemmSet<GS<16, 8, 8>, cutlass::arch::Sm90, 16>;
+using MmaSet_16816 = VolumeGemmSet<GS<16, 8, 16>, cutlass::arch::Sm90, 32>;
+using MmaSet_1684 = VolumeGemmSet<GS<16, 8, 4>, cutlass::arch::Sm90, 16>;
 
 int cutlass_error(const char *what, cutlass::Status st)
 {
@@ -53,6 +84,13 @@ int cutlass_error(const char *what, cutlass::Status st)
   }
   std::fprintf(stderr, "%s: cutlass status %d\n", what, static_cast<int>(st));
   return static_cast<int>(st);
+}
+
+int bad_mma_shape(int mma_shape)
+{
+  std::fprintf(stderr, "cutlass volume gemm: unsupported mma_shape %d\n",
+               mma_shape);
+  return 1;
 }
 
 template <class Gemm>
@@ -86,6 +124,7 @@ int run_gemm_batched_nn(int m, int n, int k, double const *A, int lda,
   return cutlass_error("batched gemm", gemm_op(args, nullptr, dg_cuda_stream));
 }
 
+template <class Set>
 int run_volume_gemms_xy(double *deriv_x, double *deriv_y, const double *flux_x,
                         const double *flux_y, const double *D1D,
                         const double *D1D_tr, int Nq, int Ne)
@@ -93,17 +132,18 @@ int run_volume_gemms_xy(double *deriv_x, double *deriv_y, const double *flux_x,
   const int nq2 = Nq * Nq;
   const long long stride_plane = nq2;
 
-  int st = run_gemm_nn<GemmNN_64x128_3>(Nq, nq2 * Ne, Nq, D1D, Nq, flux_x, Nq,
-                                        deriv_x, Nq);
+  int st = run_gemm_nn<typename Set::GemmX>(Nq, nq2 * Ne, Nq, D1D, Nq, flux_x,
+                                            Nq, deriv_x, Nq);
   if (st != 0) {
     return st;
   }
 
-  return run_gemm_batched_nn<GemmBatchedNN_64x64_4>(
+  return run_gemm_batched_nn<typename Set::GemmY>(
       Nq, Nq, Nq, flux_y, Nq, stride_plane, D1D_tr, Nq, 0, deriv_y, Nq,
       stride_plane, Nq * Ne);
 }
 
+template <class Set>
 int run_volume_gemms(double *deriv_x, double *deriv_y, double *deriv_z,
                      const double *flux_x, const double *flux_y,
                      const double *flux_z, const double *D1D,
@@ -113,17 +153,18 @@ int run_volume_gemms(double *deriv_x, double *deriv_y, double *deriv_z,
   const int Np = nq2 * Nq;
   const long long stride_vol = Np;
 
-  int st = run_volume_gemms_xy(deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, Nq,
-                               Ne);
+  int st = run_volume_gemms_xy<Set>(deriv_x, deriv_y, flux_x, flux_y, D1D,
+                                    D1D_tr, Nq, Ne);
   if (st != 0) {
     return st;
   }
 
-  return run_gemm_batched_nn<GemmBatchedNN_64x32_4>(
+  return run_gemm_batched_nn<typename Set::GemmZ>(
       nq2, Nq, Nq, flux_z, nq2, stride_vol, D1D_tr, Nq, 0, deriv_z, nq2,
       stride_vol, Ne);
 }
 
+template <class Set>
 int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr,
                         const double *deriv_x, const double *deriv_y,
                         const double *flux_bnd, const double *lift1d,
@@ -137,7 +178,7 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
   const int n = Nq;
   const int k = Nq;
 
-  using GemmZ = GemmBatchedNN_64x32_4;
+  using GemmZ = typename Set::GemmZ;
   //- Same epilogue, with the accumulator staging tile padded so the stores are
   //- bank-conflict free. See RepadEpilogue in cutlass_z_gemm_assembly.h.
   using ZEpilogue = RepadEpilogue<typename GemmZ::GemmKernel::Epilogue, 8>;
@@ -202,34 +243,80 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
 extern "C" int launch_volume_gemm_cute(
     double *deriv_x, double *deriv_y, double *deriv_z, const double *flux_x,
     const double *flux_y, const double *flux_z, const double *D1D,
-    const double *D1D_tr, int Nq, int Ne)
+    const double *D1D_tr, int Nq, int Ne, int mma_shape)
 {
   if (Nq <= 0 || Ne <= 0) {
     return 1;
   }
-  return run_volume_gemms(deriv_x, deriv_y, deriv_z, flux_x, flux_y, flux_z, D1D,
-                          D1D_tr, Nq, Ne);
+  switch (mma_shape) {
+  case 0:
+    return run_volume_gemms<MmaSet_884>(deriv_x, deriv_y, deriv_z, flux_x,
+                                        flux_y, flux_z, D1D, D1D_tr, Nq, Ne);
+  case 1:
+    return run_volume_gemms<MmaSet_1684>(deriv_x, deriv_y, deriv_z, flux_x,
+                                         flux_y, flux_z, D1D, D1D_tr, Nq, Ne);
+  case 2:
+    return run_volume_gemms<MmaSet_1688>(deriv_x, deriv_y, deriv_z, flux_x,
+                                         flux_y, flux_z, D1D, D1D_tr, Nq, Ne);
+  case 3:
+    return run_volume_gemms<MmaSet_16816>(deriv_x, deriv_y, deriv_z, flux_x,
+                                          flux_y, flux_z, D1D, D1D_tr, Nq, Ne);
+  default:
+    return bad_mma_shape(mma_shape);
+  }
 }
 
 extern "C" int launch_volume_gemm_xy(
     double *deriv_x, double *deriv_y, const double *flux_x, const double *flux_y,
-    const double *D1D, const double *D1D_tr, int Nq, int Ne)
+    const double *D1D, const double *D1D_tr, int Nq, int Ne, int mma_shape)
 {
   if (Nq <= 0 || Ne <= 0) {
     return 1;
   }
-  return run_volume_gemms_xy(deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, Nq,
-                             Ne);
+  switch (mma_shape) {
+  case 0:
+    return run_volume_gemms_xy<MmaSet_884>(deriv_x, deriv_y, flux_x, flux_y,
+                                           D1D, D1D_tr, Nq, Ne);
+  case 1:
+    return run_volume_gemms_xy<MmaSet_1684>(deriv_x, deriv_y, flux_x, flux_y,
+                                            D1D, D1D_tr, Nq, Ne);
+  case 2:
+    return run_volume_gemms_xy<MmaSet_1688>(deriv_x, deriv_y, flux_x, flux_y,
+                                            D1D, D1D_tr, Nq, Ne);
+  case 3:
+    return run_volume_gemms_xy<MmaSet_16816>(deriv_x, deriv_y, flux_x, flux_y,
+                                             D1D, D1D_tr, Nq, Ne);
+  default:
+    return bad_mma_shape(mma_shape);
+  }
 }
 
 extern "C" int launch_z_gemm_assembly(
     double *dqdt, const double *flux_z, const double *D1D_tr,
     const double *deriv_x, const double *deriv_y, const double *flux_bnd,
-    const double *lift1d, const double *escale, int Nq, int Ne)
+    const double *lift1d, const double *escale, int Nq, int Ne, int mma_shape)
 {
   if (Nq <= 0 || Ne <= 0) {
     return 1;
   }
-  return run_z_gemm_assembly(dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd,
-                             lift1d, escale, Nq, Ne);
+  switch (mma_shape) {
+  case 0:
+    return run_z_gemm_assembly<MmaSet_884>(dqdt, flux_z, D1D_tr, deriv_x,
+                                           deriv_y, flux_bnd, lift1d, escale,
+                                           Nq, Ne);
+  case 1:
+    return run_z_gemm_assembly<MmaSet_1684>(dqdt, flux_z, D1D_tr, deriv_x,
+                                            deriv_y, flux_bnd, lift1d, escale,
+                                            Nq, Ne);
+  case 2:
+    return run_z_gemm_assembly<MmaSet_1688>(dqdt, flux_z, D1D_tr, deriv_x,
+                                            deriv_y, flux_bnd, lift1d, escale,
+                                            Nq, Ne);
+  case 3:
+    return run_z_gemm_assembly<MmaSet_16816>(dqdt, flux_z, D1D_tr, deriv_x,
+                                             deriv_y, flux_bnd, lift1d, escale,
+                                             Nq, Ne);
+  default:
+    return bad_mma_shape(mma_shape);
+  }
 }

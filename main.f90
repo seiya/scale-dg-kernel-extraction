@@ -158,6 +158,7 @@ contains
     character(len=8) :: DGOptrKernel_OptType = "OPT1" ! GENERAL or OPT1
     character(len=24) :: DqdtKernel_Type = "OPENACC_SPLIT"
     logical :: CublasEmulation = .false.
+    character(len=16) :: CutlassMmaShape = "8x8x4" ! 8x8x4, 16x8x4, 16x8x8, 16x8x16
 
     namelist /PARAM_ADVECT3D/ &
       NeX, NeY, NeZ, PolyOrder,   &
@@ -166,6 +167,7 @@ contains
       DGOptrKernel_OptType,        &
       DqdtKernel_Type,             &
       CublasEmulation,             &
+      CutlassMmaShape,             &
       UseCudaGraph,                &
       MeasureKernelTime
 
@@ -203,7 +205,8 @@ contains
     call dg_optr_kernel_setup( DGOptrKernel_OptType )
 
     !- Initialize a advection equation module
-    call setup_advect3d_eq_setup(NfpTot, Np, Ne, DqdtKernel_Type, CublasEmulation)
+    call setup_advect3d_eq_setup(NfpTot, Np, Ne, DqdtKernel_Type, CublasEmulation, &
+      CutlassMmaShape)
 
     if (UseCudaGraph .and. .not. advect3d_eq_graph_supported()) then
       write(*,*) "UseCudaGraph is ignored: ", trim(DqdtKernel_Type), &
