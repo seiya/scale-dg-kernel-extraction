@@ -20,6 +20,14 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 
 ## 現時点の結論
 
+- **計測区間（2026-08-27）**: `WarmupStep`（namelist、既定 1）で指定した先頭
+  ステップは実行はするが計時に含めない。CUDA graph 経路では step 1 が直接
+  ローンチ、step 2 がキャプチャなので自動的に 2 以上に引き上げられる。
+  総ステップ数は `nstep` のままなので場の値は変わらない。報告に
+  `Measured steps:` と `Main per step:` が加わる。**これ以前の表の数値は 1
+  ステップ目を含んだ値**であり、短い `nstep` の測定（p=63/p=255 の
+  `nstep=20`）では新しい測定の方が数 % 速く出る。表はそのまま残す。
+
 - **Ozaki Scheme II（arXiv:2504.08009v3、2026-08-27）**: INT8 Tensor Core による
   FP64 GEMM エミュレーションは **不採用**。GB200 の INT8 天井は 4724 TOP/s
   （FP64 の 118 倍）で論文の前提は満たすが、volume GEMM の `K = Nq` が浅く、

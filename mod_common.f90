@@ -41,7 +41,7 @@ module mod_common
     integer(IP) :: count_accum = 0_int64
     integer(IP) :: count_rate  = 0_int64
   end type Timer  
-  public :: Timer_start, Timer_stop, Timer_add, Timer_elapsed
+  public :: Timer_start, Timer_stop, Timer_add, Timer_elapsed, Timer_reset
 
 contains
 !OCL SERIAL
@@ -77,6 +77,16 @@ contains
                     + nint(time_sec*real(this%count_rate,RP),IP)
     return
   end subroutine Timer_add
+!OCL SERIAL
+  !> Discard everything accumulated so far.  Used to drop the warm-up steps
+  !! of a run from the reported time.
+  subroutine Timer_reset(this)
+    implicit none
+    type(Timer), intent(inout) :: this
+    !------------------------------------------------------------------------------
+    this%count_accum = 0_int64
+    return
+  end subroutine Timer_reset
 !OCL SERIAL
   function Timer_elapsed(this) result(time_sec)
     implicit none

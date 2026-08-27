@@ -8,7 +8,7 @@
 !<
 module mod_advect3d_eq
   use mod_common, only: RP, ACC_QUEUE, &
-  Timer, Timer_start, Timer_stop, Timer_add, Timer_elapsed
+  Timer, Timer_start, Timer_stop, Timer_add, Timer_elapsed, Timer_reset
   use mod_cuda_dg_kernels, only: &
     cuda_dg_kernels_available,  &
     cuda_cal_volume_flux, cuda_cal_volume_deriv, &
@@ -30,6 +30,7 @@ module mod_advect3d_eq
   public :: advect3d_eq_cal_tend
   public :: advect3d_eq_graph_supported
   public :: advect3d_eq_set_time_reporting
+  public :: advect3d_eq_reset_timers
 
   !- Re-exported so that the time-stepping loop does not have to know which
   !  backend module it is built against.
@@ -288,6 +289,28 @@ contains
 
     return
   end subroutine advect3d_eq_set_time_reporting
+
+  !> Drop what the tendency timers accumulated so far.
+  !!
+  !! Called by the time loop once the warm-up steps are over, so that the
+  !! report covers the measured steps only.  The CUDA device time of a call is
+  !! read back on the following call, so the first device time accumulated
+  !! after a reset is still the one of the last warm-up call: the number of
+  !! accumulated measurements is right, the window is shifted by one call.
+!OCL SERIAL
+  subroutine advect3d_eq_reset_timers()
+    implicit none
+    !------------------------------------------------------------
+
+    call Timer_reset(timer_ebnd_flux)
+    call Timer_reset(timer_dqdt)
+    call Timer_reset(timer_volume_flux)
+    call Timer_reset(timer_volume_deriv)
+    call Timer_reset(timer_surface_lift)
+    call Timer_reset(timer_dqdt_assemble)
+
+    return
+  end subroutine advect3d_eq_reset_timers
 
   !> Finalize
 !OCL SERIAL

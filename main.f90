@@ -10,7 +10,7 @@ program main
   use mod_common, only: &
     RP,                                     &
     Timer,                                  &
-    Timer_start, Timer_stop, Timer_elapsed, &
+    Timer_start, Timer_stop, Timer_elapsed, Timer_reset, &
     ACC_QUEUE,                              &
     RK_nstage => RK3s3oSSP_nstage,          &
     rk_a => RK3s3oSSP_rk_a,                 &
@@ -21,7 +21,7 @@ program main
     normal_fn, Escale, Fscale, pos_en, update_halo
   use mod_advect3d_eq, only: &
     advect3d_eq_cal_tend, advect3d_eq_graph_supported, &
-    advect3d_eq_set_time_reporting, &
+    advect3d_eq_set_time_reporting, advect3d_eq_reset_timers, &
     cuda_dg_set_event_timing, cuda_dg_set_side_stream, &
     cuda_dg_graph_capture_begin, &
     cuda_dg_graph_capture_end, cuda_dg_graph_launch, cuda_dg_graph_is_ready
@@ -34,6 +34,15 @@ program main
 
   integer :: nstep, output_interval
   integer :: istep, stage
+
+  !> Number of leading steps that are run but not timed.  The first step of a
+  !! run pays for lazy device-side initialization (module load, first-touch of
+  !! the device allocations, the cuBLAS/CUTLASS handles and workspaces, and the
+  !! clocks still ramping up), which is amortized away at large nstep but
+  !! dominates a short run.  Set from the namelist; see the note above the
+  !! time loop for the value actually used.
+  integer :: WarmupStep = 1
+  integer :: nwarmup
   real(RP) :: dt
 
   !> Replay one captured Runge-Kutta step instead of launching its kernels
@@ -96,10 +105,29 @@ program main
     call cuda_dg_set_event_timing(.false.)
   end if
 
-  call Timer_start(timer_main)
+  !- The reported time covers the last nstep-nwarmup steps only.  The steps
+  !  that are skipped are still run, so the final field is the one of a full
+  !  nstep run and stays comparable with a reference; only the clock starts
+  !  later.  In graph mode the first two steps are structurally different from
+  !  the rest -- step 1 is launched directly and step 2 is the capture -- so at
+  !  least two steps are skipped there.  A run that is too short to spare the
+  !  steps measures all of them.
+  nwarmup = min(max(WarmupStep,0),max(nstep-1,0))
+  if (UseCudaGraph) then
+    nwarmup = min(max(nwarmup,2),max(nstep-1,0))
+  end if
 
   !- Loop for time integration
   do istep = 1, nstep
+
+    if (istep == nwarmup + 1) then
+      !- The warm-up steps are queued asynchronously, so they have to be over
+      !  before the clock starts.
+      !$acc wait(ACC_QUEUE)
+      call Timer_reset(timer_cal_tend)
+      call advect3d_eq_reset_timers()
+      call Timer_start(timer_main)
+    end if
 
     if (UseCudaGraph .and. istep >= 2) then
       if (.not. cuda_dg_graph_is_ready()) then
@@ -169,7 +197,8 @@ contains
       CublasEmulation,             &
       CutlassMmaShape,             &
       UseCudaGraph,                &
-      MeasureKernelTime
+      MeasureKernelTime,           &
+      WarmupStep
 
     integer :: fid
     integer :: ke, p
@@ -263,6 +292,10 @@ contains
     call Timer_stop(timer_main)
     write(*,'(A)') "= Report of execution time [sec]"
     write(*,'(A30,ES24.5)') "Main:", Timer_elapsed(timer_main)
+    write(*,'(A30,I24)')    "Measured steps:", nstep - nwarmup
+    write(*,'(A30,I24)')    "Skipped warm-up steps:", nwarmup
+    write(*,'(A30,ES24.5)') "Main per step:", &
+      Timer_elapsed(timer_main) / real(max(nstep-nwarmup,1),RP)
     if (UseCudaGraph) then
       write(*,'(A30,A24)') "CUDA graph replay:", "on"
       write(*,'(A30,A24)') "Cal_tend:", "not measured (graph)"
