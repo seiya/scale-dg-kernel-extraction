@@ -16,7 +16,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`cublas_emulation_survey.md`](cublas_emulation_survey.md) | cuBLAS FP64 fixed-point emulation の見かけのストール調査。EAGER 強制、永続 8 GiB workspace、p=7/p=255 の速度と数値検証 |
 | [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md) | arXiv:2504.08009v3（Ozaki Scheme II、INT8 Tensor Core による FP64 GEMM エミュレーション）の適用調査。不採用だが、成立条件が `p ≳ 500-650` であること、およびハードウェア条件が 3.82 FLOP/byte であることを実測から確定した |
 | [`p15_gap_study.md`](p15_gap_study.md) | p=7 と p=255 の間を同一 DOF で埋める最初の点 p=15 (Nq=16)。CUDA core 版と Tensor Core 版の融合カーネル、shared 戦略、Nq=16 では融合したまま占有率 50% を超えられないという構造的な壁 |
-| [`p63_gap_study.md`](p63_gap_study.md) | 同一 DOF の 4 点目 p=63 (Nq=64)。任意次数の LGL 演算子生成、CUTLASS GEMM 経路の次数開放とその batch 上限、5 本のカーネルが 3 種類の理由で別々に詰まる様子、融合カーネルを書かない判断の根拠 |
+| [`p63_gap_study.md`](p63_gap_study.md) | 同一 DOF の 4 点目 p=63 (Nq=64)。任意次数の LGL 演算子生成、CUTLASS GEMM 経路の次数開放とその batch 上限、5 本のカーネルが 3 種類の理由で別々に詰まる様子、融合カーネルを書かない判断の根拠。**§8 のその判断は 2026-08-27 に訂正された**（根拠 3 点が p=31 の `FUSED_TC` で崩れた。帯域律速のカーネルのピーク比を次数間で外挿したのが誤りで、不変量は帯域利用率のほう） |
 | [`p127_gap_study.md`](p127_gap_study.md) | 同一 DOF の 5 点目 p=127 (Nq=128)。**演算強度がマシンバランスを越える最小の次数**（p=255 も越えている側で、交差は p=63 と p=127 の間）。コード変更ゼロで 5 経路が通り、次数依存ノブ 4 種を掃引しても採用すべき変更が無かったこと、`K` が深くなると CUTLASS の x GEMM が cuBLAS に追いつくこと |
 | [`p31_gap_study.md`](p31_gap_study.md) | 同一 DOF の 6 点目にして最後の点 p=31 (Nq=32)。**最速は `CUDAFORTRAN_FUSED_TC`**（§14、374.8 µs/stage）。Nq=32 の Tensor Core 融合カーネル 2 本で CUDA core 融合版の **2.66 倍**、`GEMM` の 1.67 倍。x と z が同じ出力写像を共有するので z の shared 往復が無く、転置形にすると D1D がレジスタに載る。**「p=31 は曲線の極大点」「融合が勝つ上限は p=15」という当初の結論はこれで否定された**（§14.2、§14.1 に訂正注記）。Nq=32 の CUDA core 融合カーネル 2 本、CUTLASS 経路は p=31 で使えるという訂正、**lift と assembly の融合で `GEMM` / `GEMM_CUTE` 経路を全次数 1 割速く**した（p=31 −11.7%、p=63 −12.0%、p=127 −10.2%、ビット一致） |
 
