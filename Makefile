@@ -8,7 +8,8 @@ endif
 GPUFLAGS ?= -gpu=ccnative
 FFLAGS  ?= -O3 -acc=gpu -cuda $(GPUFLAGS) -cudalib=cublas -Minfo=accel
 NVCC ?= nvcc
-NVCCFLAGS ?= -O3 -std=c++17 -arch=native
+GPUNVCCFLAGS ?= -arch=native
+NVCCFLAGS ?= -O3 -std=c++17 $(GPUNVCCFLAGS)
 CUTLASS_HOME ?= third_party/cutlass
 NVCCFLAGS += -I$(CUTLASS_HOME)/include --expt-relaxed-constexpr
 CUDA_KERNEL_OBJ = mod_cuda_dg_kernels.o cuda_dg_kernels_tc.o cuda_cublas_gemm.o cuda_cutlass_gemm_fused.o
