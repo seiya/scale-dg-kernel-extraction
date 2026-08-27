@@ -15,6 +15,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`tma_survey.md`](tma_survey.md) | TMA の適用可能性を候補ごとに実測した記録。採用ゼロだが、FP64 での受理条件・帯域・L1 挙動と、2 候補それぞれの構造的な不採用理由 |
 | [`cublas_emulation_survey.md`](cublas_emulation_survey.md) | cuBLAS FP64 fixed-point emulation の見かけのストール調査。EAGER 強制、永続 8 GiB workspace、p=7/p=255 の速度と数値検証 |
 | [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md) | arXiv:2504.08009v3（Ozaki Scheme II、INT8 Tensor Core による FP64 GEMM エミュレーション）の適用調査。不採用だが、成立条件が `p ≳ 500-650` であること、およびハードウェア条件が 3.82 FLOP/byte であることを実測から確定した |
+| [`p15_gap_study.md`](p15_gap_study.md) | p=7 と p=255 の間を同一 DOF で埋める最初の点 p=15 (Nq=16)。`tendency_fused_p15_kernel` の追加、shared 戦略、占有率律速という第三の状態の同定 |
 
 ## 現時点の結論
 
@@ -48,6 +49,22 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 - **p=255, `Ne=1`**: `CUDAFORTRAN_GEMM_FUSED` が最速。手書きの Tensor Core 経路は
   CUTLASS / cuBLAS の multistage mainloop に大きく負ける。
 - 同じ体積 DOF 数でも、p=7 と p=255 で最適戦略は逆転する。
+- **p=15, `Ne=16^3`（2026-08-27）**: 同一 DOF の 3 点目。同一 DOF を立方一様メッシュで
+  保つ条件 `NeX*Nq = 256` から、間を埋められる次数は **p = 15, 31, 63, 127 の 2 冪だけ**で、
+  この条件は FP64 mma のタイル条件より強い。p=15 は**要素まるごとが shared に載る最後の点**
+  （1 要素の `q` が 32 KB、Nq=32 では 256 KB で 227 KB/SM を超える）。
+  `CUDAFORTRAN_FUSED` に `tendency_fused_p15_kernel` を追加した。Nq³ のスクラッチバッファ
+  1 本を x/y/z と面流束で使い回し `q` をレジスタに置くことで、global ロードを理論最小に
+  保ったまま shared 35584 B の静的枠に収めている。レーンが `i` 方向に並ぶので
+  **swizzle なしで 3 方向とも conflict free**。device 時間は **p=7 の 1.31 倍で 2 倍の
+  体積演算**（433.9 対 331.0 µs/stage）、p=15 における従来最速 `OPENACC_SPLIT` の 2.1 倍速い。
+  重要なのは**律速の性格が変わったこと**で、p=7 がメモリ系 95.6% で飽和しているのに対し
+  p=15 は**どこも飽和しておらず**（メモリ 74%、SM 36%、DRAM 40%）、実体は
+  **62 レジスタによる 1 ブロック/SM = 占有率 49%** である。
+  `launch_bounds(1024,2)` は 32 レジスタ spill ゼロを達成しながら **+6.8%**、
+  carveout 追加で **+8.2%** と、どちらも不採用。
+  したがって **Tensor Core 版を試す価値はある**（事前予測「まだ帯域律速のはず」は外れた）。
+  詳細は `p15_gap_study.md`。
 - **p=7 TC の整数・アドレス演算削減（2026-08-25）**: `tc_paper_survey` §10 が
   次の標的に挙げた整数演算は、単独で削っても end-to-end では効かない（§11）。
   同じ調査で見つかった効く要因は global アクセスのキャッシュライン数で、

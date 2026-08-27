@@ -138,8 +138,8 @@ contains
         write(*,*) "CUDAFORTRAN_FUSED requires a build with CUDA=1"
         error stop
       end if
-      if (Np /= 512 .and. Np /= 256**3) then
-        write(*,*) "CUDAFORTRAN_FUSED requires PolyOrder=7 or 255"
+      if (Np /= 512 .and. Np /= 16**3 .and. Np /= 256**3) then
+        write(*,*) "CUDAFORTRAN_FUSED requires PolyOrder=7, 15 or 255"
         error stop
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_FUSED
@@ -743,7 +743,7 @@ contains
     real(RP) :: kernel_time(2)
     !------------------------------------------------------------
 
-    if (Nq == 8) then
+    if (Nq == 8 .or. Nq == 16) then
       !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
       !$acc& use_device(normal_fn,Fscale,Escale)
       call cuda_cal_dqdt_fused( &
@@ -760,7 +760,7 @@ contains
         Nq, Np, NfpTot, Ne, NeA, kernel_time )
       !$acc end host_data
     else
-      error stop "CUDAFORTRAN_FUSED requires Nq=8 or Nq=256"
+      error stop "CUDAFORTRAN_FUSED requires Nq=8, Nq=16 or Nq=256"
     end if
 
     call accumulate_kernel_time(kernel_time)

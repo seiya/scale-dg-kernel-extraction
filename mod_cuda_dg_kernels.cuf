@@ -11,6 +11,7 @@ module mod_cuda_dg_kernels
   integer, parameter :: CUDA_BLOCK_SIZE = 256
   integer, parameter :: CUDA_P7_BLOCK_SIZE = 512
   integer, parameter :: CUDA_FUSED_P7_BLOCK_SIZE = 256
+  integer, parameter :: CUDA_FUSED_P15_BLOCK_SIZE = 1024
   integer, parameter :: CUDA_P255_NQ = 256
   integer, parameter :: CUDA_P255_TILE = 16
   integer, parameter :: CUDA_P255_BLOCKS_PER_ELEMENT = 65536
@@ -536,19 +537,28 @@ contains
 
     integer :: istat
 
-    if (Nq /= 8) then
-      write(*,*) "CUDAFORTRAN_FUSED currently requires PolyOrder=7"
+    if (Nq /= 8 .and. Nq /= 16) then
+      write(*,*) "CUDAFORTRAN_FUSED currently requires PolyOrder=7 or 15"
       error stop
     end if
     call dg_ev_begin()
 
     call dg_ev_record(1)
-    call tendency_fused_p7_kernel<<<Ne,CUDA_FUSED_P7_BLOCK_SIZE,0,dg_stream>>>( &
-      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
-      normal_fn, Fscale, Escale, Ne )
-    istat = cudaGetLastError()
-    if (istat /= cudaSuccess) call cuda_failure( &
-      "tendency_fused_p7_kernel",istat)
+    if (Nq == 8) then
+      call tendency_fused_p7_kernel<<<Ne,CUDA_FUSED_P7_BLOCK_SIZE,0,dg_stream>>>( &
+        dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
+        normal_fn, Fscale, Escale, Ne )
+      istat = cudaGetLastError()
+      if (istat /= cudaSuccess) call cuda_failure( &
+        "tendency_fused_p7_kernel",istat)
+    else
+      call tendency_fused_p15_kernel<<<Ne,CUDA_FUSED_P15_BLOCK_SIZE,0,dg_stream>>>( &
+        dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
+        normal_fn, Fscale, Escale, Ne )
+      istat = cudaGetLastError()
+      if (istat /= cudaSuccess) call cuda_failure( &
+        "tendency_fused_p15_kernel",istat)
+    end if
     call dg_ev_record(2)
     call dg_ev_end(DG_EV_SINGLE)
 
@@ -1582,6 +1592,219 @@ contains
     dqdt(idx2) = -(Escale(idx2)*sum_x2 + Escale(idx2+npoint)*sum_y2 &
       + Escale(idx2+2*npoint)*sum_z2 + lift2)
   end subroutine tendency_fused_p7_kernel
+
+  !> p=15 variable-coefficient fused tendency.  One block per element.
+  !!
+  !! The p=7 layout, which keeps the three directional fluxes resident at once,
+  !! would need 3*Nq**3*8 = 96 KB here and would force the block past the 48 KB
+  !! static shared limit into a carveout that costs more L1 than it buys
+  !! (tc_paper_survey_2407.09621.md section 13.4).  Instead a single Nq**3
+  !! buffer is reused for the x, y and z fluxes in turn and then for the face
+  !! fluxes, which fits the block into 34.75 KB of static shared.  Holding q in
+  !! registers keeps every field read from global exactly once, so the load
+  !! count stays minimal.
+  !!
+  !! Thread tid owns the four nodes tid, tid+1024, tid+2048, tid+3072, which
+  !! share (i,j) and differ by four k planes.  Lanes therefore vary along i
+  !! while the contraction index l is uniform across the warp, which makes all
+  !! three contractions conflict free without a swizzle: the x read does not
+  !! depend on i and broadcasts, and the y and z reads walk 16 consecutive
+  !! doubles per half warp.
+  attributes(global) subroutine tendency_fused_p15_kernel( &
+    dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, Ne )
+    implicit none
+    integer, value :: Ne
+    real(RP), device :: dqdt(*), D1D(*)
+    real(RP), device :: Lift1D(*), q(*), u(*), v(*), w(*)
+    integer, device :: VMapM(*), VMapP(*)
+    real(RP), device :: normal_fn(*), Fscale(*), Escale(*)
+
+    real(RP), shared :: sD1D(256)
+    real(RP), shared :: sLift(96)
+    real(RP), shared :: sbuf(4096)
+    integer :: elem, elem_offset, face_offset, tid
+    integer :: i, j, k1, k2, k3, k4, l
+    integer :: nd1, nd2, nd3, nd4, idx1, idx2, idx3, idx4
+    integer :: ib, npoint, nface
+    integer :: fp, fidx, iM, iP
+    integer :: fa1, fa2, fa3, fa4, fa5, fa6
+    real(RP) :: qv1, qv2, qv3, qv4
+    real(RP) :: acc1, acc2, acc3, acc4
+    real(RP) :: s1, s2, s3, s4
+    real(RP) :: dm, dm1, dm2, dm3, dm4
+    real(RP) :: bv, qM, qP, VelM, VelP, alpha
+
+    elem = blockIdx%x
+    if (elem > Ne) return
+
+    tid = threadIdx%x
+    nd1 = tid
+    nd2 = tid + 1024
+    nd3 = tid + 2048
+    nd4 = tid + 3072
+    elem_offset = (elem-1)*4096
+    face_offset = (elem-1)*1536
+    npoint = 4096*Ne
+    nface = 1536*Ne
+
+    if (tid <= 256) then
+      sD1D(tid) = D1D(tid)
+    else if (tid <= 352) then
+      sLift(tid-256) = Lift1D(tid-256)
+    end if
+
+    idx1 = elem_offset + nd1
+    idx2 = elem_offset + nd2
+    idx3 = elem_offset + nd3
+    idx4 = elem_offset + nd4
+    qv1 = q(idx1)
+    qv2 = q(idx2)
+    qv3 = q(idx3)
+    qv4 = q(idx4)
+
+    i  = mod(tid-1,16) + 1
+    j  = mod((tid-1)/16,16) + 1
+    k1 = (tid-1)/256 + 1
+    k2 = k1 + 4
+    k3 = k1 + 8
+    k4 = k1 + 12
+
+    !- x direction ---------------------------------------------------------
+    sbuf(nd1) = qv1*u(idx1)
+    sbuf(nd2) = qv2*u(idx2)
+    sbuf(nd3) = qv3*u(idx3)
+    sbuf(nd4) = qv4*u(idx4)
+    call syncthreads()
+
+    s1 = 0.0_RP
+    s2 = 0.0_RP
+    s3 = 0.0_RP
+    s4 = 0.0_RP
+    do l = 1, 16
+      ib = l + (j-1)*16 + (k1-1)*256
+      dm = sD1D(i+(l-1)*16)
+      s1 = s1 + dm*sbuf(ib)
+      s2 = s2 + dm*sbuf(ib+1024)
+      s3 = s3 + dm*sbuf(ib+2048)
+      s4 = s4 + dm*sbuf(ib+3072)
+    end do
+    acc1 = Escale(idx1)*s1
+    acc2 = Escale(idx2)*s2
+    acc3 = Escale(idx3)*s3
+    acc4 = Escale(idx4)*s4
+    call syncthreads()
+
+    !- y direction ---------------------------------------------------------
+    sbuf(nd1) = qv1*v(idx1)
+    sbuf(nd2) = qv2*v(idx2)
+    sbuf(nd3) = qv3*v(idx3)
+    sbuf(nd4) = qv4*v(idx4)
+    call syncthreads()
+
+    s1 = 0.0_RP
+    s2 = 0.0_RP
+    s3 = 0.0_RP
+    s4 = 0.0_RP
+    do l = 1, 16
+      ib = i + (l-1)*16 + (k1-1)*256
+      dm = sD1D(j+(l-1)*16)
+      s1 = s1 + dm*sbuf(ib)
+      s2 = s2 + dm*sbuf(ib+1024)
+      s3 = s3 + dm*sbuf(ib+2048)
+      s4 = s4 + dm*sbuf(ib+3072)
+    end do
+    acc1 = acc1 + Escale(idx1+npoint)*s1
+    acc2 = acc2 + Escale(idx2+npoint)*s2
+    acc3 = acc3 + Escale(idx3+npoint)*s3
+    acc4 = acc4 + Escale(idx4+npoint)*s4
+    call syncthreads()
+
+    !- z direction ---------------------------------------------------------
+    sbuf(nd1) = qv1*w(idx1)
+    sbuf(nd2) = qv2*w(idx2)
+    sbuf(nd3) = qv3*w(idx3)
+    sbuf(nd4) = qv4*w(idx4)
+    call syncthreads()
+
+    s1 = 0.0_RP
+    s2 = 0.0_RP
+    s3 = 0.0_RP
+    s4 = 0.0_RP
+    do l = 1, 16
+      ib = i + (j-1)*16 + (l-1)*256
+      dm1 = sD1D(k1+(l-1)*16)
+      dm2 = sD1D(k2+(l-1)*16)
+      dm3 = sD1D(k3+(l-1)*16)
+      dm4 = sD1D(k4+(l-1)*16)
+      bv = sbuf(ib)
+      s1 = s1 + dm1*bv
+      s2 = s2 + dm2*bv
+      s3 = s3 + dm3*bv
+      s4 = s4 + dm4*bv
+    end do
+    acc1 = acc1 + Escale(idx1+2*npoint)*s1
+    acc2 = acc2 + Escale(idx2+2*npoint)*s2
+    acc3 = acc3 + Escale(idx3+2*npoint)*s3
+    acc4 = acc4 + Escale(idx4+2*npoint)*s4
+    call syncthreads()
+
+    !- numerical flux on the six faces -------------------------------------
+    fp = tid
+    fidx = face_offset + fp
+    iM = VMapM(fidx)
+    iP = VMapP(fidx)
+    qM = q(iM)
+    qP = q(iP)
+    VelM = u(iM)*normal_fn(fidx) + v(iM)*normal_fn(fidx+nface) &
+      + w(iM)*normal_fn(fidx+2*nface)
+    VelP = u(iP)*normal_fn(fidx) + v(iP)*normal_fn(fidx+nface) &
+      + w(iP)*normal_fn(fidx+2*nface)
+    alpha = 0.5_RP*abs(VelP+VelM)
+    sbuf(fp) = 0.5_RP*Fscale(fidx)*( &
+      qP*VelP-qM*VelM-alpha*(qP-qM))
+    if (tid <= 512) then
+      fp = tid + 1024
+      fidx = face_offset + fp
+      iM = VMapM(fidx)
+      iP = VMapP(fidx)
+      qM = q(iM)
+      qP = q(iP)
+      VelM = u(iM)*normal_fn(fidx) + v(iM)*normal_fn(fidx+nface) &
+        + w(iM)*normal_fn(fidx+2*nface)
+      VelP = u(iP)*normal_fn(fidx) + v(iP)*normal_fn(fidx+nface) &
+        + w(iP)*normal_fn(fidx+2*nface)
+      alpha = 0.5_RP*abs(VelP+VelM)
+      sbuf(fp) = 0.5_RP*Fscale(fidx)*( &
+        qP*VelP-qM*VelM-alpha*(qP-qM))
+    end if
+    call syncthreads()
+
+    !- lift and assembly ---------------------------------------------------
+    fa1 = i + (k1-1)*16
+    fa2 = 256 + j + (k1-1)*16
+    fa3 = 512 + i + (k1-1)*16
+    fa4 = 768 + j + (k1-1)*16
+    fa5 = 1024 + i + (j-1)*16
+    fa6 = 1280 + i + (j-1)*16
+
+    dqdt(idx1) = -(acc1 &
+      + sLift(j)*sbuf(fa1) + sLift(i+16)*sbuf(fa2) &
+      + sLift(j+32)*sbuf(fa3) + sLift(i+48)*sbuf(fa4) &
+      + sLift(k1+64)*sbuf(fa5) + sLift(k1+80)*sbuf(fa6))
+    dqdt(idx2) = -(acc2 &
+      + sLift(j)*sbuf(fa1+64) + sLift(i+16)*sbuf(fa2+64) &
+      + sLift(j+32)*sbuf(fa3+64) + sLift(i+48)*sbuf(fa4+64) &
+      + sLift(k2+64)*sbuf(fa5) + sLift(k2+80)*sbuf(fa6))
+    dqdt(idx3) = -(acc3 &
+      + sLift(j)*sbuf(fa1+128) + sLift(i+16)*sbuf(fa2+128) &
+      + sLift(j+32)*sbuf(fa3+128) + sLift(i+48)*sbuf(fa4+128) &
+      + sLift(k3+64)*sbuf(fa5) + sLift(k3+80)*sbuf(fa6))
+    dqdt(idx4) = -(acc4 &
+      + sLift(j)*sbuf(fa1+192) + sLift(i+16)*sbuf(fa2+192) &
+      + sLift(j+32)*sbuf(fa3+192) + sLift(i+48)*sbuf(fa4+192) &
+      + sLift(k4+64)*sbuf(fa5) + sLift(k4+80)*sbuf(fa6))
+  end subroutine tendency_fused_p15_kernel
 
   !> x-direction p=255 tensor-product derivative and x-face lift.
   attributes(global) subroutine tendency_x_p255_kernel( &
