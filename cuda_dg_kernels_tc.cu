@@ -1401,15 +1401,21 @@ extern "C" void launch_tendency_fused_p31_tc(
 //
 // Which panels want which layout was then swept at nstep=400:
 //
-//   sD          sFW (xz)    sFV (y)     us/stage
-//   l-fast      l-fast      l-fast         563.8
-//   outer-fast  l-fast      l-fast         544.4
-//   outer-fast  outer-fast  l-fast         539.0   <- kept
-//   outer-fast  outer-fast  outer-fast     629.8
+//   sFU (xz)    sD          sFW (xz)    sFV (y)    us/stage
+//   l-fast      l-fast      l-fast      l-fast        563.8
+//   l-fast      outer-fast  l-fast      l-fast        544.4
+//   l-fast      outer-fast  outer-fast  l-fast        539.0
+//   outer-fast  outer-fast  outer-fast  l-fast        533.7   <- kept
+//   l-fast      outer-fast  outer-fast  outer-fast    629.2
 //
-// sFV is the odd one out: transposing it makes the y kernel's own numbers
-// better on paper (LSU wavefronts 24.9 M to 21.1 M, L1/TEX 59.7% to 41.3%)
-// and the kernel 22% slower.  That inversion is unexplained; section 16.6.
+// Everything the mma reads wants the outer-fast layout except sFV, and sFV is
+// not an exception to the layout rule at all: its transpose makes the y kernel
+// 7% faster once the epilogue's read-modify-write of dqdt is taken away
+// (233 against 250 us under ncu).  With that load present, the shorter mma
+// phase no longer covers it and long scoreboard goes 31% to 50%.  Moving the
+// read-modify-write to the xz kernel, which has twice the mma to hide it
+// behind, was tried and just moves the cost (541.0 against 538.9).  Section
+// 16.6.
 
 // l-fast panels: idx = l + 64*outer.  The read has l in bits 0-1 (colk) and
 // the outer index in bits 6-8 (row), so folding the latter into bits 2-4
@@ -1503,7 +1509,7 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
       const int ll = tid & (BK63 - 1);
       const int o = (tid / BK63) + (P63_THREADS / BK63) * p;
       const int g = eo + (kk + ll) + plane_off + NQ2_63 * o;
-      sFU[sw63(ll + BK63 * o)] = q[g] * u[g];
+      sFU[swt63(o + BK63 * ll)] = q[g] * u[g];
     }
     // sD[r][l] = D1D(r, l), r fast in the Fortran column-major operator.
     // sFW[i][l] = q*w at (i, jp, l), i fast in global.
@@ -1524,7 +1530,7 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
         const int m = 8 * (2 * wm + a) + row;
-        av[a] = sFU[sw63(l + BK63 * m)];
+        av[a] = sFU[swt63(m + BK63 * l)];
         avz[a] = sD[swt63(m + BK63 * l)];
       }
 #pragma unroll
