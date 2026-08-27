@@ -870,3 +870,357 @@ extern "C" void launch_tendency_fused_p15_tc(
       Ne);
   check_cuda("tendency_fused_p15_tc_kernel");
 }
+
+//============================================================================
+// p=31 (Nq=32) fused Tensor Core tendency
+//============================================================================
+//
+// At Nq=32 one element of q is 32768 doubles = 256 KB, which does not fit in
+// the 228 KB of shared memory an SM has, let alone in one block's share of it.
+// The p=15 strategy (whole element in one reused buffer, q in registers) is
+// therefore structurally impossible, and this kernel keeps the structure the
+// CUDA-core p=31 pair established instead: sweep one plane at a time and split
+// the y term into a second kernel, because at fixed j the y contraction needs
+// data from every j.  See mod_cuda_dg_kernels.cuf:1964 for that argument and
+// reports/p31_gap_study.md section 5 for the measurements behind it.
+//
+// What changes here is only the contraction.  Section 13.5 of the same report
+// measured that 87-91% of these kernels' L1/TEX wavefronts are shared, at 21.6
+// FLOP per shared wavefront, so the mma attacks the measured limiter directly.
+//
+// Two structural facts make Nq=32 easier than Nq=8 and Nq=16 were:
+//
+//   x: C(i,k) = sum_l D(i,l) * FU(l,j,k)      FU = q*u
+//   z: C(i,k) = sum_l FW(i,j,l) * D(k,l)      FW = q*w
+//
+// 1. Both land on the SAME output index pair (i,k).  At Nq=8 and Nq=16 the z
+//    derivative was the one that had to travel back through shared memory
+//    (sDz, sw_dz, sw_dz15); here it does not, and with it goes the accumulator
+//    store whose conflict-free forms measured slower on GB200 (see the note at
+//    the top of this file and section 5 of tc_paper_survey_2407.09621.md).
+//    The two results are still scaled by DIFFERENT Escale components, so they
+//    need two accumulator pairs and are summed only in the epilogue.
+// 2. Evaluated transposed -- C^T, which with m8n8k4 is the same two operand
+//    values passed in the opposite order -- the D1D operand of both directions
+//    is D[8*t + lane/4][4*ks + lane%4], which does not depend on j.  Sixteen
+//    doubles per lane hold it in registers for the whole j loop, so D1D never
+//    goes through shared memory and each mma costs exactly one shared load.
+//
+// A block owns half an element: j = 0..15 or j = 16..31.  That is not a shared
+// memory constraint (the block uses 42.5 KB either way, since the four face
+// planes halve when the j range does) but a wave one: 152 SMs and one block
+// resident each make 512 blocks four waves at 84% efficiency and 1024 blocks
+// seven waves at 96%.  Only faces 1 and 3, which do not vary in j, are
+// evaluated by both slabs; the face phase is about 28 us of the CUDA-core
+// kernel, so that redundancy is affordable at two slabs and not at four.
+
+#define NQ31 32
+#define NP31 32768
+#define NFPTOT31 6144
+#define JSLAB31 16
+
+// Every plane in this kernel is addressed as low + 32*high, and every mma
+// operand read has the contraction index in one of those two fields and the
+// tile row in the other.  Whichever way round it is, address bits 2-3 are
+// invariant across an FP64 half-warp phase and bits 5-6 vary with the lane, so
+// folding the latter into the former makes the phase cover sixteen distinct
+// banks.  One function therefore serves the x panel, the z panel, the y panel
+// and the two x-normal face planes, where p=15 needed three.
+//
+// Faces 5 and 6 are indexed (i,j) with j loop-uniform, so their epilogue loads
+// are already a four-way broadcast and are left unswizzled: applying the fold
+// there would be harmless but would buy nothing, and section 10.4 of
+// tc_paper_survey_2407.09621.md records that this kernel family loses whenever
+// a memory instruction is bought with extra integer ones.
+__device__ __forceinline__ int sw31(int idx)
+{
+  return idx ^ (((idx >> 5) & 3) << 2);
+}
+
+__device__ __forceinline__ double p31_face_flux_tc(
+    int fidx, const double *q, const double *u, const double *v,
+    const double *w, const int *VMapM, const int *VMapP,
+    const double *normal_fn, const double *Fscale, int nface)
+{
+  const int iM = VMapM[fidx] - 1;
+  const int iP = VMapP[fidx] - 1;
+  const double n1 = normal_fn[fidx];
+  const double n2 = normal_fn[fidx + nface];
+  const double n3 = normal_fn[fidx + 2 * nface];
+  const double qM = q[iM];
+  const double qP = q[iP];
+  const double VelM = u[iM] * n1 + v[iM] * n2 + w[iM] * n3;
+  const double VelP = u[iP] * n1 + v[iP] * n2 + w[iP] * n3;
+  const double alpha = 0.5 * fabs(VelP + VelM);
+  return 0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+}
+
+__global__ __launch_bounds__(512, 1) void tendency_fused_p31_xz_tc_kernel(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale,
+    const double *Escale, int Ne)
+{
+  // sFU and sFW hold the current j plane under ONE address map, node index
+  // i + 32*k.  For x the contraction index l is the i field and for z it is
+  // the k field, which is why one store path and one global load map serve
+  // both panels.
+  __shared__ __align__(16) double sFU[1024], sFW[1024];
+  // Faces 2 and 4 are (j,k) planes and faces 5 and 6 are (i,j) planes, so
+  // under the mma output map a consumer thread needs 16 j values of the first
+  // pair and 32 of the second.  Faces 1 and 3 are (i,k) planes and stay in
+  // registers; see the bijection note below.
+  __shared__ __align__(16) double sf2[1024], sf4[1024];
+  __shared__ __align__(16) double sf5[512], sf6[512];
+  __shared__ __align__(16) double sLift[192];
+
+  const int elem = (int)blockIdx.x >> 1;
+  if (elem >= Ne) {
+    return;
+  }
+  const int j0 = ((int)blockIdx.x & 1) * JSLAB31;
+
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int ti = warp & 3;
+  const int tk = warp >> 2;
+  const int row = lane >> 2;
+  const int colk = lane & 3;
+
+  const int elem_offset = elem * NP31;
+  const int face_offset = elem * NFPTOT31;
+  const int npoint = NP31 * Ne;
+  const int nface = NFPTOT31 * Ne;
+
+  if (tid < 192) {
+    sLift[tid] = Lift1D[tid];
+  }
+
+  // D1D is Fortran column major, so D(r,l) is at r + 32*l.  x wants the B
+  // operand D[i][l] with i = 8*ti + row and z the A operand D[k][l] with
+  // k = 8*tk + row; both read column 4*ks + colk, and neither depends on j.
+  double Dx[8], Dz[8];
+#pragma unroll
+  for (int ks = 0; ks < 8; ++ks) {
+    const int col = NQ31 * (4 * ks + colk);
+    Dx[ks] = D1D[(ti * 8 + row) + col];
+    Dz[ks] = D1D[(tk * 8 + row) + col];
+  }
+
+  // Output nodes of this lane, for every j: i = 8*ti + 2*colk and +1 at
+  // k = 8*tk + row.  The pair is adjacent in i, so dqdt and Escale move as
+  // aligned double2.
+  const int i0 = ti * 8 + 2 * colk;
+  const int kout = tk * 8 + row;
+
+  // Faces 1 and 3 are (i,k) planes, and (thread, {0,1}) -> i0 + 32*kout and +1
+  // is a bijection onto the 1024 face points, so each thread evaluates exactly
+  // the two points it will consume.  No redistribution, and the gather is
+  // eight 64-byte runs per warp, the same shape as the epilogue.
+  const int p13 = i0 + NQ31 * kout;
+  const double f1a = p31_face_flux_tc(face_offset + p13, q, u, v, w, VMapM,
+                                      VMapP, normal_fn, Fscale, nface);
+  const double f1b = p31_face_flux_tc(face_offset + p13 + 1, q, u, v, w, VMapM,
+                                      VMapP, normal_fn, Fscale, nface);
+  const double f3a = p31_face_flux_tc(face_offset + 2048 + p13, q, u, v, w,
+                                      VMapM, VMapP, normal_fn, Fscale, nface);
+  const double f3b = p31_face_flux_tc(face_offset + 2048 + p13 + 1, q, u, v, w,
+                                      VMapM, VMapP, normal_fn, Fscale, nface);
+
+  // Faces 2 and 4: 16 j by 32 k is exactly 512 points.  The producer takes k
+  // from the high nibble so a half warp holds k fixed and walks 16 consecutive
+  // j, which is one 128-byte global run and, since the fold source is then
+  // constant, a conflict-free shared store.
+  {
+    const int jl = tid & 15;
+    const int kk = tid >> 4;
+    const int pl = (j0 + jl) + NQ31 * kk;
+    const int sa = sw31(jl + NQ31 * kk);
+    sf2[sa] = p31_face_flux_tc(face_offset + 1024 + pl, q, u, v, w, VMapM,
+                               VMapP, normal_fn, Fscale, nface);
+    sf4[sa] = p31_face_flux_tc(face_offset + 3072 + pl, q, u, v, w, VMapM,
+                               VMapP, normal_fn, Fscale, nface);
+  }
+  // Faces 5 and 6: 32 i by 16 j.  A warp walks 32 consecutive i at fixed j.
+  {
+    const int ii = tid & 31;
+    const int jl = tid >> 5;
+    const int pl = ii + NQ31 * (j0 + jl);
+    const int sa = ii + NQ31 * jl;
+    sf5[sa] = p31_face_flux_tc(face_offset + 4096 + pl, q, u, v, w, VMapM,
+                               VMapP, normal_fn, Fscale, nface);
+    sf6[sa] = p31_face_flux_tc(face_offset + 5120 + pl, q, u, v, w, VMapM,
+                               VMapP, normal_fn, Fscale, nface);
+  }
+  __syncthreads();
+
+  // Lift1D(Nq,6) varies in j for faces 1 and 3, in i for faces 2 and 4 and in
+  // k for faces 5 and 6, so six of the eight coefficients this lane needs are
+  // constant over the j loop and are read once here.
+  const double lf2a = sLift[32 + i0];
+  const double lf2b = sLift[33 + i0];
+  const double lf4a = sLift[96 + i0];
+  const double lf4b = sLift[97 + i0];
+  const double lf5 = sLift[128 + kout];
+  const double lf6 = sLift[160 + kout];
+
+  // Operand base addresses.  For sFU the fold source is kout and for sFW it is
+  // colk, and neither depends on ks, so the k-step is one XOR by a constant on
+  // the x side and one add on the z side.
+  const int ax = sw31(colk + NQ31 * kout);
+  const int bz = sw31((ti * 8 + row) + NQ31 * colk);
+
+  // The plane load is linear and coalesced, which the mma fragment map is not
+  // and does not have to be: a half warp covers 32 consecutive nodes of one k
+  // line, one 256-byte run, and each thread moves a double2 of q, u and w.
+  const int ldi = 2 * (tid & 15);
+  const int ldk = tid >> 4;
+  const int ldsh = sw31(ldi + NQ31 * ldk);
+  int gidx = elem_offset + ldi + NQ31 * j0 + (NQ31 * NQ31) * ldk;
+
+  // One block per SM leaves no second block to interleave with, so the plane
+  // for j+1 is issued before the mma of j consumes the plane for j.
+  double2 qp = *reinterpret_cast<const double2 *>(q + gidx);
+  double2 up = *reinterpret_cast<const double2 *>(u + gidx);
+  double2 wp = *reinterpret_cast<const double2 *>(w + gidx);
+
+  for (int jl = 0; jl < JSLAB31; ++jl) {
+    *reinterpret_cast<double2 *>(sFU + ldsh) =
+        make_double2(qp.x * up.x, qp.y * up.y);
+    *reinterpret_cast<double2 *>(sFW + ldsh) =
+        make_double2(qp.x * wp.x, qp.y * wp.y);
+    if (jl + 1 < JSLAB31) {
+      gidx += NQ31;
+      qp = *reinterpret_cast<const double2 *>(q + gidx);
+      up = *reinterpret_cast<const double2 *>(u + gidx);
+      wp = *reinterpret_cast<const double2 *>(w + gidx);
+    }
+    __syncthreads();
+
+    // x^T = (D * FU)^T and z^T = (FW * D^T)^T on this j plane.  Same output
+    // map, separate accumulators, because Escale differs by direction.
+    double cx0, cx1, cz0, cz1;
+    mma_reset(cx0, cx1);
+    mma_reset(cz0, cz1);
+#pragma unroll
+    for (int ks = 0; ks < 8; ++ks) {
+      mma_m8n8k4_f64(cx0, cx1, sFU[ax ^ (4 * ks)], Dx[ks], cx0, cx1);
+      mma_m8n8k4_f64(cz0, cz1, Dz[ks], sFW[bz + 128 * ks], cz0, cz1);
+    }
+
+    const int j = j0 + jl;
+    const int nidx = elem_offset + i0 + NQ31 * j + (NQ31 * NQ31) * kout;
+    const double2 ex = *reinterpret_cast<const double2 *>(Escale + nidx);
+    const double2 ez =
+        *reinterpret_cast<const double2 *>(Escale + nidx + 2 * npoint);
+    const double lf1 = sLift[j];
+    const double lf3 = sLift[64 + j];
+    const int a24 = sw31(jl + NQ31 * kout);
+    const double fb2 = sf2[a24];
+    const double fb4 = sf4[a24];
+    const double2 fb5 =
+        *reinterpret_cast<const double2 *>(sf5 + i0 + NQ31 * jl);
+    const double2 fb6 =
+        *reinterpret_cast<const double2 *>(sf6 + i0 + NQ31 * jl);
+
+    // Same summation order as tendency_fused_p31_xz_kernel.
+    *reinterpret_cast<double2 *>(dqdt + nidx) = make_double2(
+        -(ex.x * cx0 + ez.x * cz0 + lf1 * f1a + lf2a * fb2 + lf3 * f3a +
+          lf4a * fb4 + lf5 * fb5.x + lf6 * fb6.x),
+        -(ex.y * cx1 + ez.y * cz1 + lf1 * f1b + lf2b * fb2 + lf3 * f3b +
+          lf4b * fb4 + lf5 * fb5.y + lf6 * fb6.y));
+    __syncthreads();
+  }
+}
+
+//> p=31 y volume term, accumulated onto what the xz kernel wrote.
+//
+// Threads are (i,j) with k the inner loop, and the contraction
+// C(i,j) = sum_l FV(i,k,l) * D(j,l) is structurally the z contraction of the
+// first kernel: transposed it wants D as the A operand from registers and the
+// plane as the B operand from shared, under the same address map and the same
+// swizzle.  The block owns half an element in k, for the same wave reason.
+__global__ __launch_bounds__(512, 1) void tendency_fused_p31_y_tc_kernel(
+    double *dqdt, const double *D1D, const double *q, const double *v,
+    const double *Escale, int Ne)
+{
+  __shared__ __align__(16) double sFV[1024];
+
+  const int elem = (int)blockIdx.x >> 1;
+  if (elem >= Ne) {
+    return;
+  }
+  const int k0 = ((int)blockIdx.x & 1) * JSLAB31;
+
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int ti = warp & 3;
+  const int tj = warp >> 2;
+  const int row = lane >> 2;
+  const int colk = lane & 3;
+
+  const int elem_offset = elem * NP31;
+  const int npoint = NP31 * Ne;
+
+  double Dy[8];
+#pragma unroll
+  for (int ks = 0; ks < 8; ++ks) {
+    Dy[ks] = D1D[(tj * 8 + row) + NQ31 * (4 * ks + colk)];
+  }
+
+  const int i0 = ti * 8 + 2 * colk;
+  const int jout = tj * 8 + row;
+  const int by = sw31((ti * 8 + row) + NQ31 * colk);
+
+  const int ldi = 2 * (tid & 15);
+  const int ldj = tid >> 4;
+  const int ldsh = sw31(ldi + NQ31 * ldj);
+  int gidx = elem_offset + ldi + NQ31 * ldj + (NQ31 * NQ31) * k0;
+
+  double2 qp = *reinterpret_cast<const double2 *>(q + gidx);
+  double2 vp = *reinterpret_cast<const double2 *>(v + gidx);
+
+  for (int kl = 0; kl < JSLAB31; ++kl) {
+    *reinterpret_cast<double2 *>(sFV + ldsh) =
+        make_double2(qp.x * vp.x, qp.y * vp.y);
+    if (kl + 1 < JSLAB31) {
+      gidx += NQ31 * NQ31;
+      qp = *reinterpret_cast<const double2 *>(q + gidx);
+      vp = *reinterpret_cast<const double2 *>(v + gidx);
+    }
+    __syncthreads();
+
+    double c0, c1;
+    mma_reset(c0, c1);
+#pragma unroll
+    for (int ks = 0; ks < 8; ++ks) {
+      mma_m8n8k4_f64(c0, c1, Dy[ks], sFV[by + 128 * ks], c0, c1);
+    }
+
+    const int nidx =
+        elem_offset + i0 + NQ31 * jout + (NQ31 * NQ31) * (k0 + kl);
+    const double2 ey =
+        *reinterpret_cast<const double2 *>(Escale + nidx + npoint);
+    double2 out = *reinterpret_cast<const double2 *>(dqdt + nidx);
+    out.x -= ey.x * c0;
+    out.y -= ey.y * c1;
+    *reinterpret_cast<double2 *>(dqdt + nidx) = out;
+    __syncthreads();
+  }
+}
+
+extern "C" void launch_tendency_fused_p31_tc(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale,
+    const double *Escale, int Ne)
+{
+  tendency_fused_p31_xz_tc_kernel<<<2 * Ne, 512, 0, dg_cuda_stream>>>(
+      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
+      Ne);
+  tendency_fused_p31_y_tc_kernel<<<2 * Ne, 512, 0, dg_cuda_stream>>>(
+      dqdt, D1D, q, v, Escale, Ne);
+  check_cuda("tendency_fused_p31_tc kernels");
+}

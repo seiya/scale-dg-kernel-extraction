@@ -140,6 +140,18 @@ module mod_cuda_dg_kernels
       real(c_double), device :: normal_fn(*), Fscale(*), Escale(*)
     end subroutine launch_tendency_fused_p15_tc
 
+    subroutine launch_tendency_fused_p31_tc( &
+      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
+      normal_fn, Fscale, Escale, Ne) &
+      bind(C, name="launch_tendency_fused_p31_tc")
+      import
+      integer(c_int), value :: Ne
+      real(c_double), device :: dqdt(*), D1D(*), Lift1D(*)
+      real(c_double), device :: q(*), u(*), v(*), w(*)
+      integer(c_int), device :: VMapM(*), VMapP(*)
+      real(c_double), device :: normal_fn(*), Fscale(*), Escale(*)
+    end subroutine launch_tendency_fused_p31_tc
+
     subroutine launch_tendency_xyz_p255_tc( &
       dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, Ne) &
       bind(C, name="launch_tendency_xyz_p255_tc")
@@ -675,28 +687,38 @@ contains
 
     integer :: istat
 
-    if (Nq /= 8 .and. Nq /= 16) then
-      write(*,*) "CUDAFORTRAN_FUSED_TC currently requires PolyOrder=7 or 15"
+    if (Nq /= 8 .and. Nq /= 16 .and. Nq /= CUDA_FUSED_P31_NQ) then
+      write(*,*) "CUDAFORTRAN_FUSED_TC currently requires PolyOrder=7, 15 or 31"
       error stop
     end if
     call dg_ev_begin()
 
     call dg_ev_record(1)
-    if (Nq == 8) then
+    select case (Nq)
+    case (8)
       call launch_tendency_fused_p7_tc( &
         dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
         normal_fn, Fscale, Escale, int(Ne,c_int) )
       istat = cudaGetLastError()
       if (istat /= cudaSuccess) call cuda_failure( &
         "tendency_fused_p7_tc_kernel",istat)
-    else
+    case (16)
       call launch_tendency_fused_p15_tc( &
         dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
         normal_fn, Fscale, Escale, int(Ne,c_int) )
       istat = cudaGetLastError()
       if (istat /= cudaSuccess) call cuda_failure( &
         "tendency_fused_p15_tc_kernel",istat)
-    end if
+    case default
+      ! Nq = 32.  The x and z volume terms and all six face lifts run first,
+      ! then the y term is accumulated on top, as on the CUDA-core path.
+      call launch_tendency_fused_p31_tc( &
+        dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, &
+        normal_fn, Fscale, Escale, int(Ne,c_int) )
+      istat = cudaGetLastError()
+      if (istat /= cudaSuccess) call cuda_failure( &
+        "tendency_fused_p31_tc kernels",istat)
+    end select
     call dg_ev_record(2)
     call dg_ev_end(DG_EV_SINGLE)
 
