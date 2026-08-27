@@ -248,6 +248,7 @@ contains
     integer :: fid
     integer :: i, j, k, fp
 
+    logical :: have_file, dense_lift
     character(len=128) :: fname
     !----------------------------------------------------------
 
@@ -268,13 +269,22 @@ contains
     ! Operator data
     !----------------------------------------------------------
 
-    if (p == 255) then
-      allocate(Lift_mat(1,1,1,1))
-      call generate_lgl_operators_p255(x1D,D1D,Lift1D)
-    else
-      allocate(Lift_mat(Nq,Nq,Nq,6))
-      write(fname,'(a,"/p",I0,".dat")') operator_data_dir, p
+    write(fname,'(a,"/p",I0,".dat")') operator_data_dir, p
+    inquire(file=trim(fname), exist=have_file)
 
+    ! The dense Lift_mat is a repackaging of Lift1D that costs 6*Nq**3 doubles.
+    ! Keep it where the OpenACC / CPU paths can afford it (100 MB at Nq=128);
+    ! at Nq=256 it would be 805 MB, so that order gets a dummy allocation and
+    ! only the separable Lift1D.
+    dense_lift = (Nq <= 128)
+
+    if (dense_lift) then
+      allocate(Lift_mat(Nq,Nq,Nq,6))
+    else
+      allocate(Lift_mat(1,1,1,1))
+    end if
+
+    if (have_file) then
       fid = 20
       open(fid,file=trim(fname),status='old',action='read')
 
@@ -289,6 +299,9 @@ contains
       Lift1D(:,4) = Lift_mat(:,1,1,4)
       Lift1D(:,5) = Lift_mat(1,1,:,5)
       Lift1D(:,6) = Lift_mat(1,1,:,6)
+    else
+      call generate_lgl_operators(p,x1D,D1D,Lift1D)
+      if (dense_lift) call expand_lift1d(Lift1D,Lift_mat,Nq)
     end if
 
     D1D_tr = transpose(D1D)
@@ -358,65 +371,72 @@ contains
   end subroutine element_init
 
 
-  !> Generate the p=255 Legendre-Gauss-Lobatto operators at startup.
-  !! Keeping this generated avoids a roughly multi-gigabyte text data file.
-  subroutine generate_lgl_operators_p255(nodes,deriv,lift1d)
+  !> Generate the Legendre-Gauss-Lobatto operators of degree p at startup.
+  !! Used for the orders that have no operator_data/p<p>.dat file.  Keeping
+  !! them generated avoids text data files that grow as 6*Nq**3 values.
+  subroutine generate_lgl_operators(p,nodes,deriv,lift1d)
     implicit none
-    real(RP), intent(out) :: nodes(256), deriv(256,256)
-    real(RP), intent(out) :: lift1d(256,6)
+    integer, intent(in) :: p
+    real(RP), intent(out) :: nodes(p+1)
+    real(RP), intent(out) :: deriv(p+1,p+1)
+    real(RP), intent(out) :: lift1d(p+1,6)
 
-    integer, parameter :: degree = 255
+    integer :: n
     integer :: i, j, iter
     real(RP) :: x, xnew, pn_i, pnm1_i, pn_j, pnm1_j
-    real(RP) :: left_lift(256), right_lift(256)
+    real(RP), allocatable :: left_lift(:), right_lift(:)
     real(RP), parameter :: tolerance = 32.0_RP*epsilon(1.0_RP)
     !------------------------------------------------------------
 
+    n = p + 1
+    allocate(left_lift(n), right_lift(n))
+
     nodes(1) = -1.0_RP
-    nodes(256) = 1.0_RP
-    do i = 2, 255
-      x = -cos(PI*real(i-1,RP)/real(degree,RP))
+    nodes(n) = 1.0_RP
+    do i = 2, n-1
+      x = -cos(PI*real(i-1,RP)/real(p,RP))
       do iter = 1, 100
-        call eval_legendre_pair(degree,x,pn_i,pnm1_i)
-        xnew = x - (x*pn_i-pnm1_i)/(real(degree+1,RP)*pn_i)
+        call eval_legendre_pair(p,x,pn_i,pnm1_i)
+        xnew = x - (x*pn_i-pnm1_i)/(real(p+1,RP)*pn_i)
         if (abs(xnew-x) <= tolerance*max(1.0_RP,abs(xnew))) exit
         x = xnew
       end do
-      if (iter > 100) error stop "p=255 LGL node iteration did not converge"
+      if (iter > 100) error stop "LGL node iteration did not converge"
       nodes(i) = xnew
     end do
 
     ! Enforce the exact symmetry of the LGL grid.
-    do i = 1, 128
-      x = 0.5_RP*(nodes(257-i)-nodes(i))
+    do i = 1, n/2
+      x = 0.5_RP*(nodes(n+1-i)-nodes(i))
       nodes(i) = -x
-      nodes(257-i) = x
+      nodes(n+1-i) = x
     end do
+    if (mod(n,2) == 1) nodes((n+1)/2) = 0.0_RP
 
-    do i = 1, 256
-      call eval_legendre_pair(degree,nodes(i),pn_i,pnm1_i)
-      do j = 1, 256
+    do i = 1, n
+      call eval_legendre_pair(p,nodes(i),pn_i,pnm1_i)
+      do j = 1, n
         if (i == j) then
           if (i == 1) then
-            deriv(i,j) = -0.25_RP*real(degree*(degree+1),RP)
-          else if (i == 256) then
-            deriv(i,j) = 0.25_RP*real(degree*(degree+1),RP)
+            deriv(i,j) = -0.25_RP*real(p*(p+1),RP)
+          else if (i == n) then
+            deriv(i,j) = 0.25_RP*real(p*(p+1),RP)
           else
             deriv(i,j) = 0.0_RP
           end if
         else
-          call eval_legendre_pair(degree,nodes(j),pn_j,pnm1_j)
+          call eval_legendre_pair(p,nodes(j),pn_j,pnm1_j)
           deriv(i,j) = pn_i/(pn_j*(nodes(i)-nodes(j)))
         end if
       end do
 
-      left_lift(i) = 0.5_RP*real(degree+1,RP)*pn_i*(-1.0_RP)
-      right_lift(i) = 0.5_RP*real(degree+1,RP)*pn_i
+      left_lift(i) = 0.5_RP*real(p+1,RP)*pn_i*(-1.0_RP)
+      right_lift(i) = 0.5_RP*real(p+1,RP)*pn_i
     end do
     left_lift(1) = left_lift(1) &
-      + 0.5_RP*real(degree*(degree+1),RP)
-    right_lift(256) = right_lift(256) &
-      + 0.5_RP*real(degree*(degree+1),RP)
+      + 0.5_RP*real(p*(p+1),RP)
+    right_lift(n) = right_lift(n) &
+      + 0.5_RP*real(p*(p+1),RP)
 
     lift1d(:,1) = left_lift
     lift1d(:,2) = right_lift
@@ -424,7 +444,40 @@ contains
     lift1d(:,4) = left_lift
     lift1d(:,5) = left_lift
     lift1d(:,6) = right_lift
-  end subroutine generate_lgl_operators_p255
+
+    deallocate(left_lift, right_lift)
+  end subroutine generate_lgl_operators
+
+
+  !> Expand the separable 1D lift coefficients into the dense Lift_mat that
+  !! the general tensor-product lift kernel indexes.  Faces 1 and 3 vary with
+  !! j, faces 2 and 4 with i, faces 5 and 6 with k; this is the same structure
+  !! the Lift1D slices are pulled back out of when the operators come from a
+  !! data file.
+  subroutine expand_lift1d(lift1d,lift_mat,nq_in)
+    implicit none
+    integer, intent(in) :: nq_in
+    real(RP), intent(in) :: lift1d(nq_in,6)
+    real(RP), intent(out) :: lift_mat(nq_in,nq_in,nq_in,6)
+
+    integer :: i, j, k
+    !------------------------------------------------------------
+
+    do k = 1, nq_in
+    do j = 1, nq_in
+    do i = 1, nq_in
+      lift_mat(i,j,k,1) = lift1d(j,1)
+      lift_mat(i,j,k,2) = lift1d(i,2)
+      lift_mat(i,j,k,3) = lift1d(j,3)
+      lift_mat(i,j,k,4) = lift1d(i,4)
+      lift_mat(i,j,k,5) = lift1d(k,5)
+      lift_mat(i,j,k,6) = lift1d(k,6)
+    end do
+    end do
+    end do
+
+    return
+  end subroutine expand_lift1d
 
 
   !> Evaluate P_n(x) and P_{n-1}(x) by the stable three-term recurrence.
