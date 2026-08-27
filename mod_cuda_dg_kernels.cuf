@@ -188,6 +188,16 @@ module mod_cuda_dg_kernels
       integer(c_int) :: launch_volume_gemm_xy
     end function launch_volume_gemm_xy
 
+    function launch_volume_gemm_y(deriv_y, flux_y, D1D_tr, &
+      Nq, Ne, mma_shape) bind(C, name="launch_volume_gemm_y")
+      import
+      integer(c_int), value :: Nq, Ne, mma_shape
+      real(c_double), device :: deriv_y(*)
+      real(c_double), device :: flux_y(*)
+      real(c_double), device :: D1D_tr(*)
+      integer(c_int) :: launch_volume_gemm_y
+    end function launch_volume_gemm_y
+
     function launch_z_gemm_assembly(dqdt, flux_z, D1D_tr, deriv_x, deriv_y, &
       flux_bnd, lift1d, escale, Nq, Ne, mma_shape) &
       bind(C, name="launch_z_gemm_assembly")
@@ -1042,10 +1052,33 @@ contains
         flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
     end if
 
-    istat = launch_volume_gemm_xy( &
-      deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, Nq, Ne, &
-      cutlass_mma_shape_id )
-    if (istat /= 0) call cuda_failure("launch_volume_gemm_xy",istat)
+    ! Who runs the x GEMM depends on how deep K = Nq is.  Both libraries pick
+    ! the same 64x128 threadblock tile with TileK=16 and 3 stages over the same
+    ! m8n8k4 instruction, but with only four mainloop iterations at Nq=64 the
+    ! CUTLASS 2.x prologue and epilogue stop being amortized: it spends 44.3 M
+    ! instructions where cuBLAS spends 21.2 M, and runs 184.4 us against
+    ! 115.7 us.  Measured at 660.4 -> 590.9 us per stage for the whole tendency
+    ! (-10.5%).  At Nq=256 the mainloop is 16 iterations deep and the advantage
+    ! is gone (990.7 against 998.6 us per stage, i.e. a wash), so leave the
+    ! deep orders on CUTLASS - that also keeps CutlassMmaShape meaningful for
+    ! the x GEMM on H100, where 16x8x4 is what makes it win.
+    ! The y GEMM is within 4% either way and stays on CUTLASS.  The z GEMM has
+    ! to: the lift and the assembly live in its epilogue.
+    ! See reports/p63_gap_study.md.
+    if (Nq <= 64) then
+      istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
+        D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
+      if (istat /= 0) call cuda_failure("cublasDgemm x-deriv (fused)",istat)
+
+      istat = launch_volume_gemm_y( &
+        deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
+      if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
+    else
+      istat = launch_volume_gemm_xy( &
+        deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, Nq, Ne, &
+        cutlass_mma_shape_id )
+      if (istat /= 0) call cuda_failure("launch_volume_gemm_xy",istat)
+    end if
 
     call dg_ev_record(3)
 

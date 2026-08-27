@@ -147,6 +147,17 @@ int run_volume_gemms_xy(double *deriv_x, double *deriv_y, const double *flux_x,
 }
 
 template <class Set>
+int run_volume_gemm_y(double *deriv_y, const double *flux_y,
+                      const double *D1D_tr, int Nq, int Ne)
+{
+  const long long stride_plane = Nq * Nq;
+
+  return run_gemm_batched_nn<typename Set::GemmY>(
+      Nq, Nq, Nq, flux_y, Nq, stride_plane, D1D_tr, Nq, 0, deriv_y, Nq,
+      stride_plane, Nq * Ne);
+}
+
+template <class Set>
 int run_volume_gemms(double *deriv_x, double *deriv_y, double *deriv_z,
                      const double *flux_x, const double *flux_y,
                      const double *flux_z, const double *D1D,
@@ -289,6 +300,30 @@ extern "C" int launch_volume_gemm_xy(
   case 3:
     return run_volume_gemms_xy<MmaSet_16816>(deriv_x, deriv_y, flux_x, flux_y,
                                              D1D, D1D_tr, Nq, Ne);
+  default:
+    return bad_mma_shape(mma_shape);
+  }
+}
+
+//  The x GEMM of the fused path is served by cuBLAS instead: at p=63 the two
+//  land on the identical 64x128_16x3 d884 tile and cuBLAS is 1.59x faster
+//  there, so only the y GEMM is left to CUTLASS.  See reports/p63_gap_study.md.
+extern "C" int launch_volume_gemm_y(double *deriv_y, const double *flux_y,
+                                    const double *D1D_tr, int Nq, int Ne,
+                                    int mma_shape)
+{
+  if (Nq <= 0 || Ne <= 0) {
+    return 1;
+  }
+  switch (mma_shape) {
+  case 0:
+    return run_volume_gemm_y<MmaSet_884>(deriv_y, flux_y, D1D_tr, Nq, Ne);
+  case 1:
+    return run_volume_gemm_y<MmaSet_1684>(deriv_y, flux_y, D1D_tr, Nq, Ne);
+  case 2:
+    return run_volume_gemm_y<MmaSet_1688>(deriv_y, flux_y, D1D_tr, Nq, Ne);
+  case 3:
+    return run_volume_gemm_y<MmaSet_16816>(deriv_y, flux_y, D1D_tr, Nq, Ne);
   default:
     return bad_mma_shape(mma_shape);
   }
