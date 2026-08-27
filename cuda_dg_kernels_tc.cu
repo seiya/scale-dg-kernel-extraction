@@ -576,15 +576,37 @@ __device__ __forceinline__ int sw_z15(int idx)
   return idx ^ (((idx >> 8) & 3) << 2);
 }
 
-// The z accumulator store has 2*colk in bits 1-2 and the output k in bits
-// 8-11, so a store phase would hit four banks.  Folding bit 8 into bit 3
-// gives eight, i.e. 2-way, exactly the compromise sw_dz() settles for at
-// Nq=8; section 10.3 of the survey records that the fully conflict-free
-// permutation measured slower there.  Bit 0 is left alone so the c0/c1 pair
-// stays adjacent.
+// The z derivative is written under the mma output map and read back under
+// the x/y one, and the two disagree about where the varying bits live: the
+// store has 2*colk in bits 1-2 and the output k in bits 8-10, while the read
+// has 2*colk in bits 1-2 and j in bits 4-6.  Bits 0 and 3 are dead in both,
+// so folding the store's bits 8-9 and the read's bits 4-5 into them makes
+// both phases conflict free at once.  Each phase only ever sees the other's
+// source bits as warp-invariant, so the extra terms are a constant XOR there
+// and do no harm.  Bit 0 is only ever XORed with warp-invariant bits, which
+// keeps the c0/c1 pair adjacent so the pair still moves as one double2.
+//
+// Unlike Nq=8, where section 10.3 of the survey found the fully conflict-free
+// permutation slower, this one is not a trade: at Nq=16 the read was 4-way,
+// and ncu (job 55570) put 3.21 M of the kernel's shared-load conflicts here.
 __device__ __forceinline__ int sw_dz15(int idx)
 {
-  return idx ^ (((idx >> 8) & 1) << 3);
+  return idx ^ (((idx >> 8) & 1) << 3) ^ (((idx >> 9) & 1) << 0) ^
+         (((idx >> 4) & 1) << 0) ^ (((idx >> 5) & 1) << 3);
+}
+
+// Face-flux staging.  The six faces are read back with three different index
+// shapes: faces 1 and 3 vary in (i,k), faces 2 and 4 in (j,k) and faces 5 and
+// 6 in (i,j).  Within a warp k is constant, so the first two shapes broadcast,
+// but the (i,j) one has 2*colk in bits 1-2 and j in bits 4-7 with bits 0 and 3
+// dead, which is a 4-way conflict on eight of the epilogue's loads.  Folding
+// the j bits into the dead ones fixes faces 5 and 6 and leaves the other four
+// broadcasting, because there those bits are warp-invariant.  The write side
+// is fp = tid, i.e. sixteen consecutive indices per half warp, and a fold of
+// bits that are constant across them is still a permutation of the sixteen.
+__device__ __forceinline__ int sw_f15(int fp)
+{
+  return fp ^ (((fp >> 4) & 1) << 0) ^ (((fp >> 5) & 1) << 3);
 }
 
 __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
@@ -771,7 +793,7 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
     double VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
                   w[iP] * normal_fn[fidx + 2 * nface];
     double alpha = 0.5 * fabs(VelP + VelM);
-    sbuf[fp] =
+    sbuf[sw_f15(fp)] =
         0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
     if (tid < 512) {
       fp = tid + 1024;
@@ -785,7 +807,7 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
       VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
              w[iP] * normal_fn[fidx + 2 * nface];
       alpha = 0.5 * fabs(VelP + VelM);
-      sbuf[fp] =
+      sbuf[sw_f15(fp)] =
           0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
     }
   }
@@ -801,25 +823,29 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
     const double lf6 = sLift[80 + k];
     // Faces 2 and 4 vary in j and k only, so all four nodes share the value
     // and differ only through the Lift1D coefficient, which varies in i.
-    const double fb2 = sbuf[256 + jout + NQ15 * k];
-    const double fb4 = sbuf[768 + jout + NQ15 * k];
-    const int f1A = iA + NQ15 * k;
-    const int f1B = iB + NQ15 * k;
-    const int f5A = 1024 + iA + NQ15 * jout;
-    const int f5B = 1024 + iB + NQ15 * jout;
+    // Every index below is even and the swizzle only ever XORs bit 0 with
+    // warp-invariant bits here, so the +1 neighbour stays the XOR neighbour;
+    // likewise +256 and +512 move bits the fold does not read.
+    const int sb2 = sw_f15(256 + jout + NQ15 * k);
+    const double fb2 = sbuf[sb2];
+    const double fb4 = sbuf[sb2 + 512];
+    const int s1A = sw_f15(iA + NQ15 * k);
+    const int s1B = sw_f15(iB + NQ15 * k);
+    const int s5A = sw_f15(1024 + iA + NQ15 * jout);
+    const int s5B = sw_f15(1024 + iB + NQ15 * jout);
 
-    const double l0 = lf1 * sbuf[f1A] + sLift[16 + iA] * fb2 +
-                      lf3 * sbuf[512 + f1A] + sLift[48 + iA] * fb4 +
-                      lf5 * sbuf[f5A] + lf6 * sbuf[f5A + 256];
-    const double l1 = lf1 * sbuf[f1A + 1] + sLift[17 + iA] * fb2 +
-                      lf3 * sbuf[512 + f1A + 1] + sLift[49 + iA] * fb4 +
-                      lf5 * sbuf[f5A + 1] + lf6 * sbuf[f5A + 257];
-    const double l2 = lf1 * sbuf[f1B] + sLift[16 + iB] * fb2 +
-                      lf3 * sbuf[512 + f1B] + sLift[48 + iB] * fb4 +
-                      lf5 * sbuf[f5B] + lf6 * sbuf[f5B + 256];
-    const double l3 = lf1 * sbuf[f1B + 1] + sLift[17 + iB] * fb2 +
-                      lf3 * sbuf[512 + f1B + 1] + sLift[49 + iB] * fb4 +
-                      lf5 * sbuf[f5B + 1] + lf6 * sbuf[f5B + 257];
+    const double l0 = lf1 * sbuf[s1A] + sLift[16 + iA] * fb2 +
+                      lf3 * sbuf[512 + s1A] + sLift[48 + iA] * fb4 +
+                      lf5 * sbuf[s5A] + lf6 * sbuf[s5A + 256];
+    const double l1 = lf1 * sbuf[s1A ^ 1] + sLift[17 + iA] * fb2 +
+                      lf3 * sbuf[512 + (s1A ^ 1)] + sLift[49 + iA] * fb4 +
+                      lf5 * sbuf[s5A ^ 1] + lf6 * sbuf[(s5A ^ 1) + 256];
+    const double l2 = lf1 * sbuf[s1B] + sLift[16 + iB] * fb2 +
+                      lf3 * sbuf[512 + s1B] + sLift[48 + iB] * fb4 +
+                      lf5 * sbuf[s5B] + lf6 * sbuf[s5B + 256];
+    const double l3 = lf1 * sbuf[s1B ^ 1] + sLift[17 + iB] * fb2 +
+                      lf3 * sbuf[512 + (s1B ^ 1)] + sLift[49 + iB] * fb4 +
+                      lf5 * sbuf[s5B ^ 1] + lf6 * sbuf[(s5B ^ 1) + 256];
 
     *reinterpret_cast<double2 *>(dqdt + gA) =
         make_double2(-(acc0 + l0), -(acc1 + l1));
