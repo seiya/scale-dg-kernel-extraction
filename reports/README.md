@@ -15,7 +15,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`tma_survey.md`](tma_survey.md) | TMA の適用可能性を候補ごとに実測した記録。採用ゼロだが、FP64 での受理条件・帯域・L1 挙動と、2 候補それぞれの構造的な不採用理由 |
 | [`cublas_emulation_survey.md`](cublas_emulation_survey.md) | cuBLAS FP64 fixed-point emulation の見かけのストール調査。EAGER 強制、永続 8 GiB workspace、p=7/p=255 の速度と数値検証 |
 | [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md) | arXiv:2504.08009v3（Ozaki Scheme II、INT8 Tensor Core による FP64 GEMM エミュレーション）の適用調査。不採用だが、成立条件が `p ≳ 500-650` であること、およびハードウェア条件が 3.82 FLOP/byte であることを実測から確定した |
-| [`p15_gap_study.md`](p15_gap_study.md) | p=7 と p=255 の間を同一 DOF で埋める最初の点 p=15 (Nq=16)。`tendency_fused_p15_kernel` の追加、shared 戦略、占有率律速という第三の状態の同定 |
+| [`p15_gap_study.md`](p15_gap_study.md) | p=7 と p=255 の間を同一 DOF で埋める最初の点 p=15 (Nq=16)。CUDA core 版と Tensor Core 版の融合カーネル、shared 戦略、Nq=16 では融合したまま占有率 50% を超えられないという構造的な壁 |
 
 ## 現時点の結論
 
@@ -63,7 +63,18 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   **62 レジスタによる 1 ブロック/SM = 占有率 49%** である。
   `launch_bounds(1024,2)` は 32 レジスタ spill ゼロを達成しながら **+6.8%**、
   carveout 追加で **+8.2%** と、どちらも不採用。
-  したがって **Tensor Core 版を試す価値はある**（事前予測「まだ帯域律速のはず」は外れた）。
+  **Tensor Core 版も実装した**（`tendency_fused_p15_tc_kernel`）。m8n8k4 のタイルが
+  8x8 なので 16x16 プレーンは出力タイル 4 枚・k ステップ 4 回になるが、
+  **フラグメント配置 1 つが x/y/z 3 方向すべてに使え、swizzle も 1 本で x と y を賄える**。
+  shared 戦略は CUDA core 版のものをそのまま流用でき、事前調査が TC 移植の最大の障壁と
+  見ていた「3 本の流束パネルで 96 KB」は問題にならなかった。
+  結果は device **26.04 → 22.22 ms（1.17 倍）**で、ncu では狙いどおり
+  **Compute (SM) が 36.0% → 19.8% とほぼ半減**している。
+  ただし**帯域は使い切らず**（DRAM 47%）、占有率も 48.9% で動かない。
+  **CUDA core に対する TC の優位は Nq とともに伸びない**（p=7 で 1.21 倍、p=15 で 1.17 倍）。
+  両版が同じ占有率で並ぶのは構造的で、z 収縮が要素全体を要求する以上
+  1 要素 = 1 ブロック、4096 ノード / 最大 1024 スレッド = 4 ノード/スレッドが下限、
+  その状態量は 32 レジスタに収まらない、という連鎖による。
   詳細は `p15_gap_study.md`。
 - **p=7 TC の整数・アドレス演算削減（2026-08-25）**: `tc_paper_survey` §10 が
   次の標的に挙げた整数演算は、単独で削っても end-to-end では効かない（§11）。

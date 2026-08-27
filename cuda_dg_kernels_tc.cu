@@ -532,3 +532,310 @@ extern "C" void launch_tendency_xyz_p255_tc(
       dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, Ne);
   check_cuda("p255 tensor-core tendency kernels");
 }
+
+//============================================================================
+// p=15 (Nq=16) fused Tensor Core tendency
+//============================================================================
+//
+// Shared memory strategy is the one the CUDA-core p=15 kernel established:
+// laying out three directional flux panels the way the p=7 kernel does would
+// need 3*4096*8 = 96 KB and push the block past the 48 KB static limit into a
+// carveout that costs more L1 than it buys (section 13.4 of
+// tc_paper_survey_2407.09621.md).  One 4096-double buffer is reused for the x,
+// y and z panels in turn and then for the face fluxes, and q is held in
+// registers so every field is still read from global exactly once.
+//
+// The m8n8k4 tile is 8x8 while a plane here is 16x16, so one plane needs four
+// output tiles and four k-steps instead of one tile and two steps.  A warp
+// owns one j-half of one plane (both i-halves), so each lane still ends up
+// with four nodes: i = tn*8 + 2*colk and +1 for tn = 0, 1.
+//
+// The same fragment array serves all three directions.  x reads it as the B
+// operand D[i][l], y as the A operand D[j_out][j_in] and z as the A operand
+// D[k_out][l]; in every case a lane wants D[tile*8 + row][colk + 4*ks], so one
+// layout indexed by (tile, ks, row, colk) covers them all.
+#define NQ15 16
+#define NP15 4096
+#define NFPTOT15 1536
+
+// x reads the panel at (i = colk + 4*ks, j = tm*8 + row): colk lands in bits
+// 0-1 and row in bits 4-5, leaving bits 2-3 dead for a 4-way conflict.  y
+// reads at (i = tn*8 + row, j = colk + 4*ks), which is the same picture with
+// the roles swapped, so folding node bits 4-5 into address bits 2-3 fixes
+// both with one function -- the same trick sw_xy() plays at Nq=8, one bit
+// wider.  Neither the x k-step offset (bits 2-3) nor the y one (bits 6-7) is
+// read here, so both stay a plain XOR on the swizzled address.
+__device__ __forceinline__ int sw_xy15(int idx)
+{
+  return idx ^ (((idx >> 4) & 3) << 2);
+}
+
+// z strides by 256 doubles, so its contraction index sits in bits 8-9.
+__device__ __forceinline__ int sw_z15(int idx)
+{
+  return idx ^ (((idx >> 8) & 3) << 2);
+}
+
+// The z accumulator store has 2*colk in bits 1-2 and the output k in bits
+// 8-11, so a store phase would hit four banks.  Folding bit 8 into bit 3
+// gives eight, i.e. 2-way, exactly the compromise sw_dz() settles for at
+// Nq=8; section 10.3 of the survey records that the fully conflict-free
+// permutation measured slower there.  Bit 0 is left alone so the c0/c1 pair
+// stays adjacent.
+__device__ __forceinline__ int sw_dz15(int idx)
+{
+  return idx ^ (((idx >> 8) & 1) << 3);
+}
+
+__global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale,
+    const double *Escale, int Ne)
+{
+  __shared__ __align__(16) double sbuf[NP15];
+  __shared__ __align__(16) double sDfrag[256];
+  __shared__ __align__(16) double sLift[96];
+
+  const int elem = (int)blockIdx.x;
+  if (elem >= Ne) {
+    return;
+  }
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int row = lane >> 2;
+  const int colk = lane & 3;
+  const int k = warp >> 1;
+  const int tm = warp & 1;
+
+  const int elem_offset = elem * NP15;
+  const int face_offset = elem * NFPTOT15;
+  const int npoint = NP15 * Ne;
+  const int nface = NFPTOT15 * Ne;
+
+  if (tid < 256) {
+    const int t = tid >> 7;
+    const int ks = (tid >> 5) & 3;
+    const int r = (tid >> 2) & 7;
+    const int c = tid & 3;
+    sDfrag[tid] = D1D[(t * 8 + r) + (c + 4 * ks) * NQ15];
+  } else if (tid < 352) {
+    sLift[tid - 256] = Lift1D[tid - 256];
+  }
+
+  // Linear, coalesced ownership for the loads; the mma fragment map decides
+  // who computes what, which is a different mapping and does not have to
+  // agree with this one.
+  const int n0 = tid;
+  const int n1 = tid + 1024;
+  const int n2 = tid + 2048;
+  const int n3 = tid + 3072;
+  const int i0g = elem_offset + n0;
+  const int i1g = elem_offset + n1;
+  const int i2g = elem_offset + n2;
+  const int i3g = elem_offset + n3;
+  const double q0 = q[i0g], q1 = q[i1g], q2 = q[i2g], q3 = q[i3g];
+
+  // Output nodes of this lane: j = tm*8 + row, i = tn*8 + 2*colk and +1.
+  const int jout = tm * 8 + row;
+  const int outA = (2 * colk) + NQ15 * jout + 256 * k;
+  const int outB = outA + 8;
+  const int gA = elem_offset + outA;
+  const int gB = elem_offset + outB;
+
+  double acc0, acc1, acc2, acc3;
+  double c0, c1, c2, c3;
+
+  //- x -----------------------------------------------------------------
+  {
+    const int sx0 = sw_xy15(n0), sx1 = sw_xy15(n1);
+    const int sx2 = sw_xy15(n2), sx3 = sw_xy15(n3);
+    sbuf[sx0] = q0 * u[i0g];
+    sbuf[sx1] = q1 * u[i1g];
+    sbuf[sx2] = q2 * u[i2g];
+    sbuf[sx3] = q3 * u[i3g];
+  }
+  __syncthreads();
+  {
+    // A = flux panel at (i = colk + 4*ks, j = jout); the k-step moves bits
+    // 2-3, which sw_xy15 does not read.
+    const int ax = sw_xy15(colk + NQ15 * jout + 256 * k);
+    const int fbase = row * 4 + colk;
+    mma_reset(c0, c1);
+    mma_reset(c2, c3);
+#pragma unroll
+    for (int ks = 0; ks < 4; ++ks) {
+      const double a = sbuf[ax ^ (4 * ks)];
+      mma_m8n8k4_f64(c0, c1, a, sDfrag[(ks * 8 << 2) + fbase], c0, c1);
+      mma_m8n8k4_f64(c2, c3, a, sDfrag[128 + (ks * 8 << 2) + fbase], c2, c3);
+    }
+    const double2 ea = *reinterpret_cast<const double2 *>(Escale + gA);
+    const double2 eb = *reinterpret_cast<const double2 *>(Escale + gB);
+    acc0 = ea.x * c0;
+    acc1 = ea.y * c1;
+    acc2 = eb.x * c2;
+    acc3 = eb.y * c3;
+  }
+  __syncthreads();
+
+  //- y -----------------------------------------------------------------
+  {
+    const int sx0 = sw_xy15(n0), sx1 = sw_xy15(n1);
+    const int sx2 = sw_xy15(n2), sx3 = sw_xy15(n3);
+    sbuf[sx0] = q0 * v[i0g];
+    sbuf[sx1] = q1 * v[i1g];
+    sbuf[sx2] = q2 * v[i2g];
+    sbuf[sx3] = q3 * v[i3g];
+  }
+  __syncthreads();
+  {
+    // B = flux panel at (i = tn*8 + row, j = colk + 4*ks); the k-step moves
+    // bits 6-7, again not read by sw_xy15.
+    const int byA = sw_xy15(row + NQ15 * colk + 256 * k);
+    const int byB = sw_xy15((row + 8) + NQ15 * colk + 256 * k);
+    const int fbase = (tm << 7) + row * 4 + colk;
+    mma_reset(c0, c1);
+    mma_reset(c2, c3);
+#pragma unroll
+    for (int ks = 0; ks < 4; ++ks) {
+      const double a = sDfrag[(ks * 8 << 2) + fbase];
+      mma_m8n8k4_f64(c0, c1, a, sbuf[byA ^ (64 * ks)], c0, c1);
+      mma_m8n8k4_f64(c2, c3, a, sbuf[byB ^ (64 * ks)], c2, c3);
+    }
+    const double2 ea = *reinterpret_cast<const double2 *>(Escale + gA + npoint);
+    const double2 eb = *reinterpret_cast<const double2 *>(Escale + gB + npoint);
+    acc0 += ea.x * c0;
+    acc1 += ea.y * c1;
+    acc2 += eb.x * c2;
+    acc3 += eb.y * c3;
+  }
+  __syncthreads();
+
+  //- z -----------------------------------------------------------------
+  {
+    const int sz0 = sw_z15(n0), sz1 = sw_z15(n1);
+    const int sz2 = sw_z15(n2), sz3 = sw_z15(n3);
+    sbuf[sz0] = q0 * w[i0g];
+    sbuf[sz1] = q1 * w[i1g];
+    sbuf[sz2] = q2 * w[i2g];
+    sbuf[sz3] = q3 * w[i3g];
+  }
+  __syncthreads();
+  {
+    // The z output map is not the x/y one, so the z derivative is the only one
+    // that travels back through shared memory, as it is at Nq=8.  This warp
+    // owns the eight columns 8*warp .. 8*warp+7 and both halves of k.
+    const int bz = sw_z15(warp * 8 + row + 256 * colk);
+    const int fbase = row * 4 + colk;
+    mma_reset(c0, c1);
+    mma_reset(c2, c3);
+#pragma unroll
+    for (int ks = 0; ks < 4; ++ks) {
+      const double b = sbuf[bz ^ (1024 * ks)];
+      mma_m8n8k4_f64(c0, c1, sDfrag[(ks * 8 << 2) + fbase], b, c0, c1);
+      mma_m8n8k4_f64(c2, c3, sDfrag[128 + (ks * 8 << 2) + fbase], b, c2, c3);
+    }
+    __syncthreads();
+    const int dzA = sw_dz15((warp * 8 + 2 * colk) + 256 * row);
+    const int dzB = sw_dz15((warp * 8 + 2 * colk) + 256 * (row + 8));
+    sbuf[dzA] = c0;
+    sbuf[dzA ^ 1] = c1;
+    sbuf[dzB] = c2;
+    sbuf[dzB ^ 1] = c3;
+  }
+  __syncthreads();
+  {
+    const int dA = sw_dz15(outA);
+    const int dB = sw_dz15(outB);
+    const double2 ea =
+        *reinterpret_cast<const double2 *>(Escale + gA + 2 * npoint);
+    const double2 eb =
+        *reinterpret_cast<const double2 *>(Escale + gB + 2 * npoint);
+    acc0 += ea.x * sbuf[dA];
+    acc1 += ea.y * sbuf[dA ^ 1];
+    acc2 += eb.x * sbuf[dB];
+    acc3 += eb.y * sbuf[dB ^ 1];
+  }
+  __syncthreads();
+
+  //- numerical flux on the six faces ------------------------------------
+  {
+    int fp = tid;
+    int fidx = face_offset + fp;
+    int iM = VMapM[fidx] - 1;
+    int iP = VMapP[fidx] - 1;
+    double qM = q[iM], qP = q[iP];
+    double VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
+                  w[iM] * normal_fn[fidx + 2 * nface];
+    double VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
+                  w[iP] * normal_fn[fidx + 2 * nface];
+    double alpha = 0.5 * fabs(VelP + VelM);
+    sbuf[fp] =
+        0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+    if (tid < 512) {
+      fp = tid + 1024;
+      fidx = face_offset + fp;
+      iM = VMapM[fidx] - 1;
+      iP = VMapP[fidx] - 1;
+      qM = q[iM];
+      qP = q[iP];
+      VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
+             w[iM] * normal_fn[fidx + 2 * nface];
+      VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
+             w[iP] * normal_fn[fidx + 2 * nface];
+      alpha = 0.5 * fabs(VelP + VelM);
+      sbuf[fp] =
+          0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+    }
+  }
+  __syncthreads();
+
+  //- lift and assembly --------------------------------------------------
+  {
+    const int iA = 2 * colk;
+    const int iB = iA + 8;
+    const double lf1 = sLift[jout];
+    const double lf3 = sLift[32 + jout];
+    const double lf5 = sLift[64 + k];
+    const double lf6 = sLift[80 + k];
+    // Faces 2 and 4 vary in j and k only, so all four nodes share the value
+    // and differ only through the Lift1D coefficient, which varies in i.
+    const double fb2 = sbuf[256 + jout + NQ15 * k];
+    const double fb4 = sbuf[768 + jout + NQ15 * k];
+    const int f1A = iA + NQ15 * k;
+    const int f1B = iB + NQ15 * k;
+    const int f5A = 1024 + iA + NQ15 * jout;
+    const int f5B = 1024 + iB + NQ15 * jout;
+
+    const double l0 = lf1 * sbuf[f1A] + sLift[16 + iA] * fb2 +
+                      lf3 * sbuf[512 + f1A] + sLift[48 + iA] * fb4 +
+                      lf5 * sbuf[f5A] + lf6 * sbuf[f5A + 256];
+    const double l1 = lf1 * sbuf[f1A + 1] + sLift[17 + iA] * fb2 +
+                      lf3 * sbuf[512 + f1A + 1] + sLift[49 + iA] * fb4 +
+                      lf5 * sbuf[f5A + 1] + lf6 * sbuf[f5A + 257];
+    const double l2 = lf1 * sbuf[f1B] + sLift[16 + iB] * fb2 +
+                      lf3 * sbuf[512 + f1B] + sLift[48 + iB] * fb4 +
+                      lf5 * sbuf[f5B] + lf6 * sbuf[f5B + 256];
+    const double l3 = lf1 * sbuf[f1B + 1] + sLift[17 + iB] * fb2 +
+                      lf3 * sbuf[512 + f1B + 1] + sLift[49 + iB] * fb4 +
+                      lf5 * sbuf[f5B + 1] + lf6 * sbuf[f5B + 257];
+
+    *reinterpret_cast<double2 *>(dqdt + gA) =
+        make_double2(-(acc0 + l0), -(acc1 + l1));
+    *reinterpret_cast<double2 *>(dqdt + gB) =
+        make_double2(-(acc2 + l2), -(acc3 + l3));
+  }
+}
+
+extern "C" void launch_tendency_fused_p15_tc(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale,
+    const double *Escale, int Ne)
+{
+  tendency_fused_p15_tc_kernel<<<Ne, 1024, 0, dg_cuda_stream>>>(
+      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
+      Ne);
+  check_cuda("tendency_fused_p15_tc_kernel");
+}
