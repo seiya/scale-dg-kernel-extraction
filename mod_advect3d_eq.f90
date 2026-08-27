@@ -13,8 +13,9 @@ module mod_advect3d_eq
     cuda_dg_kernels_available,  &
     cuda_cal_volume_flux, cuda_cal_volume_deriv, &
     cuda_cal_surface_lift, cuda_assemble_dqdt, cuda_cal_dqdt_split, &
-    cuda_cal_dqdt_fused, cuda_cal_dqdt_fused_p255, &
-    cuda_cal_dqdt_fused_tc, cuda_cal_dqdt_fused_p255_tc, &
+    cuda_cal_dqdt_fused, cuda_cal_dqdt_fused_p63, cuda_cal_dqdt_fused_p255, &
+    cuda_cal_dqdt_fused_tc, cuda_cal_dqdt_fused_p63_tc, &
+    cuda_cal_dqdt_fused_p255_tc, &
     cuda_cal_dqdt_gemm, cuda_cal_dqdt_gemm_fused, cuda_cal_dqdt_gemm_cute, &
     cuda_gemm_setup, cuda_cutlass_set_mma_shape, cuda_gemm_finalize, &
     cuda_cal_elembnd_flux, cuda_dg_bind_acc_stream, &
@@ -139,8 +140,9 @@ contains
         write(*,*) "CUDAFORTRAN_FUSED requires a build with CUDA=1"
         error stop
       end if
-      if (Np /= 512 .and. Np /= 16**3 .and. Np /= 32**3 .and. Np /= 256**3) then
-        write(*,*) "CUDAFORTRAN_FUSED requires PolyOrder=7, 15, 31 or 255"
+      if (Np /= 512 .and. Np /= 16**3 .and. Np /= 32**3 .and. &
+          Np /= 64**3 .and. Np /= 256**3) then
+        write(*,*) "CUDAFORTRAN_FUSED requires PolyOrder=7, 15, 31, 63 or 255"
         error stop
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_FUSED
@@ -151,8 +153,8 @@ contains
         error stop
       end if
       if (Np /= 512 .and. Np /= 16**3 .and. Np /= 32**3 .and. &
-          Np /= 256**3) then
-        write(*,*) "CUDAFORTRAN_FUSED_TC requires PolyOrder=7, 15, 31 or 255"
+          Np /= 64**3 .and. Np /= 256**3) then
+        write(*,*) "CUDAFORTRAN_FUSED_TC requires PolyOrder=7, 15, 31, 63 or 255"
         error stop
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_FUSED_TC
@@ -229,9 +231,14 @@ contains
       allocate(ebnd_flux(NfpTot,Ne))
       !$acc enter data create(ebnd_flux)
     end if
+    !- The p=255 and p=63 fused paths evaluate the six face fluxes in a
+    !  separate pass instead of inside the volume kernels.  At p=63 the reason
+    !  is that Ne is only 4**3 while the GPU has 152 SMs, so an element has to
+    !  be split over many blocks; evaluating the faces in the volume kernel
+    !  would then repeat the (i,k) faces once per block.
     if ((dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED .or. &
          dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_TC) .and. &
-        Np == 256**3) then
+        (Np == 256**3 .or. Np == 64**3)) then
       allocate(fused_flux_bnd(NfpTot,Ne))
       !$acc enter data create(fused_flux_bnd)
     end if
@@ -775,6 +782,14 @@ contains
         normal_fn, Fscale, Escale, &
         Nq, Np, NfpTot, Ne, NeA, kernel_time )
       !$acc end host_data
+    else if (Nq == 64) then
+      !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
+      !$acc& use_device(normal_fn,Fscale,Escale,fused_flux_bnd)
+      call cuda_cal_dqdt_fused_p63( &
+        dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+        normal_fn, Fscale, Escale, fused_flux_bnd, &
+        Nq, Np, NfpTot, Ne, NeA, kernel_time )
+      !$acc end host_data
     else if (Nq == 256) then
       !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
       !$acc& use_device(normal_fn,Fscale,Escale,fused_flux_bnd)
@@ -784,7 +799,7 @@ contains
         Nq, Np, NfpTot, Ne, NeA, kernel_time )
       !$acc end host_data
     else
-      error stop "CUDAFORTRAN_FUSED requires Nq=8, 16, 32 or 256"
+      error stop "CUDAFORTRAN_FUSED requires Nq=8, 16, 32, 64 or 256"
     end if
 
     call accumulate_kernel_time(kernel_time)
@@ -821,6 +836,14 @@ contains
         normal_fn, Fscale, Escale, &
         Nq, Np, NfpTot, Ne, NeA, kernel_time )
       !$acc end host_data
+    else if (Nq == 64) then
+      !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
+      !$acc& use_device(normal_fn,Fscale,Escale,fused_flux_bnd)
+      call cuda_cal_dqdt_fused_p63_tc( &
+        dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+        normal_fn, Fscale, Escale, fused_flux_bnd, &
+        Nq, Np, NfpTot, Ne, NeA, kernel_time )
+      !$acc end host_data
     else if (Nq == 256) then
       !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
       !$acc& use_device(normal_fn,Fscale,Escale,fused_flux_bnd)
@@ -830,7 +853,7 @@ contains
         Nq, Np, NfpTot, Ne, NeA, kernel_time )
       !$acc end host_data
     else
-      error stop "CUDAFORTRAN_FUSED_TC requires Nq=8, 16, 32 or 256"
+      error stop "CUDAFORTRAN_FUSED_TC requires Nq=8, 16, 32, 64 or 256"
     end if
 
     call accumulate_kernel_time(kernel_time)

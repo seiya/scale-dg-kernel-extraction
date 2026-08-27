@@ -16,7 +16,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`cublas_emulation_survey.md`](cublas_emulation_survey.md) | cuBLAS FP64 fixed-point emulation の見かけのストール調査。EAGER 強制、永続 8 GiB workspace、p=7/p=255 の速度と数値検証 |
 | [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md) | arXiv:2504.08009v3（Ozaki Scheme II、INT8 Tensor Core による FP64 GEMM エミュレーション）の適用調査。不採用だが、成立条件が `p ≳ 500-650` であること、およびハードウェア条件が 3.82 FLOP/byte であることを実測から確定した |
 | [`p15_gap_study.md`](p15_gap_study.md) | p=7 と p=255 の間を同一 DOF で埋める最初の点 p=15 (Nq=16)。CUDA core 版と Tensor Core 版の融合カーネル、shared 戦略、Nq=16 では融合したまま占有率 50% を超えられないという構造的な壁 |
-| [`p63_gap_study.md`](p63_gap_study.md) | 同一 DOF の 4 点目 p=63 (Nq=64)。任意次数の LGL 演算子生成、CUTLASS GEMM 経路の次数開放とその batch 上限、5 本のカーネルが 3 種類の理由で別々に詰まる様子、融合カーネルを書かない判断の根拠。**§8 のその判断は 2026-08-27 に訂正された**（根拠 3 点が p=31 の `FUSED_TC` で崩れた。帯域律速のカーネルのピーク比を次数間で外挿したのが誤りで、不変量は帯域利用率のほう） |
+| [`p63_gap_study.md`](p63_gap_study.md) | 同一 DOF の 4 点目 p=63 (Nq=64)。任意次数の LGL 演算子生成、CUTLASS GEMM 経路の次数開放とその batch 上限、5 本のカーネルが 3 種類の理由で別々に詰まる様子、融合カーネルを書かない判断の根拠。§8 のその判断は 2026-08-27 に訂正され、**§13 で実際に両方書いて測った**: `FUSED` 970.7 µs / `FUSED_TC` 662.3 µs に対し `GEMM_FUSED` 598.6 µs で、**p=63 の最速は `GEMM_FUSED` のまま**。§8 の訂正注記が外挿した 365 µs は 1.8 倍外れており、理由は TC 版が帯域律速でも発行律速でもなく**レイテンシ律速**（DRAM 18%、占有率 24.6%）であること。**これで交差点が確定し、融合が GEMM に勝つ上限は p=31** |
 | [`p127_gap_study.md`](p127_gap_study.md) | 同一 DOF の 5 点目 p=127 (Nq=128)。**演算強度がマシンバランスを越える最小の次数**（p=255 も越えている側で、交差は p=63 と p=127 の間）。コード変更ゼロで 5 経路が通り、次数依存ノブ 4 種を掃引しても採用すべき変更が無かったこと、`K` が深くなると CUTLASS の x GEMM が cuBLAS に追いつくこと |
 | [`p31_gap_study.md`](p31_gap_study.md) | 同一 DOF の 6 点目にして最後の点 p=31 (Nq=32)。**最速は `CUDAFORTRAN_FUSED_TC`**（§14、374.8 µs/stage）。Nq=32 の Tensor Core 融合カーネル 2 本で CUDA core 融合版の **2.66 倍**、`GEMM` の 1.67 倍。x と z が同じ出力写像を共有するので z の shared 往復が無く、転置形にすると D1D がレジスタに載る。**「p=31 は曲線の極大点」「融合が勝つ上限は p=15」という当初の結論はこれで否定された**（§14.2、§14.1 に訂正注記）。Nq=32 の CUDA core 融合カーネル 2 本、CUTLASS 経路は p=31 で使えるという訂正、**lift と assembly の融合で `GEMM` / `GEMM_CUTE` 経路を全次数 1 割速く**した（p=31 −11.7%、p=63 −12.0%、p=127 −10.2%、ビット一致） |
 
@@ -57,6 +57,20 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   device 時間 1.076 → 0.851 秒。同じ知見を CUDA core 版にも適用すると
   そちらも 1.153 → 0.986 秒になり（§8）、両者を 100% occupancy で揃えた
   TC 版の優位は 1.16× である。
+- **p=63, `Ne=4³`（2026-08-27）**: `CUDAFORTRAN_FUSED` と `CUDAFORTRAN_FUSED_TC` を実装したが、
+  **最速は `CUDAFORTRAN_GEMM_FUSED` のまま**（598.6 対 `FUSED_TC` 662.3 µs/stage、1.11 倍）。
+  Nq=64 は p=31 の設計の前提を 2 つ壊す（`Ne=4³` しかなく 1 要素 1 ブロックでは 152 SM が
+  埋まらない、1 平面 32 KB で x と z のパネルが両方載らない）ので、面 flux を
+  `elembnd_flux_bnd` に先出しし、縮約を `BK=16` でチャンク化して 3 枚 24 KB に収めた。
+  swizzle は **p=255 の `sw255` をそのまま流用**でき（レイアウトが同じ `l + 16*outer`）、
+  ロードのバンクコンフリクトは 0 件。**p=31 の勝因だった D1D のレジスタ常駐は
+  Nq=64 では成立しない**（1 レーン 64 double 要る）。mma は shared wavefront を
+  5 分の 1 にしたのに時間は 1.6 分の 1 にしかならず、**その先で何も律速になっていない**
+  （SM 39%、DRAM 18%、L1/TEX 53%、占有率 24.6% のレイテンシ律速）。
+  **これで「融合が GEMM に勝つ上限は p=31」が確定した。**
+  warp 形状は 3 通り全部測り、p=255 と同じ 2×4 は 198 レジスタ・占有率 12.5% で最悪、
+  2×2（512 スレッド）が最良、2×1（1024 スレッド、占有率 50%）は得ゼロだった。
+  詳細は `p63_gap_study.md` §13。
 - **p=255, `Ne=1`**: `CUDAFORTRAN_GEMM_FUSED` が最速。手書きの Tensor Core 経路は
   CUTLASS / cuBLAS の multistage mainloop に大きく負ける。
 - 同じ体積 DOF 数でも、p=7 と p=255 で最適戦略は逆転する。

@@ -1310,3 +1310,301 @@ extern "C" void launch_tendency_fused_p31_tc(
       dqdt, D1D, q, v, Escale, Ne);
   check_cuda("tendency_fused_p31_tc kernels");
 }
+
+//============================================================================
+// p=63 (Nq=64) fused Tensor Core tendency
+//============================================================================
+//
+// Nq=64 is where the p=31 design stops working, for two reasons, and where the
+// p=255 tile GEMM starts fitting exactly.
+//
+// The p=31 kernel evaluated its own face fluxes and held a whole plane in
+// shared.  Here Ne is 4**3 against 152 SMs, so an element has to be spread
+// over many blocks and in-kernel face evaluation would repeat the (i,k) faces
+// once per block; the fluxes come from flux_bnd instead.  And a plane is
+// 32 KB, so the x and z panels together would be 64 KB.
+//
+// Chunking the contraction with BK=16 fixes both: three 64x16 panels are
+// 24 KB, and one block owns one (element, j plane), which is 64*64 = 4096
+// blocks, 27 waves.  This is exactly the sA/sB arrangement of
+// tendency_p255_tc_kernel, so sw255 applies unchanged -- the address is
+// l + 16*outer in both.
+//
+// At Nq=64 the p=31 trick of keeping the D1D fragment in registers is gone:
+// there are 16 k-steps and two tile rows per warp, so a lane would need 64
+// doubles.  D goes through shared like the flux panels.  It is read as the B
+// operand of x and the A operand of z, one panel serving both.
+//
+// Transposed, with n the fast (i) index and m the slow one:
+//   x: C[m=k][n=i] = sum_l FU[k][l] * D[i][l]      A = sFU, B = sD
+//   z: C[m=k][n=i] = sum_l D[k][l]  * FW[i][l]     A = sD,  B = sFW
+// Escale differs by direction, so the two accumulator sets stay separate.
+
+#define NQ63 64
+#define NP63 262144
+#define NQ2_63 4096
+#define NFPTOT63 24576
+#define BK63 16
+
+// Warp shape of the volume kernels.  The warp grid is 4 rows by P63_WN
+// columns and each warp owns 2 by P63_TN of the 8x8 mma tiles, so the block
+// always covers the whole 64x64 plane: 4*2*8 rows and P63_WN*P63_TN*8 columns
+// with P63_WN*P63_TN = 8.
+//
+// All three legal shapes were measured (Slurm 59919, 59924, Ne=4**3):
+//
+//   P63_WN  threads  blocking  reg (xz)  occupancy  Main [ms/step]
+//        2      256       2x4       198      12.5%       2.41994
+//        4      512       2x2       124      25.0%       2.21588   <- kept
+//        8     1024       2x1        64      50.0%       2.22658
+//
+// The p=255 shape (2x4, the one that minimizes operand loads per k-step) is
+// the worst here, because at 198 registers only one block fits an SM and a
+// 12.5% occupancy kernel has nothing to hide latency with.  Halving the
+// accumulators buys 9.4%.  Halving them again doubles occupancy once more and
+// buys nothing: 2x1 needs 2+1 operand loads per k-step against the 2+2 of
+// 2x2 for half the tiles, so the extra warps spend their slots on shared
+// traffic.  Occupancy is worth chasing only until the operand loads start
+// paying for it.
+#define P63_WN 4
+#define P63_TN (8 / P63_WN)
+#define P63_THREADS (32 * 4 * P63_WN)
+#define P63_STAGE_ITERS (NQ63 * BK63 / P63_THREADS)
+
+__global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kernel(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *w, const double *flux_bnd,
+    const double *Escale, int Ne)
+{
+  __shared__ __align__(16) double sFU[NQ63 * BK63];
+  __shared__ __align__(16) double sD[NQ63 * BK63];
+  __shared__ __align__(16) double sFW[NQ63 * BK63];
+
+  const int elem = (int)blockIdx.x / NQ63;
+  if (elem >= Ne) {
+    return;
+  }
+  const int jp = (int)blockIdx.x - elem * NQ63;
+
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int wm = warp & 3;
+  const int wn = warp >> 2;
+  const int row = lane >> 2;
+  const int colk = lane & 3;
+
+  const int eo = elem * NP63;
+  const int efo = elem * NFPTOT63;
+  const int npoint = NP63 * Ne;
+  const int plane_off = NQ63 * jp;
+
+  // Eight 8x8 tiles per warp in a 2x4 arrangement, for each of the two
+  // directions: 2 + 4 operand loads per k-step instead of the 1 + 8 that a
+  // 1x8 shape would need.
+  double ax[2 * 2 * P63_TN], az[2 * 2 * P63_TN];
+#pragma unroll
+  for (int e = 0; e < 2 * 2 * P63_TN; ++e) {
+    ax[e] = 0.0;
+    az[e] = 0.0;
+  }
+
+  for (int kk = 0; kk < NQ63; kk += BK63) {
+    // sFU[k][l] = q*u at (l, jp, k).  l is fast in global, so sixteen lanes
+    // walk l and cover one 128-byte run.
+#pragma unroll
+    for (int p = 0; p < P63_STAGE_ITERS; ++p) {
+      const int ll = tid & 15;
+      const int o = (tid >> 4) + (P63_THREADS / 16) * p;
+      const int g = eo + (kk + ll) + plane_off + NQ2_63 * o;
+      sFU[sw255(ll + BK63 * o)] = q[g] * u[g];
+    }
+    // sD[r][l] = D1D(r, l), r fast in the Fortran column-major operator.
+    // sFW[i][l] = q*w at (i, jp, l), i fast in global.
+#pragma unroll
+    for (int p = 0; p < P63_STAGE_ITERS; ++p) {
+      const int o = tid & 63;
+      const int ll = (tid >> 6) + (P63_THREADS / 64) * p;
+      sD[sw255(ll + BK63 * o)] = D1D[o + NQ63 * (kk + ll)];
+      const int g = eo + o + plane_off + NQ2_63 * (kk + ll);
+      sFW[sw255(ll + BK63 * o)] = q[g] * w[g];
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int ks = 0; ks < BK63 / 4; ++ks) {
+      const int l = 4 * ks + colk;
+      double av[2], bv[P63_TN], avz[2], bvz[P63_TN];
+#pragma unroll
+      for (int a = 0; a < 2; ++a) {
+        const int m = 8 * (2 * wm + a) + row;
+        av[a] = sFU[sw255(l + BK63 * m)];
+        avz[a] = sD[sw255(l + BK63 * m)];
+      }
+#pragma unroll
+      for (int bb = 0; bb < P63_TN; ++bb) {
+        const int n = 8 * (P63_TN * wn + bb) + row;
+        bv[bb] = sD[sw255(l + BK63 * n)];
+        bvz[bb] = sFW[sw255(l + BK63 * n)];
+      }
+#pragma unroll
+      for (int a = 0; a < 2; ++a) {
+#pragma unroll
+        for (int bb = 0; bb < P63_TN; ++bb) {
+          const int e = 2 * (P63_TN * a + bb);
+          mma_m8n8k4_f64(ax[e], ax[e + 1], av[a], bv[bb], ax[e], ax[e + 1]);
+          mma_m8n8k4_f64(az[e], az[e + 1], avz[a], bvz[bb], az[e], az[e + 1]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  // j is block uniform, so the faces 1 and 3 coefficients and the whole (i,j)
+  // face contribution are loop invariant.
+  const double lf1 = Lift1D[jp];
+  const double lf3 = Lift1D[jp + 2 * NQ63];
+
+#pragma unroll
+  for (int e8 = 0; e8 < 2 * P63_TN; ++e8) {
+    const int a = e8 / P63_TN;
+    const int bb = e8 % P63_TN;
+    const int m = 8 * (2 * wm + a) + row;                 // k
+    const int n = 8 * (P63_TN * wn + bb) + 2 * colk;      // i, and i+1
+    const int node = eo + n + plane_off + NQ2_63 * m;
+
+    const double2 ex = *reinterpret_cast<const double2 *>(Escale + node);
+    const double2 ez =
+        *reinterpret_cast<const double2 *>(Escale + node + 2 * npoint);
+
+    // Faces 1 and 3 are (i,k) planes, so the pair is one aligned double2 and
+    // the coefficient is shared.  Faces 2 and 4 are (j,k) planes, so the pair
+    // shares the flux value and the coefficient varies in i.  Faces 5 and 6
+    // are (i,j) planes, so the pair is a double2 again.
+    const int fp13 = n + NQ63 * m;
+    const double2 fb1 = *reinterpret_cast<const double2 *>(flux_bnd + efo + fp13);
+    const double2 fb3 =
+        *reinterpret_cast<const double2 *>(flux_bnd + efo + 2 * NQ2_63 + fp13);
+    const int fp24 = jp + NQ63 * m;
+    const double fb2 = flux_bnd[efo + NQ2_63 + fp24];
+    const double fb4 = flux_bnd[efo + 3 * NQ2_63 + fp24];
+    const int fp56 = n + plane_off;
+    const double2 fb5 =
+        *reinterpret_cast<const double2 *>(flux_bnd + efo + 4 * NQ2_63 + fp56);
+    const double2 fb6 =
+        *reinterpret_cast<const double2 *>(flux_bnd + efo + 5 * NQ2_63 + fp56);
+    const double lf2a = Lift1D[n + NQ63];
+    const double lf2b = Lift1D[n + 1 + NQ63];
+    const double lf4a = Lift1D[n + 3 * NQ63];
+    const double lf4b = Lift1D[n + 1 + 3 * NQ63];
+    const double lf5 = Lift1D[m + 4 * NQ63];
+    const double lf6 = Lift1D[m + 5 * NQ63];
+
+    // Same summation order as tendency_fused_p63_xz_kernel.
+    *reinterpret_cast<double2 *>(dqdt + node) = make_double2(
+        -(ex.x * ax[2 * e8] + ez.x * az[2 * e8] + lf1 * fb1.x + lf2a * fb2 +
+          lf3 * fb3.x + lf4a * fb4 + lf5 * fb5.x + lf6 * fb6.x),
+        -(ex.y * ax[2 * e8 + 1] + ez.y * az[2 * e8 + 1] + lf1 * fb1.y +
+          lf2b * fb2 + lf3 * fb3.y + lf4b * fb4 + lf5 * fb5.y + lf6 * fb6.y));
+  }
+}
+
+//> p=63 y volume term, accumulated onto what the xz kernel wrote.
+//
+// One block per (element, k plane).  C[m=j][n=i] = sum_l D[j][l] * FV[i][l],
+// which is the z contraction of the first kernel with (i,j) in place of (i,k),
+// so the same two panel shapes and the same swizzle serve it.
+__global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_y_tc_kernel(
+    double *dqdt, const double *D1D, const double *q, const double *v,
+    const double *Escale, int Ne)
+{
+  __shared__ __align__(16) double sD[NQ63 * BK63];
+  __shared__ __align__(16) double sFV[NQ63 * BK63];
+
+  const int elem = (int)blockIdx.x / NQ63;
+  if (elem >= Ne) {
+    return;
+  }
+  const int kp = (int)blockIdx.x - elem * NQ63;
+
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int wm = warp & 3;
+  const int wn = warp >> 2;
+  const int row = lane >> 2;
+  const int colk = lane & 3;
+
+  const int eo = elem * NP63;
+  const int npoint = NP63 * Ne;
+  const int plane_off = NQ2_63 * kp;
+
+  double acc[2 * 2 * P63_TN];
+#pragma unroll
+  for (int e = 0; e < 2 * 2 * P63_TN; ++e) {
+    acc[e] = 0.0;
+  }
+
+  for (int kk = 0; kk < NQ63; kk += BK63) {
+#pragma unroll
+    for (int p = 0; p < P63_STAGE_ITERS; ++p) {
+      const int o = tid & 63;
+      const int ll = (tid >> 6) + (P63_THREADS / 64) * p;
+      sD[sw255(ll + BK63 * o)] = D1D[o + NQ63 * (kk + ll)];
+      const int g = eo + o + NQ63 * (kk + ll) + plane_off;
+      sFV[sw255(ll + BK63 * o)] = q[g] * v[g];
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int ks = 0; ks < BK63 / 4; ++ks) {
+      const int l = 4 * ks + colk;
+      double av[2], bv[P63_TN];
+#pragma unroll
+      for (int a = 0; a < 2; ++a) {
+        av[a] = sD[sw255(l + BK63 * (8 * (2 * wm + a) + row))];
+      }
+#pragma unroll
+      for (int bb = 0; bb < P63_TN; ++bb) {
+        bv[bb] = sFV[sw255(l + BK63 * (8 * (P63_TN * wn + bb) + row))];
+      }
+#pragma unroll
+      for (int a = 0; a < 2; ++a) {
+#pragma unroll
+        for (int bb = 0; bb < P63_TN; ++bb) {
+          const int e = 2 * (P63_TN * a + bb);
+          mma_m8n8k4_f64(acc[e], acc[e + 1], av[a], bv[bb], acc[e], acc[e + 1]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int e8 = 0; e8 < 2 * P63_TN; ++e8) {
+    const int a = e8 / P63_TN;
+    const int bb = e8 % P63_TN;
+    const int m = 8 * (2 * wm + a) + row;                 // j
+    const int n = 8 * (P63_TN * wn + bb) + 2 * colk;      // i, and i+1
+    const int node = eo + n + NQ63 * m + plane_off;
+    const double2 ey =
+        *reinterpret_cast<const double2 *>(Escale + node + npoint);
+    double2 out = *reinterpret_cast<const double2 *>(dqdt + node);
+    out.x -= ey.x * acc[2 * e8];
+    out.y -= ey.y * acc[2 * e8 + 1];
+    *reinterpret_cast<double2 *>(dqdt + node) = out;
+  }
+}
+
+extern "C" void launch_tendency_fused_p63_tc(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const double *flux_bnd,
+    const double *Escale, int Ne)
+{
+  const int nblock = NQ63 * Ne;
+  tendency_fused_p63_xz_tc_kernel<<<nblock, P63_THREADS, 0, dg_cuda_stream>>>(
+      dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
+  tendency_fused_p63_y_tc_kernel<<<nblock, P63_THREADS, 0, dg_cuda_stream>>>(
+      dqdt, D1D, q, v, Escale, Ne);
+  check_cuda("tendency_fused_p63_tc kernels");
+}
