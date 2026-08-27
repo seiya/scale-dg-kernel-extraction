@@ -16,6 +16,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`cublas_emulation_survey.md`](cublas_emulation_survey.md) | cuBLAS FP64 fixed-point emulation の見かけのストール調査。EAGER 強制、永続 8 GiB workspace、p=7/p=255 の速度と数値検証 |
 | [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md) | arXiv:2504.08009v3（Ozaki Scheme II、INT8 Tensor Core による FP64 GEMM エミュレーション）の適用調査。不採用だが、成立条件が `p ≳ 500-650` であること、およびハードウェア条件が 3.82 FLOP/byte であることを実測から確定した |
 | [`p15_gap_study.md`](p15_gap_study.md) | p=7 と p=255 の間を同一 DOF で埋める最初の点 p=15 (Nq=16)。CUDA core 版と Tensor Core 版の融合カーネル、shared 戦略、Nq=16 では融合したまま占有率 50% を超えられないという構造的な壁 |
+| [`p63_gap_study.md`](p63_gap_study.md) | 同一 DOF の 4 点目 p=63 (Nq=64)。任意次数の LGL 演算子生成、CUTLASS GEMM 経路の次数開放とその batch 上限、5 本のカーネルが 3 種類の理由で別々に詰まる様子、融合カーネルを書かない判断の根拠 |
 
 ## 現時点の結論
 
@@ -123,6 +124,38 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   **比較の公平性**: 1.249 倍のうち 4.1% 分は CUDA core 側に持ち込めない最適化に由来し、
   両者に同じ最適化だけを許した時点の比は **1.196 倍**である。
   詳細は `p15_gap_study.md`。
+
+- **p=63, `Ne=4³`（2026-08-27）**: 同一 DOF の 4 点目で、**GEMM 側の最初の点**。
+  最速は **`CUDAFORTRAN_GEMM_FUSED`**、Main **0.04583** 秒 / **674.1 µs/stage**
+  （graph on 0.04499）。本作業の前は `operator_data/p63.dat` が無く
+  **どの実装でも起動できなかった**ので、`generate_lgl_operators_p255` を任意次数に
+  一般化して p=31 / 63 / 127 を自動的に通るようにした（p=255 では旧ルーチンと
+  **ビット一致**）。密な `Lift_mat` は分離形なので `Lift1D` から再構成する。
+  併せて `mod_dg_optr_kernel.f90` の 4 か所の `select case(Nq-1)` に
+  **`case default` が無く、p≥16 では `intent(out)` が未書き込みのまま
+  エラーも出ずに返っていた**のを塞いだ。
+  `GEMM_FUSED` / `GEMM_CUTE` の p=255 ゲートは C++ 側が元から Nq/Ne 汎用なので
+  外せたが、**y GEMM の batch が `grid.z` に載るため `Nq*Ne <= 65535` が真の上限**で、
+  p=7 `Ne=32³` と p=15 `Ne=16³` はこの経路を使えない（ゲートをその検査に置き換えた）。
+  **Nq=64 では要素が shared に載らない**（1 要素 2 MB）ので融合カーネルは書いていない。
+  書かない根拠は演算側にある: 融合の理想転送量 671 MB/stage は帯域下限 85 µs を与えるが、
+  6.811 GFLOP を 674 µs 未満で回すには FP64 ピークの **25.2% 超**が要り、
+  手書き融合がこれまで出した比は p=7 で 12.8%、p=15 で 14.9% にすぎない。
+  **融合が勝つ p≤15 と GEMM が勝つ p≥63 の交差は p=15 と p=63 の間にある。**
+  達成効率は **10.10 TFLOP/s（25.2%）/ 3.96 TB/s（50%）** で、同一 DOF 4 点の
+  FP64 ピーク比は **12.8 → 14.9 → 25.2 → 64.9%** と単調に上がる。
+  **p=63 の tendency に単一の律速は無い**: `volume_flux`/`elembnd` は DRAM の屋根
+  （85% / 76%）、x/y GEMM は SM 発行律速（74% / 67%）、最大の z GEMM+assembly
+  （33.9%）はどちらでもないレイテンシ律速（SM 38% / DRAM 37%、レジスタ 254 本）。
+  **GEMM 経路の転送量は Nq に依存しない**（159 B/ノード対 p=255 の 151 B）ことの
+  直接の証拠は、`volume_flux_kernel` が両次数で **129.7 対 129.5 µs、
+  実行命令数まで同一**なことである。`K=Nq` が浅い代償は命令効率に出ていて、
+  x GEMM の FLOP/命令は p=255 の 135 に対し **48.5**。
+  **事前予測は 2 つとも外れた**（「DRAM 側に寄る」「y GEMM が弱点」）。
+  副産物として `cuda_cal_dqdt_gemm` の側ストリーム条件を `Nq == 256` から
+  **`Nq >= 64`** に変えた（p=63 で Main −1.4%）。
+  次にマシンバランスを越えるのは `6*Nq+20 = 5.0*151` から **Nq ≒ 123**、
+  すなわち **p=127** のはずである。詳細は `p63_gap_study.md`。
 - **p=7 TC の整数・アドレス演算削減（2026-08-25）**: `tc_paper_survey` §10 が
   次の標的に挙げた整数演算は、単独で削っても end-to-end では効かない（§11）。
   同じ調査で見つかった効く要因は global アクセスのキャッシュライン数で、
