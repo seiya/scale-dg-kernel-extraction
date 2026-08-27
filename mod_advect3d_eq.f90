@@ -168,8 +168,8 @@ contains
         write(*,*) "CUDAFORTRAN_GEMM_FUSED requires a build with CUDA=1"
         error stop
       end if
-      if (Np /= 256**3) then
-        write(*,*) "CUDAFORTRAN_GEMM_FUSED currently requires PolyOrder=255"
+      if (nint(sqrt(real(NfpTot/6)))*Ne > 65535) then
+        write(*,*) "CUDAFORTRAN_GEMM_FUSED needs Nq*Ne <= 65535 (CUTLASS batch on grid.z)"
         error stop
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED
@@ -181,8 +181,8 @@ contains
         write(*,*) "CUDAFORTRAN_GEMM_CUTE requires a build with CUDA=1"
         error stop
       end if
-      if (Np /= 256**3) then
-        write(*,*) "CUDAFORTRAN_GEMM_CUTE currently requires PolyOrder=255"
+      if (nint(sqrt(real(NfpTot/6)))*Ne > 65535) then
+        write(*,*) "CUDAFORTRAN_GEMM_CUTE needs Nq*Ne <= 65535 (CUTLASS batch on grid.z)"
         error stop
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE

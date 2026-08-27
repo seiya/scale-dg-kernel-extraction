@@ -814,7 +814,9 @@ contains
     ! At p=7 it must not: there the boundary flux is 181 us while the volume
     ! GEMMs are 24 launches of 8x8 matrices, so it is far larger than the
     ! window it would hide in and overlapping the two loses 3.1%.
-    use_side = dg_side_enabled .and. (Nq == CUDA_P255_NQ)
+    ! The window is wide enough from Nq=64 on: measured at p=7 (loss), p=63
+    ! (-1.4% on Main) and p=255 (-1.3%, overall_summary_report.md 8.7).
+    use_side = dg_side_enabled .and. (Nq >= 64)
 
     if (.not. use_side) then
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
@@ -887,8 +889,15 @@ contains
     integer :: nq2, plane_batch
     integer(c_long_long) :: stride_plane, stride_elem, stride_zero, stride_vol
 
-    if (Nq /= CUDA_P255_NQ) then
-      error stop "cuda_cal_dqdt_gemm_cute currently requires PolyOrder=255"
+    ! The CUTLASS batched GEMMs put the batch on grid.z, which CUDA caps at
+    ! 65535.  The y GEMM batches over Nq*Ne planes, so this path is available
+    ! at any polynomial order that keeps Nq*Ne within that cap: it covers
+    ! p=63 at Ne=4**3 and p=255 at Ne=1, but not p=7 at Ne=32**3 (262144
+    ! batches) or p=15 at Ne=16**3 (65536).  Those orders keep using
+    ! CUDAFORTRAN_GEMM, whose cuBLAS strided-batched calls have no such cap.
+    if (Nq*Ne > 65535) then
+      write(*,*) "cuda_cal_dqdt_gemm_cute: Nq*Ne exceeds the 65535 CUTLASS batch limit:", Nq*Ne
+      error stop
     end if
     if (.not. gemm_inited) then
       call cuda_gemm_setup(.false.)
@@ -979,8 +988,15 @@ contains
     integer :: nq2, plane_batch
     integer(c_long_long) :: stride_plane, stride_elem, stride_zero, stride_vol
 
-    if (Nq /= CUDA_P255_NQ) then
-      error stop "cuda_cal_dqdt_gemm_fused currently requires PolyOrder=255"
+    ! The CUTLASS batched GEMMs put the batch on grid.z, which CUDA caps at
+    ! 65535.  The y GEMM batches over Nq*Ne planes, so this path is available
+    ! at any polynomial order that keeps Nq*Ne within that cap: it covers
+    ! p=63 at Ne=4**3 and p=255 at Ne=1, but not p=7 at Ne=32**3 (262144
+    ! batches) or p=15 at Ne=16**3 (65536).  Those orders keep using
+    ! CUDAFORTRAN_GEMM, whose cuBLAS strided-batched calls have no such cap.
+    if (Nq*Ne > 65535) then
+      write(*,*) "cuda_cal_dqdt_gemm_fused: Nq*Ne exceeds the 65535 CUTLASS batch limit:", Nq*Ne
+      error stop
     end if
     if (.not. gemm_inited) then
       call cuda_gemm_setup(.false.)
