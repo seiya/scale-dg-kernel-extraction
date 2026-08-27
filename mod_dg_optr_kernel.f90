@@ -136,6 +136,12 @@ contains
       case(15)
         call element_operation_kernel_matvec_divlike_dirXYZ_P15( &
           Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z )
+      case default
+        call tensorprod_divlike_dirXYZ_general( &
+              vec_out_x, vec_out_y, vec_out_z, &
+              Mat, Mat_tr,                     &
+              vec_in_x, vec_in_y, vec_in_z,    &
+              Nq )
       end select
     end if
     return
@@ -190,6 +196,10 @@ contains
         call element_operation_kernel_matvec_Lift_hexahedral_P14( Lift, vec_in, vec_out )
       case(15)
         call element_operation_kernel_matvec_Lift_hexahedral_P15( Lift, vec_in, vec_out )
+      case default
+        call tensorprod_Lift_hexahedral_general( &
+          vec_out,         &
+          Lift, vec_in, Nq )
       end select
     end if
 
@@ -266,6 +276,10 @@ contains
       case (15)
         call element_operation_kernel_matvec_divlike_dirXYZ_all_P15( &
           Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, vec_out_x, vec_out_y, vec_out_z, Ne )
+      case default
+        call tensorprod_divlike_dirXYZ_all_general( &
+          vec_out_x, vec_out_y, vec_out_z, &
+          Mat, Mat_tr, vec_in_x, vec_in_y, vec_in_z, Nq, Ne )
       end select
     end if
 
@@ -334,6 +348,9 @@ contains
       case (15)
         call element_operation_kernel_matvec_Lift_hexahedral_all_P15( &
           Lift, vec_in, vec_out, Ne )
+      case default
+        call tensorprod_Lift_hexahedral_all_general( &
+          vec_out, Lift, vec_in, Nq, Ne )
       end select
     end if
 
