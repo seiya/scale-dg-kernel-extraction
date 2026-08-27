@@ -14,8 +14,23 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`sm90_mma_shape_survey.md`](sm90_mma_shape_survey.md) | CUTLASS volume GEMM の MMA 命令形状（8x8x4 / 16x8x4 / 16x8x8 / 16x8x16）を namelist で選べるようにして実測した記録。GB200 では ptxas が SM90 の f64 MMA を `DMMA.8x8x4` に展開するため得るものが無く、H100 では 16x8x4 が最速（cuBLAS が選ぶ 16x8x8 ではない）。kK>4 を CUTLASS 2.x で正しく動かすための warp tile iterator も含む |
 | [`tma_survey.md`](tma_survey.md) | TMA の適用可能性を候補ごとに実測した記録。採用ゼロだが、FP64 での受理条件・帯域・L1 挙動と、2 候補それぞれの構造的な不採用理由 |
 | [`cublas_emulation_survey.md`](cublas_emulation_survey.md) | cuBLAS FP64 fixed-point emulation の見かけのストール調査。EAGER 強制、永続 8 GiB workspace、p=7/p=255 の速度と数値検証 |
+| [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md) | arXiv:2504.08009v3（Ozaki Scheme II、INT8 Tensor Core による FP64 GEMM エミュレーション）の適用調査。不採用だが、成立条件が `p ≳ 500-650` であること、およびハードウェア条件が 3.82 FLOP/byte であることを実測から確定した |
 
 ## 現時点の結論
+
+- **Ozaki Scheme II（arXiv:2504.08009v3、2026-08-27）**: INT8 Tensor Core による
+  FP64 GEMM エミュレーションは **不採用**。GB200 の INT8 天井は 4724 TOP/s
+  （FP64 の 118 倍）で論文の前提は満たすが、volume GEMM の `K = Nq` が浅く、
+  K=256 では INT8 GEMM が INT32 出力の書き出し帯域で律速して天井の 7.6% しか
+  出ない。s=14 のエミュレーションは**演算だけ**で native DGEMM の 95-103% を
+  消費し、CRT 再構成を足すと 1.9 倍遅い。融合実装も s 組の INT32
+  アキュムレータ（917 KB/CTA）がレジスタ 256 KB に入らず不可能。
+  実測レートからの外挿では成立条件は **p ≳ 500-650**（確実に勝つのは p ≳ 1000）で、
+  p=255 は交点の半分の Nq しかない。x/y/z をまとめても 1.83x → 1.63x で桁は変わらない
+  （`Escale` の点ごと重み付けにより 3 方向は INT32 アキュムレータを共有できない）。
+  ハードウェア側の条件は `P_fp64 / B < 2*Nq/(9s+8)` = **3.82 FLOP/byte**（p=255, s=14）で、
+  GB200 の 5.08 は **1.33 倍足りないだけ**。鍵は INT8 の速さではなく FP64 に対する帯域である。
+  詳細は `ozaki2_survey_2504.08009.md`。
 
 - **cuBLAS FP64 emulation（2026-08-27）**: `CublasEmulation=.true.` は比較実験の
   ため `EAGER` を明示的に強制する。p=7 では native FP64 の **約131倍遅い**ため、

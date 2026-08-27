@@ -1,0 +1,5 @@
+# build products of the microbenchmarks in this directory
+ozaki2_floor
+int8_peak
+pscan
+combined
