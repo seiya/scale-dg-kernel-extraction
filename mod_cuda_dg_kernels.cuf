@@ -873,11 +873,9 @@ contains
 
     if (use_side) call dg_side_join()
 
-    call separable_lift_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      lift_out, flux_bnd, Lift1D, Nq, Np, npoint )
-
-    call dqdt_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      dqdt, Escale, deriv_x, deriv_y, deriv_z, lift_out, npoint )
+    call separable_lift_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+      dqdt, Escale, deriv_x, deriv_y, deriv_z, flux_bnd, Lift1D, &
+      Nq, Np, npoint )
 
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("CUDAFORTRAN_GEMM kernels",istat)
@@ -973,11 +971,9 @@ contains
 
     if (dg_side_enabled) call dg_side_join()
 
-    call separable_lift_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      lift_out, flux_bnd, Lift1D, Nq, Np, npoint )
-
-    call dqdt_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      dqdt, Escale, deriv_x, deriv_y, deriv_z, lift_out, npoint )
+    call separable_lift_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+      dqdt, Escale, deriv_x, deriv_y, deriv_z, flux_bnd, Lift1D, &
+      Nq, Np, npoint )
 
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("CUDAFORTRAN_GEMM_CUTE kernels",istat)
@@ -1212,6 +1208,56 @@ contains
       lift_out(idx) = (lx + ly) + lz
     end if
   end subroutine separable_lift_kernel
+
+  !> separable_lift_kernel and dqdt_assembly_kernel in one pass.
+  !!
+  !! The two were split because CUDAFORTRAN_SPLIT wants to time the lift and
+  !! the assembly separately, but on the GEMM paths nothing reads lift_out in
+  !! between, so materializing it costs a full Np*Ne write plus a full read --
+  !! 268 MB per stage at 16.78 M DOF.  That is pure loss on any order where
+  !! the assembly sits on the DRAM roof, which ncu measures at 91.4% for
+  !! p=31 (reports/p31_gap_study.md section 9).
+  !!
+  !! The summation order is the one the two kernels produced together:
+  !! (lx + ly) + lz was rounded to a double in lift_out, and that is still
+  !! where the parenthesis is, so the result is unchanged.
+  attributes(global) subroutine separable_lift_assembly_kernel( &
+    dqdt, Escale, deriv_x, deriv_y, deriv_z, flux_bnd, Lift1D, &
+    Nq, Np, npoint )
+    implicit none
+    integer, value :: Nq, Np, npoint
+    real(RP), device :: dqdt(*), Escale(*)
+    real(RP), device :: deriv_x(*), deriv_y(*), deriv_z(*)
+    real(RP), device :: flux_bnd(*), Lift1D(*)
+
+    integer :: idx, node, elem, nq2, base
+    integer :: i, j, k
+    real(RP) :: lx, ly, lz
+
+    idx = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    if (idx <= npoint) then
+      nq2 = Nq*Nq
+      node = mod(idx-1,Np)
+      elem = (idx-1)/Np
+      i = mod(node,Nq)
+      j = mod(node/Nq,Nq)
+      k = node/nq2
+      base = elem*6*nq2
+
+      lx = Lift1D(  Nq+i+1)*flux_bnd(base+  nq2+j+k*Nq+1) &
+         + Lift1D(3*Nq+i+1)*flux_bnd(base+3*nq2+j+k*Nq+1)
+      ly = Lift1D(     j+1)*flux_bnd(base+      i+k*Nq+1) &
+         + Lift1D(2*Nq+j+1)*flux_bnd(base+2*nq2+i+k*Nq+1)
+      lz = Lift1D(4*Nq+k+1)*flux_bnd(base+4*nq2+i+j*Nq+1) &
+         + Lift1D(5*Nq+k+1)*flux_bnd(base+5*nq2+i+j*Nq+1)
+
+      dqdt(idx) = -( &
+          Escale(idx)*deriv_x(idx) &
+        + Escale(idx+npoint)*deriv_y(idx) &
+        + Escale(idx+2*npoint)*deriv_z(idx) &
+        + ((lx + ly) + lz) )
+    end if
+  end subroutine separable_lift_assembly_kernel
 
   ! The four operands are read into registers before any store is issued.
   ! Written as three q(idx)*vel expressions instead, nvfortran interleaved the

@@ -407,6 +407,13 @@ x を cuBLAS に差し替えて `nstep=20` で測ると **Main 0.04583 → 0.059
 
 **第 4 節の順位は一部間違っていた。** 初期化を除くと
 `CUDAFORTRAN_GEMM`（709.2 µs/stage）は `GEMM_CUTE`（794.9）より**速い**。
+**（追記 2026-08-27）この表の `CUDAFORTRAN_GEMM` と `GEMM_CUTE` は
+その後 1 割速くなった。** `separable_lift_kernel` と `dqdt_assembly_kernel` を
+1 本に融合して `lift_out` の往復 268 MB/stage を消したためで、p=63 では
+Main 2.39632 → **2.10950 ms/step（−12.0%）**、出力はビット一致である。
+`GEMM_FUSED` は CUTLASS の z epilogue が同じ融合を既に持つので不変で、
+最速であることも変わらないが、差は 1.20 倍から **1.04 倍**に縮んだ。
+`p31_gap_study.md` §13 を参照。
 `nstep=20` では 1003 対 811 µs で逆に見えていた。これで nsys のカーネル和とも辻褄が合う
 （GEMM 671.2 対 CUTE 755.0 µs/stage、差 83.8 µs は実測差 85.7 µs と一致）。
 
