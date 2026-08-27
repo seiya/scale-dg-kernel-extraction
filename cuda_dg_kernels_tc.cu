@@ -702,6 +702,12 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
     const double *Escale, int Ne)
 {
   __shared__ __align__(16) double sbuf[NP15];
+  // A buffer of its own for the six face fluxes, 12288 B on top of the 35584 B
+  // the rest of the kernel uses and still inside the 48 KB static limit.
+  // Sharing sbuf with the volume panels forced the fluxes to be evaluated
+  // after the z phase, which is where their scattered gathers used to be the
+  // first thing anyone waited on.  See section 15 of p15_gap_study.md.
+  __shared__ __align__(16) double sflux[NFPTOT15];
   __shared__ __align__(16) double sDfrag[256];
   __shared__ __align__(16) double sLift[96];
 
@@ -768,6 +774,46 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
         make_double2(qa.x * ua.x, qa.y * ua.y);
     *reinterpret_cast<double2 *>(sbuf + sw_xy15(nb)) =
         make_double2(qb.x * ub.x, qb.y * ub.y);
+  }
+
+  //- numerical flux on the six faces ------------------------------------
+  //
+  // This runs here, before any of the three contractions is consumed, rather
+  // than after the z phase where it used to.  The gathers are unchanged --
+  // ncu counts the same 4.63 M requests and 62.36 M sectors either way -- but
+  // from here they have the x, y and z phases to complete in.  Section 15 of
+  // p15_gap_study.md measured long scoreboard falling 47.1% to 24.5% and the
+  // kernel 5.3% shorter, with bit-identical output.  Evaluating them one step
+  // earlier still, before the x panel is staged, is 1% worse: it delays the
+  // first mma without buying more overlap.
+  {
+    int fp = tid;
+    int fidx = face_offset + fp;
+    int iM = VMapM[fidx] - 1;
+    int iP = VMapP[fidx] - 1;
+    double qM = q[iM], qP = q[iP];
+    double VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
+                  w[iM] * normal_fn[fidx + 2 * nface];
+    double VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
+                  w[iP] * normal_fn[fidx + 2 * nface];
+    double alpha = 0.5 * fabs(VelP + VelM);
+    sflux[sw_f15(fp)] =
+        0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+    if (tid < 512) {
+      fp = tid + 1024;
+      fidx = face_offset + fp;
+      iM = VMapM[fidx] - 1;
+      iP = VMapP[fidx] - 1;
+      qM = q[iM];
+      qP = q[iP];
+      VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
+             w[iM] * normal_fn[fidx + 2 * nface];
+      VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
+             w[iP] * normal_fn[fidx + 2 * nface];
+      alpha = 0.5 * fabs(VelP + VelM);
+      sflux[sw_f15(fp)] =
+          0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+    }
   }
   __syncthreads();
   {
@@ -872,37 +918,6 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
   }
   __syncthreads();
 
-  //- numerical flux on the six faces ------------------------------------
-  {
-    int fp = tid;
-    int fidx = face_offset + fp;
-    int iM = VMapM[fidx] - 1;
-    int iP = VMapP[fidx] - 1;
-    double qM = q[iM], qP = q[iP];
-    double VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
-                  w[iM] * normal_fn[fidx + 2 * nface];
-    double VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
-                  w[iP] * normal_fn[fidx + 2 * nface];
-    double alpha = 0.5 * fabs(VelP + VelM);
-    sbuf[sw_f15(fp)] =
-        0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
-    if (tid < 512) {
-      fp = tid + 1024;
-      fidx = face_offset + fp;
-      iM = VMapM[fidx] - 1;
-      iP = VMapP[fidx] - 1;
-      qM = q[iM];
-      qP = q[iP];
-      VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
-             w[iM] * normal_fn[fidx + 2 * nface];
-      VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
-             w[iP] * normal_fn[fidx + 2 * nface];
-      alpha = 0.5 * fabs(VelP + VelM);
-      sbuf[sw_f15(fp)] =
-          0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
-    }
-  }
-  __syncthreads();
 
   //- lift and assembly --------------------------------------------------
   {
@@ -918,25 +933,25 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
     // warp-invariant bits here, so the +1 neighbour stays the XOR neighbour;
     // likewise +256 and +512 move bits the fold does not read.
     const int sb2 = sw_f15(256 + jout + NQ15 * k);
-    const double fb2 = sbuf[sb2];
-    const double fb4 = sbuf[sb2 + 512];
+    const double fb2 = sflux[sb2];
+    const double fb4 = sflux[sb2 + 512];
     const int s1A = sw_f15(iA + NQ15 * k);
     const int s1B = sw_f15(iB + NQ15 * k);
     const int s5A = sw_f15(1024 + iA + NQ15 * jout);
     const int s5B = sw_f15(1024 + iB + NQ15 * jout);
 
-    const double l0 = lf1 * sbuf[s1A] + sLift[16 + iA] * fb2 +
-                      lf3 * sbuf[512 + s1A] + sLift[48 + iA] * fb4 +
-                      lf5 * sbuf[s5A] + lf6 * sbuf[s5A + 256];
-    const double l1 = lf1 * sbuf[s1A ^ 1] + sLift[17 + iA] * fb2 +
-                      lf3 * sbuf[512 + (s1A ^ 1)] + sLift[49 + iA] * fb4 +
-                      lf5 * sbuf[s5A ^ 1] + lf6 * sbuf[(s5A ^ 1) + 256];
-    const double l2 = lf1 * sbuf[s1B] + sLift[16 + iB] * fb2 +
-                      lf3 * sbuf[512 + s1B] + sLift[48 + iB] * fb4 +
-                      lf5 * sbuf[s5B] + lf6 * sbuf[s5B + 256];
-    const double l3 = lf1 * sbuf[s1B ^ 1] + sLift[17 + iB] * fb2 +
-                      lf3 * sbuf[512 + (s1B ^ 1)] + sLift[49 + iB] * fb4 +
-                      lf5 * sbuf[s5B ^ 1] + lf6 * sbuf[(s5B ^ 1) + 256];
+    const double l0 = lf1 * sflux[s1A] + sLift[16 + iA] * fb2 +
+                      lf3 * sflux[512 + s1A] + sLift[48 + iA] * fb4 +
+                      lf5 * sflux[s5A] + lf6 * sflux[s5A + 256];
+    const double l1 = lf1 * sflux[s1A ^ 1] + sLift[17 + iA] * fb2 +
+                      lf3 * sflux[512 + (s1A ^ 1)] + sLift[49 + iA] * fb4 +
+                      lf5 * sflux[s5A ^ 1] + lf6 * sflux[(s5A ^ 1) + 256];
+    const double l2 = lf1 * sflux[s1B] + sLift[16 + iB] * fb2 +
+                      lf3 * sflux[512 + s1B] + sLift[48 + iB] * fb4 +
+                      lf5 * sflux[s5B] + lf6 * sflux[s5B + 256];
+    const double l3 = lf1 * sflux[s1B ^ 1] + sLift[17 + iB] * fb2 +
+                      lf3 * sflux[512 + (s1B ^ 1)] + sLift[49 + iB] * fb4 +
+                      lf5 * sflux[s5B ^ 1] + lf6 * sflux[(s5B ^ 1) + 256];
 
     *reinterpret_cast<double2 *>(dqdt + gA) =
         make_double2(-(acc0 + l0), -(acc1 + l1));
