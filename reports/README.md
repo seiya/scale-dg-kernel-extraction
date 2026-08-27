@@ -9,7 +9,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`execution_times.md`](execution_times.md) | `nstep=1000` の同一条件でのパス別実行時間 |
 | [`gpu_optimization_session_report.md`](gpu_optimization_session_report.md) | OpenACC → CUDA Fortran → Tensor Core / GEMM に至る実装の変遷と、途中で踏んだ誤り（代表スカラー特殊化）の記録 |
 | [`p255_gemm_fusion_session_report.md`](p255_gemm_fusion_session_report.md) | p=255 の volume GEMM と z-epilogue 融合の詳細実験 |
-| [`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) | arXiv:2407.09621 の取り込み調査と、p=7 Tensor Core カーネルの shared memory レイアウト刷新 |
+| [`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) | arXiv:2407.09621 の取り込み調査と、p=7 Tensor Core カーネルの shared memory レイアウト刷新。§14 は p=31 で効いた「D1D フラグメントのレジスタ常駐化」が p=7 では**効かない**ことの実測（32 レジスタの天井に余白が無く、shared ロード 2 本がスピル 2 本に置き換わるだけ、+0.63%） |
 | [`h100_report.md`](h100_report.md) | H100（TSUBAME 4）で同じコードを走らせた記録。経路横断の GB200 比、FP64 Tensor Core ピークが 2 倍あることの帰結、H100 では `CutlassMmaShape = "16x8x4"` を選ぶこと |
 | [`sm90_mma_shape_survey.md`](sm90_mma_shape_survey.md) | CUTLASS volume GEMM の MMA 命令形状（8x8x4 / 16x8x4 / 16x8x8 / 16x8x16）を namelist で選べるようにして実測した記録。GB200 では ptxas が SM90 の f64 MMA を `DMMA.8x8x4` に展開するため得るものが無く、H100 では 16x8x4 が最速（cuBLAS が選ぶ 16x8x8 ではない）。kK>4 を CUTLASS 2.x で正しく動かすための warp tile iterator も含む |
 | [`tma_survey.md`](tma_survey.md) | TMA の適用可能性を候補ごとに実測した記録。採用ゼロだが、FP64 での受理条件・帯域・L1 挙動と、2 候補それぞれの構造的な不採用理由 |
