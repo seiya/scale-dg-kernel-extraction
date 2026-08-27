@@ -649,15 +649,20 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
   // Linear, coalesced ownership for the loads; the mma fragment map decides
   // who computes what, which is a different mapping and does not have to
   // agree with this one.
-  const int n0 = tid;
-  const int n1 = tid + 1024;
-  const int n2 = tid + 2048;
-  const int n3 = tid + 3072;
-  const int i0g = elem_offset + n0;
-  const int i1g = elem_offset + n1;
-  const int i2g = elem_offset + n2;
-  const int i3g = elem_offset + n3;
-  const double q0 = q[i0g], q1 = q[i1g], q2 = q[i2g], q3 = q[i3g];
+  //
+  // The two nodes of a pair are adjacent rather than 1024 apart, so q, u, v
+  // and w each move as one double2 instead of two doubles and the volume
+  // phases issue half the global load instructions.  What this kernel pays
+  // for is the number of instructions that traverse L1/TEX, not the bytes:
+  // the sector count is identical either way.  No swizzle here reads or
+  // writes bit 0 and na is even, so a pair stays a pair through them and the
+  // shared store is one aligned double2 as well.
+  const int na = tid << 1;
+  const int nb = na + 2048;
+  const int iag = elem_offset + na;
+  const int ibg = elem_offset + nb;
+  const double2 qa = *reinterpret_cast<const double2 *>(q + iag);
+  const double2 qb = *reinterpret_cast<const double2 *>(q + ibg);
 
   // Output nodes of this lane: j = tm*8 + row, i = tn*8 + 2*colk and +1.
   const int jout = tm * 8 + row;
@@ -671,12 +676,12 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
 
   //- x -----------------------------------------------------------------
   {
-    const int sx0 = sw_xy15(n0), sx1 = sw_xy15(n1);
-    const int sx2 = sw_xy15(n2), sx3 = sw_xy15(n3);
-    sbuf[sx0] = q0 * u[i0g];
-    sbuf[sx1] = q1 * u[i1g];
-    sbuf[sx2] = q2 * u[i2g];
-    sbuf[sx3] = q3 * u[i3g];
+    const double2 ua = *reinterpret_cast<const double2 *>(u + iag);
+    const double2 ub = *reinterpret_cast<const double2 *>(u + ibg);
+    *reinterpret_cast<double2 *>(sbuf + sw_xy15(na)) =
+        make_double2(qa.x * ua.x, qa.y * ua.y);
+    *reinterpret_cast<double2 *>(sbuf + sw_xy15(nb)) =
+        make_double2(qb.x * ub.x, qb.y * ub.y);
   }
   __syncthreads();
   {
@@ -703,12 +708,12 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
 
   //- y -----------------------------------------------------------------
   {
-    const int sx0 = sw_xy15(n0), sx1 = sw_xy15(n1);
-    const int sx2 = sw_xy15(n2), sx3 = sw_xy15(n3);
-    sbuf[sx0] = q0 * v[i0g];
-    sbuf[sx1] = q1 * v[i1g];
-    sbuf[sx2] = q2 * v[i2g];
-    sbuf[sx3] = q3 * v[i3g];
+    const double2 va = *reinterpret_cast<const double2 *>(v + iag);
+    const double2 vb = *reinterpret_cast<const double2 *>(v + ibg);
+    *reinterpret_cast<double2 *>(sbuf + sw_xy15(na)) =
+        make_double2(qa.x * va.x, qa.y * va.y);
+    *reinterpret_cast<double2 *>(sbuf + sw_xy15(nb)) =
+        make_double2(qb.x * vb.x, qb.y * vb.y);
   }
   __syncthreads();
   {
@@ -736,12 +741,12 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
 
   //- z -----------------------------------------------------------------
   {
-    const int sz0 = sw_z15(n0), sz1 = sw_z15(n1);
-    const int sz2 = sw_z15(n2), sz3 = sw_z15(n3);
-    sbuf[sz0] = q0 * w[i0g];
-    sbuf[sz1] = q1 * w[i1g];
-    sbuf[sz2] = q2 * w[i2g];
-    sbuf[sz3] = q3 * w[i3g];
+    const double2 wa = *reinterpret_cast<const double2 *>(w + iag);
+    const double2 wb = *reinterpret_cast<const double2 *>(w + ibg);
+    *reinterpret_cast<double2 *>(sbuf + sw_z15(na)) =
+        make_double2(qa.x * wa.x, qa.y * wa.y);
+    *reinterpret_cast<double2 *>(sbuf + sw_z15(nb)) =
+        make_double2(qb.x * wb.x, qb.y * wb.y);
   }
   __syncthreads();
   {
