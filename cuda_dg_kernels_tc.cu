@@ -1359,7 +1359,73 @@ extern "C" void launch_tendency_fused_p31_tc(
 #define NP63 262144
 #define NQ2_63 4096
 #define NFPTOT63 24576
-#define BK63 16
+// Depth of the contraction chunk.  All three legal values were measured
+// (Slurm 60560, Ne=4**3, nstep=20):
+//
+//   BK63   panels    shared   us/stage
+//     16   3 x 1024   24 KB      660.5
+//     32   3 x 2048   48 KB      615.1
+//     64   3 x 4096   96 KB      572.3   <- kept
+//
+// Deeper wins for a reason that has nothing to do with reuse: the kernel is
+// latency bound, not bandwidth or issue bound (section 13.4), and a chunk loop
+// with no prefetch stalls once per chunk because the loads for chunk k+1 are
+// not issued until the mma of chunk k has consumed chunk k.  At BK63=64 there
+// is no chunk loop at all, so every global load of the plane is in flight
+// before the first mma and the memory-level parallelism is the whole panel
+// instead of a quarter of it.  Section 16 of p63_gap_study.md.
+#define BK63 64
+
+// Two shared layouts, because the transpose between global and the mma has to
+// be paid somewhere.  A flux panel arrives from global with i fast and is
+// wanted by the mma with the contraction index fast; the two are orthogonal,
+// so either the shared store takes the conflict (lanes walking the outer
+// index all land in one bank) or the read does.
+//
+//   sD layout   flux layout   us/stage
+//   l-fast      l-fast           564.0
+//   outer-fast  l-fast           556.7   <- kept
+//   l-fast      outer-fast       637.2
+//   outer-fast  outer-fast       656.7
+//
+// A first attempt folded l into bits 3-4 and looked conflict free by the
+// usual test -- 32 lanes, 32 distinct banks -- but measured a uniform 2 extra
+// wavefronts per LDS.64.  The usual test is the wrong one for 8-byte shared
+// accesses: 32 lanes times 8 B is 256 B against 128 B of banks, so the access
+// is two phases of 16 lanes and what has to be distinct is d mod 16 within a
+// half warp.  There only two bits of row and two of colk vary, so a fold into
+// bits 3-4 leaves bit 4 outside the window and the 16 lanes cover 8 banks.
+// Folding into bits 2-3 instead puts both varying pairs inside it.  That took
+// the load conflicts from 8.4 M back to 0 and the kernel from 555.6 to 544.4
+// us/stage; section 16.5.
+//
+// Which panels want which layout was then swept at nstep=400:
+//
+//   sD          sFW (xz)    sFV (y)     us/stage
+//   l-fast      l-fast      l-fast         563.8
+//   outer-fast  l-fast      l-fast         544.4
+//   outer-fast  outer-fast  l-fast         539.0   <- kept
+//   outer-fast  outer-fast  outer-fast     629.8
+//
+// sFV is the odd one out: transposing it makes the y kernel's own numbers
+// better on paper (LSU wavefronts 24.9 M to 21.1 M, L1/TEX 59.7% to 41.3%)
+// and the kernel 22% slower.  That inversion is unexplained; section 16.6.
+
+// l-fast panels: idx = l + 64*outer.  The read has l in bits 0-1 (colk) and
+// the outer index in bits 6-8 (row), so folding the latter into bits 2-4
+// spreads it over all 32 banks; the store has the lanes walking l, which is
+// already 32 consecutive addresses.
+__device__ __forceinline__ int sw63(int idx)
+{
+  return idx ^ (((idx >> 6) & 7) << 2);
+}
+
+// outer-fast panel: idx = outer + 64*l.  Now the store is the contiguous side
+// and l sits in bits 6-11, so its low two bits fold into bits 3-4 instead.
+__device__ __forceinline__ int swt63(int idx)
+{
+  return idx ^ (((idx >> 6) & 3) << 2);
+}
 
 // Warp shape of the volume kernels.  The warp grid is 4 rows by P63_WN
 // columns and each warp owns 2 by P63_TN of the 8x8 mma tiles, so the block
@@ -1391,9 +1457,14 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
     const double *u, const double *w, const double *flux_bnd,
     const double *Escale, int Ne)
 {
-  __shared__ __align__(16) double sFU[NQ63 * BK63];
-  __shared__ __align__(16) double sD[NQ63 * BK63];
-  __shared__ __align__(16) double sFW[NQ63 * BK63];
+  // Dynamic, because at BK63=32 the three panels are exactly the 48 KB static
+  // limit and at BK63=64 they are twice it.  Occupancy is capped by registers
+  // (512 threads times 124) long before shared memory matters, so the extra
+  // shared costs nothing; see section 16 of p63_gap_study.md.
+  extern __shared__ __align__(16) double smem63[];
+  double *const sFU = smem63;
+  double *const sD = smem63 + NQ63 * BK63;
+  double *const sFW = smem63 + 2 * NQ63 * BK63;
 
   const int elem = (int)blockIdx.x / NQ63;
   if (elem >= Ne) {
@@ -1429,10 +1500,10 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
     // walk l and cover one 128-byte run.
 #pragma unroll
     for (int p = 0; p < P63_STAGE_ITERS; ++p) {
-      const int ll = tid & 15;
-      const int o = (tid >> 4) + (P63_THREADS / 16) * p;
+      const int ll = tid & (BK63 - 1);
+      const int o = (tid / BK63) + (P63_THREADS / BK63) * p;
       const int g = eo + (kk + ll) + plane_off + NQ2_63 * o;
-      sFU[sw255(ll + BK63 * o)] = q[g] * u[g];
+      sFU[sw63(ll + BK63 * o)] = q[g] * u[g];
     }
     // sD[r][l] = D1D(r, l), r fast in the Fortran column-major operator.
     // sFW[i][l] = q*w at (i, jp, l), i fast in global.
@@ -1440,9 +1511,9 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
     for (int p = 0; p < P63_STAGE_ITERS; ++p) {
       const int o = tid & 63;
       const int ll = (tid >> 6) + (P63_THREADS / 64) * p;
-      sD[sw255(ll + BK63 * o)] = D1D[o + NQ63 * (kk + ll)];
+      sD[swt63(o + BK63 * ll)] = D1D[o + NQ63 * (kk + ll)];
       const int g = eo + o + plane_off + NQ2_63 * (kk + ll);
-      sFW[sw255(ll + BK63 * o)] = q[g] * w[g];
+            sFW[swt63(o + BK63 * ll)] = q[g] * w[g];
     }
     __syncthreads();
 
@@ -1453,14 +1524,14 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
         const int m = 8 * (2 * wm + a) + row;
-        av[a] = sFU[sw255(l + BK63 * m)];
-        avz[a] = sD[sw255(l + BK63 * m)];
+        av[a] = sFU[sw63(l + BK63 * m)];
+        avz[a] = sD[swt63(m + BK63 * l)];
       }
 #pragma unroll
       for (int bb = 0; bb < P63_TN; ++bb) {
         const int n = 8 * (P63_TN * wn + bb) + row;
-        bv[bb] = sD[sw255(l + BK63 * n)];
-        bvz[bb] = sFW[sw255(l + BK63 * n)];
+        bv[bb] = sD[swt63(n + BK63 * l)];
+        bvz[bb] = sFW[swt63(n + BK63 * l)];
       }
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
@@ -1533,8 +1604,9 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_y_tc_kernel
     double *dqdt, const double *D1D, const double *q, const double *v,
     const double *Escale, int Ne)
 {
-  __shared__ __align__(16) double sD[NQ63 * BK63];
-  __shared__ __align__(16) double sFV[NQ63 * BK63];
+  extern __shared__ __align__(16) double smem63[];
+  double *const sD = smem63;
+  double *const sFV = smem63 + NQ63 * BK63;
 
   const int elem = (int)blockIdx.x / NQ63;
   if (elem >= Ne) {
@@ -1565,9 +1637,9 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_y_tc_kernel
     for (int p = 0; p < P63_STAGE_ITERS; ++p) {
       const int o = tid & 63;
       const int ll = (tid >> 6) + (P63_THREADS / 64) * p;
-      sD[sw255(ll + BK63 * o)] = D1D[o + NQ63 * (kk + ll)];
+      sD[swt63(o + BK63 * ll)] = D1D[o + NQ63 * (kk + ll)];
       const int g = eo + o + NQ63 * (kk + ll) + plane_off;
-      sFV[sw255(ll + BK63 * o)] = q[g] * v[g];
+            sFV[sw63(ll + BK63 * o)] = q[g] * v[g];
     }
     __syncthreads();
 
@@ -1577,11 +1649,11 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_y_tc_kernel
       double av[2], bv[P63_TN];
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
-        av[a] = sD[sw255(l + BK63 * (8 * (2 * wm + a) + row))];
+        av[a] = sD[swt63((8 * (2 * wm + a) + row) + BK63 * l)];
       }
 #pragma unroll
       for (int bb = 0; bb < P63_TN; ++bb) {
-        bv[bb] = sFV[sw255(l + BK63 * (8 * (P63_TN * wn + bb) + row))];
+        bv[bb] = sFV[sw63(l + BK63 * (8 * (P63_TN * wn + bb) + row))];
       }
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
@@ -1617,9 +1689,23 @@ extern "C" void launch_tendency_fused_p63_tc(
     const double *Escale, int Ne)
 {
   const int nblock = NQ63 * Ne;
-  tendency_fused_p63_xz_tc_kernel<<<nblock, P63_THREADS, 0, dg_cuda_stream>>>(
+  const size_t smem_xz = 3 * NQ63 * BK63 * sizeof(double);
+  const size_t smem_y = 2 * NQ63 * BK63 * sizeof(double);
+  static bool opted_in = false;
+  if (!opted_in) {
+    cudaFuncSetAttribute(tendency_fused_p63_xz_tc_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)smem_xz);
+    cudaFuncSetAttribute(tendency_fused_p63_y_tc_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)smem_y);
+    opted_in = true;
+  }
+  tendency_fused_p63_xz_tc_kernel<<<nblock, P63_THREADS, smem_xz,
+                                    dg_cuda_stream>>>(
       dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
-  tendency_fused_p63_y_tc_kernel<<<nblock, P63_THREADS, 0, dg_cuda_stream>>>(
+  tendency_fused_p63_y_tc_kernel<<<nblock, P63_THREADS, smem_y,
+                                   dg_cuda_stream>>>(
       dqdt, D1D, q, v, Escale, Ne);
   check_cuda("tendency_fused_p63_tc kernels");
 }
