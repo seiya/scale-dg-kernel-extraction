@@ -13,8 +13,15 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`h100_report.md`](h100_report.md) | H100（TSUBAME 4）で同じコードを走らせた記録。経路横断の GB200 比、FP64 Tensor Core ピークが 2 倍あることの帰結、H100 では `CutlassMmaShape = "16x8x4"` を選ぶこと |
 | [`sm90_mma_shape_survey.md`](sm90_mma_shape_survey.md) | CUTLASS volume GEMM の MMA 命令形状（8x8x4 / 16x8x4 / 16x8x8 / 16x8x16）を namelist で選べるようにして実測した記録。GB200 では ptxas が SM90 の f64 MMA を `DMMA.8x8x4` に展開するため得るものが無く、H100 では 16x8x4 が最速（cuBLAS が選ぶ 16x8x8 ではない）。kK>4 を CUTLASS 2.x で正しく動かすための warp tile iterator も含む |
 | [`tma_survey.md`](tma_survey.md) | TMA の適用可能性を候補ごとに実測した記録。採用ゼロだが、FP64 での受理条件・帯域・L1 挙動と、2 候補それぞれの構造的な不採用理由 |
+| [`cublas_emulation_survey.md`](cublas_emulation_survey.md) | cuBLAS FP64 fixed-point emulation の見かけのストール調査。EAGER 強制、永続 8 GiB workspace、p=7/p=255 の速度と数値検証 |
 
 ## 現時点の結論
+
+- **cuBLAS FP64 emulation（2026-08-27）**: `CublasEmulation=.true.` は比較実験の
+  ため `EAGER` を明示的に強制する。p=7 では native FP64 の **約131倍遅い**ため、
+  計測は `nstep=1--10` に制限する。8 GiB workspace は初期化時に一度だけ確保して
+  再利用するが、cuBLAS 13.2.1 の内部 `cudaMallocAsync` は残り、p=7 の不利は
+  解消しない。詳細は `cublas_emulation_survey.md`。
 
 - **p=7, `Ne=32^3`**: `CUDAFORTRAN_FUSED_TC` が最速（commit `e22dda1` 以降）。
   現時点の device 時間は 0.806 秒 / Main 1.066 秒（下の ±x 面の項目）。

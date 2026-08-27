@@ -115,6 +115,10 @@ contains
       end select
     end if
 
+    !- Bind the OpenACC queue before creating a cuBLAS handle so its stream
+    !  and persistent workspace can be configured once during GEMM setup.
+    call cuda_dg_bind_acc_stream(ACC_QUEUE)
+
     select case (trim(dqdt_kernel_type))
     case ("OPENACC_ASIS")
       dqdt_kernel_typeid = DQDT_KERNEL_OPENACC_ASIS
@@ -194,8 +198,6 @@ contains
       dqdt_kernel_typeid == DQDT_KERNEL_OPENACC_ASIS .or. &
       dqdt_kernel_typeid == DQDT_KERNEL_OPENACC_SPLIT .or. &
       dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_SPLIT
-
-    call cuda_dg_bind_acc_stream(ACC_QUEUE)
 
     if (cublas_emulation_enabled .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &

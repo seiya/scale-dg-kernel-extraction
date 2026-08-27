@@ -878,7 +878,7 @@ z の結果から見て、どちらも時間では報われない公算が大き
 | auxiliary fragment の寿命短縮 | maxabs 2e-15（可）、3.60 → **3.70 s** | 不採用。load 直列化のレイテンシがレジスタ圧緩和を上回る |
 | epilogue loop のフルアンロール | maxabs 3.6e-15（可）、3.60 → **3.69 s** | 不採用。register / code-size で不利 |
 | 代表スカラー特殊化（`Escale(1,1,1)*u(1,1)` 等） | 高速だが**数値契約違反** | 撤回（`03551c7`）。速度に関係なく即 revert |
-| cuBLAS FP emulation（Ozaki / BF16x9） | 導入 toolkit に API が無く native FP64 へ fallback → timeout | 現環境では評価不能 |
+| cuBLAS FP64 emulation（Ozaki fixed-point） | 後の調査で API 判定と表示の誤りを修正。EAGER は p=7 で native の約131倍遅い | `nstep=1--10` でのみ比較。`cublas_emulation_survey.md` 参照 |
 | SSP-RK 更新の `rk_a(stage)` / `rk_b(stage)` だけをスカラー化 | −0.2〜0.5% | 単独では**ほぼ無意味**（§8.8）。全スレッドが同一アドレスを読むので L1 に当たり、発行スロットしか消費していない。同じ関数の 1 次元化と併せて採用 |
 | p=7 の grid-stride loop 除去（1 thread / 1 point） | 全体の律速は解消せず | 不採用。launch 構造と中間配列トラフィックが本体 |
 | p=7 TC の face gather 前倒し（`VMapM`/`VMapP` の先行ロード） | 版 A（index だけ前倒し）0.850 → **0.868 s**（+2.1%）、版 B（セクションごと入れ替え）0.849 s（±0） | **不採用**（2026-08-25）。カーネルはレジスタ 32 本ちょうどで余裕がゼロなので、ptxas が先行ロードを元の位置へ押し戻す。詳細は `tc_paper_survey_2407.09621.md` §12 |

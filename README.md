@@ -168,10 +168,21 @@ CublasEmulation = .false.
 
 Volume flux and numerical flux stay pointwise CUDA kernels. Tensor-product
 derivatives and the separable `Lift1D` operator are evaluated with `cublasDgemm`
-/ `cublasDgemmStridedBatched`. `CublasEmulation` switches cuBLAS floating-point
-emulation (Ozaki / BF16x9, when the installed toolkit supports it) on or off at
-run time without rebuilding. Example inputs are `input_p7_val_gemm.conf` and
-`input_p255_val_gemm.conf`.
+/ `cublasDgemmStridedBatched`. `CublasEmulation` switches cuBLAS FP64
+fixed-point emulation (Ozaki scheme) on or off at run time without rebuilding.
+The enabled mode deliberately selects the `EAGER` strategy: this repository
+uses the flag to compare native and emulated algorithms, not to let cuBLAS
+choose one automatically. An 8 GiB handle workspace is allocated once and
+reused. Example validation inputs are `input_p7_val_gemm.conf`,
+`input_p7_val_gemm_emu.conf`, `input_p255_val_gemm.conf`, and
+`input_p255_val_gemm_emu.conf`.
+
+The forced emulation path is about 131 times slower than native FP64 for the
+p=7 benchmark on GB200. Use only 1--10 steps for exploratory p=7 emulation
+measurements; copying the usual `nstep=1000` performance input makes a healthy
+run look stalled. `input_p7_perf_gemm_emu.conf` is the corresponding one-step
+performance input. See `reports/cublas_emulation_survey.md` for timings and the
+remaining cuBLAS-internal allocation cost.
 
 A fused-volume GEMM variant keeps `volume_flux` materialization and the same
 lift `cublasDgemm` calls as `CUDAFORTRAN_GEMM_CUTE`. Volume x/y derivatives use

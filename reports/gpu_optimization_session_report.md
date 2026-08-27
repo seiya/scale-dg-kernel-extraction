@@ -354,8 +354,11 @@ load/store、実DRAM byte、L2 hit、他kernelとのfusion可能性を確認す�
 - p=255 は大きな dense contraction になり、GEMM 化が有効。
 - GEMM は通常 FUSED の Main に対して約3.50倍高速。
 - 同じ総DOFでも p=7/32^3 と最適戦略が逆になる。
-- cuBLAS floating-point emulation API は導入toolkitで利用できず、native FP64へ
-  fallback後に timeoutした試行がある。
+- この時点で「cuBLAS floating-point emulation API は利用不可、native FP64へ
+  fallback後に timeout」と判断した試行は、後に誤りと判明した。enum値を
+  `defined()` で検査して表示だけが fallback になり、環境変数では EAGER FP64
+  emulation が有効だった。p=7 で native の約131倍遅いため、実体は timeout
+  ではなく進行中の低速計算だった。`cublas_emulation_survey.md` 参照。
 
 ## 10. Tensor Core / CUTLASS / fusion の追加調査
 

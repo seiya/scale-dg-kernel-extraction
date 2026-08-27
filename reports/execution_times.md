@@ -199,10 +199,13 @@ stage 1 の `dqdt` 全点ダンプと min/max 系列の**全 18 比較が `43fe5
 残り、5 step 後に 1e-11 のずれとして現れた。**「全部同じストリームに載った」ことは
 nsys の stream 列で確認すること。**
 
-`CUDAFORTRAN_GEMM` with `CublasEmulation=.true.` did not produce a
-timing. The run printed that cuBLAS floating-point emulation APIs are
-unavailable and that native FP64 GEMM would be used, then hit the 180 s
-timeout.
+`CUDAFORTRAN_GEMM` with `CublasEmulation=.true.` did not produce a timing in
+this historical run. The later investigation in
+`cublas_emulation_survey.md` showed that the API-availability message was
+incorrect: an enum value had been tested with `defined()`, while environment
+variables still enabled `EAGER` FP64 emulation. The run was progressing about
+about 131 times more slowly than native FP64 at p=7, so `nstep=1000` was unsuitable.
+Use `nstep=1--10` for this comparison.
 
 ## p=255, `Ne = 1`
 
