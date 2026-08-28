@@ -13,6 +13,7 @@
 #include "cutlass/arch/synclog.hpp"
 
 #include "cutlass_z_gemm_assembly.h"
+#include "cutlass_y_gemm_scaleadd.h"
 
 // Volume GEMM tiles match the cuBLAS nsys kernels:
 //   cutlass_80_tensorop_d884gemm_64x128_16x3_nn_align1
@@ -43,7 +44,15 @@ using ColumnMajor = cutlass::layout::ColumnMajor;
 using TensorOp = cutlass::arch::OpClassTensorOp;
 using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
 using BatchedSwizzle = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
+
 using EpilogueOp = cutlass::epilogue::thread::LinearCombination<double, 1, double, double>;
+//- Two elements per contiguous access, i.e. 16-byte loads and stores in the
+//- epilogue.  Only the Nq > 64 branch takes it: there it is worth 7.2 us per
+//- stage at p=127 and 17 us at p=255, while at Nq = 64 the same change makes
+//- the z kernel 2.8% slower for an identical result (the same asymmetry the
+//- other three z epilogue changes have, cutlass_z_gemm_assembly.h).
+using EpilogueOp2 = cutlass::epilogue::thread::LinearCombination<double, 2, double, double>;
+
 
 //- Epilogue output op for the x and y volume GEMMs of the fused path:
 //-   D = accumulator * source
@@ -58,7 +67,8 @@ using EpilogueOp = cutlass::epilogue::thread::LinearCombination<double, 1, doubl
 //- CUTLASS's stock epilogue with a hand-rolled one on the y GEMM costs 72 us
 //- per stage all by itself, which is four times what the whole move can win.
 //- See reports/p255_gap_study.md.
-class PointwiseScale {
+template <int kCountV>
+class PointwiseScaleV {
 public:
   using ElementOutput = double;
   using ElementSource = double;
@@ -67,7 +77,7 @@ public:
   using ElementC = double;
   using ElementD = double;
 
-  static int const kCount = 1;
+  static int const kCount = kCountV;
   using FragmentOutput = cutlass::Array<ElementOutput, kCount>;
   using FragmentSource = cutlass::Array<ElementSource, kCount>;
   using FragmentAccumulator = cutlass::Array<ElementAccumulator, kCount>;
@@ -77,10 +87,10 @@ public:
   };
 
   CUTLASS_HOST_DEVICE
-  explicit PointwiseScale(Params const & = Params()) {}
+  explicit PointwiseScaleV(Params const & = Params()) {}
 
   CUTLASS_HOST_DEVICE
-  explicit PointwiseScale(Params const &, int) {}
+  explicit PointwiseScaleV(Params const &, int) {}
 
   //- The source is the Escale field, so it is always needed.
   CUTLASS_HOST_DEVICE bool is_source_needed() const { return true; }
@@ -113,6 +123,7 @@ public:
   }
 };
 
+
 template <int M, int N, int K>
 using GS = cutlass::gemm::GemmShape<M, N, K>;
 
@@ -142,17 +153,23 @@ struct VolumeGemmSet {
   using GemmXScale = cutlass::gemm::device::Gemm<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
       TensorOp, ArchTag, GS<64, 128, TileK>, GS<32, 64, TileK>, InstShape,
-      PointwiseScale, Swizzle, 3>;
+      PointwiseScaleV<2>, Swizzle, 3>;
 
   using GemmYScale = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
       TensorOp, ArchTag, GS<64, 64, TileK>, GS<32, 32, TileK>, InstShape,
-      PointwiseScale, BatchedSwizzle, 4>;
+      PointwiseScaleV<2>, BatchedSwizzle, 4>;
 
   using GemmZ = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
       TensorOp, ArchTag, GS<64, 32, TileK>, GS<32, 32, TileK>, InstShape,
       EpilogueOp, BatchedSwizzle, 4>;
+
+  //- Same z GEMM with 16-byte epilogue accesses, for the Nq > 64 branch.
+  using GemmZWide = cutlass::gemm::device::GemmBatched<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, ArchTag, GS<64, 32, TileK>, GS<32, 32, TileK>, InstShape,
+      EpilogueOp2, BatchedSwizzle, 4>;
 };
 
 using MmaSet_884 = VolumeGemmSet<GS<8, 8, 4>, cutlass::arch::Sm80, 16>;
@@ -242,6 +259,66 @@ int run_gemm_batched_nn_scaled(int m, int n, int k, double const *A, int lda,
   return cutlass_error("scaled batched gemm", gemm_op(args, nullptr, dg_cuda_stream));
 }
 
+//- y GEMM whose epilogue takes two sources: D = Escale_y * acc + deriv_x.
+//- Same tiles, warps, stages and mainloop as GemmYScale; only the epilogue
+//- differs.  cutlass_y_gemm_scaleadd.h says why deriv_x is read here.
+template <class Set>
+int run_volume_gemm_y_scaleadd(double *deriv_xy, const double *flux_y,
+                               const double *D1D_tr, const double *escale_y,
+                               const double *deriv_x, int Nq, int Ne)
+{
+  const int nq2 = Nq * Nq;
+  const long long stride_plane = nq2;
+
+  using GemmY = typename Set::GemmYScale;
+  using Kernel = GemmBatchedScaleAdd<typename GemmY::GemmKernel::Mma,
+                                     typename GemmY::GemmKernel::Epilogue, BatchedSwizzle>;
+
+  cutlass::TensorRef<double const, ColumnMajor> ref_A(flux_y, Nq);
+  cutlass::TensorRef<double const, ColumnMajor> ref_B(D1D_tr, Nq);
+  cutlass::TensorRef<double, ColumnMajor> ref_D(deriv_xy, Nq);
+
+  typename GemmY::Arguments gemm_args({Nq, Nq, Nq}, ref_A, stride_plane, ref_B, 0,
+                                      ref_D, stride_plane, ref_D, stride_plane,
+                                      typename GemmY::EpilogueOutputOp::Params(), Nq * Ne);
+  cutlass::Status can = GemmY::can_implement(gemm_args);
+  if (can != cutlass::Status::kSuccess) {
+    return cutlass_error("y-scaleadd can_implement", can);
+  }
+
+  auto uargs = GemmY::to_underlying_arguments(gemm_args);
+  BatchedSwizzle swizzle;
+  cutlass::gemm::GemmCoord grid_shape = swizzle.get_tiled_shape(
+      uargs.problem_size,
+      {GemmY::ThreadblockShape::kM, GemmY::ThreadblockShape::kN,
+       GemmY::ThreadblockShape::kK},
+      uargs.batch_count);
+
+  typename Kernel::Params params;
+  params.gemm = typename Kernel::BaseKernel::Params(
+      uargs.problem_size, grid_shape, uargs.ref_A.non_const_ref(), uargs.stride_A,
+      uargs.ref_B.non_const_ref(), uargs.stride_B, uargs.ref_C.non_const_ref(),
+      uargs.stride_C, uargs.ref_D, uargs.stride_D, uargs.epilogue, uargs.batch_count);
+  params.ptr_scale = escale_y;
+  params.ptr_add = deriv_x;
+  params.stride_scale = stride_plane;
+  params.stride_add = stride_plane;
+
+  dim3 grid = swizzle.get_grid_shape(grid_shape);
+  dim3 block(Kernel::kThreadCount, 1, 1);
+  int smem_size = int(sizeof(typename Kernel::SharedStorage));
+  if (smem_size >= (48 << 10)) {
+    cudaError_t attr = cudaFuncSetAttribute(
+        cutlass::Kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    if (attr != cudaSuccess) {
+      return 1;
+    }
+  }
+  cutlass::arch::synclog_setup();
+  cutlass::Kernel<Kernel><<<grid, block, smem_size, dg_cuda_stream>>>(params);
+  return cudaGetLastError() == cudaSuccess ? 0 : 1;
+}
+
 template <class Set>
 int run_volume_gemms_xy(double *deriv_x, double *deriv_y, const double *flux_x,
                         const double *flux_y, const double *D1D,
@@ -250,7 +327,6 @@ int run_volume_gemms_xy(double *deriv_x, double *deriv_y, const double *flux_x,
 {
   const int nq2 = Nq * Nq;
   const int npoint = nq2 * Nq * Ne;
-  const long long stride_plane = nq2;
 
   int st = run_gemm_nn_scaled<typename Set::GemmXScale>(
       Nq, nq2 * Ne, Nq, D1D, Nq, flux_x, Nq, escale, Nq, deriv_x, Nq);
@@ -258,9 +334,11 @@ int run_volume_gemms_xy(double *deriv_x, double *deriv_y, const double *flux_x,
     return st;
   }
 
-  return run_gemm_batched_nn_scaled<typename Set::GemmYScale>(
-      Nq, Nq, Nq, flux_y, Nq, stride_plane, D1D_tr, Nq, 0, escale + npoint, Nq,
-      stride_plane, deriv_y, Nq, stride_plane, Nq * Ne);
+  //- deriv_y comes out holding Escale_y * D(flux_y) + deriv_x, so the z
+  //- epilogue reads one volume tensor instead of two.  See
+  //- cutlass_y_gemm_scaleadd.h.
+  return run_volume_gemm_y_scaleadd<Set>(deriv_y, flux_y, D1D_tr, escale + npoint,
+                                         deriv_x, Nq, Ne);
 }
 
 //- The Nq <= 64 branch runs the x GEMM on cuBLAS, which has no epilogue to
@@ -321,7 +399,8 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
   const int n = Nq;
   const int k = Nq;
 
-  using GemmZ = typename Set::GemmZ;
+  using GemmZ = typename cutlass::platform::conditional<
+      kWeighted, typename Set::GemmZWide, typename Set::GemmZ>::type;
   //- Same epilogue, with the accumulator staging tile padded so the stores are
   //- bank-conflict free. See RepadEpilogue in cutlass_z_gemm_assembly.h.
   using ZEpilogue = RepadEpilogue<typename GemmZ::GemmKernel::Epilogue, 8>;
@@ -354,7 +433,9 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
       uargs.ref_B.non_const_ref(), uargs.stride_B, uargs.ref_C.non_const_ref(),
       uargs.stride_C, uargs.ref_D, uargs.stride_D, uargs.epilogue,
       uargs.batch_count);
-  params.ptr_dx = deriv_x;
+  //- On the weighted branch the y GEMM already added deriv_x into deriv_y, so
+  //- the tensor the epilogue reads as "dx" is the merged one.
+  params.ptr_dx = kWeighted ? deriv_y : deriv_x;
   params.ptr_dy = deriv_y;
   params.ptr_flux_bnd = flux_bnd;
   params.ptr_lift1d = lift1d;
@@ -442,9 +523,6 @@ extern "C" int launch_volume_gemm_xy(
   }
 }
 
-//  The x GEMM of the fused path is served by cuBLAS instead: at p=63 the two
-//  land on the identical 64x128_16x3 d884 tile and cuBLAS is 1.59x faster
-//  there, so only the y GEMM is left to CUTLASS.  See reports/p63_gap_study.md.
 extern "C" int launch_volume_gemm_y(double *deriv_y, const double *flux_y,
                                     const double *D1D_tr, int Nq, int Ne,
                                     int mma_shape)
