@@ -231,7 +231,11 @@ contains
 !OCL SERIAL
   subroutine update_halo(f)
     implicit none
-    real(RP), intent(inout) :: f(Np*NeA)
+    ! The caller owns the allocation extent.  Keep this dummy assumed-size so
+    ! merely forming Np*NeA cannot overflow the default integer kind at very
+    ! high order; the actual halo indices below remain within their validated
+    ! 32-bit range.
+    real(RP), intent(inout) :: f(*)
 
     integer :: ibuf
     !------------------------------------------------------------

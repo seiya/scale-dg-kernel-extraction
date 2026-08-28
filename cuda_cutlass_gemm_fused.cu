@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cstdint>
 #include <cstdio>
 
 #include "cutlass/cutlass.h"
@@ -393,7 +394,10 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
 {
   const int nq2 = Nq * Nq;
   const int Np = nq2 * Nq;
-  const int npoint = Np * Ne;
+  // Pointer arithmetic is 64-bit even when each kernel-local index remains in
+  // the validated 32-bit range.  Promote before multiplying so large batches
+  // cannot wrap while locating the y/z Escale components.
+  const std::int64_t npoint = std::int64_t{Np} * Ne;
   const long long stride_vol = Np;
   const int m = nq2;
   const int n = Nq;
