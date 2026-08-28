@@ -80,6 +80,12 @@ mapping、runtime allocation は含めない。
 `q0` と `dqdt` は owned 領域だけ、`q/u/v/w` は packed halo を含む2要素相当の
 領域を確保する現行実装を前提に数えた。
 
+**現行treeでの訂正（2026-08-28、`p1023_gap_study.md`）:** 上表はこの測定時点の
+allocationを記録したものである。p=1023対応で通常GEMMも未使用`surface_lift`を
+除き、z-GEMM出力を`dqdt`に置いて`deriv_z`を再利用するようになった。現行treeの
+通常GEMMはGEMM_FUSEDと同じ`144*Np` = 25.63 GiBである。浮動小数点演算と定常時の
+write/read回数は変わらないため、§5の測定表は当時の結果として維持する。
+
 再現用の1ステップ入力として次を追加した。
 
 - `input_p575_val_gemm.conf`
@@ -158,3 +164,5 @@ lift、assembly も含まれる。
 - 本結果は p=575、`Ne=1` のもの。p=1023 では `Np=1024^3=2^30` 自体は
   32-bitに収まるが、その倍数となる extent / offset が境界を越える。既知の
   host-side境界は対処済みだが、残る32-bit device添字とメモリ容量を別途検証する必要がある。
+
+上記p=1023の残課題は`p1023_gap_study.md`で解決し、両GEMM経路を実機検証した。

@@ -1167,7 +1167,7 @@ contains
   subroutine cuda_cal_dqdt_gemm( &
     dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &
     normal_fn, Fscale, Escale, flux_bnd, &
-    flux_x, flux_y, flux_z, deriv_x, deriv_y, deriv_z, lift_out, &
+    flux_x, flux_y, flux_z, deriv_x, deriv_y, &
     Nq, Np, NfpTot, Ne, NeA, kernel_time )
     implicit none
     integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
@@ -1182,8 +1182,7 @@ contains
     real(RP), device, intent(in) :: Escale(Np,Ne,3)
     real(RP), device, intent(out) :: flux_bnd(NfpTot,Ne)
     real(RP), device, intent(out) :: flux_x(Np,Ne), flux_y(Np,Ne), flux_z(Np,Ne)
-    real(RP), device, intent(out) :: deriv_x(Np,Ne), deriv_y(Np,Ne), deriv_z(Np,Ne)
-    real(RP), device, intent(out) :: lift_out(Np,Ne)
+    real(RP), device, intent(out) :: deriv_x(Np,Ne), deriv_y(Np,Ne)
     real(RP), intent(out) :: kernel_time(2)
 
     integer :: istat, nface, npoint, nblock, nblock_face
@@ -1242,15 +1241,20 @@ contains
       deriv_y, Nq, stride_plane, plane_batch)
     if (istat /= 0) call cuda_failure("cublasDgemm y-deriv",istat)
 
+    ! The assembly reads each z derivative once and then overwrites that same
+    ! point with the final tendency.  Store the z GEMM directly in dqdt so a
+    ! volume-sized deriv_z temporary is unnecessary; beta=0 means no previous
+    ! dqdt value participates in the numerical result.
     istat = cublas_dgemm_strided_batched_impl(0, 0, nq2, Nq, Nq, 1.0_c_double, &
       flux_z, nq2, stride_vol, D1D_tr, Nq, stride_zero, 0.0_c_double, &
-      deriv_z, nq2, stride_vol, Ne)
+      dqdt, nq2, stride_vol, Ne)
     if (istat /= 0) call cuda_failure("cublasDgemm z-deriv",istat)
 
     if (use_side) call dg_side_join()
 
     call separable_lift_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      dqdt, Escale, deriv_x, deriv_y, deriv_z, flux_bnd, Lift1D, &
+      dqdt, Escale(1,1,1), Escale(1,1,2), Escale(1,1,3), &
+      deriv_x, deriv_y, dqdt, flux_bnd, Lift1D, &
       Nq, Np, npoint )
 
     istat = cudaGetLastError()
@@ -1633,7 +1637,8 @@ contains
     if (dg_side_enabled) call dg_side_join()
 
     call separable_lift_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      dqdt, Escale, deriv_x, deriv_y, deriv_z, flux_bnd, Lift1D, &
+      dqdt, Escale(1,1,1), Escale(1,1,2), Escale(1,1,3), &
+      deriv_x, deriv_y, deriv_z, flux_bnd, Lift1D, &
       Nq, Np, npoint )
 
     istat = cudaGetLastError()
@@ -1904,12 +1909,19 @@ contains
   !! The summation order is the one the two kernels produced together:
   !! (lx + ly) + lz was rounded to a double in lift_out, and that is still
   !! where the parenthesis is, so the result is unchanged.
+  !!
+  !! Pass the three Escale components as separate base pointers.  At p=1023,
+  !! npoint=2^30 and the old device expression idx+2*npoint crossed the signed
+  !! 32-bit boundary.  The host-side array descriptor forms each component
+  !! pointer with its native address kind, while every kernel-local point index
+  !! remains 32-bit and keeps the existing paths' instruction mix unchanged.
   attributes(global) subroutine separable_lift_assembly_kernel( &
-    dqdt, Escale, deriv_x, deriv_y, deriv_z, flux_bnd, Lift1D, &
+    dqdt, Escale_x, Escale_y, Escale_z, &
+    deriv_x, deriv_y, deriv_z, flux_bnd, Lift1D, &
     Nq, Np, npoint )
     implicit none
     integer, value :: Nq, Np, npoint
-    real(RP), device :: dqdt(*), Escale(*)
+    real(RP), device :: dqdt(*), Escale_x(*), Escale_y(*), Escale_z(*)
     real(RP), device :: deriv_x(*), deriv_y(*), deriv_z(*)
     real(RP), device :: flux_bnd(*), Lift1D(*)
 
@@ -1935,9 +1947,9 @@ contains
          + Lift1D(5*Nq+k+1)*flux_bnd(base+5*nq2+i+j*Nq+1)
 
       dqdt(idx) = -( &
-          Escale(idx)*deriv_x(idx) &
-        + Escale(idx+npoint)*deriv_y(idx) &
-        + Escale(idx+2*npoint)*deriv_z(idx) &
+          Escale_x(idx)*deriv_x(idx) &
+        + Escale_y(idx)*deriv_y(idx) &
+        + Escale_z(idx)*deriv_z(idx) &
         + ((lx + ly) + lz) )
     end if
   end subroutine separable_lift_assembly_kernel

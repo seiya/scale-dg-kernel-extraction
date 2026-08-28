@@ -304,7 +304,7 @@ contains
   subroutine cuda_cal_dqdt_gemm( &
     dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &
     normal_fn, Fscale, Escale, flux_bnd, &
-    flux_x, flux_y, flux_z, deriv_x, deriv_y, deriv_z, lift_out, &
+    flux_x, flux_y, flux_z, deriv_x, deriv_y, &
     Nq, Np, NfpTot, Ne, NeA, kernel_time )
     implicit none
     integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
@@ -316,8 +316,7 @@ contains
     real(RP), intent(in) :: Escale(Np,Ne,3)
     real(RP), intent(out) :: flux_bnd(NfpTot,Ne)
     real(RP), intent(out) :: flux_x(Np,Ne), flux_y(Np,Ne), flux_z(Np,Ne)
-    real(RP), intent(out) :: deriv_x(Np,Ne), deriv_y(Np,Ne), deriv_z(Np,Ne)
-    real(RP), intent(out) :: lift_out(Np,Ne)
+    real(RP), intent(out) :: deriv_x(Np,Ne), deriv_y(Np,Ne)
     real(RP), intent(out) :: kernel_time(2)
     error stop "CUDA Fortran kernels are not available in this build"
   end subroutine cuda_cal_dqdt_gemm

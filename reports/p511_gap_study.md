@@ -203,3 +203,9 @@ pointwise volume flux、全6面の numerical flux、lift、assembly も含まれ
   p=7 / p=511 の smoke test と
   CUDA / 非CUDA clean build を再確認した。変更の性能・数値比較は
   `reports/index64_boundary_validation.md` に記録した。
+
+**現行treeでの追記（2026-08-28、`p1023_gap_study.md`）:** 通常GEMMもliftと
+assemblyを既に融合済みだったため、未使用`surface_lift`を除いた。さらにz-GEMM
+出力を`dqdt`へ直接置き、assemblyが同じ場所を読んで上書きすることで`deriv_z`も
+除いた。p=511では各1 GiB、計2 GiBのdevice allocation削減である。演算順と定常時の
+write/read回数は変わらず、p=1023の全点比較とp=511点変化smoke testで確認した。

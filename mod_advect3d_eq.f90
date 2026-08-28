@@ -280,10 +280,11 @@ contains
       error stop "PolyOrder=255 currently requires CUDAFORTRAN_FUSED, CUDAFORTRAN_FUSED_TC, CUDAFORTRAN_GEMM, CUDAFORTRAN_GEMM_FUSED, CUDAFORTRAN_GEMM_CUTE, CUDAFORTRAN_GEMM_OZAKI2, or CUDAFORTRAN_GEMM_OZAKI1"
     end if
 
-    if ((Np == 512**3 .or. Np == 576**3 .or. Np == 768**3) .and. &
+    if ((Np == 512**3 .or. Np == 576**3 .or. Np == 768**3 .or. &
+         Np == 1024**3) .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED) then
-      error stop "PolyOrder=511, 575, or 767 requires CUDAFORTRAN_GEMM or CUDAFORTRAN_GEMM_FUSED"
+      error stop "PolyOrder=511, 575, 767, or 1023 requires CUDAFORTRAN_GEMM or CUDAFORTRAN_GEMM_FUSED"
     end if
 
     if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
@@ -306,7 +307,8 @@ contains
     if (dqdt_kernel_typeid /= DQDT_KERNEL_OPENACC_ASIS .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC) then
-      if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED) then
+      if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM .or. &
+          dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED) then
         allocate(volume_deriv_x(Np,Ne), volume_deriv_y(Np,Ne))
         !$acc enter data create(volume_deriv_x,volume_deriv_y)
       else
@@ -317,6 +319,7 @@ contains
     if (dqdt_kernel_typeid /= DQDT_KERNEL_OPENACC_ASIS .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
       allocate(surface_lift(Np,Ne))
@@ -1043,12 +1046,12 @@ contains
     !$acc host_data use_device(dqdt,q,u,v,w,D1D,D1D_tr,Lift1D,VMapM,VMapP) &
     !$acc& use_device(normal_fn,Fscale,Escale,ebnd_flux) &
     !$acc& use_device(volume_flux_x,volume_flux_y,volume_flux_z) &
-    !$acc& use_device(volume_deriv_x,volume_deriv_y,volume_deriv_z,surface_lift)
+    !$acc& use_device(volume_deriv_x,volume_deriv_y)
     call cuda_cal_dqdt_gemm( &
       dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &
       normal_fn, Fscale, Escale, ebnd_flux, &
       volume_flux_x, volume_flux_y, volume_flux_z, &
-      volume_deriv_x, volume_deriv_y, volume_deriv_z, surface_lift, &
+      volume_deriv_x, volume_deriv_y, &
       Nq, Np, NfpTot, Ne, NeA, kernel_time )
     !$acc end host_data
 

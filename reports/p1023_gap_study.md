@@ -1,0 +1,198 @@
+# p=1023 GEMM / GEMM_FUSED 対応
+
+## 1. 結論
+
+`PolyOrder=1023`（`Nq=1024`, `Np=2^30`）を
+`CUDAFORTRAN_GEMM` と `CUDAFORTRAN_GEMM_FUSED` で実行可能にした。
+既存のruntime Nq対応GEMMに加え、32-bit境界を越える `Escale` 方向offsetと、
+GB200 189471 MiBに収めるためのvolume-size一時配列を修正した。
+
+点ごとに変化する `u`, `v`, `w`, `Escale`, `normal_fn`, `Fscale` を使い、
+両経路の全 owned `dqdt` 1,073,741,824 点を比較した。最大絶対差は
+`3.5527136788005009e-15`、非有限値は0で、差は浮動小数点丸めの範囲だった。
+
+GB200 の同一入力を3回ずつ実行した中央値では、warm-up後のdevice tendencyが
+GEMMの194.058 ms/stageに対してGEMM_FUSEDは187.617 ms/stageで、3.32%短い。
+
+## 2. 測定条件
+
+- 日付: 2026-08-28（Asia/Tokyo）
+- ブランチ: `feature/p511`
+- base commit: `47f41981b5c3e4ba412686101acabb7fb9ac3094`
+- 測定状態: 本レポートと同時にコミットする working tree
+- GPU: NVIDIA GB200、189471 MiB
+- 性能測定GPU: index 1
+- GPU UUID: `GPU-d5214545-6d82-2be9-a314-442682ff446b`
+- driver: 580.173.02
+- compiler: NVIDIA HPC SDK 26.3
+- target: CUDA Fortran `cc100`、C++ CUDA `sm_100`
+- Slurm job: なし（通常のlogin-node GPU実行。`nsys` / `ncu`は未使用）
+- CUDA graph: off
+- profiler: なし
+
+数値検証はGPU index 0、性能測定は測定開始時に空きが最も多かったindex 1を使った。
+いずれも同じGB200、driver、buildである。
+
+ビルドコマンド:
+
+```bash
+module load nvhpc
+make clean
+make -j4 CUDA=1 GPUFLAGS=-gpu=cc100 GPUNVCCFLAGS=-arch=sm_100 \
+  CUTLASS_HOME=/data1/rkp00015/rku00044/scale-dg-kernel-extraction/third_party/cutlass
+```
+
+interface変更後、非CUDA buildも次でclean buildした。
+
+```bash
+make clean
+make -j4
+```
+
+最終的なworking executableは上記CUDA buildである。
+
+## 3. 境界修正
+
+### 3.1 成立する32-bit index
+
+`Ne=1`, `Nq=1024`では次となる。
+
+| 項目 | 値 | signed 32-bit内 |
+|---|---:|:---:|
+| `Nq` | 1,024 | yes |
+| `Nfp=Nq^2` | 1,048,576 | yes |
+| `NfpTot=6*Nfp` | 6,291,456 | yes |
+| `Np=Nq^3` | 1,073,741,824 | yes |
+| 最大halo field index `Np+6*Nfp` | 1,080,033,280 | yes |
+| y GEMM batch `Nq*Ne` | 1,024 | yes |
+
+y GEMMのbatchはCUDA `grid.z <= 65535`制約を十分下回る。point index、face
+index、VMap値、block数は32-bitのままでよく、全device kernelを64-bit化する
+必要はない。
+
+### 3.2 `Escale` の方向offset
+
+`Escale(:,:,3)` の先頭offsetは `2*Np=2^31` elementsで、signed 32-bit境界を
+越える。GEMM_FUSEDのC++ custom epilogueは既に `std::int64_t npoint` から
+3方向のbase pointerを作っていた。
+
+通常GEMMのassembly kernelは従来 `Escale(idx+2*npoint)` をdevice内で評価して
+いたため、p=1023ではoverflowする。変更後はFortran array descriptorがnative
+address kindで `Escale(1,1,1:3)` の3 base pointerを形成し、kernelへ別々に渡す。
+kernel内は各pointerを32-bit `idx`だけで参照するので、既存次数へ64-bit device
+index演算を追加しない。
+
+## 4. メモリ削減
+
+### 4.1 最初のOOM
+
+従来の通常GEMMは主要配列が `160*Np = 160 GiB`だった。GB200の公称容量内に
+見えるが、OpenACC/CUDA runtime、allocation管理、geometryとmappingも必要であり、
+最後の8 GiB allocation時に空き約6 GiBでOOMになった。
+
+調査すると、通常GEMMには実行時に読まれない `surface_lift` が残り、さらに
+z-GEMMの `deriv_z` は直後のassemblyが各点を一度読んで `dqdt`へ上書きするだけ
+だった。
+
+### 4.2 採用した配置
+
+- 通常GEMMから未使用の `surface_lift` allocationとinterfaceを除いた。
+- z-GEMMを `beta=0` で `dqdt`へ直接出力した。
+- assemblyは同じ点のz微分を `dqdt`からregisterへ読んだ後、最終値を同じ
+  `dqdt`へ書く。
+
+GEMMの浮動小数点演算、縮約順、global memoryのwrite/read回数は変わらない。
+変わるのは同じz中間値を置くallocationの名前だけである。
+
+p=1023、`Ne=1`の主要device allocationは両経路とも次となる。小さい演算子、
+geometry、mapping、runtime allocationは含めない。
+
+| 配列群 | bytes / `Np` | GiB |
+|---|---:|---:|
+| packed halo付き `q/u/v/w` | 64 | 64 |
+| owned `q0/dqdt` | 16 | 16 |
+| `Escale` | 24 | 24 |
+| `volume_flux_x/y/z` | 24 | 24 |
+| `volume_deriv_x/y` | 16 | 16 |
+| 合計 | `144*Np` | **144** |
+
+この配置で通常GEMMとGEMM_FUSEDがともに実機で完走した。
+
+## 5. 数値検証
+
+### 5.1 方法
+
+各経路の最初のRK stageが計算したowned `dqdt(:,1:Ne)`を一時ファイルへ出力し、
+全1,073,741,824個のFP64値を比較した。両実行に
+`SCALE_DG_VARYING_COEFF=1`を指定し、点変化する速度・幾何係数・面係数を使用した。
+
+各dumpは1,073,741,824行、26,843,545,600 byteであることを確認した。固定幅
+`ES24.16`を読む並列比較器で全点を集計し、約50 GiBのdumpと比較器は検証後に
+削除した。
+
+### 5.2 結果
+
+| 係数 | 比較点数 | exact不一致 | 非有限値 | 最大絶対差 | 最大相対差 |
+|---|---:|---:|---:|---:|---:|
+| 点変化 | 1,073,741,824 | 468,585,417 | 0 | 3.5527136788005009e-15 | 4.6778976414349106e-9 |
+
+最大相対差は値が0に近い点で生じる。最大絶対差は数ulpの範囲であり、cuBLASと
+CUTLASSの異なる縮約順による丸め差と整合する。全owned fieldと全6面を含む
+比較なので、定数速度や代表スカラーへの特殊化はない。
+
+通常benchmark係数の1-step最終min/maxは両経路で
+`-9.999992746461386E-01` / `9.999992747335267E-01`、点変化ケースは
+`-9.999992815793513E-01` / `9.999992816672274E-01`で一致した。
+
+回帰としてp=511でも点変化係数の両経路を1-step実行し、最終min/maxが
+`-9.999738234621957E-01` / `9.999738239901469E-01`で一致した。
+
+## 6. 性能
+
+### 6.1 入力と方法
+
+測定用一時入力は `/tmp/conf_perf_p1023_gemm.conf` と
+`/tmp/conf_perf_p1023_gemm_fused.conf` とし、違いは `DqdtKernel_Type`だけである。
+
+```fortran
+NeX = 1; NeY = 1; NeZ = 1
+PolyOrder = 1023
+dt = 1.0D-8
+nstep = 15
+output_interval = 15
+WarmupStep = 3
+UseCudaGraph = .false.
+MeasureKernelTime = .true.
+CublasEmulation = .false.
+CutlassMmaShape = "8x8x4"
+```
+
+各経路を3回ずつ実行した。各runでは先頭3 stepを実行するが計時から除き、残り
+12 step = 36 RK stagesを集計した。表は3 runの中央値である。巨大host/device
+allocationと初期copyはMainおよびdevice eventの計測区間外である。
+
+### 6.2 結果
+
+| 経路 | Main [s] | Main [ms/step] | device tendency [s] | device [ms/stage] |
+|---|---:|---:|---:|---:|
+| `CUDAFORTRAN_GEMM` | 6.94625 | 578.854 | 6.98610 | 194.058 |
+| `CUDAFORTRAN_GEMM_FUSED` | 6.75001 | 562.501 | 6.75420 | 187.617 |
+
+GEMM_FUSEDはdevice tendencyで3.32%、end-to-end Main/stepで2.83%短い。
+GEMM_FUSED内のvolume GEMM区間は中央値6.44566 s、179.046 ms/stageだった。
+
+各runのdevice tendency合計はGEMMが6.95583 / 7.10037 / 6.98610 s、
+GEMM_FUSEDが6.76640 / 6.75420 / 6.75351 sである。
+
+この測定では`ncu`を使っていないため、profiler measured FLOP/sやbandwidthは
+報告しない。理論volume workは3方向合計
+`6*Nq^4 = 6,597,069,766,656` FLOP/stageだが、device tendencyにはpointwise
+flux、全6面のnumerical flux、lift、assemblyも含まれる。
+
+## 7. 結論
+
+- p=1023はGB200 189471 MiB上でGEMM/GEMM_FUSEDとも実行可能になった。
+- 64-bit化は境界を越えるbase pointer形成に限定し、point indexは32-bitのままにした。
+- 両経路の主要device配列は144 GiBである。
+- 点変化係数を含む全2^30点の`dqdt`は丸め誤差範囲で一致した。
+- p=1023でも最速は`CUDAFORTRAN_GEMM_FUSED`で、device時間の優位は3.32%だった。
