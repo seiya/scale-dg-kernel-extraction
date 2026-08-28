@@ -53,7 +53,20 @@ struct Ozaki1Workspace {
 
 static Ozaki1Workspace g_ws;
 
+struct BDecompCache {
+  const double *ptr = nullptr;
+  int k = 0;
+  int n = 0;
+  int ldb = 0;
+  int slices_b = 0;
+  int valid = 0;
+};
+
+static BDecompCache g_b_cache;
+
 static constexpr double kSliceThreshold = 1.0;
+
+static void invalidate_b_cache() { g_b_cache = BDecompCache{}; }
 
 static int check_cuda(cudaError_t err, const char *what)
 {
@@ -420,6 +433,25 @@ static int decompose_b_nn(const double *B, int k, int n, int ldb, int *slices_us
   return 0;
 }
 
+static int decompose_b_or_cache(const double *B, int k, int n, int ldb,
+                                int *slices_used)
+{
+  if (g_b_cache.valid && g_b_cache.ptr == B && g_b_cache.k == k &&
+      g_b_cache.n == n && g_b_cache.ldb == ldb) {
+    *slices_used = g_b_cache.slices_b;
+    return 0;
+  }
+  int err = decompose_b_nn(B, k, n, ldb, slices_used);
+  if (err) return err;
+  g_b_cache.ptr = B;
+  g_b_cache.k = k;
+  g_b_cache.n = n;
+  g_b_cache.ldb = ldb;
+  g_b_cache.slices_b = *slices_used;
+  g_b_cache.valid = 1;
+  return 0;
+}
+
 static int run_slice_pairs(int m, int n, int k, double *C, int ldc, int sa, int sb,
                            long long stride_c, int batch, bool batched)
 {
@@ -541,6 +573,7 @@ extern "C" int ozaki1_alloc_workspace(int Nq, int Ne, int Np)
 
 extern "C" void ozaki1_free_workspace(void)
 {
+  invalidate_b_cache();
   if (g_ws.iA) cudaFree(g_ws.iA);
   if (g_ws.iB) cudaFree(g_ws.iB);
   if (g_ws.scale_a) cudaFree(g_ws.scale_a);
@@ -581,7 +614,7 @@ extern "C" int ozaki1_dgemm(int transa, int transb, int m, int n, int k,
   if (ensure_workspace(m, n, k, 1) != 0) return -1;
 
   int sa = 0, sb = 0;
-  int err = decompose_b_nn(B, k, n, ldb, &sb);
+  int err = decompose_b_or_cache(B, k, n, ldb, &sb);
   if (err) return err;
   err = decompose_a_tn(A, m, k, lda, 1, 0, &sa);
   if (err) return err;
@@ -609,7 +642,7 @@ extern "C" int ozaki1_dgemm_strided_batched(int transa, int transb, int m, int n
   int sa = 0, sb = 0;
   int err = 0;
   if (strideB == 0) {
-    err = decompose_b_nn(B, k, n, ldb, &sb);
+    err = decompose_b_or_cache(B, k, n, ldb, &sb);
     if (err) return err;
   } else {
     std::fprintf(stderr, "ozaki1: strided B decomposition not implemented\n");

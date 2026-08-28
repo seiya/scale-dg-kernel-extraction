@@ -2,8 +2,12 @@
 
 作成日: 2026-08-28
 対象リポジトリ: `scale-dg-kernel-extraction`（worktree `scale-dg-kernel-extraction-ozaki`）
-ブランチ / HEAD: `feature/ozaki` / `e237fbb` 上の **未コミット作業ツリー**（本レポートと Ozaki I 本体）
+ブランチ / HEAD: `feature/ozaki` / `023900c`（参照比較・B キャッシュ・単体テストは本レポート作業時の未コミット差分）
 関連実装: [`ozaki2_implementation_report.md`](ozaki2_implementation_report.md)（Scheme II）
+参照実装:
+- [RIKEN-RCCS/GEMMul8](https://github.com/RIKEN-RCCS/GEMMul8) — Ozaki I は **cuBLAS 内蔵 FP64 fixed-point**（`test/common/ozaki1.hpp`）
+- [enp1s0/ozIMMU](https://github.com/enp1s0/ozIMMU) — Ozaki Scheme I の **オープン INT8 Tensor Core** 実装
+- 本リポジトリ [`cublas_emulation_survey.md`](cublas_emulation_survey.md) — `CublasEmulation` 経路（cuBLAS EAGER、別比較対象）
 対象 GPU: NVIDIA GB200（RIKYU login ノード）、`make CUDA=1 GPUFLAGS=-gpu=cc100`
 ビルド: NVIDIA HPC SDK 26.3、cuBLAS 13.2.1
 
@@ -22,6 +26,7 @@ Scheme II（`CUDAFORTRAN_GEMM_OZAKI2`）と並ぶ **比較・計測用経路**�
 | 統合 | `cuda_cal_dqdt_gemm_ozaki1`（`mod_cuda_dg_kernels.cuf`）— 既存 `cuda_cal_dqdt_gemm` と同段構成 |
 | namelist | `OzakiSliceCount`（2–16、既定 8）。`OzakiModuliCount` は OZAKI2 専用 |
 | 検証 conf | `input_p7_val_gemm_ozaki1.conf`、`input_p255_val_gemm_ozaki1.conf` |
+| 単体テスト | `bench_ozaki2/ozaki1_crt_test.cu`（合成行列、tol `2e-2`） |
 
 ### 1.1 Scheme I と Scheme II の違い
 
@@ -46,7 +51,85 @@ volume_flux_kernel
 
 ---
 
-## 2. アルゴリズム（`cuda_ozaki1_gemm.cu`）
+## 2. 参照実装との比較
+
+Ozaki Scheme I の「本家」参照は **2 系統**ある。GEMMul8 リポジトリ本体は Scheme II 中心だが、
+ベンチの `OS1-*` ラベルは **cuBLAS 13 の FP64 fixed-point emulation**（`CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH` +
+`cublasSetFixedPointEmulationMaxMantissaBitCount`）を指す。オープンソースでアルゴリズム全体が読めるのは
+**ozIMMU**（INT8 Tensor Core 上の slice GEMM + FP64 再構成）である。本実装は ozIMMU に近い
+**明示的 slice 分解**だが、スケーリング方式と再構成経路は DG 用途に合わせて簡略化している。
+
+### 2.1 アーキテクチャ差分
+
+| 観点 | GEMMul8 / cuBLAS Ozaki I | ozIMMU | 本実装（`cuda_ozaki1_gemm`） |
+|---|---|---|---|
+| 提供形態 | cuBLAS **クローズド** emulation API | スタンドアロン C++/CUDA ライブラリ | DG volume GEMM **3 本のみ** |
+| スライス分割 | 内部（mantissa bit 列、ADP オプション） | 行ごと **指数 max** + mantissa ビット切り出し | 行/列 **値 max / 127** + **残差反復** |
+| スライス本数 | `num_slice`（`mantissaBitCount = num_slice×8−1`） | `fp64_int8_3` … `_18` 固定、**auto 選択**可 | `OzakiSliceCount`（2–16、既定 8）+ **早期打ち切り** |
+| INT8 1 スライス当たり bit | 8（cuBLAS 設定） | **`get_bits_per_int8(K)`**（K 依存、最大 7） | 量子化幅 **127**（実質 7 bit + 符号） |
+| 整数 GEMM ペア | 内部（非公開） | **s×(s+1)/2**（mantissa 位置 `(i,j)` の三角和） | **s_a × s_b**（残差スライスの直積和） |
+| 中間型 | 非公開 | INT32 GEMM → **指数シフト**で FP64 累積 | INT32 GEMM → **scale_a×scale_b** で FP64 直接加算 |
+| CRT | なし（Scheme I） | なし | なし |
+| 定数 B の再利用 | 内部最適化（非公開） | なし（呼び出し毎 split） | **B 分解キャッシュ**（同一 `(ptr,k,n,ldb)`） |
+| ワークスペース | `ozaki1::workSize`（1024/128 pad + 8 GiB 定数） | handle 内動的再割当 | setup 時 `ozaki1_alloc_workspace(Nq,Ne,Np)` 固定 |
+| 比較用既存経路 | `CublasEmulation`（本 repo、130× 遅） | なし | **`CUDAFORTRAN_GEMM_OZAKI1`**（3× 程度、計測可能） |
+
+### 2.2 取り込んだ点
+
+#### ゼロ行スケールと pack 除算（§4.2、本 repo 独自修正）
+
+ozIMMU / cuBLAS いずれも「ゼロ行を scale=1 で次スライスへ回す」経路は持たない。
+本実装で `scale=0` + `denom>0` ガードを入れ、**無意味な s² ペア量産**と NaN を除去した。
+
+#### `scale_a` バッファ（z 方向 m=Nq²）（§4.1）
+
+参照実装は任意 M を想定し、DG 特化の batched row 数は持たない。z 導関数の
+`m=nq²` に合わせ `max_m=Nq²` を workspace に持つ修正は **本用途固有**。
+
+#### 定数 `D1D_tr` の B 分解キャッシュ（本レポート作業）
+
+y/z 導関数は `strideB=0` で同一 `D1D_tr` を共有する。参照（ozIMMU）は呼び出し毎に
+`split_B` するが、GEMMul8 / cuBLAS が内部で行う **定数行列 skip** に相当する最適化を、
+`(B,k,n,ldb)` キーで **INT8 pack + scale_b を再利用**する形で取り込んだ。
+1 tendency あたり B 分解は x=`D1D` 1 回 + `D1D_tr` 1 回に削減（従来 3 回）。
+
+#### 単体回帰テスト `ozaki1_crt_test.cu`
+
+ozIMMU の `test/main_test.cu` / OZAKI2 の `ozaki2_crt_test.cu` に倣い、p=255 形状の
+x/y/z GEMM を native DGEMM と比較する bench を追加（tol `2e-2`）。
+
+#### スライス数と cuBLAS パラメータの対応（ドキュメント）
+
+GEMMul8 `ozaki1.hpp`: `mantissaBitCount = num_slice × 8 − 1`、
+`numSlices = ⌈(maxMantissaBitCount+1)/8⌉`。FP64 尾数 53 bit なら **7 スライスで十分**、
+既定 `OzakiSliceCount=8` は **余裕 1 枚**（cuBLAS OS1-8 と同じ意味）。コード変更はせず
+namelist コメントとして整合を取った。
+
+### 2.3 意図的に残す差分と理由
+
+| 差分 | こちらが優れている / 特化している理由 | 参照が優れている点 |
+|---|---|---|
+| **残差 max/127 分解**（ozIMMU の指数 bit 切り出しでない） | **点ごとに変化する flux**（`AGENTS.md`）にそのまま適用できる。実装が短く、OZAKI2 と pack 核を共有しやすい。 | ozIMMU / cuBLAS は **mantissa ビット位置**が明確で、理論上 s×(s+1)/2 ペアに削減可能。**K が巨大**な一般 GEMM で INT32 オーバーフロー回避と整合。 |
+| **s_a × s_b 全ペア GEMM** | 残差スライス同士は **独立残差**のため直積和が正しい。K≤256 では INT32 飽和余裕（§3）。 | ozIMMU の **s(s+1)/2** は bit-split 専用。**cuBLAS 内部**はさらに最適化されている可能性。 |
+| **`get_bits_per_int8(K)` 未採用** | DG では K=Nq≤256 固定。**127 量子化で INT32 安全**（|Σ|≈4×10⁶ ≪ 2×10⁹）。 | K≈8000 の一般問題では ozIMMU が **K に応じ bit 幅を縮め** INT32 積を守る。 |
+| **FP64 直接加算再構成**（ozIMMU の指数シフト累積でない） | CRT 不要の Scheme I そのもの。**assembly 前の residue** として既存経路と接続。 | ozIMMU の shift 累積は **スライス index ごとの厳密な位相**を保つ。 |
+| **明示 cublasGemmEx INT8** | 呼び出し回数・帯域が **計測可能**。OZAKI2 と同じ `cuda_cublas_gemm.cu` ラッパ。 | cuBLAS EAGER emulation は **130× 遅**（[`cublas_emulation_survey.md`](cublas_emulation_survey.md)）だが **ビット一致に近い**。比較用には `CublasEmulation` を使う。 |
+| **固定 `OzakiSliceCount`** | 再現性のある **A/B 比較**（s を振って誤差–コスト曲線）。 | ozIMMU **`fp64_int8_auto`** / cuBLAS **ADP** は入力に応じた動的精度。 |
+| **DG 専用 workspace・NN/TN のみ** | Ne, Nq 既知。**余計な pad / 8 GiB cuBLAS workspace 不要**。 | GEMMul8 `workSize` の 1024 整列・8 GiB 定数は **任意 M,N,K BLAS** 向け。 |
+| **B キャッシュはポインタ同一性のみ** | メッシュ固定で **D1D / D1D_tr は不変**。実装が単純。 | 係数が時間変化する一般 BLAS では **内容ハッシュ invalidation** が必要。 |
+| **ADP / mantissa loss 自動選択なし** | 性能最適化目的ではなく **Scheme I 経路のモデル化**が目的。 | ozIMMU `auto_mode_select` は **mantissa loss 閾値**で s を最小化。 |
+
+### 2.4 本リポジトリ内ベンチとの関係
+
+| ベンチ | 役割 | 本実装との差 |
+|---|---|---|
+| `CublasEmulation` | cuBLAS **内蔵** Ozaki I（EAGER） | 本体統合済み・**別フラグ**。速度は使えないが精度参照。 |
+| `bench_ozaki2/ozaki1_crt_test.cu` | 合成データで native DGEMM 比較 | 本番 `ozaki1_dgemm*` API の **回帰テスト**。 |
+| `bench_ozaki2/mini_ozaki2_all.cu`（Ozaki I API 差替） | 単体 GEMM 誤差比較 | OZAKI1/2 で **同一 INT8 核**のとき誤差一致を確認済み。 |
+
+---
+
+## 3. アルゴリズム（`cuda_ozaki1_gemm.cu`）
 
 1. **B の分解**（`decompose_b_nn`）: 列 max / 127 で量子化 → 残差が閾値超なら次スライス（最大 `OzakiSliceCount`）。
 2. **A の分解**（`decompose_a_tn`）: 行 max、pack は TN 形（OZAKI2 と同じ cuBLAS 呼び出し `transa=T`）。
@@ -59,9 +142,9 @@ INT32 飽和: 内積次元 K = Nq ≤ 256 なので 1 回の INT8 GEMM あたり
 
 ---
 
-## 3. 実装時に修正した欠陥
+## 4. 実装時に修正した欠陥
 
-### 3.1 `scale_a` バッファ不足（z 方向 GEMM）
+### 4.1 `scale_a` バッファ不足（z 方向 GEMM）
 
 **症状**: p=7 で `dqdt` が NaN / 10⁴ オーダーの外れ値、`OzakiSliceCount=2` では
 `ozaki1_dgemm z-deriv` で `CUDA_ERROR_ILLEGAL_ADDRESS`。
@@ -74,7 +157,7 @@ Nq=8 分の領域を **8 倍オーバーラン**。
 `slices × max_m × max_batch` に拡張。OZAKI2 も同型のインデックスを使うが、
 OZAKI2 は slice あたり scale を上書き再利用するため顕在化しにくかった。
 
-### 3.2 ゼロ行のスケール
+### 4.2 ゼロ行のスケール
 
 **症状**: 上記修正前は定数速度 p=7 で q が ±1.8×10³⁰⁸ に発散。
 
@@ -85,7 +168,7 @@ OZAKI2 は slice あたり scale を上書き再利用するため顕在化し�
 
 ---
 
-## 4. OZAKI2 との比較（設計・トレードオフ）
+## 5. OZAKI2 との比較（設計・トレードオフ）
 
 | 観点 | OZAKI1 | OZAKI2 |
 |---|---|---|
@@ -101,7 +184,7 @@ OZAKI1/2 が **同一誤差** —— 差は **B 側マルチスライス本数**
 
 ---
 
-## 5. 数値検証
+## 6. 数値検証
 
 login ノード、`nstep=1`、定数速度（`SCALE_DG_VARYING_COEFF` 未設定）。
 `SCALE_DG_DUMP_DQDT` で owned `dqdt(:,1:Ne)` 全点比較、参照は `CUDAFORTRAN_GEMM`。
@@ -118,7 +201,7 @@ login ノード、`nstep=1`、定数速度（`SCALE_DG_VARYING_COEFF` 未設定�
 
 ---
 
-## 6. 性能（参考、login ノード・nstep=1）
+## 7. 性能（参考、login ノード・nstep=1）
 
 device イベント行（`CUDA device Ozaki-I GEMM` / `GEMM tendency`）を 1 step 分として記録。
 **login ノード共有 GPU のためばらつきあり**。傾向比較用。
@@ -135,7 +218,7 @@ OZAKI1 が native より速く見えたが、スライスが早期打ち切り�
 
 ---
 
-## 7. メモリ（workspace 概算）
+## 8. メモリ（workspace 概算）
 
 setup ログ例:
 
@@ -151,7 +234,7 @@ ozaki1 workspace: Nq=256 Ne=1 Np=16777216 slices=8 iB=134.2 MB
 |---|---|
 | `iB` | s × Np × Ne（INT8） |
 | `iA` | s × Nq² × max(Nq×Ne, Ne)（INT8） |
-| `scale_a` | s × **Nq²** × max_batch × 8 B（§3.1 修正後） |
+| `scale_a` | s × **Nq²** × max_batch × 8 B（§4.1 修正後） |
 | `scale_b` | s × Np × Ne × 8 B（非 batched B 最大列数は nq²×Ne だが batched 小 B は先頭のみ使用） |
 | `prod` | Np × Ne × 4 B |
 | `res_a`, `res_b` | Np × Ne × 8 B |
@@ -161,7 +244,7 @@ residue 940 MB と同オーダーだが、**s² 回 GEMM** の方が時間側の
 
 ---
 
-## 8. 統合上の制約
+## 9. 統合上の制約
 
 - **CUDA Graph 非対応**: ホスト側 slice 判定・可変 s_a/s_b・stream sync のため
   `advect3d_eq_graph_supported` が false（OZAKI2 と同様）。
@@ -171,7 +254,7 @@ residue 940 MB と同オーダーだが、**s² 回 GEMM** の方が時間側の
 
 ---
 
-## 9. 再現方法
+## 10. 再現方法
 
 ```bash
 module load nvhpc
@@ -179,7 +262,12 @@ export CUTLASS_HOME=/path/to/third_party/cutlass
 cd scale-dg-kernel-extraction-ozaki
 make clean && make CUDA=1 GPUFLAGS=-gpu=cc100 GPUNVCCFLAGS=-arch=sm_100
 
-# smoke
+cd bench_ozaki2
+nvcc -O3 -arch=sm_100 -I.. ../cuda_ozaki1_gemm.cu ../cuda_cublas_gemm.cu \
+  ozaki1_crt_test.cu -lcublas -o ozaki1_crt_test
+./ozaki1_crt_test
+
+# DG smoke
 ./scale-dg_extraction input_p7_val_gemm_ozaki1.conf
 ./scale-dg_extraction input_p255_val_gemm_ozaki1.conf
 
@@ -196,16 +284,17 @@ export SCALE_DG_DUMP_DQDT=dqdt_ozaki1.txt
 
 ---
 
-## 10. まとめ
+## 11. まとめ
 
 - **Ozaki Scheme I** を `CUDAFORTRAN_GEMM_OZAKI1` として volume GEMM 3 本に統合。
   CRT なし・A/B 両スライス・FP64 直接加算が Scheme II との本質差。
-- **クリティカル修正**: z 方向の `m=Nq²` に合わせた `scale_a` 確保と、ゼロ行スケール処理。
-  これ無しでは p=7 で数値破壊・GPU 非法アクセス。
+- **参照比較**: GEMMul8 の Ozaki I は **cuBLAS 内蔵**、オープン参照は **ozIMMU**。
+  残差 max/127 分解・s_a×s_b ペア・固定 s は **DG 点ごと flux** と **再現可能な計測**に特化。
+- **取り込み**: ゼロ行スケール、`scale_a` 拡張、**D1D_tr B 分解キャッシュ**、`ozaki1_crt_test`。
 - **性能結論**: p=7 では native の **約 3 倍**、OZAKI2 の **約 1.8 倍遅い**（s=8）。
   最速経路ではないが、Scheme I の **計測可能な正しい経路**として残す。
-- **今後**: 単体 `ozaki1_crt_test` 相当の bench、変動係数での p=255 全点比較、
-  B 側スライス早期打ち切りのプロファイル（実効 s_a/s_b のログ）は任意。
+- **今後**: ozIMMU 式 **mantissa bit split** の ablation、変動係数 p=255 全点比較、
+  B キャッシュ効果の nsys 計測は任意。
 
 関連: [`ozaki2_implementation_report.md`](ozaki2_implementation_report.md)、
 [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md)、
