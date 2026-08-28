@@ -64,6 +64,11 @@ module mod_cuda_dg_kernels
   type(cudaEvent), save :: dg_side_fork_ev, dg_side_join_ev
   logical, save :: dg_side_ready = .false.
   logical, save :: dg_side_enabled = .true.
+  ! Lift1D columns 5 and 6 interleaved, so that the p>64 GEMM_FUSED z epilogue
+  ! reads both z-face coefficients of a row in one 16-byte load.  Lift1D is a
+  ! mesh operator and does not change during a run, so this is built once.
+  real(RP), device, allocatable, save :: dg_lift_zpair(:)
+  integer, save :: dg_lift_zpair_nq = -1
 
   type(cudaEvent), save :: split_events(5,2)
   logical, save :: split_events_initialized = .false.
@@ -227,13 +232,17 @@ module mod_cuda_dg_kernels
       integer(c_int) :: cublas_dgemm_strided_batched_impl
     end function cublas_dgemm_strided_batched_impl
 
+    !- The fused-path x and y GEMMs apply Escale in their own epilogues, so
+    !- deriv_x and deriv_y come back as Escale_x*Dx and Escale_y*Dy and the z
+    !- epilogue reads three volume tensors instead of five.  See
+    !- cuda_cutlass_gemm_fused.cu and reports/p255_gap_study.md.
     function launch_volume_gemm_xy(deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, &
-      Nq, Ne, mma_shape) bind(C, name="launch_volume_gemm_xy")
+      escale, Nq, Ne, mma_shape) bind(C, name="launch_volume_gemm_xy")
       import
       integer(c_int), value :: Nq, Ne, mma_shape
       real(c_double), device :: deriv_x(*), deriv_y(*)
       real(c_double), device :: flux_x(*), flux_y(*)
-      real(c_double), device :: D1D(*), D1D_tr(*)
+      real(c_double), device :: D1D(*), D1D_tr(*), escale(*)
       integer(c_int) :: launch_volume_gemm_xy
     end function launch_volume_gemm_xy
 
@@ -248,14 +257,14 @@ module mod_cuda_dg_kernels
     end function launch_volume_gemm_y
 
     function launch_z_gemm_assembly(dqdt, flux_z, D1D_tr, deriv_x, deriv_y, &
-      flux_bnd, lift1d, escale, Nq, Ne, mma_shape) &
+      flux_bnd, lift1d, lift_zpair, escale, Nq, Ne, mma_shape, xy_weighted) &
       bind(C, name="launch_z_gemm_assembly")
       import
-      integer(c_int), value :: Nq, Ne, mma_shape
+      integer(c_int), value :: Nq, Ne, mma_shape, xy_weighted
       real(c_double), device :: dqdt(*)
       real(c_double), device :: flux_z(*), D1D_tr(*)
       real(c_double), device :: deriv_x(*), deriv_y(*), escale(*)
-      real(c_double), device :: flux_bnd(*), lift1d(*)
+      real(c_double), device :: flux_bnd(*), lift1d(*), lift_zpair(*)
       integer(c_int) :: launch_z_gemm_assembly
     end function launch_z_gemm_assembly
 
@@ -584,7 +593,7 @@ contains
     nface = NfpTot*Ne
     nblock = (nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
     call elembnd_flux_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      flux, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+      flux, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     call synchronize_cuda_kernel("elembnd_flux_kernel")
   end subroutine cuda_cal_elembnd_flux
 
@@ -687,7 +696,7 @@ contains
 
     call dg_ev_record(1)
     call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     call tendency_fused_p63_xz_kernel &
       <<<nblock_vol,CUDA_FUSED_P63_BLOCK_SIZE,0,dg_stream>>>( &
       dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne )
@@ -738,7 +747,7 @@ contains
 
     call dg_ev_record(1)
     call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     call tendency_fused_p127_xz_kernel &
       <<<nblock_vol,CUDA_FUSED_P127_BLOCK_SIZE,0,dg_stream>>>( &
       dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne )
@@ -788,7 +797,7 @@ contains
 
     call dg_ev_record(1)
     call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     call tendency_x_p255_kernel<<<nblock_deriv,tile_threads,0,dg_stream>>>( &
       dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, Ne )
     call tendency_y_p255_kernel<<<nblock_deriv,tile_threads,0,dg_stream>>>( &
@@ -896,7 +905,7 @@ contains
 
     call dg_ev_record(1)
     call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("elembnd_flux_kernel",istat)
     call launch_tendency_fused_p63_tc( &
@@ -945,7 +954,7 @@ contains
 
     call dg_ev_record(1)
     call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("elembnd_flux_kernel",istat)
     call launch_tendency_fused_p127_tc( &
@@ -991,7 +1000,7 @@ contains
 
     call dg_ev_record(1)
     call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     call launch_tendency_xyz_p255_tc( &
       dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, int(Ne,c_int) )
     istat = cudaGetLastError()
@@ -1101,7 +1110,7 @@ contains
 
     if (.not. use_side) then
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     end if
 
     call launch_volume_flux( &
@@ -1110,7 +1119,7 @@ contains
     if (use_side) then
       call dg_side_fork()
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     end if
 
     istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
@@ -1204,7 +1213,7 @@ contains
     ! volume flux has streamed q, u, v and w past it through L2.
     if (.not. dg_side_enabled) then
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     end if
 
     call launch_volume_flux( &
@@ -1215,7 +1224,7 @@ contains
     if (dg_side_enabled) then
       call dg_side_fork()
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     end if
 
     istat = launch_volume_gemm_cute( &
@@ -1262,7 +1271,7 @@ contains
     real(RP), intent(out) :: kernel_time(2)
 
     integer :: istat, nface, npoint, nblock, nblock_face
-    integer :: nq2, plane_batch
+    integer :: nq2, plane_batch, xy_weighted, pair_nq2
     integer(c_long_long) :: stride_plane, stride_elem, stride_zero, stride_vol
 
     ! The CUTLASS batched GEMMs put the batch on grid.z, which CUDA caps at
@@ -1282,6 +1291,23 @@ contains
     call dg_ev_begin()
 
     nq2 = Nq*Nq
+    ! The deep-order branch is the one whose x GEMM is CUTLASS and therefore has
+    ! an epilogue to weight Escale into.  The z epilogue's three other savings
+    ! ride on the same condition; see cutlass_z_gemm_assembly.h.
+    if (Nq <= 64) then
+      xy_weighted = 0
+      pair_nq2 = 0
+    else
+      xy_weighted = 1
+      pair_nq2 = nq2
+      if (dg_lift_zpair_nq /= Nq) then
+        if (allocated(dg_lift_zpair)) deallocate(dg_lift_zpair)
+        allocate(dg_lift_zpair(2*Nq))
+        call pack_lift_zpair_kernel<<<(Nq+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE, &
+          CUDA_BLOCK_SIZE,0,dg_stream>>>( dg_lift_zpair, Lift1D, Nq )
+        dg_lift_zpair_nq = Nq
+      end if
+    end if
     nface = NfpTot*Ne
     npoint = Np*Ne
     nblock = (npoint+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
@@ -1305,7 +1331,7 @@ contains
     ! volume flux has streamed q, u, v and w past it through L2.
     if (.not. dg_side_enabled) then
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
     end if
 
     call launch_volume_flux( &
@@ -1316,7 +1342,7 @@ contains
     if (dg_side_enabled) then
       call dg_side_fork()
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
     end if
 
     ! Who runs the x GEMM depends on how deep K = Nq is.  Both libraries pick
@@ -1342,11 +1368,10 @@ contains
       if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
     else
       istat = launch_volume_gemm_xy( &
-        deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, Nq, Ne, &
+        deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, Escale, Nq, Ne, &
         cutlass_mma_shape_id )
       if (istat /= 0) call cuda_failure("launch_volume_gemm_xy",istat)
     end if
-
     call dg_ev_record(3)
 
     if (dg_side_enabled) call dg_side_join()
@@ -1354,9 +1379,15 @@ contains
     call dg_ev_record(4)
 
     ! The lift is evaluated inside the z epilogue, so lift_out is never formed.
-    istat = launch_z_gemm_assembly( &
-      dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, Lift1D, Escale, Nq, Ne, &
-      cutlass_mma_shape_id )
+    if (xy_weighted /= 0) then
+      istat = launch_z_gemm_assembly( &
+        dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, Lift1D, &
+        dg_lift_zpair, Escale, Nq, Ne, cutlass_mma_shape_id, xy_weighted )
+    else
+      istat = launch_z_gemm_assembly( &
+        dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, Lift1D, &
+        Lift1D, Escale, Nq, Ne, cutlass_mma_shape_id, xy_weighted )
+    end if
     if (istat /= 0) call cuda_failure("launch_z_gemm_assembly",istat)
 
     istat = cudaGetLastError()
@@ -2998,15 +3029,34 @@ contains
     end if
   end subroutine dqdt_assembly_kernel
 
-  attributes(global) subroutine elembnd_flux_kernel( &
-    flux, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+  ! pair_nq2 = 0 writes the plain layout: six face planes of nq2 points, in
+  ! face order.  pair_nq2 = nq2 instead interleaves the planes in the three
+  ! pairs the p>64 GEMM_FUSED z epilogue reads at a common index -- (1,3),
+  ! (2,4), (5,6) -- so that each of its three lift terms is one 16-byte load
+  ! instead of two 8-byte ones.  It moves the same bytes; only the destination
+  ! index differs.  See cutlass_z_gemm_assembly.h.
+  attributes(global) subroutine pack_lift_zpair_kernel( zpair, lift1d, Nq )
     implicit none
-    integer, value :: nface
+    integer, value :: Nq
+    real(RP), device :: zpair(*), lift1d(*)
+    integer :: k
+
+    k = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    if (k <= Nq) then
+      zpair(2*k-1) = lift1d(4*Nq+k)
+      zpair(2*k  ) = lift1d(5*Nq+k)
+    end if
+  end subroutine pack_lift_zpair_kernel
+
+  attributes(global) subroutine elembnd_flux_kernel( &
+    flux, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
+    implicit none
+    integer, value :: nface, pair_nq2
     real(RP), device :: flux(*), q(*), u(*), v(*), w(*)
     integer, device :: VMapM(*), VMapP(*)
     real(RP), device :: normal_fn(*), Fscale(*)
 
-    integer :: idx, iM, iP
+    integer :: idx, iM, iP, iout, ir, iface, ipt, igrp, islot
     real(RP) :: qM, qP, VelM, VelP, alpha
 
     idx = (blockIdx%x-1)*blockDim%x + threadIdx%x
@@ -3022,7 +3072,24 @@ contains
            + v(iP)*normal_fn(idx+nface) &
            + w(iP)*normal_fn(idx+2*nface)
       alpha = 0.5_RP*abs(VelP+VelM)
-      flux(idx) = 0.5_RP*Fscale(idx)*( &
+      if (pair_nq2 == 0) then
+        iout = idx
+      else
+        ! face f -> (group, slot): 0->(0,0) 1->(1,0) 2->(0,1) 3->(1,1)
+        !                          4->(2,0) 5->(2,1)
+        ir = mod(idx-1, 6*pair_nq2)
+        iface = ir / pair_nq2
+        ipt = mod(ir, pair_nq2)
+        if (iface < 4) then
+          igrp = mod(iface, 2)
+          islot = iface / 2
+        else
+          igrp = 2
+          islot = iface - 4
+        end if
+        iout = (idx-1) - ir + 2*pair_nq2*igrp + 2*ipt + islot + 1
+      end if
+      flux(iout) = 0.5_RP*Fscale(idx)*( &
         qP*VelP-qM*VelM-alpha*(qP-qM) )
     end if
   end subroutine elembnd_flux_kernel

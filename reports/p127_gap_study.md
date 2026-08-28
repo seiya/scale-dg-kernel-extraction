@@ -905,3 +905,41 @@ ncu の stall 分布（barrier 9.83 ワープ）と一致する。
 **p=127 の最速は `CUDAFORTRAN_FUSED_TC`（707.7 µs）である。** `GEMM_FUSED` の
 711.3 に 1.005 倍、素の `GEMM`（741.5）に 1.048 倍、`GEMM_CUTE`（757.7）に 1.071 倍。
 `Main` でも 2.3969 対 2.4051 ms/step で融合側が速い。
+
+---
+
+## 12. `GEMM_FUSED` 側の改修で最速が戻った（2026-08-28）
+
+コミット: 本節を追加したコミット（親は `ba53906`）。GPU は RIKYU GB200 1 枚、
+`CUDA_VISIBLE_DEVICES=1` 固定。入力は `conf_perf_p127_gemm_fused.conf` /
+`conf_perf_p127_tc.conf`（どちらも `NeX=NeY=NeZ=2, PolyOrder=127, nstep=100,
+UseCudaGraph=.false.`）。時間は両者が出す `Volume derivate + surface lift` を
+`WarmupStep` を除いた 99 ステップ × 3 RK ステージ = 297 で割った値、5 回の中央値。
+nsys は Slurm job `64240`。
+
+`p255_gap_study.md` §10 で `CUDAFORTRAN_GEMM_FUSED` の z assembly epilogue を
+3 点直した（`Escale_x`/`Escale_y` の乗算を x/y GEMM の epilogue へ前送り、
+添字クランプのタイル原点への集約、lift の 6 本のロードの `double2` 化）。
+どれも `Nq > 64` の枝に入るので p=127 にもそのまま効く。
+
+| 経路 | µs/stage | Main [ms/step] |
+|---|---:|---:|
+| `CUDAFORTRAN_GEMM_FUSED`（本改修後） | **752.8** | **2.28825** |
+| `CUDAFORTRAN_FUSED_TC` | 787.8 | 2.39081 |
+| `CUDAFORTRAN_GEMM_FUSED`（`ba53906`） | 789.8 | —— |
+
+**−4.7%。p=127 の最速は `CUDAFORTRAN_FUSED_TC` から `CUDAFORTRAN_GEMM_FUSED` に
+戻った**（1.047 倍）。§11.13 の「p=127 の最速は `CUDAFORTRAN_FUSED_TC` である」
+という結論はここで覆る。§11 の表と記述は当時の測定としてそのまま残す。
+
+改修が p=255 の 2.6% に対して p=127 で 4.7% と大きいのは、z epilogue の仕事量が
+出力点数に比例する一方で mma の仕事量は `Nq` の 4 乗に比例するためで、
+`Nq` が小さいほど epilogue の占める割合が大きい。nsys job `64240` の内訳
+（300 launch の中央値）: z GEMM + assembly 210.7、x GEMM 167.8、y GEMM 142.3、
+`volume_flux` 128.5、`elembnd`（side stream）46.6 µs。
+1 方向の mma 下限は `2*Nq^4 * Ne / 40.1 TFLOP/s` = 107.1 µs なので、
+x は 64%、y は 75%、z は 51% の効率である。**p=255 と違って x/y の mainloop 自体に
+まだ余地がある**（`K = Nq = 128` は p=255 の半分の深さしかない）。
+
+検証: `SCALE_DG_VARYING_COEFF=1` で `dqdt(:,1:Ne)` を全点比較し、
+`CUDAFORTRAN_GEMM` に対して最大絶対差 1.776e-15、相対 2.078e-16、>1e-14 が 0 件。

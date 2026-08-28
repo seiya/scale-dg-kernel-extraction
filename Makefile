@@ -71,6 +71,7 @@ cuda_cutlass_gemm_fused.o: cuda_cutlass_gemm_fused.cu
 
 
 # Dependency
+cuda_cutlass_gemm_fused.o: cutlass_z_gemm_assembly.h cutlass_f64_kdeep_mma.h
 mod_mesh.o: mod_common.o
 mod_dg_optr_kernel_opt1.o: mod_common.o
 mod_dg_optr_kernel.o: mod_common.o mod_dg_optr_kernel_opt1.o
