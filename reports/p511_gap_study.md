@@ -195,6 +195,11 @@ pointwise volume flux、全6面の numerical flux、lift、assembly も含まれ
 - p=511 の `Ne>1` は整数添字と batch 上限の範囲では実行可能だが、今回は
   intended case の `Ne=1` だけを実測した。追加要素はメモリ量が大きいため、
   smoke test は空きGPUメモリを確認して行う。
-- `surface_lift` など GEMM wrapper に残る未使用 work allocation は、p=511 では
-  1配列あたり1 GiBになる。今回の実行を妨げないため変更していないが、次の
-  memory-footprint cleanup 候補である。
+- `surface_lift` の未使用 allocation は本変更で GEMM_FUSED と GEMM_CUTE から除去した。
+  GEMM_CUTE も `separable_lift_assembly_kernel` が直接 assembly するため、不要な
+  `lift_out` interface も併せて削除した。p=511 `Ne=1` では 1配列あたり 1 GiB
+  （一般には `8*Np*Ne` bytes）の device memory を予約していたが、両経路とも
+  lift と assembly を device kernel 内で完結するため定常 kernel のデータ経路は変わらない。
+  p=7 / p=511 の smoke test と
+  CUDA / 非CUDA clean build を再確認した。変更の性能・数値比較は
+  `reports/index64_boundary_validation.md` に記録した。

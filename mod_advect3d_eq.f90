@@ -316,7 +316,9 @@ contains
     end if
     if (dqdt_kernel_typeid /= DQDT_KERNEL_OPENACC_ASIS .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
-        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC) then
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
       allocate(surface_lift(Np,Ne))
       !$acc enter data create(surface_lift)
     end if
@@ -588,7 +590,7 @@ contains
     integer, intent(in) :: NfpTot
     integer, intent(in) :: Ne
     integer, intent(in) :: NeA
-    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(out) :: dqdt(Np,Ne)
     real(RP), intent(in) :: q(Np,NeA)
     real(RP), intent(in) :: u(Np,NeA)
     real(RP), intent(in) :: v(Np,NeA)
@@ -763,7 +765,7 @@ contains
     integer, intent(in) :: NfpTot
     integer, intent(in) :: Ne
     integer, intent(in) :: NeA
-    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(out) :: dqdt(Np,Ne)
     real(RP), intent(in) :: q(Np,NeA)
     real(RP), intent(in) :: u(Np,NeA)
     real(RP), intent(in) :: v(Np,NeA)
@@ -823,7 +825,7 @@ contains
     Nq, Np, NfpTot, Ne, NeA                ) ! (in)
     implicit none
     integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
-    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(out) :: dqdt(Np,Ne)
     real(RP), intent(in) :: q(Np,NeA)
     real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
     real(RP), intent(in) :: flux_bnd(NfpTot,Ne)
@@ -868,7 +870,7 @@ contains
     Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
     implicit none
     integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
-    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(out) :: dqdt(Np,Ne)
     real(RP), intent(in) :: q(Np,NeA)
     real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
     real(RP), intent(in) :: flux_bnd(NfpTot,Ne)
@@ -903,7 +905,7 @@ contains
     Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
     implicit none
     integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
-    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(out) :: dqdt(Np,Ne)
     real(RP), intent(in) :: q(Np,NeA)
     real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
     real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
@@ -965,7 +967,7 @@ contains
     Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
     implicit none
     integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
-    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(out) :: dqdt(Np,Ne)
     real(RP), intent(in) :: q(Np,NeA)
     real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
     real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
@@ -1027,7 +1029,7 @@ contains
     Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
     implicit none
     integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
-    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(out) :: dqdt(Np,Ne)
     real(RP), intent(in) :: q(Np,NeA)
     real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
     real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
@@ -1138,7 +1140,7 @@ contains
     Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
     implicit none
     integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
-    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(out) :: dqdt(Np,Ne)
     real(RP), intent(in) :: q(Np,NeA)
     real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
     real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
@@ -1152,12 +1154,12 @@ contains
     !$acc host_data use_device(dqdt,q,u,v,w,D1D,D1D_tr,Lift1D,VMapM,VMapP) &
     !$acc& use_device(normal_fn,Fscale,Escale,ebnd_flux) &
     !$acc& use_device(volume_flux_x,volume_flux_y,volume_flux_z) &
-    !$acc& use_device(volume_deriv_x,volume_deriv_y,volume_deriv_z,surface_lift)
+    !$acc& use_device(volume_deriv_x,volume_deriv_y,volume_deriv_z)
     call cuda_cal_dqdt_gemm_cute( &
       dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &
       normal_fn, Fscale, Escale, ebnd_flux, &
       volume_flux_x, volume_flux_y, volume_flux_z, &
-      volume_deriv_x, volume_deriv_y, volume_deriv_z, surface_lift, &
+      volume_deriv_x, volume_deriv_y, volume_deriv_z, &
       Nq, Np, NfpTot, Ne, NeA, kernel_time )
     !$acc end host_data
 
@@ -1175,7 +1177,7 @@ contains
     Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
     implicit none
     integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
-    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(out) :: dqdt(Np,Ne)
     real(RP), intent(in) :: q(Np,NeA)
     real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
     real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
@@ -1277,7 +1279,7 @@ contains
     dqdt, Escale, deriv_x, deriv_y, deriv_z, lift_in, Np, Ne, NeA )
     implicit none
     integer, intent(in) :: Np, Ne, NeA
-    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(out) :: dqdt(Np,Ne)
     real(RP), intent(in) :: Escale(Np,Ne,3)
     real(RP), intent(in) :: deriv_x(Np,Ne), deriv_y(Np,Ne), deriv_z(Np,Ne)
     real(RP), intent(in) :: lift_in(Np,Ne)

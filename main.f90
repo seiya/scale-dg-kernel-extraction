@@ -233,7 +233,10 @@ contains
     call mesh_setup( NeX, NeY, NeZ, PolyOrder, &
       1.0_RP, 1.0_RP, 1.0_RP )
 
-    allocate( q(Np,NeA), q0(Np,NeA), dqdt(Np,NeA) )
+    ! Only q participates in halo exchange.  q0 and dqdt are consumed and
+    ! produced over owned elements, so do not reserve the halo columns for
+    ! either work array.
+    allocate( q(Np,NeA), q0(Np,Ne), dqdt(Np,Ne) )
     allocate( u(Np,NeA), v(Np,NeA), w(Np,NeA) )
 
     !- Initialize a DG operator module
