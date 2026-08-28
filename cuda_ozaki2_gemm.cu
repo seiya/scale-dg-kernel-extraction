@@ -36,10 +36,11 @@ static constexpr int kMaxModuli = 20;
 static constexpr int kMinModuli = 2;
 static constexpr int kDefaultModuli = 14;
 
-// Descending primes below 256 for INT8 modular residues.
-static const int kPrimePool[] = {
-    251, 241, 239, 233, 229, 227, 223, 211, 199, 197, 193, 191, 181, 173,
-    167, 163, 157, 151, 149, 139};
+// INT8 moduli table aligned with RIKEN-RCCS/GEMMul8 (src/oz2/common/table.hpp).
+// Not all entries are prime; they are pairwise coprime CRT moduli.
+static const int kModuliPool[] = {
+    256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199,
+    197, 193, 191, 181, 179, 173};
 
 struct Ozaki2State {
   int moduli_count = 0;
@@ -680,7 +681,7 @@ extern "C" int ozaki2_init(int moduli_count)
   }
   g_state.moduli_count = moduli_count;
   for (int i = 0; i < moduli_count; ++i) {
-    g_state.moduli[i] = kPrimePool[i];
+    g_state.moduli[i] = kModuliPool[i];
   }
   precompute_garner_inverses(g_state);
   g_state.inited = 1;
