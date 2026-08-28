@@ -269,3 +269,18 @@ p=767 では Scheme I が native を上回ったが、p=1023 では Ozaki worksp
 （`iB` / `scale_a` / OZAKI2 residue 等）が **144 GiB payload に上乗せ**され、
 189 GiB GPU で setup 中に OOM となる。`OzakiSliceCount` / `OzakiModuliCount`
 の削減、または workspace 分割は未実施。
+
+## 9. cuBLAS FP64 emulation（2026-08-28 追記）
+
+`CublasEmulation = .true.`、`CUDAFORTRAN_GEMM` のみ。commit `a1cdb57`、
+§6 と同条件（`nstep=15`、`WarmupStep=3`）、GB200 login ノード。
+
+| 経路 | device [ms/stage] | native GEMM 比 | 備考 |
+|---|---:|---:|---|
+| `CUDAFORTRAN_GEMM`（native） | 194.06 | 1.00 | §6 |
+| `CUDAFORTRAN_GEMM` + emulation | **338.2** | **1.74×** | 2 run 中央値 |
+
+3 run 目は 144 GiB payload 確保後、emulation 用 8 GiB workspace 確保で OOM
+（free ≈ 6.2 GiB）。2 run は 268.7 / 407.6 ms/stage と run 間変動が大きい。
+入力は `input_p1023_val_gemm_emu.conf`。
+[`cublas_emulation_survey.md`](cublas_emulation_survey.md) §4 参照。

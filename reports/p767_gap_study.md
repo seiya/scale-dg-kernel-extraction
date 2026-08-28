@@ -183,3 +183,16 @@ commit `38952e4`、`nstep=20`、`WarmupStep=2`、
 **Scheme I が native volume GEMM を上回る最初の次数**（device 160.6 対 188.4 ms/stage）。
 ただし最速は `GEMM_FUSED`（60.4 ms/stage）のままで、Ozaki は volume GEMM 置換の
 参考比較にとどまる。
+
+## 9. cuBLAS FP64 emulation（2026-08-28 追記）
+
+`CublasEmulation = .true.`、`CUDAFORTRAN_GEMM` のみ。commit `a1cdb57`、
+§5 と同条件（`nstep=30`、`WarmupStep=5`）、GB200 login ノード、3 run 中央値。
+
+| 経路 | device [ms/stage] | native GEMM 比 |
+|---|---:|---:|
+| `CUDAFORTRAN_GEMM`（native） | 62.82 | 1.00 |
+| `CUDAFORTRAN_GEMM` + emulation | **122.03** | **1.94×** |
+
+入力は `input_p767_val_gemm_emu.conf`。
+[`cublas_emulation_survey.md`](cublas_emulation_survey.md) §4 参照。

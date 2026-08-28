@@ -61,9 +61,22 @@ nativeは通常のperformance入力を1000 step、emulationは長時間化を避
 | p=7 EAGER emulation | `input_p7_perf_gemm_emu.conf` | 1 | 667.642 ms | **130.6倍遅い** |
 | p=255 native | `bench_runs/p255_gemm.conf` | 1000 | 3.496 ms | 1.00 |
 | p=255 EAGER emulation | `input_p255_val_gemm_emu.conf` | 1 | 30.748 ms | **8.80倍遅い** |
+| p=511 native | §5 参照 | 20 | 40.58 ms/step | 1.00 |
+| p=511 EAGER emulation | `input_p511_val_gemm_emu.conf` | 20 | 60.68 ms/step | **1.50倍遅い** |
+| p=575 native | §5 参照 | 50 | 62.74 ms/step | 1.00 |
+| p=575 EAGER emulation | `input_p575_val_gemm_emu.conf` | 50 | 131.9 ms/step | **2.10倍遅い** |
+| p=767 native | §5 参照 | 30 | 188.5 ms/step | 1.00 |
+| p=767 EAGER emulation | `input_p767_val_gemm_emu.conf` | 30 | 366.1 ms/step | **1.94倍遅い** |
+| p=1023 native | §6 参照 | 15 | 582.2 ms/step | 1.00 |
+| p=1023 EAGER emulation | `input_p1023_val_gemm_emu.conf` | 15 | 1014.6 ms/step（2 run 中央値） | **1.74倍遅い** |
 
 p=7 emulationの3回は634.964 / 667.642 / 1058.470 msで、内部allocation由来の
 run間変動も大きい。表は中央値を使った。
+
+p=511 以降も emulation は3 run 中央値（p=1023 は3 run 目が 8 GiB workspace
+確保時 OOM のため2 run 中央値）。表の device 時間は 1 time step あたり
+（SSP-RK3 の 3 tendency 合計）。p=1023 の2 run は 806 / 1223 ms/step と
+変動が大きい（p=7 と同様、cuBLAS 内部 allocation の影響）。
 
 p=7の通常計測で使う `nstep=1000` をそのままemulationへ適用してはいけない。
 初回の機能・速度確認は **`nstep=1--10`** とする。p=255も比較の初回は

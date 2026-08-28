@@ -181,3 +181,16 @@ commit `38952e4`、`nstep=20`、`WarmupStep=2`、
 
 Scheme I は native GEMM と **実質互角**（1.04×）。最速は `GEMM_FUSED`
 （20.5 ms/stage）のまま。
+
+## 9. cuBLAS FP64 emulation（2026-08-28 追記）
+
+`CublasEmulation = .true.`、`CUDAFORTRAN_GEMM` のみ。commit `a1cdb57`、
+§5 と同条件（`nstep=50`、`WarmupStep=5`）、GB200 login ノード、3 run 中央値。
+
+| 経路 | device [ms/stage] | native GEMM 比 |
+|---|---:|---:|
+| `CUDAFORTRAN_GEMM`（native） | 20.91 | 1.00 |
+| `CUDAFORTRAN_GEMM` + emulation | **43.97** | **2.10×** |
+
+入力は `input_p575_val_gemm_emu.conf`。
+[`cublas_emulation_survey.md`](cublas_emulation_survey.md) §4 参照。

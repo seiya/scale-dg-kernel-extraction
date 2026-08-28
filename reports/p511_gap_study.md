@@ -227,3 +227,18 @@ write/read回数は変わらず、p=1023の全点比較とp=511点変化smoke te
 （演算強度 ≳ 3.82 FLOP/byte、p ≳ 500–650）に p=511 が近づき、
 **Scheme I が native volume GEMM に 1.14 倍**まで縮む。最速は `GEMM_FUSED`
 （13.2 ms/stage）のまま。
+
+## 9. cuBLAS FP64 emulation（2026-08-28 追記）
+
+`CublasEmulation = .true.` で `CUDAFORTRAN_GEMM` の volume 3 方向を cuBLAS
+fixed-point emulation（EAGER）に置き換えた。commit `a1cdb57`、§5 と同条件
+（`nstep=20`、`WarmupStep=2`）、GB200 login ノード、3 run 中央値。
+
+| 経路 | device [ms/stage] | native GEMM 比 |
+|---|---:|---:|
+| `CUDAFORTRAN_GEMM`（native） | 13.53 | 1.00 |
+| `CUDAFORTRAN_GEMM` + emulation | **20.23** | **1.50×** |
+
+p=255 の 8.8× より大幅に縮むが、依然 native より遅い。入力は
+`input_p511_val_gemm_emu.conf`。詳細は
+[`cublas_emulation_survey.md`](cublas_emulation_survey.md) §4。
