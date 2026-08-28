@@ -22,6 +22,8 @@ program main
   use mod_advect3d_eq, only: &
     advect3d_eq_cal_tend, advect3d_eq_graph_supported, &
     advect3d_eq_set_time_reporting, advect3d_eq_reset_timers, &
+    advect3d_eq_ozaki1_slice_stats_begin_step, &
+    advect3d_eq_ozaki1_slice_stats_end_step, &
     cuda_dg_set_event_timing, cuda_dg_set_side_stream, &
     cuda_dg_graph_capture_begin, &
     cuda_dg_graph_capture_end, cuda_dg_graph_launch, cuda_dg_graph_is_ready
@@ -186,6 +188,8 @@ contains
     character(len=8) :: DGOptrKernel_OptType = "OPT1" ! GENERAL or OPT1
     character(len=24) :: DqdtKernel_Type = "OPENACC_SPLIT"
     logical :: CublasEmulation = .false.
+    integer :: OzakiModuliCount = 14
+    integer :: OzakiSliceCount = 8
     character(len=16) :: CutlassMmaShape = "8x8x4" ! 8x8x4, 16x8x4, 16x8x8, 16x8x16
 
     namelist /PARAM_ADVECT3D/ &
@@ -195,6 +199,8 @@ contains
       DGOptrKernel_OptType,        &
       DqdtKernel_Type,             &
       CublasEmulation,             &
+      OzakiModuliCount,            &
+      OzakiSliceCount,             &
       CutlassMmaShape,             &
       UseCudaGraph,                &
       MeasureKernelTime,           &
@@ -235,7 +241,7 @@ contains
 
     !- Initialize a advection equation module
     call setup_advect3d_eq_setup(NfpTot, Np, Ne, DqdtKernel_Type, CublasEmulation, &
-      CutlassMmaShape)
+      CutlassMmaShape, OzakiModuliCount, OzakiSliceCount)
 
     if (UseCudaGraph .and. .not. advect3d_eq_graph_supported()) then
       write(*,*) "UseCudaGraph is ignored: ", trim(DqdtKernel_Type), &
@@ -315,6 +321,8 @@ contains
     implicit none
     !------------------------------------------------------------
 
+    if (istep > nwarmup) call advect3d_eq_ozaki1_slice_stats_begin_step()
+
     do stage = 1, RK_nstage
       call update_halo(q)
 
@@ -339,6 +347,8 @@ contains
 
       call rk_update_stage( q, q0, dqdt, Np*Ne, a_rk, b_rk, dt, stage == 1 )
     end do
+
+    if (istep > nwarmup) call advect3d_eq_ozaki1_slice_stats_end_step()
 
     return
   end subroutine advance_step

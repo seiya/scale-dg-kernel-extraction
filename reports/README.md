@@ -16,6 +16,8 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`tma_survey.md`](tma_survey.md) | TMA の適用可能性を候補ごとに実測した記録。採用ゼロだが、FP64 での受理条件・帯域・L1 挙動と、2 候補それぞれの構造的な不採用理由 |
 | [`cublas_emulation_survey.md`](cublas_emulation_survey.md) | cuBLAS FP64 fixed-point emulation の見かけのストール調査。EAGER 強制、永続 8 GiB workspace、p=7/p=255 の速度と数値検証 |
 | [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md) | arXiv:2504.08009v3（Ozaki Scheme II、INT8 Tensor Core による FP64 GEMM エミュレーション）の適用調査。不採用だが、成立条件が `p ≳ 500-650` であること、およびハードウェア条件が 3.82 FLOP/byte であることを実測から確定した |
+| [`ozaki2_implementation_report.md`](ozaki2_implementation_report.md) | `feature/ozaki` の `CUDAFORTRAN_GEMM_OZAKI2` 本体実装。GEMMul8 参照実装との差分整理、moduli テーブル整合、数値・性能検証。性能結論は調査どおり不採用だが計測可能な経路として統合 |
+| [`ozaki1_implementation_report.md`](ozaki1_implementation_report.md) | 同 worktree の `CUDAFORTRAN_GEMM_OZAKI1`（Ozaki Scheme I）。A/B 両スライス・最大 s² 本 INT8 GEMM・CRT なし FP64 加算。`scale_a` の z 方向バッファ修正を含む。p=7 で native 比 max abs ≈21（OZAKI2 と同オーダー）、device 時間は OZAKI2 より遅い典型 |
 | [`p15_gap_study.md`](p15_gap_study.md) | p=7 と p=255 の間を同一 DOF で埋める最初の点 p=15 (Nq=16)。CUDA core 版と Tensor Core 版の融合カーネル、shared 戦略、Nq=16 では融合したまま占有率 50% を超えられないという構造的な壁。**§14（2026-08-27）は p=15 が同一 DOF の曲線から外れている**（p=31 が 1.83 倍の演算を 1.07 倍の時間でこなす）ことを追い、律速を測り直した: 命令数でも shared でも占有率でもなく **global ロード**（`long scoreboard` 48%、sector/request 13.46）。z の shared 往復を消しても **0%**、面 gather をタダにしても **−17.5% が上限**。p=63 で効いた「面 flux の別カーネル化」は面点率 37.5% の p=15 では 3 倍の赤字。**§15 で採用に至った**: 面フラックスに専用の shared バッファ 12 KB を与えて x パネル格納の直後に前倒しすると、**gather を 1 つも減らさないまま `long scoreboard` が 47.1% → 24.5% に半減し −5.3%**（345.1 → 326.8 µs/stage、ビット一致）。占有率はレジスタで決まっているので 12 KB は事実上タダ。**§16（2026-08-28）は「shared を節約する」という前提そのものを捨てて 332.0 → 272.0 µs/stage（−18.1%、ビット一致）**: カーブアウトの代金を先に測って **+64 KB まではタダ・+128 KB で崖**を確かめ、3 パネル同時 shared 化（バリア 8 → 3 本、−7.0%）、面フェーズの 2 面点/スレッド化（−3.0%）、`__restrict__`（−2.2%、**p=63 では −11.6%** と次数をまたぐ。p=7 だけは spill で +3.6% と逆効果）、**M 側 i 境界 2 面の shared 常駐**（§14.6 が残した唯一の筋、−6.1%）、z 往復のバリアを `__syncwarp` に（−0.8%）。床は 281.3 → 223.0 µs |
 | [`p63_gap_study.md`](p63_gap_study.md) | 同一 DOF の 4 点目 p=63 (Nq=64)。任意次数の LGL 演算子生成、CUTLASS GEMM 経路の次数開放とその batch 上限、5 本のカーネルが 3 種類の理由で別々に詰まる様子、融合カーネルを書かない判断の根拠。§8 のその判断は 2026-08-27 に訂正され、**§13 で実際に両方書いて測った**: `FUSED` 970.7 µs / `FUSED_TC` 662.3 µs に対し `GEMM_FUSED` 598.6 µs で、**p=63 の最速は `GEMM_FUSED` のまま**。§8 の訂正注記が外挿した 365 µs は 1.8 倍外れており、理由は TC 版が帯域律速でも発行律速でもなく**レイテンシ律速**（DRAM 18%、占有率 24.6%）であること。**§16 でこれは覆った**: チャンクループを消し（`BK63` 16→64、動的 shared 96 KB）、shared レイアウトを直して **539.0 µs/stage、`GEMM_FUSED` の 587.3 に 1.090 倍**。**p=63 の最速は `CUDAFORTRAN_FUSED_TC` に交代**し、融合が勝つ上限は p=63 に上がった。§16.4 は「8 B の shared アクセスの条件は 32 レーンの `d mod 32` ではなく半ワープ 16 レーンの `d mod 16`」を SASS と実測で確定させている 。**§18（2026-08-28）でさらに 477.2 µs/stage**: チャンクループ本体の末尾に置いていたバリアを先頭へ `if (kk)` 付きで移すと、`BK63 = NQ63` で 1 回しか回らないこのループでは末尾の 1 本がまるごと消える（ビット一致、−7.7%）。`GEMM_FUSED` との差は 1.101 倍から 1.20 倍に広がった |
 | [`p127_gap_study.md`](p127_gap_study.md) | 同一 DOF の 5 点目 p=127 (Nq=128)。**演算強度がマシンバランスを越える最小の次数**。コード変更ゼロで 5 経路が通り、次数依存ノブ 4 種を掃引しても採用すべき変更が無かったこと、`K` が深くなると CUTLASS の x GEMM が cuBLAS に追いつくこと。**§11（2026-08-28）で `CUDAFORTRAN_FUSED` / `CUDAFORTRAN_FUSED_TC` を p=127 に開き、最終的に `FUSED_TC` 707.7 µs/stage で `GEMM_FUSED` の 711.3 を抜いて最速になった**（初稿の 1141 から 5 段階）。設計は融合 2 本とも 128×64 タイル・1024 スレッド・1 ワープ 2×2 mma タイル、**1 平面 1 回しか読まないフラックスパネルだけを全深さで常駐**させ 2 倍冗長な方と L2 常駐の `D1D` をチャンク。§11.9 の ncu が律速を確定させ（**Tensor Core 化は律速を shared から DMMA パイプへ移す**: CUDA core 版 mio throttle 13.1 / shared ld 201.3 M に対し TC 版 0.16 / 33.6 M）、§11.10 で**スウィズルは mma ループ内で恒等的に簡約でき**命令数 −29%、§11.11 で**チャンクループの末尾バリアが最終反復で無駄**と分かって −4.5%。§11.12 のモデル: **どの資源も飽和しておらず、5 種の削減のうちスケールしたのはバリアだけ** —— 律速は資源ではなく同期点である。**§12（同日）でこれは覆った**: `GEMM_FUSED` の z epilogue を 3 点直すと 789.8 → **752.8 µs/stage（−4.7%）**になり、**p=127 の最速は `CUDAFORTRAN_GEMM_FUSED` に戻った**（`FUSED_TC` 787.8 に 1.047 倍）。**§13（同日）でさらに 751.7 → 730.7 µs/stage（−2.8%、`Main` −3.0%）**: z GEMM は 5 本のストリームで epilogue のメモリ側に詰まっており、**134 MB 消しても 403 MB 消しても −72 µs で止まる**（= mainloop 床 139 µs に当たる）。そこで **`deriv_x` を y GEMM の 2 ソース epilogue に畳んで** z の読みを 1 本減らすと z −15.7 µs に対し y は +2.1 µs しか払わない（y は DMMA パイプ 81% / DRAM 18% で、しかも `deriv_x` は直前の x GEMM が書いたばかりで L2 に温かい）。lift の演算をアキュムレータの shared 往復の後ろへ回して −5 µs、epilogue のアクセスを 16 バイトにして −7.2 µs（32 バイトは赤字、`Nq<=64` では +2.8% なので `GemmZWide` を別型に）。**落とした候補**: ワープ数を増やす（x/y/z とも +2〜10%、発行スロットは元から余っている）、z のタイルとスウィズル（`flux_z` の L2 再利用は既に成立）、epilogue ループ展開。**§13.8 は計測衛生**: `++it_dy` を 2 行動かすだけでビット一致のまま +3.5% |
@@ -32,18 +34,14 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   `nstep=20`）では新しい測定の方が数 % 速く出る。表はそのまま残す。
 
 - **Ozaki Scheme II（arXiv:2504.08009v3、2026-08-27）**: INT8 Tensor Core による
-  FP64 GEMM エミュレーションは **不採用**。GB200 の INT8 天井は 4724 TOP/s
-  （FP64 の 118 倍）で論文の前提は満たすが、volume GEMM の `K = Nq` が浅く、
-  K=256 では INT8 GEMM が INT32 出力の書き出し帯域で律速して天井の 7.6% しか
-  出ない。s=14 のエミュレーションは**演算だけ**で native DGEMM の 95-103% を
-  消費し、CRT 再構成を足すと 1.9 倍遅い。融合実装も s 組の INT32
-  アキュムレータ（917 KB/CTA）がレジスタ 256 KB に入らず不可能。
-  実測レートからの外挿では成立条件は **p ≳ 500-650**（確実に勝つのは p ≳ 1000）で、
-  p=255 は交点の半分の Nq しかない。x/y/z をまとめても 1.83x → 1.63x で桁は変わらない
-  （`Escale` の点ごと重み付けにより 3 方向は INT32 アキュムレータを共有できない）。
-  ハードウェア側の条件は `P_fp64 / B < 2*Nq/(9s+8)` = **3.82 FLOP/byte**（p=255, s=14）で、
-  GB200 の 5.08 は **1.33 倍足りないだけ**。鍵は INT8 の速さではなく FP64 に対する帯域である。
-  詳細は `ozaki2_survey_2504.08009.md`。
+  FP64 GEMM エミュレーションは **本番最速経路としては不採用**（下記 `ozaki2_survey`）。
+  `feature/ozaki` ブランチでは **`CUDAFORTRAN_GEMM_OZAKI2`** として volume GEMM
+  置換を実装済み（`ozaki2_implementation_report.md`）。GEMMul8 参照実装と比較し
+  moduli テーブルを整合。p=255 では native GEMM 比 **約 2.25 倍遅い**。
+- **Ozaki Scheme I（2026-08-28）**: 同 worktree で **`CUDAFORTRAN_GEMM_OZAKI1`**
+  を追加（`ozaki1_implementation_report.md`）。A/B 両方をスライスし最大 s² 本の
+  INT8 GEMM を FP64 で直接加算（CRT なし）。p=7 では OZAKI2 より遅い典型（s=8 で
+  device 約 3.2× native）。数値は OZAKI2 と同オーダーの量子化誤差。
 
 - **cuBLAS FP64 emulation（2026-08-27）**: `CublasEmulation=.true.` は比較実験の
   ため `EAGER` を明示的に強制する。p=7 では native FP64 の **約131倍遅い**ため、
