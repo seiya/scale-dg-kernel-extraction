@@ -280,6 +280,12 @@ contains
       error stop "PolyOrder=255 currently requires CUDAFORTRAN_FUSED, CUDAFORTRAN_FUSED_TC, CUDAFORTRAN_GEMM, CUDAFORTRAN_GEMM_FUSED, CUDAFORTRAN_GEMM_CUTE, CUDAFORTRAN_GEMM_OZAKI2, or CUDAFORTRAN_GEMM_OZAKI1"
     end if
 
+    if (Np == 512**3 .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED) then
+      error stop "PolyOrder=511 requires CUDAFORTRAN_GEMM or CUDAFORTRAN_GEMM_FUSED"
+    end if
+
     if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC) then
       allocate(ebnd_flux(NfpTot,Ne))

@@ -174,8 +174,8 @@ The enabled mode deliberately selects the `EAGER` strategy: this repository
 uses the flag to compare native and emulated algorithms, not to let cuBLAS
 choose one automatically. An 8 GiB handle workspace is allocated once and
 reused. Example validation inputs are `input_p7_val_gemm.conf`,
-`input_p7_val_gemm_emu.conf`, `input_p255_val_gemm.conf`, and
-`input_p255_val_gemm_emu.conf`.
+`input_p7_val_gemm_emu.conf`, `input_p255_val_gemm.conf`,
+`input_p255_val_gemm_emu.conf`, and `input_p511_val_gemm.conf`.
 
 The forced emulation path is about 131 times slower than native FP64 for the
 p=7 benchmark on GB200. Use only 1--10 steps for exploratory p=7 emulation
@@ -195,9 +195,10 @@ launched. Pointwise `q*velocity` is not fused into the GEMM mainloop.
 DqdtKernel_Type = "CUDAFORTRAN_GEMM_FUSED"
 ```
 
-It is limited to `PolyOrder = 255`. Example input: `input_p255_val_gemm_fused.conf`.
-The unfused `CUDAFORTRAN_GEMM` path is unchanged so the two can be timed side by
-side.
+Its CUTLASS y GEMM puts `Nq*Ne` batches on `grid.z`, so it requires
+`Nq*Ne <= 65535`. Example inputs are `input_p255_val_gemm_fused.conf` and
+`input_p511_val_gemm_fused.conf`. The unfused `CUDAFORTRAN_GEMM` path is
+unchanged so the two can be timed side by side.
 
 `CUDAFORTRAN_GEMM_CUTE` keeps flux, lift, and assembly identical to
 `CUDAFORTRAN_GEMM`, but replaces only the three volume `cublasDgemm` calls with
@@ -211,6 +212,13 @@ operator is stored as `Lift1D(256,6)` instead of a dense
 `Lift_mat(256,256,256,6)`. The p=255 path currently requires
 `CUDAFORTRAN_FUSED`, `CUDAFORTRAN_FUSED_TC`, `CUDAFORTRAN_GEMM`,
 `CUDAFORTRAN_GEMM_FUSED`, or `CUDAFORTRAN_GEMM_CUTE`.
+
+The p=511 path likewise generates its operators at startup and keeps only
+`Lift1D(512,6)`. It currently supports `CUDAFORTRAN_GEMM` and
+`CUDAFORTRAN_GEMM_FUSED`, with `Ne=1` in the supplied validation inputs. Halo
+face points are packed into the minimum number of `Np`-sized field columns, so
+the six periodic faces do not reserve six otherwise-unused 512^3-point halo
+elements.
 
 The CUDA Fortran kernels are in `mod_cuda_dg_kernels.cuf`. OpenACC `host_data`
 regions pass the resident device arrays directly to CUDA Fortran, without

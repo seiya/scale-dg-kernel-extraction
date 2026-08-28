@@ -97,9 +97,15 @@ contains
 
     Ne = NeX * NeY * NeZ
     Nhalo = 2 * ( NeY * NeZ + NeX * NeZ + NeX * NeY )
-    NeA = Ne + Nhalo
-
     NhaloNode = Nfp * Nhalo
+
+    ! The halo contains only face points and is packed directly after the
+    ! owned Np*Ne values.  NeA is an allocation extent, not a count of full
+    ! halo elements, so reserve only the number of Np-sized columns needed to
+    ! hold those points.  This matters at high order: for p=511, Ne=1 the old
+    ! Ne+Nhalo extent reserved six unused 512^3-point elements per field even
+    ! though the complete halo has only 6*512^2 points.
+    NeA = Ne + (NhaloNode + Np - 1) / Np
 
     allocate(halo_src_map(NhaloNode))
 
