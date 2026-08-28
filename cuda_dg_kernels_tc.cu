@@ -514,8 +514,10 @@ __device__ __forceinline__ void p255_epilogue(
 //     registers and occupancy, never through the operand traffic they save.
 template <int DIR>
 __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_tc_kernel(
-    double *dqdt, const double *q, const double *velocity, const double *D1D,
-    const double *Lift1D, const double *flux_bnd, const double *Escale, int Ne)
+    double *__restrict__ dqdt, const double *__restrict__ q,
+    const double *__restrict__ velocity, const double *__restrict__ D1D,
+    const double *__restrict__ Lift1D, const double *__restrict__ flux_bnd,
+    const double *__restrict__ Escale, int Ne)
 {
   constexpr int BM = BM255;
   constexpr int BN = BN255;
@@ -871,21 +873,61 @@ __device__ __forceinline__ int sw_f15(int fp)
   return fp ^ (((fp >> 4) & 1) << 0) ^ (((fp >> 5) & 1) << 3);
 }
 
+// Read q, u, v and w at an M-side face node.  The two i-boundary planes of the
+// element are in shared memory; every other node still goes to global.  The
+// index is the one VMapM gave, so the test is on the map's own answer.
+#define LOAD_M(iM, qv, uv, vv, wv)                                             \
+  {                                                                            \
+    const int loc = (iM) - elem_offset;                                        \
+    const int im = loc & 15;                                                   \
+    if ((unsigned)loc < (unsigned)NP15 && (im == 0 || im == 15)) {             \
+      const int sidx = ((im >> 3) << 8) + ((loc >> 4) & 255);                  \
+      qv = sMq[sidx]; uv = sMu[sidx]; vv = sMv[sidx]; wv = sMw[sidx];          \
+    } else {                                                                   \
+      qv = q[iM]; uv = u[iM]; vv = v[iM]; wv = w[iM];                          \
+    }                                                                          \
+  }
+
 __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
-    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *v, const double *w, const int *VMapM,
-    const int *VMapP, const double *normal_fn, const double *Fscale,
-    const double *Escale, int Ne)
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ Lift1D, const double *__restrict__ q,
+    const double *__restrict__ u, const double *__restrict__ v,
+    const double *__restrict__ w, const int *__restrict__ VMapM,
+    const int *__restrict__ VMapP, const double *__restrict__ normal_fn,
+    const double *__restrict__ Fscale, const double *__restrict__ Escale,
+    int Ne)
 {
-  __shared__ __align__(16) double sbuf[NP15];
-  // A buffer of its own for the six face fluxes, 12288 B on top of the 35584 B
-  // the rest of the kernel uses and still inside the 48 KB static limit.
-  // Sharing sbuf with the volume panels forced the fluxes to be evaluated
-  // after the z phase, which is where their scattered gathers used to be the
-  // first thing anyone waited on.  See section 15 of p15_gap_study.md.
-  __shared__ __align__(16) double sflux[NFPTOT15];
-  __shared__ __align__(16) double sDfrag[256];
-  __shared__ __align__(16) double sLift[96];
+  // Three panels at once, 113408 B, past the 48 KB static limit and so an
+  // opt-in dynamic allocation.  One buffer reused for x, y and z saves shared
+  // memory that this kernel does not need -- occupancy is fixed at one block
+  // per SM by the 64 registers times 1024 threads -- and pays for it in
+  // barriers: every reuse needs the whole block to finish reading before the
+  // next panel is stored.  Holding all three lets the u, v and w loads issue
+  // together and takes the kernel from eight __syncthreads to two plus one
+  // __syncwarp.  Section 16.4 of p15_gap_study.md: 7.0%, and the bank
+  // conflicts of the shared buffer go to zero because the three access maps
+  // no longer overlap in one array.
+  extern __shared__ __align__(16) double smem[];
+  double *const sbufX = smem;
+  double *const sbufY = smem + NP15;
+  double *const sbufZ = smem + 2 * NP15;
+  double *const sflux = smem + 3 * NP15;
+  double *const sDfrag = sflux + NFPTOT15;
+  double *const sLift = sDfrag + 256;
+  // The two i-boundary planes of q, u, v and w, 2048 doubles = 16 KB.  The
+  // face points of the two faces that hold i fixed are 16 doubles = 128 B
+  // apart, so a warp gathering them pulls 32 cache lines where it wants 8;
+  // ncu job 66332 put that at sector/request 17.5.  Those nodes are read once
+  // already by the volume phase, so the block writes them down on the way past
+  // and the face phase reads them out of shared instead of going back to
+  // global.  Nothing is assumed about VMapM: the node index it returns decides
+  // whether the staged copy exists, and the global path is still there when it
+  // does not.  Staging the whole element instead would need 128 KB more and
+  // section 16.2 of p15_gap_study.md measures that carveout at +12%.
+  double *const sMq = sLift + 96;
+  double *const sMu = sMq + 512;
+  double *const sMv = sMu + 512;
+  double *const sMw = sMv + 512;
 
   const int elem = (int)blockIdx.x;
   if (elem >= Ne) {
@@ -942,56 +984,95 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
   double acc0, acc1, acc2, acc3;
   double c0, c1, c2, c3;
 
-  //- x -----------------------------------------------------------------
+  //- the three flux panels ----------------------------------------------
   {
     const double2 ua = *reinterpret_cast<const double2 *>(u + iag);
     const double2 ub = *reinterpret_cast<const double2 *>(u + ibg);
-    *reinterpret_cast<double2 *>(sbuf + sw_xy15(na)) =
+    const double2 va = *reinterpret_cast<const double2 *>(v + iag);
+    const double2 vb = *reinterpret_cast<const double2 *>(v + ibg);
+    const double2 wa = *reinterpret_cast<const double2 *>(w + iag);
+    const double2 wb = *reinterpret_cast<const double2 *>(w + ibg);
+    *reinterpret_cast<double2 *>(sbufX + sw_xy15(na)) =
         make_double2(qa.x * ua.x, qa.y * ua.y);
-    *reinterpret_cast<double2 *>(sbuf + sw_xy15(nb)) =
+    *reinterpret_cast<double2 *>(sbufX + sw_xy15(nb)) =
         make_double2(qb.x * ub.x, qb.y * ub.y);
-  }
+    *reinterpret_cast<double2 *>(sbufY + sw_xy15(na)) =
+        make_double2(qa.x * va.x, qa.y * va.y);
+    *reinterpret_cast<double2 *>(sbufY + sw_xy15(nb)) =
+        make_double2(qb.x * vb.x, qb.y * vb.y);
+    *reinterpret_cast<double2 *>(sbufZ + sw_z15(na)) =
+        make_double2(qa.x * wa.x, qa.y * wa.y);
+    *reinterpret_cast<double2 *>(sbufZ + sw_z15(nb)) =
+        make_double2(qb.x * wb.x, qb.y * wb.y);
 
-  //- numerical flux on the six faces ------------------------------------
-  //
-  // This runs here, before any of the three contractions is consumed, rather
-  // than after the z phase where it used to.  The gathers are unchanged --
-  // ncu counts the same 4.63 M requests and 62.36 M sectors either way -- but
-  // from here they have the x, y and z phases to complete in.  Section 15 of
-  // p15_gap_study.md measured long scoreboard falling 47.1% to 24.5% and the
-  // kernel 5.3% shorter, with bit-identical output.  Evaluating them one step
-  // earlier still, before the x panel is staged, is 1% worse: it delays the
-  // first mma without buying more overlap.
-  {
-    int fp = tid;
-    int fidx = face_offset + fp;
-    int iM = VMapM[fidx] - 1;
-    int iP = VMapP[fidx] - 1;
-    double qM = q[iM], qP = q[iP];
-    double VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
-                  w[iM] * normal_fn[fidx + 2 * nface];
-    double VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
-                  w[iP] * normal_fn[fidx + 2 * nface];
-    double alpha = 0.5 * fabs(VelP + VelM);
-    sflux[sw_f15(fp)] =
-        0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
-    if (tid < 512) {
-      fp = tid + 1024;
-      fidx = face_offset + fp;
-      iM = VMapM[fidx] - 1;
-      iP = VMapP[fidx] - 1;
-      qM = q[iM];
-      qP = q[iP];
-      VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
-             w[iM] * normal_fn[fidx + 2 * nface];
-      VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
-             w[iP] * normal_fn[fidx + 2 * nface];
-      alpha = 0.5 * fabs(VelP + VelM);
-      sflux[sw_f15(fp)] =
-          0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+    // na is even and nb = na + 2048, so the two nodes of a pair have i = na&15
+    // and that plus one: the low plane can only be the first of a pair and the
+    // high plane only the second.  One thread in eight writes.
+    const int ia = na & 15;
+    if (ia == 0) {
+      const int s0 = (na >> 4) & 255;
+      const int s1 = (nb >> 4) & 255;
+      sMq[s0] = qa.x; sMu[s0] = ua.x; sMv[s0] = va.x; sMw[s0] = wa.x;
+      sMq[s1] = qb.x; sMu[s1] = ub.x; sMv[s1] = vb.x; sMw[s1] = wb.x;
+    } else if (ia == 14) {
+      const int s0 = 256 + ((na >> 4) & 255);
+      const int s1 = 256 + ((nb >> 4) & 255);
+      sMq[s0] = qa.y; sMu[s0] = ua.y; sMv[s0] = va.y; sMw[s0] = wa.y;
+      sMq[s1] = qb.y; sMu[s1] = ub.y; sMv[s1] = vb.y; sMw[s1] = wb.y;
     }
   }
+
   __syncthreads();
+  //- numerical flux on the six faces ------------------------------------
+  //
+  // This runs before any of the three contractions is consumed, so the
+  // gathers have the x, y and z phases to complete in; section 15 of
+  // p15_gap_study.md measured that placement at 5.3%.  It now sits just after
+  // the barrier rather than just before it, because the M-side planes it
+  // reads are written on the other side of that barrier.
+  //
+  // Two face points per thread, 768 threads covering all 1536.  The four
+  // coalesced fields (three normal components and Fscale) and the two maps
+  // then move as double2 and int2 instead of eight doubles and four ints, so
+  // the phase issues six fewer L1/TEX instructions per pair -- section 15.7
+  // named MIO throttle plus LG throttle, i.e. the number of memory
+  // instructions rather than their latency, as what was left.  face_offset
+  // and 2*tid are both even and the device allocations are 256 B aligned, so
+  // every pair load is aligned.  Section 16.3: request count falls 12.7% and
+  // sector count rises 13.7%, for a net 3.0%.
+  if (tid < 768) {
+    const int fp0 = tid << 1;
+    const int fidx = face_offset + fp0;
+    const int2 mM = *reinterpret_cast<const int2 *>(VMapM + fidx);
+    const int2 mP = *reinterpret_cast<const int2 *>(VMapP + fidx);
+    const double2 n0 = *reinterpret_cast<const double2 *>(normal_fn + fidx);
+    const double2 n1 =
+        *reinterpret_cast<const double2 *>(normal_fn + fidx + nface);
+    const double2 n2 =
+        *reinterpret_cast<const double2 *>(normal_fn + fidx + 2 * nface);
+    const double2 fs = *reinterpret_cast<const double2 *>(Fscale + fidx);
+
+    const int iM0 = mM.x - 1, iP0 = mP.x - 1;
+    const int iM1 = mM.y - 1, iP1 = mP.y - 1;
+
+    double qM0, uM0, vM0, wM0;
+    LOAD_M(iM0, qM0, uM0, vM0, wM0);
+    const double qP0 = q[iP0];
+    const double VelM0 = uM0 * n0.x + vM0 * n1.x + wM0 * n2.x;
+    const double VelP0 = u[iP0] * n0.x + v[iP0] * n1.x + w[iP0] * n2.x;
+    const double a0 = 0.5 * fabs(VelP0 + VelM0);
+    sflux[sw_f15(fp0)] =
+        0.5 * fs.x * (qP0 * VelP0 - qM0 * VelM0 - a0 * (qP0 - qM0));
+
+    double qM1, uM1, vM1, wM1;
+    LOAD_M(iM1, qM1, uM1, vM1, wM1);
+    const double qP1 = q[iP1];
+    const double VelM1 = uM1 * n0.y + vM1 * n1.y + wM1 * n2.y;
+    const double VelP1 = u[iP1] * n0.y + v[iP1] * n1.y + w[iP1] * n2.y;
+    const double a1 = 0.5 * fabs(VelP1 + VelM1);
+    sflux[sw_f15(fp0 + 1)] =
+        0.5 * fs.y * (qP1 * VelP1 - qM1 * VelM1 - a1 * (qP1 - qM1));
+  }
   {
     // A = flux panel at (i = colk + 4*ks, j = jout); the k-step moves bits
     // 2-3, which sw_xy15 does not read.
@@ -1001,7 +1082,7 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
     mma_reset(c2, c3);
 #pragma unroll
     for (int ks = 0; ks < 4; ++ks) {
-      const double a = sbuf[ax ^ (4 * ks)];
+      const double a = sbufX[ax ^ (4 * ks)];
       mma_m8n8k4_f64(c0, c1, a, sDfrag[(ks * 8 << 2) + fbase], c0, c1);
       mma_m8n8k4_f64(c2, c3, a, sDfrag[128 + (ks * 8 << 2) + fbase], c2, c3);
     }
@@ -1012,18 +1093,8 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
     acc2 = eb.x * c2;
     acc3 = eb.y * c3;
   }
-  __syncthreads();
 
   //- y -----------------------------------------------------------------
-  {
-    const double2 va = *reinterpret_cast<const double2 *>(v + iag);
-    const double2 vb = *reinterpret_cast<const double2 *>(v + ibg);
-    *reinterpret_cast<double2 *>(sbuf + sw_xy15(na)) =
-        make_double2(qa.x * va.x, qa.y * va.y);
-    *reinterpret_cast<double2 *>(sbuf + sw_xy15(nb)) =
-        make_double2(qb.x * vb.x, qb.y * vb.y);
-  }
-  __syncthreads();
   {
     // B = flux panel at (i = tn*8 + row, j = colk + 4*ks); the k-step moves
     // bits 6-7, again not read by sw_xy15.
@@ -1035,8 +1106,8 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
 #pragma unroll
     for (int ks = 0; ks < 4; ++ks) {
       const double a = sDfrag[(ks * 8 << 2) + fbase];
-      mma_m8n8k4_f64(c0, c1, a, sbuf[byA ^ (64 * ks)], c0, c1);
-      mma_m8n8k4_f64(c2, c3, a, sbuf[byB ^ (64 * ks)], c2, c3);
+      mma_m8n8k4_f64(c0, c1, a, sbufY[byA ^ (64 * ks)], c0, c1);
+      mma_m8n8k4_f64(c2, c3, a, sbufY[byB ^ (64 * ks)], c2, c3);
     }
     const double2 ea = *reinterpret_cast<const double2 *>(Escale + gA + npoint);
     const double2 eb = *reinterpret_cast<const double2 *>(Escale + gB + npoint);
@@ -1045,18 +1116,8 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
     acc2 += eb.x * c2;
     acc3 += eb.y * c3;
   }
-  __syncthreads();
 
   //- z -----------------------------------------------------------------
-  {
-    const double2 wa = *reinterpret_cast<const double2 *>(w + iag);
-    const double2 wb = *reinterpret_cast<const double2 *>(w + ibg);
-    *reinterpret_cast<double2 *>(sbuf + sw_z15(na)) =
-        make_double2(qa.x * wa.x, qa.y * wa.y);
-    *reinterpret_cast<double2 *>(sbuf + sw_z15(nb)) =
-        make_double2(qb.x * wb.x, qb.y * wb.y);
-  }
-  __syncthreads();
   {
     // The z output map is not the x/y one, so the z derivative is the only one
     // that travels back through shared memory, as it is at Nq=8.  This warp
@@ -1067,33 +1128,41 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
     mma_reset(c2, c3);
 #pragma unroll
     for (int ks = 0; ks < 4; ++ks) {
-      const double b = sbuf[bz ^ (1024 * ks)];
+      const double b = sbufZ[bz ^ (1024 * ks)];
       mma_m8n8k4_f64(c0, c1, sDfrag[(ks * 8 << 2) + fbase], b, c0, c1);
       mma_m8n8k4_f64(c2, c3, sDfrag[128 + (ks * 8 << 2) + fbase], b, c2, c3);
     }
-    __syncthreads();
-    const int dzA = sw_dz15((warp * 8 + 2 * colk) + 256 * row);
-    const int dzB = sw_dz15((warp * 8 + 2 * colk) + 256 * (row + 8));
-    sbuf[dzA] = c0;
-    sbuf[dzA ^ 1] = c1;
-    sbuf[dzB] = c2;
-    sbuf[dzB ^ 1] = c3;
+    // The 128 nodes this warp writes are exactly the 128 it just read: the z
+    // mma covers ij in [8*warp, 8*warp+8) for every k, and so does the round
+    // trip.  Addressing both with the same swizzle therefore makes the store
+    // land inside the warp's own read set, so no other warp's live data is
+    // clobbered and the barrier that used to guard the overwrite becomes a
+    // __syncwarp().  The price is that the round trip no longer gets its own
+    // permutation: sw_dz15 existed to make the store and the read conflict
+    // free, and sw_z15 leaves the read 4-way.
+    __syncwarp();
+    const int dzA = sw_z15((warp * 8 + 2 * colk) + 256 * row);
+    const int dzB = sw_z15((warp * 8 + 2 * colk) + 256 * (row + 8));
+    sbufZ[dzA] = c0;
+    sbufZ[dzA ^ 1] = c1;
+    sbufZ[dzB] = c2;
+    sbufZ[dzB ^ 1] = c3;
   }
   __syncthreads();
   {
-    const int dA = sw_dz15(outA);
-    const int dB = sw_dz15(outB);
+    const int dA = sw_z15(outA);
+    const int dB = sw_z15(outB);
     const double2 ea =
         *reinterpret_cast<const double2 *>(Escale + gA + 2 * npoint);
     const double2 eb =
         *reinterpret_cast<const double2 *>(Escale + gB + 2 * npoint);
-    acc0 += ea.x * sbuf[dA];
-    acc1 += ea.y * sbuf[dA ^ 1];
-    acc2 += eb.x * sbuf[dB];
-    acc3 += eb.y * sbuf[dB ^ 1];
+    acc0 += ea.x * sbufZ[dA];
+    acc1 += ea.y * sbufZ[dA ^ 1];
+    acc2 += eb.x * sbufZ[dB];
+    acc3 += eb.y * sbufZ[dB ^ 1];
   }
-  __syncthreads();
-
+  // No barrier here: sflux has a buffer of its own and nothing below writes
+  // shared memory.
 
   //- lift and assembly --------------------------------------------------
   {
@@ -1142,7 +1211,15 @@ extern "C" void launch_tendency_fused_p15_tc(
     const int *VMapP, const double *normal_fn, const double *Fscale,
     const double *Escale, int Ne)
 {
-  tendency_fused_p15_tc_kernel<<<Ne, 1024, 0, dg_cuda_stream>>>(
+  const int p15_smem =
+      (3 * NP15 + NFPTOT15 + 256 + 96 + 2048) * (int)sizeof(double);
+  static bool p15_optin = false;
+  if (!p15_optin) {
+    cudaFuncSetAttribute(tendency_fused_p15_tc_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, p15_smem);
+    p15_optin = true;
+  }
+  tendency_fused_p15_tc_kernel<<<Ne, 1024, p15_smem, dg_cuda_stream>>>(
       dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
       Ne);
   check_cuda("tendency_fused_p15_tc_kernel");
@@ -1233,10 +1310,13 @@ __device__ __forceinline__ double p31_face_flux_tc(
 }
 
 __global__ __launch_bounds__(512, 1) void tendency_fused_p31_xz_tc_kernel(
-    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *v, const double *w, const int *VMapM,
-    const int *VMapP, const double *normal_fn, const double *Fscale,
-    const double *Escale, int Ne)
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ Lift1D, const double *__restrict__ q,
+    const double *__restrict__ u, const double *__restrict__ v,
+    const double *__restrict__ w, const int *__restrict__ VMapM,
+    const int *__restrict__ VMapP, const double *__restrict__ normal_fn,
+    const double *__restrict__ Fscale, const double *__restrict__ Escale,
+    int Ne)
 {
   // sFU and sFW hold the current j plane under ONE address map, node index
   // i + 32*k.  For x the contraction index l is the i field and for z it is
@@ -1419,8 +1499,9 @@ __global__ __launch_bounds__(512, 1) void tendency_fused_p31_xz_tc_kernel(
 // plane as the B operand from shared, under the same address map and the same
 // swizzle.  The block owns half an element in k, for the same wave reason.
 __global__ __launch_bounds__(512, 1) void tendency_fused_p31_y_tc_kernel(
-    double *dqdt, const double *D1D, const double *q, const double *v,
-    const double *Escale, int Ne)
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ q, const double *__restrict__ v,
+    const double *__restrict__ Escale, int Ne)
 {
   __shared__ __align__(16) double sFV[1024];
 
@@ -1635,9 +1716,11 @@ __device__ __forceinline__ int swt63(int idx)
 #define P63_STAGE_ITERS (NQ63 * BK63 / P63_THREADS)
 
 __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kernel(
-    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *w, const double *flux_bnd,
-    const double *Escale, int Ne)
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ Lift1D, const double *__restrict__ q,
+    const double *__restrict__ u, const double *__restrict__ w,
+    const double *__restrict__ flux_bnd, const double *__restrict__ Escale,
+    int Ne)
 {
   // Dynamic, because at BK63=32 the three panels are exactly the 48 KB static
   // limit and at BK63=64 they are twice it.  Occupancy is capped by registers
@@ -1785,8 +1868,9 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
 // which is the z contraction of the first kernel with (i,j) in place of (i,k),
 // so the same two panel shapes and the same swizzle serve it.
 __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_y_tc_kernel(
-    double *dqdt, const double *D1D, const double *q, const double *v,
-    const double *Escale, int Ne)
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ q, const double *__restrict__ v,
+    const double *__restrict__ Escale, int Ne)
 {
   extern __shared__ __align__(16) double smem63[];
   double *const sD = smem63;
@@ -2020,9 +2104,11 @@ __device__ __forceinline__ int sw127(int idx)
 #define P127_Y_FSTAGE_ITERS (P127_MT * NQ127 / P127_Y_THREADS)
 
 __global__ __launch_bounds__(1024, 1) void tendency_fused_p127_xz_tc_kernel(
-    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *w, const double *flux_bnd,
-    const double *Escale, int Ne)
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ Lift1D, const double *__restrict__ q,
+    const double *__restrict__ u, const double *__restrict__ w,
+    const double *__restrict__ flux_bnd, const double *__restrict__ Escale,
+    int Ne)
 {
   extern __shared__ __align__(16) double smem127[];
   double *const sFW = smem127;                       //  64 x NQ, full depth
@@ -2194,8 +2280,9 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p127_xz_tc_kernel(
 // kernel with (i,j) in place of (i,k), so only the A panel of the two is
 // needed and the block holds 64 KB.
 __global__ __launch_bounds__(P127_Y_THREADS, 1) void tendency_fused_p127_y_tc_kernel(
-    double *dqdt, const double *D1D, const double *q, const double *v,
-    const double *Escale, int Ne)
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ q, const double *__restrict__ v,
+    const double *__restrict__ Escale, int Ne)
 {
   extern __shared__ __align__(16) double smem127[];
   double *const sDm = smem127;
