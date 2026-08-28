@@ -1583,6 +1583,17 @@ extern "C" void launch_tendency_fused_p31_tc(
   check_cuda("tendency_fused_p31_tc kernels");
 }
 
+// One 16-byte global-to-shared copy that never passes through a register.
+// The y epilogue's read-modify-write of dqdt is the one load in these kernels
+// that the mma cannot cover, and staging it in registers is blocked by the
+// register file (section 16.6); cp.async is the way in that costs nothing.
+__device__ __forceinline__ void cp_async_16(void *dst, const void *src)
+{
+  const unsigned sm = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sm),
+               "l"(src));
+}
+
 //============================================================================
 // p=63 (Nq=64) fused Tensor Core tendency
 //============================================================================
@@ -1690,6 +1701,19 @@ __device__ __forceinline__ int swt63(int idx)
   return idx ^ (((idx >> 6) & 3) << 2);
 }
 
+// sFU is the one panel whose store conflicts.  Its address is k + 64*l with
+// the lanes walking l at store time and k at read time, so swt63 -- which
+// only folds l's low two bits into bits 2-3 -- leaves the sixteen lanes of a
+// store phase on four banks.  Folding l's bits 2-3 into bits 0-1 as well
+// makes the map bijective on l's low four bits, so a store phase covers all
+// sixteen banks; the read is unharmed because l = 4*ks + colk there, which
+// puts colk in bits 2-3 as before and ks -- a compile-time constant of the
+// unrolled k loop -- in bits 0-1.  Section 19 of p63_gap_study.md.
+__device__ __forceinline__ int swu63(int idx)
+{
+  return idx ^ ((((idx >> 6) & 3) << 2) | ((idx >> 8) & 3));
+}
+
 // Warp shape of the volume kernels.  The warp grid is 4 rows by P63_WN
 // columns and each warp owns 2 by P63_TN of the 8x8 mma tiles, so the block
 // always covers the whole 64x64 plane: 4*2*8 rows and P63_WN*P63_TN*8 columns
@@ -1714,8 +1738,20 @@ __device__ __forceinline__ int swt63(int idx)
 #define P63_TN (8 / P63_WN)
 #define P63_THREADS (32 * 4 * P63_WN)
 #define P63_STAGE_ITERS (NQ63 * BK63 / P63_THREADS)
+#define P63_BPSM 1
 
-__global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kernel(
+// The y kernel carries one accumulator set where the xz kernel carries two,
+// so its shape is set separately.  Two blocks per SM is what that buys: 512
+// threads asking for 64 registers is exactly the register file twice over,
+// and the y kernel reaches 64 with no spill where the xz kernel spills 128 to
+// 176 bytes and loses 8%.  Section 19 of p63_gap_study.md.
+#define P63Y_WN 4
+#define P63Y_TN (8 / P63Y_WN)
+#define P63Y_THREADS (32 * 4 * P63Y_WN)
+#define P63Y_STAGE_ITERS (NQ63 * BK63 / P63Y_THREADS)
+#define P63Y_BPSM 2
+
+__global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_tc_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ w,
@@ -1761,6 +1797,10 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
   }
 
   for (int kk = 0; kk < NQ63; kk += BK63) {
+    // The barrier that protects the panels from being overwritten belongs at
+    // the head of the body, not at its end: written at the end it also runs
+    // after the last chunk, where nothing follows it.  At BK63 = NQ63 the
+    // loop runs once and that saves one barrier out of two.
     if (kk) {
       __syncthreads();
     }
@@ -1771,7 +1811,7 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
       const int ll = tid & (BK63 - 1);
       const int o = (tid / BK63) + (P63_THREADS / BK63) * p;
       const int g = eo + (kk + ll) + plane_off + NQ2_63 * o;
-      sFU[swt63(o + BK63 * ll)] = q[g] * u[g];
+      sFU[swu63(o + BK63 * ll)] = q[g] * u[g];
     }
     // sD[r][l] = D1D(r, l), r fast in the Fortran column-major operator.
     // sFW[i][l] = q*w at (i, jp, l), i fast in global.
@@ -1781,7 +1821,7 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
       const int ll = (tid >> 6) + (P63_THREADS / 64) * p;
       sD[swt63(o + BK63 * ll)] = D1D[o + NQ63 * (kk + ll)];
       const int g = eo + o + plane_off + NQ2_63 * (kk + ll);
-            sFW[swt63(o + BK63 * ll)] = q[g] * w[g];
+      sFW[swt63(o + BK63 * ll)] = q[g] * w[g];
     }
     __syncthreads();
 
@@ -1792,7 +1832,7 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
         const int m = 8 * (2 * wm + a) + row;
-        av[a] = sFU[swt63(m + BK63 * l)];
+        av[a] = sFU[swu63(m + BK63 * l)];
         avz[a] = sD[swt63(m + BK63 * l)];
       }
 #pragma unroll
@@ -1867,7 +1907,7 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
 // One block per (element, k plane).  C[m=j][n=i] = sum_l D[j][l] * FV[i][l],
 // which is the z contraction of the first kernel with (i,j) in place of (i,k),
 // so the same two panel shapes and the same swizzle serve it.
-__global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_y_tc_kernel(
+__global__ __launch_bounds__(P63Y_THREADS, P63Y_BPSM) void tendency_fused_p63_y_tc_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
@@ -1875,6 +1915,10 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_y_tc_kernel
   extern __shared__ __align__(16) double smem63[];
   double *const sD = smem63;
   double *const sFV = smem63 + NQ63 * BK63;
+  // The dqdt tile the epilogue reads back, 64x64 doubles addressed exactly as
+  // the plane is in global, so a thread reads back the same slot it asked for
+  // and no barrier is needed.
+  double *const sDQ = smem63 + 2 * NQ63 * BK63;
 
   const int elem = (int)blockIdx.x / NQ63;
   if (elem >= Ne) {
@@ -1894,59 +1938,77 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_y_tc_kernel
   const int npoint = NP63 * Ne;
   const int plane_off = NQ2_63 * kp;
 
-  double acc[2 * 2 * P63_TN];
+  double acc[2 * 2 * P63Y_TN];
 #pragma unroll
-  for (int e = 0; e < 2 * 2 * P63_TN; ++e) {
+  for (int e = 0; e < 2 * 2 * P63Y_TN; ++e) {
     acc[e] = 0.0;
   }
+
+  // Ask for the four dqdt pairs this thread will need before the first mma.
+  // The epilogue's read-modify-write is the only load here the mma cannot
+  // cover: with it in place the y kernel stalls on long_scoreboard 2.54 of 32
+  // warps, and prefetching it takes that to 0.34.  Section 19.4.
+  // The whole plane is 4096 doubles at eo + plane_off and the 512 threads
+  // cover it exactly, four 16-byte slots each.
+#pragma unroll
+  for (int e8 = 0; e8 < 2 * P63Y_TN; ++e8) {
+    const int a = e8 / P63Y_TN;
+    const int bb = e8 % P63Y_TN;
+    const int loc = (8 * (P63Y_TN * wn + bb) + 2 * colk) +
+                    NQ63 * (8 * (2 * wm + a) + row);
+    cp_async_16(sDQ + loc, dqdt + eo + plane_off + loc);
+  }
+  asm volatile("cp.async.commit_group;\n" ::);
 
   for (int kk = 0; kk < NQ63; kk += BK63) {
     if (kk) {
       __syncthreads();
     }
 #pragma unroll
-    for (int p = 0; p < P63_STAGE_ITERS; ++p) {
+    for (int p = 0; p < P63Y_STAGE_ITERS; ++p) {
       const int o = tid & 63;
-      const int ll = (tid >> 6) + (P63_THREADS / 64) * p;
+      const int ll = (tid >> 6) + (P63Y_THREADS / 64) * p;
       sD[swt63(o + BK63 * ll)] = D1D[o + NQ63 * (kk + ll)];
       const int g = eo + o + NQ63 * (kk + ll) + plane_off;
-            sFV[sw63(ll + BK63 * o)] = q[g] * v[g];
+      sFV[sw63(ll + BK63 * o)] = q[g] * v[g];
     }
     __syncthreads();
 
 #pragma unroll
     for (int ks = 0; ks < BK63 / 4; ++ks) {
       const int l = 4 * ks + colk;
-      double av[2], bv[P63_TN];
+      double av[2], bv[P63Y_TN];
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
         av[a] = sD[swt63((8 * (2 * wm + a) + row) + BK63 * l)];
       }
 #pragma unroll
-      for (int bb = 0; bb < P63_TN; ++bb) {
-        bv[bb] = sFV[sw63(l + BK63 * (8 * (P63_TN * wn + bb) + row))];
+      for (int bb = 0; bb < P63Y_TN; ++bb) {
+        bv[bb] = sFV[sw63(l + BK63 * (8 * (P63Y_TN * wn + bb) + row))];
       }
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
 #pragma unroll
-        for (int bb = 0; bb < P63_TN; ++bb) {
-          const int e = 2 * (P63_TN * a + bb);
+        for (int bb = 0; bb < P63Y_TN; ++bb) {
+          const int e = 2 * (P63Y_TN * a + bb);
           mma_m8n8k4_f64(acc[e], acc[e + 1], av[a], bv[bb], acc[e], acc[e + 1]);
         }
       }
     }
   }
 
+  asm volatile("cp.async.wait_group 0;\n" ::);
+
 #pragma unroll
-  for (int e8 = 0; e8 < 2 * P63_TN; ++e8) {
-    const int a = e8 / P63_TN;
-    const int bb = e8 % P63_TN;
+  for (int e8 = 0; e8 < 2 * P63Y_TN; ++e8) {
+    const int a = e8 / P63Y_TN;
+    const int bb = e8 % P63Y_TN;
     const int m = 8 * (2 * wm + a) + row;                 // j
-    const int n = 8 * (P63_TN * wn + bb) + 2 * colk;      // i, and i+1
+    const int n = 8 * (P63Y_TN * wn + bb) + 2 * colk;      // i, and i+1
     const int node = eo + n + NQ63 * m + plane_off;
     const double2 ey =
         *reinterpret_cast<const double2 *>(Escale + node + npoint);
-    double2 out = *reinterpret_cast<const double2 *>(dqdt + node);
+    double2 out = *reinterpret_cast<const double2 *>(sDQ + n + NQ63 * m);
     out.x -= ey.x * acc[2 * e8];
     out.y -= ey.y * acc[2 * e8 + 1];
     *reinterpret_cast<double2 *>(dqdt + node) = out;
@@ -1960,7 +2022,7 @@ extern "C" void launch_tendency_fused_p63_tc(
 {
   const int nblock = NQ63 * Ne;
   const size_t smem_xz = 3 * NQ63 * BK63 * sizeof(double);
-  const size_t smem_y = 2 * NQ63 * BK63 * sizeof(double);
+  const size_t smem_y = (2 * NQ63 * BK63 + NQ2_63) * sizeof(double);
   static bool opted_in = false;
   if (!opted_in) {
     cudaFuncSetAttribute(tendency_fused_p63_xz_tc_kernel,
@@ -1974,7 +2036,7 @@ extern "C" void launch_tendency_fused_p63_tc(
   tendency_fused_p63_xz_tc_kernel<<<nblock, P63_THREADS, smem_xz,
                                     dg_cuda_stream>>>(
       dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
-  tendency_fused_p63_y_tc_kernel<<<nblock, P63_THREADS, smem_y,
+  tendency_fused_p63_y_tc_kernel<<<nblock, P63Y_THREADS, smem_y,
                                    dg_cuda_stream>>>(
       dqdt, D1D, q, v, Escale, Ne);
   check_cuda("tendency_fused_p63_tc kernels");
