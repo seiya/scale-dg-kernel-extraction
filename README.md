@@ -175,8 +175,8 @@ uses the flag to compare native and emulated algorithms, not to let cuBLAS
 choose one automatically. An 8 GiB handle workspace is allocated once and
 reused. Example validation inputs are `input_p7_val_gemm.conf`,
 `input_p7_val_gemm_emu.conf`, `input_p255_val_gemm.conf`,
-`input_p255_val_gemm_emu.conf`, `input_p511_val_gemm.conf`, and
-`input_p575_val_gemm.conf`.
+`input_p255_val_gemm_emu.conf`, `input_p511_val_gemm.conf`,
+`input_p575_val_gemm.conf`, and `input_p767_val_gemm.conf`.
 
 The forced emulation path is about 131 times slower than native FP64 for the
 p=7 benchmark on GB200. Use only 1--10 steps for exploratory p=7 emulation
@@ -198,9 +198,9 @@ DqdtKernel_Type = "CUDAFORTRAN_GEMM_FUSED"
 
 Its CUTLASS y GEMM puts `Nq*Ne` batches on `grid.z`, so it requires
 `Nq*Ne <= 65535`. Example inputs are `input_p255_val_gemm_fused.conf`,
-`input_p511_val_gemm_fused.conf`, and `input_p575_val_gemm_fused.conf`. The
-unfused `CUDAFORTRAN_GEMM` path is unchanged so the two can be timed side by
-side.
+`input_p511_val_gemm_fused.conf`, `input_p575_val_gemm_fused.conf`, and
+`input_p767_val_gemm_fused.conf`. The unfused `CUDAFORTRAN_GEMM` path is
+unchanged so the two can be timed side by side.
 
 `CUDAFORTRAN_GEMM_CUTE` keeps flux, lift, and assembly identical to
 `CUDAFORTRAN_GEMM`, but replaces only the three volume `cublasDgemm` calls with
