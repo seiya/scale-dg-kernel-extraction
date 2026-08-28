@@ -4,6 +4,7 @@
 #include "cuda_ozaki1_gemm.h"
 
 #include <cuda_runtime.h>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -66,7 +67,76 @@ static BDecompCache g_b_cache;
 
 static constexpr double kSliceThreshold = 1.0;
 
+struct StepSliceStats {
+  int active = 0;
+  int samples = 0;
+  int sa_min = INT_MAX;
+  int sa_max = 0;
+  long long sa_sum = 0;
+  int sb_min = INT_MAX;
+  int sb_max = 0;
+  long long sb_sum = 0;
+  int pairs_min = INT_MAX;
+  int pairs_max = 0;
+  long long pairs_sum = 0;
+};
+
+struct RunSliceStats {
+  int steps = 0;
+  int samples = 0;
+  int sa_min = INT_MAX;
+  int sa_max = 0;
+  long long sa_sum = 0;
+  int sb_min = INT_MAX;
+  int sb_max = 0;
+  long long sb_sum = 0;
+  int pairs_min = INT_MAX;
+  int pairs_max = 0;
+  long long pairs_sum = 0;
+  int step_pairs_sum_min = INT_MAX;
+  int step_pairs_sum_max = 0;
+  long long step_pairs_sum_total = 0;
+};
+
+struct Ozaki1SliceStats {
+  int enabled = 0;
+  int verbose = 0;
+  StepSliceStats step{};
+  RunSliceStats run{};
+};
+
+static Ozaki1SliceStats g_slice_stats;
+
 static void invalidate_b_cache() { g_b_cache = BDecompCache{}; }
+
+static void update_min_int(int &mn, int v)
+{
+  if (v < mn) mn = v;
+}
+
+static void update_max_int(int &mx, int v)
+{
+  if (v > mx) mx = v;
+}
+
+static void record_slice(int sa, int sb)
+{
+  if (!g_slice_stats.enabled || !g_slice_stats.step.active) {
+    return;
+  }
+  const int pairs = sa * sb;
+  StepSliceStats &st = g_slice_stats.step;
+  st.samples++;
+  st.sa_sum += sa;
+  st.sb_sum += sb;
+  st.pairs_sum += pairs;
+  update_min_int(st.sa_min, sa);
+  update_max_int(st.sa_max, sa);
+  update_min_int(st.sb_min, sb);
+  update_max_int(st.sb_max, sb);
+  update_min_int(st.pairs_min, pairs);
+  update_max_int(st.pairs_max, pairs);
+}
 
 static int check_cuda(cudaError_t err, const char *what)
 {
@@ -498,6 +568,91 @@ static int run_slice_pairs(int m, int n, int k, double *C, int ldc, int sa, int 
   return 0;
 }
 
+extern "C" void ozaki1_slice_stats_set_enabled(int enabled)
+{
+  g_slice_stats.enabled = enabled ? 1 : 0;
+  if (!g_slice_stats.enabled) {
+    g_slice_stats = Ozaki1SliceStats{};
+  }
+}
+
+extern "C" void ozaki1_slice_stats_set_verbose(int verbose)
+{
+  g_slice_stats.verbose = verbose ? 1 : 0;
+}
+
+extern "C" void ozaki1_slice_stats_begin_step(void)
+{
+  if (!g_slice_stats.enabled) return;
+  g_slice_stats.step = StepSliceStats{};
+  g_slice_stats.step.active = 1;
+}
+
+extern "C" void ozaki1_slice_stats_end_step(void)
+{
+  if (!g_slice_stats.enabled || !g_slice_stats.step.active) return;
+
+  StepSliceStats &s = g_slice_stats.step;
+  s.active = 0;
+  if (s.samples == 0) return;
+
+  RunSliceStats &r = g_slice_stats.run;
+  r.steps++;
+  r.samples += s.samples;
+  r.sa_sum += s.sa_sum;
+  r.sb_sum += s.sb_sum;
+  r.pairs_sum += s.pairs_sum;
+  update_min_int(r.sa_min, s.sa_min);
+  update_max_int(r.sa_max, s.sa_max);
+  update_min_int(r.sb_min, s.sb_min);
+  update_max_int(r.sb_max, s.sb_max);
+  update_min_int(r.pairs_min, s.pairs_min);
+  update_max_int(r.pairs_max, s.pairs_max);
+  update_min_int(r.step_pairs_sum_min, static_cast<int>(s.pairs_sum));
+  update_max_int(r.step_pairs_sum_max, static_cast<int>(s.pairs_sum));
+  r.step_pairs_sum_total += s.pairs_sum;
+
+  if (g_slice_stats.verbose) {
+    std::printf(
+        "ozaki1 slices step: calls=%d s_a[%d,%d] s_b[%d,%d] "
+        "pairs/call[%d,%d] pairs_sum=%lld\n",
+        s.samples, s.sa_min, s.sa_max, s.sb_min, s.sb_max, s.pairs_min,
+        s.pairs_max, static_cast<long long>(s.pairs_sum));
+  }
+}
+
+extern "C" void ozaki1_slice_stats_print(void)
+{
+  if (!g_slice_stats.enabled) return;
+
+  const RunSliceStats &r = g_slice_stats.run;
+  if (r.steps == 0 || r.samples == 0) {
+    std::printf("  Ozaki1 effective slices: no measured steps recorded\n");
+    return;
+  }
+
+  const double sa_mean = static_cast<double>(r.sa_sum) /
+                         static_cast<double>(r.samples);
+  const double sb_mean = static_cast<double>(r.sb_sum) /
+                         static_cast<double>(r.samples);
+  const double pairs_mean = static_cast<double>(r.pairs_sum) /
+                            static_cast<double>(r.samples);
+  const double step_pairs_mean = static_cast<double>(r.step_pairs_sum_total) /
+                                 static_cast<double>(r.steps);
+
+  std::printf("  Ozaki1 effective slices (%d steps, %d GEMM calls):\n", r.steps,
+              r.samples);
+  std::printf("    s_a per call: min=%d max=%d mean=%.2f\n", r.sa_min, r.sa_max,
+              sa_mean);
+  std::printf("    s_b per call: min=%d max=%d mean=%.2f\n", r.sb_min, r.sb_max,
+              sb_mean);
+  std::printf("    s_a*s_b per call: min=%d max=%d mean=%.2f\n", r.pairs_min,
+              r.pairs_max, pairs_mean);
+  std::printf(
+      "    s_a*s_b sum per step: min=%d max=%d mean=%.2f (INT8 GEMM proxy)\n",
+      r.step_pairs_sum_min, r.step_pairs_sum_max, step_pairs_mean);
+}
+
 extern "C" int ozaki1_init(int slice_count)
 {
   if (slice_count < kMinSlices || slice_count > kMaxSlices) {
@@ -620,6 +775,7 @@ extern "C" int ozaki1_dgemm(int transa, int transb, int m, int n, int k,
   if (err) return err;
   g_ws.slices_a = sa;
   g_ws.slices_b = sb;
+  record_slice(sa, sb);
   err = run_slice_pairs(m, n, k, C, ldc, sa, sb, 0, 1, false);
   if (err) return err;
   return sync_stream();
@@ -658,6 +814,7 @@ extern "C" int ozaki1_dgemm_strided_batched(int transa, int transb, int m, int n
 
   g_ws.slices_a = sa;
   g_ws.slices_b = sb;
+  record_slice(sa, sb);
   err = run_slice_pairs(m, n, k, C, ldc, sa, sb, strideC, batch, true);
   if (err) return err;
   return sync_stream();

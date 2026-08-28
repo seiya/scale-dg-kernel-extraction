@@ -30,6 +30,11 @@ module mod_cuda_dg_kernels
   public :: cuda_ozaki1_init
   public :: cuda_ozaki1_alloc_workspace
   public :: cuda_ozaki1_finalize
+  public :: cuda_ozaki1_slice_stats_set_enabled
+  public :: cuda_ozaki1_slice_stats_set_verbose
+  public :: cuda_ozaki1_slice_stats_begin_step
+  public :: cuda_ozaki1_slice_stats_end_step
+  public :: cuda_ozaki1_slice_stats_print
   public :: cuda_gemm_setup
   public :: cuda_cutlass_set_mma_shape
   public :: cuda_gemm_finalize
@@ -371,6 +376,33 @@ contains
     implicit none
     error stop "CUDA Fortran kernels are not available in this build"
   end subroutine cuda_ozaki1_finalize
+
+  subroutine cuda_ozaki1_slice_stats_set_enabled(enabled)
+    implicit none
+    integer, intent(in) :: enabled
+    return
+  end subroutine cuda_ozaki1_slice_stats_set_enabled
+
+  subroutine cuda_ozaki1_slice_stats_set_verbose(verbose)
+    implicit none
+    integer, intent(in) :: verbose
+    return
+  end subroutine cuda_ozaki1_slice_stats_set_verbose
+
+  subroutine cuda_ozaki1_slice_stats_begin_step()
+    implicit none
+    return
+  end subroutine cuda_ozaki1_slice_stats_begin_step
+
+  subroutine cuda_ozaki1_slice_stats_end_step()
+    implicit none
+    return
+  end subroutine cuda_ozaki1_slice_stats_end_step
+
+  subroutine cuda_ozaki1_slice_stats_print()
+    implicit none
+    return
+  end subroutine cuda_ozaki1_slice_stats_print
 
   subroutine cuda_cal_dqdt_gemm_ozaki1( &
     dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &

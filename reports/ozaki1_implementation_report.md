@@ -2,7 +2,7 @@
 
 作成日: 2026-08-28
 対象リポジトリ: `scale-dg-kernel-extraction`（worktree `scale-dg-kernel-extraction-ozaki`）
-ブランチ / HEAD: `feature/ozaki` / `023900c`（参照比較・B キャッシュ・単体テストは本レポート作業時の未コミット差分）
+ブランチ / HEAD: `feature/ozaki` / `74f09bc`（§6.2・§7.2 の slice 統計はその上の未コミット差分）
 関連実装: [`ozaki2_implementation_report.md`](ozaki2_implementation_report.md)（Scheme II）
 参照実装:
 - [RIKEN-RCCS/GEMMul8](https://github.com/RIKEN-RCCS/GEMMul8) — Ozaki I は **cuBLAS 内蔵 FP64 fixed-point**（`test/common/ozaki1.hpp`）
@@ -25,7 +25,7 @@ Scheme II（`CUDAFORTRAN_GEMM_OZAKI2`）と並ぶ **比較・計測用経路**�
 | CUDA コア | `cuda_ozaki1_gemm.cu` — A・B 両方のスライス分解、最大 s² 本の INT8 `cublasGemmEx`、CRT **なし** |
 | 統合 | `cuda_cal_dqdt_gemm_ozaki1`（`mod_cuda_dg_kernels.cuf`）— 既存 `cuda_cal_dqdt_gemm` と同段構成 |
 | namelist | `OzakiSliceCount`（2–16、既定 8）。`OzakiModuliCount` は OZAKI2 専用 |
-| 検証 conf | `input_p7_val_gemm_ozaki1.conf`、`input_p255_val_gemm_ozaki1.conf` |
+| 検証 conf | `input_p7_val_gemm_ozaki1.conf`、`input_p255_val_gemm_ozaki1.conf`、長時間 `input_p7_val_gemm_ozaki1_1000.conf` |
 | 単体テスト | `bench_ozaki2/ozaki1_crt_test.cu`（合成行列、tol `2e-2`） |
 
 ### 1.1 Scheme I と Scheme II の違い
@@ -199,6 +199,25 @@ login ノード、`nstep=1`、定数速度（`SCALE_DG_VARYING_COEFF` 未設定�
 **Ozaki 経路全体の精度特性**（volume GEMM 量子化）を示す。定数速度ベンチだけでは
 見えない外れ値は、変動係数テストで捕捉する（`AGENTS.md`）。
 
+### 6.2 変動係数・1000 step 長時間 run（p=7, Ne=32³）
+
+login ノード、`SCALE_DG_VARYING_COEFF=1`、`dt=10⁻⁵`、`nstep=1000`、`WarmupStep=1`
+（測定 999 step）、`s=8`。入力は
+[`input_p7_val_gemm_ozaki1_1000.conf`](../input_p7_val_gemm_ozaki1_1000.conf)
+（比較 native は [`input_p7_val_gemm_1000.conf`](../input_p7_val_gemm_1000.conf)）。
+
+| 観測 | OZAKI1 | native `CUDAFORTRAN_GEMM` |
+|---|---|---|
+| step 1000 の q min / max | −1.007 / **+1.007** | −1.007 / **+1.007** |
+| 時間積分として | **安定**（|q| ≈ 1 付近） | **同様**（Ozaki 固有の発散なし） |
+
+**解釈**: `dt=10⁻³` では step 200 付近から |q| が指数関数的に増え、step 300 前後で
+両経路とも ±1.80×10³⁰⁸ に飽和した（Ozaki 固有ではない）。本節の slice 統計・性能は
+**積分が安定する `dt=10⁻⁵`** で再取得した。変動係数下でも |q| が O(1) に留まるため、
+実効 pairs_sum は定数速度 1 step（30）からわずかに増える **36/step** にとどまる
+（§7.2）。旧 `dt=10⁻³` run の mean pairs_sum=78.7 は **発散に伴う flux 拡大**の
+アーティファクトと見なす。
+
 ---
 
 ## 7. 性能（参考、login ノード・nstep=1）
@@ -214,7 +233,39 @@ device イベント行（`CUDA device Ozaki-I GEMM` / `GEMM tendency`）を 1 st
 
 p=7 では **s² まで増える INT8 GEMM** のため OZAKI2 より遅いのが典型。p=255 Ne=1 の 1 回測定では
 OZAKI1 が native より速く見えたが、スライスが早期打ち切りされた場合の **ノイズ**と見なし、
-本番最速経路としては採用しない。
+本番最速経路としては採用しない。実効 s_a/s_b は
+`SCALE_DG_OZAKI1_SLICE_STATS=1` で run 終了時に min/max/mean と step あたり
+`s_a*s_b` 合計（INT8 GEMM 本数の proxy）が出力される。
+
+### 7.2 変動係数・1000 step（§6.2 同一 run、`dt=10⁻⁵`）
+
+環境: `SCALE_DG_VARYING_COEFF=1`、`SCALE_DG_OZAKI1_SLICE_STATS=1`、測定 999 step。
+
+**性能**（Cal_tend 合計 / 999 step）:
+
+| 経路 | Cal_tend / step | CUDA device GEMM / step | native 比 |
+|---|---:|---:|---:|
+| `CUDAFORTRAN_GEMM` | **5.07 ms** | 4.86 ms | 1.00 |
+| `CUDAFORTRAN_GEMM_OZAKI1` | **60.9 ms** | 60.7 ms | **≈12.0×** |
+
+定数速度 1 step（§7）の **≈3.2×** より悪化するが、旧 `dt=10⁻³` 発散 run の
+**≈16.9×** よりは軽い。差の主因は **pairs_sum**（下表）: 安定積分では
+36/step と定数速度 30 に近く、発散 run の mean 78.7 は flux 飽和の副産物。
+
+**実効スライス**（999 step × 9 GEMM 呼び出し = 8991 サンプル）:
+
+| 量 | min | max | mean |
+|---|---:|---:|---:|
+| s_a / 呼び出し | 2 | 2 | 2.00 |
+| s_b / 呼び出し | 2 | 2 | 2.00 |
+| s_a×s_b / 呼び出し | 4 | 4 | 4.00 |
+| **s_a×s_b 合計 / step** | **36** | **36** | **36** |
+
+参照（定数速度・1 step）: pairs_sum/step = **30**（p=7 Ne=32³）、**15**（p=255 Ne=1）。
+変動係数・安定積分では **36**（定数 p=7 の **1.2 倍**）— 係数変動だけでは s_a=s_b=2
+が全 step で固定。§7 の p=255「15 ms」は pairs_sum=15 の best case。
+旧 `dt=10⁻³` run（mean 78.7、max 304）は積分発散時の flux 拡大を反映しており、
+本番性能見積もりには使わない。
 
 ---
 
@@ -271,6 +322,18 @@ nvcc -O3 -arch=sm_100 -I.. ../cuda_ozaki1_gemm.cu ../cuda_cublas_gemm.cu \
 ./scale-dg_extraction input_p7_val_gemm_ozaki1.conf
 ./scale-dg_extraction input_p255_val_gemm_ozaki1.conf
 
+# 実効スライス統計（warmup 後の step を集約、run 終了時に表示）
+export SCALE_DG_OZAKI1_SLICE_STATS=1
+./scale-dg_extraction input_p7_val_gemm_ozaki1.conf
+# 1 step ごとの内訳: SCALE_DG_OZAKI1_SLICE_STATS_VERBOSE=1 も併用
+
+# 変動係数・1000 step（dt=10⁻⁵、slice 統計 + 性能）
+export SCALE_DG_VARYING_COEFF=1
+export SCALE_DG_OZAKI1_SLICE_STATS=1
+./scale-dg_extraction input_p7_val_gemm_ozaki1_1000.conf   # OZAKI1 約 61 s
+# native 比較（同条件・約 5 s）
+./scale-dg_extraction input_p7_val_gemm_1000.conf
+
 # dqdt 比較（p=7）
 ./scale-dg_extraction input_p7_val_gemm.conf
 export SCALE_DG_DUMP_DQDT=dqdt_ref.txt
@@ -291,8 +354,10 @@ export SCALE_DG_DUMP_DQDT=dqdt_ozaki1.txt
 - **参照比較**: GEMMul8 の Ozaki I は **cuBLAS 内蔵**、オープン参照は **ozIMMU**。
   残差 max/127 分解・s_a×s_b ペア・固定 s は **DG 点ごと flux** と **再現可能な計測**に特化。
 - **取り込み**: ゼロ行スケール、`scale_a` 拡張、**D1D_tr B 分解キャッシュ**、`ozaki1_crt_test`。
-- **性能結論**: p=7 では native の **約 3 倍**、OZAKI2 の **約 1.8 倍遅い**（s=8）。
-  最速経路ではないが、Scheme I の **計測可能な正しい経路**として残す。
+- **性能結論**: 定数速度 p=7 では native の **約 3 倍**（§7）。**変動係数 1000 step**
+  （`dt=10⁻⁵`・安定積分）では pairs_sum=36 により **約 12 倍**（§7.2）。
+  `dt=10⁻³` 発散 run の ≈17 倍は flux 飽和のアーティファクト。p=255 1 step の
+  「native より速い」は pairs_sum=15 の外れ値（§7）。
 - **今後**: ozIMMU 式 **mantissa bit split** の ablation、変動係数 p=255 全点比較、
   B キャッシュ効果の nsys 計測は任意。
 

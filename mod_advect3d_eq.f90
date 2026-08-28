@@ -21,6 +21,9 @@ module mod_advect3d_eq
     cuda_cal_dqdt_gemm_ozaki2, cuda_ozaki2_init, cuda_ozaki2_alloc_workspace, &
     cuda_ozaki2_finalize, cuda_cal_dqdt_gemm_ozaki1, cuda_ozaki1_init, &
     cuda_ozaki1_alloc_workspace, cuda_ozaki1_finalize, &
+    cuda_ozaki1_slice_stats_set_enabled, cuda_ozaki1_slice_stats_set_verbose, &
+    cuda_ozaki1_slice_stats_begin_step, cuda_ozaki1_slice_stats_end_step, &
+    cuda_ozaki1_slice_stats_print, &
     cuda_gemm_setup, cuda_cutlass_set_mma_shape, cuda_gemm_finalize, &
     cuda_cal_elembnd_flux, cuda_dg_bind_acc_stream, &
     cuda_dg_flush_kernel_time, cuda_dg_set_event_timing, &
@@ -36,6 +39,8 @@ module mod_advect3d_eq
   public :: advect3d_eq_graph_supported
   public :: advect3d_eq_set_time_reporting
   public :: advect3d_eq_reset_timers
+  public :: advect3d_eq_ozaki1_slice_stats_begin_step
+  public :: advect3d_eq_ozaki1_slice_stats_end_step
 
   !- Re-exported so that the time-stepping loop does not have to know which
   !  backend module it is built against.
@@ -80,6 +85,7 @@ module mod_advect3d_eq
   logical :: cublas_emulation_enabled = .false.
   integer :: ozaki_moduli_count = 14
   integer :: ozaki_slice_count = 8
+  logical :: ozaki1_slice_stats_enabled = .false.
   !> MMA instruction shape of the CUTLASS volume GEMMs (GEMM_CUTE / GEMM_FUSED).
   !! 0 = SM80 8x8x4, 1 = SM90 16x8x4, 2 = SM90 16x8x8, 3 = SM90 16x8x16.
   integer :: cutlass_mma_shape_id = 0
@@ -238,6 +244,7 @@ contains
       call cuda_ozaki1_init(ozaki_slice_count)
       Nq = nint(sqrt(real(NfpTot)/6.0_RP))
       call cuda_ozaki1_alloc_workspace(Nq, Ne, Np)
+      call setup_ozaki1_slice_stats_from_env()
     case default
       write(*,*) "Unsupported dqdt_kernel_type: ", trim(dqdt_kernel_type)
       error stop
@@ -371,6 +378,48 @@ contains
     return
   end subroutine advect3d_eq_reset_timers
 
+  subroutine setup_ozaki1_slice_stats_from_env()
+    implicit none
+    character(len=256) :: envval
+    !------------------------------------------------------------
+
+    ozaki1_slice_stats_enabled = .false.
+    envval = ''
+    call get_environment_variable('SCALE_DG_OZAKI1_SLICE_STATS', envval)
+    if (len_trim(envval) == 0) return
+
+    ozaki1_slice_stats_enabled = .true.
+    call cuda_ozaki1_slice_stats_set_enabled(1)
+
+    envval = ''
+    call get_environment_variable('SCALE_DG_OZAKI1_SLICE_STATS_VERBOSE', envval)
+    if (len_trim(envval) > 0) call cuda_ozaki1_slice_stats_set_verbose(1)
+
+    return
+  end subroutine setup_ozaki1_slice_stats_from_env
+
+  subroutine advect3d_eq_ozaki1_slice_stats_begin_step()
+    implicit none
+    !------------------------------------------------------------
+
+    if (.not. ozaki1_slice_stats_enabled) return
+    if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI1) return
+    call cuda_ozaki1_slice_stats_begin_step()
+
+    return
+  end subroutine advect3d_eq_ozaki1_slice_stats_begin_step
+
+  subroutine advect3d_eq_ozaki1_slice_stats_end_step()
+    implicit none
+    !------------------------------------------------------------
+
+    if (.not. ozaki1_slice_stats_enabled) return
+    if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI1) return
+    call cuda_ozaki1_slice_stats_end_step()
+
+    return
+  end subroutine advect3d_eq_ozaki1_slice_stats_end_step
+
   !> Finalize
 !OCL SERIAL
   subroutine setup_advect3d_eq_finalize()
@@ -434,6 +483,9 @@ contains
       else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI1) then
         write(*,'(A30,ES24.5)') "  CUDA device Ozaki-I GEMM:", Timer_elapsed(timer_volume_deriv)
         write(*,'(A30,I10)') "  Ozaki slice count:", ozaki_slice_count
+        if (ozaki1_slice_stats_enabled) then
+          call cuda_ozaki1_slice_stats_print()
+        end if
       else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED) then
         write(*,'(A30,ES24.5)') "  CUDA device GEMM fused:", Timer_elapsed(timer_volume_deriv)
         write(*,'(A30,ES24.5)') "  FUSED volume GEMM only:", Timer_elapsed(timer_surface_lift)

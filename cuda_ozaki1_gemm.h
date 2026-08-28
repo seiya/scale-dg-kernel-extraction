@@ -19,6 +19,12 @@ int ozaki1_dgemm_strided_batched(int transa, int transb, int m, int n, int k,
                                  double *C, int ldc, long long strideC,
                                  int batch);
 
+void ozaki1_slice_stats_set_enabled(int enabled);
+void ozaki1_slice_stats_set_verbose(int verbose);
+void ozaki1_slice_stats_begin_step(void);
+void ozaki1_slice_stats_end_step(void);
+void ozaki1_slice_stats_print(void);
+
 #ifdef __cplusplus
 }
 #endif
