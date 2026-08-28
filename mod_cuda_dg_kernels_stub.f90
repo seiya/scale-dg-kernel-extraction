@@ -293,9 +293,11 @@ contains
     error stop "CUDA Fortran kernels are not available in this build"
   end subroutine cuda_cal_dqdt_fused_p255_tc
 
-  subroutine cuda_gemm_setup(emulate)
+  subroutine cuda_gemm_setup(emulate, mantissa_fixed, mantissa_bits)
     implicit none
     logical, intent(in) :: emulate
+    logical, intent(in), optional :: mantissa_fixed
+    integer, intent(in), optional :: mantissa_bits
     error stop "CUDA Fortran kernels are not available in this build"
   end subroutine cuda_gemm_setup
 
@@ -330,9 +332,10 @@ contains
     error stop "CUDA Fortran kernels are not available in this build"
   end subroutine cuda_cal_dqdt_gemm
 
-  subroutine cuda_ozaki2_init(moduli_count)
+  subroutine cuda_ozaki2_init(moduli_count, fixed_mantissa)
     implicit none
     integer, intent(in) :: moduli_count
+    logical, intent(in), optional :: fixed_mantissa
     error stop "CUDA Fortran kernels are not available in this build"
   end subroutine cuda_ozaki2_init
 
@@ -368,9 +371,10 @@ contains
     error stop "CUDA Fortran kernels are not available in this build"
   end subroutine cuda_cal_dqdt_gemm_ozaki2
 
-  subroutine cuda_ozaki1_init(slice_count)
+  subroutine cuda_ozaki1_init(slice_count, fixed_mantissa)
     implicit none
     integer, intent(in) :: slice_count
+    logical, intent(in), optional :: fixed_mantissa
     error stop "CUDA Fortran kernels are not available in this build"
   end subroutine cuda_ozaki1_init
 

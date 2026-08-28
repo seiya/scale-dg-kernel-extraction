@@ -213,8 +213,10 @@ contains
     character(len=8) :: DGOptrKernel_OptType = "OPT1" ! GENERAL or OPT1
     character(len=24) :: DqdtKernel_Type = "OPENACC_SPLIT"
     logical :: CublasEmulation = .false.
-    integer :: OzakiModuliCount = 14
-    integer :: OzakiSliceCount = 8
+    character(len=16) :: EmulationMantissaControl = "FIXED"
+    integer :: EmulationMantissaBits = 55
+    integer :: OzakiModuliCount = 7
+    integer :: OzakiSliceCount = 7
     character(len=16) :: CutlassMmaShape = "8x8x4" ! 8x8x4, 16x8x4, 16x8x8, 16x8x16
 
     namelist /PARAM_ADVECT3D/ &
@@ -224,6 +226,8 @@ contains
       DGOptrKernel_OptType,        &
       DqdtKernel_Type,             &
       CublasEmulation,             &
+      EmulationMantissaControl,    &
+      EmulationMantissaBits,       &
       OzakiModuliCount,            &
       OzakiSliceCount,             &
       CutlassMmaShape,             &
@@ -269,7 +273,8 @@ contains
 
     !- Initialize a advection equation module
     call setup_advect3d_eq_setup(NfpTot, Np, Ne, DqdtKernel_Type, CublasEmulation, &
-      CutlassMmaShape, OzakiModuliCount, OzakiSliceCount)
+      CutlassMmaShape, OzakiModuliCount, OzakiSliceCount, &
+      EmulationMantissaControl, EmulationMantissaBits)
 
     if (UseCudaGraph .and. .not. advect3d_eq_graph_supported()) then
       write(*,*) "UseCudaGraph is ignored: ", trim(DqdtKernel_Type), &

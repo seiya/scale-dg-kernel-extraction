@@ -10,7 +10,7 @@
 
 #include "../cuda_ozaki1_gemm.h"
 
-extern "C" int cublas_gemm_init(int emulate);
+extern "C" int cublas_gemm_init(int emulate, int mantissa_fixed, int mantissa_bits);
 cudaStream_t dg_cuda_stream = nullptr;
 
 #define CK(...)                                                                  \
@@ -50,11 +50,11 @@ int main(int argc, char **argv)
   cublasHandle_t h;
   BK(cublasCreate(&h));
 
-  if (ozaki1_init(s) != 0) {
+  if (ozaki1_init(s, 1) != 0) {
     fprintf(stderr, "ozaki1_init failed\n");
     return 1;
   }
-  if (cublas_gemm_init(0) != 0) {
+  if (cublas_gemm_init(0, 1, 55) != 0) {
     fprintf(stderr, "cublas_gemm_init failed\n");
     return 1;
   }

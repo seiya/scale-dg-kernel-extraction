@@ -83,8 +83,10 @@ module mod_advect3d_eq
   integer :: dqdt_kernel_typeid
   character(len=24) :: dqdt_kernel_name
   logical :: cublas_emulation_enabled = .false.
-  integer :: ozaki_moduli_count = 14
-  integer :: ozaki_slice_count = 8
+  logical :: emulation_mantissa_fixed = .true.
+  integer :: emulation_mantissa_bits = 55
+  integer :: ozaki_moduli_count = 7
+  integer :: ozaki_slice_count = 7
   logical :: ozaki1_slice_stats_enabled = .false.
   !> MMA instruction shape of the CUTLASS volume GEMMs (GEMM_CUTE / GEMM_FUSED).
   !! 0 = SM80 8x8x4, 1 = SM90 16x8x4, 2 = SM90 16x8x8, 3 = SM90 16x8x16.
@@ -103,7 +105,8 @@ contains
   !> Setup
 !OCL SERIAL
   subroutine setup_advect3d_eq_setup(NfpTot, Np, Ne, dqdt_kernel_type, cublas_emulation, &
-    cutlass_mma_shape, ozaki_moduli_count_in, ozaki_slice_count_in)
+    cutlass_mma_shape, ozaki_moduli_count_in, ozaki_slice_count_in, &
+    emulation_mantissa_control, emulation_mantissa_bits_in)
     implicit none
     integer, intent(in) :: NfpTot, Np, Ne
     character(len=*), intent(in) :: dqdt_kernel_type
@@ -111,14 +114,39 @@ contains
     character(len=*), intent(in), optional :: cutlass_mma_shape
     integer, intent(in), optional :: ozaki_moduli_count_in
     integer, intent(in), optional :: ozaki_slice_count_in
+    character(len=*), intent(in), optional :: emulation_mantissa_control
+    integer, intent(in), optional :: emulation_mantissa_bits_in
     integer :: Nq
+    character(len=16) :: mantissa_ctrl
     !------------------------------------------------------------------------------
     cublas_emulation_enabled = .false.
     if (present(cublas_emulation)) cublas_emulation_enabled = cublas_emulation
-    ozaki_moduli_count = 14
-    ozaki_slice_count = 8
+    ozaki_moduli_count = 7
+    ozaki_slice_count = 7
     if (present(ozaki_moduli_count_in)) ozaki_moduli_count = ozaki_moduli_count_in
     if (present(ozaki_slice_count_in)) ozaki_slice_count = ozaki_slice_count_in
+
+    emulation_mantissa_fixed = .true.
+    emulation_mantissa_bits = 55
+    if (present(emulation_mantissa_bits_in)) then
+      emulation_mantissa_bits = emulation_mantissa_bits_in
+    end if
+    mantissa_ctrl = "FIXED"
+    if (present(emulation_mantissa_control)) mantissa_ctrl = emulation_mantissa_control
+    select case (trim(adjustl(mantissa_ctrl)))
+    case ("FIXED", "fixed")
+      emulation_mantissa_fixed = .true.
+    case ("DYNAMIC", "ADP", "dynamic", "adp")
+      emulation_mantissa_fixed = .false.
+    case default
+      write(*,*) "Unsupported EmulationMantissaControl: ", trim(mantissa_ctrl)
+      write(*,*) "Choose FIXED or DYNAMIC"
+      error stop
+    end select
+    if (emulation_mantissa_bits < 1 .or. emulation_mantissa_bits > 127) then
+      write(*,*) "EmulationMantissaBits must be in [1, 127], got", emulation_mantissa_bits
+      error stop
+    end if
 
     cutlass_mma_shape_id = 0
     if (present(cutlass_mma_shape)) then
@@ -187,7 +215,8 @@ contains
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM
       dqdt_kernel_name = "CUDAFORTRAN_GEMM"
-      call cuda_gemm_setup(cublas_emulation_enabled)
+      call cuda_gemm_setup(cublas_emulation_enabled, emulation_mantissa_fixed, &
+        emulation_mantissa_bits)
     case ("CUDAFORTRAN_GEMM_FUSED")
       if (.not. cuda_dg_kernels_available) then
         write(*,*) "CUDAFORTRAN_GEMM_FUSED requires a build with CUDA=1"
@@ -199,7 +228,8 @@ contains
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED
       dqdt_kernel_name = "CUDAFORTRAN_GEMM_FUSED"
-      call cuda_gemm_setup(cublas_emulation_enabled)
+      call cuda_gemm_setup(cublas_emulation_enabled, emulation_mantissa_fixed, &
+        emulation_mantissa_bits)
       call cuda_cutlass_set_mma_shape(cutlass_mma_shape_id)
     case ("CUDAFORTRAN_GEMM_CUTE")
       if (.not. cuda_dg_kernels_available) then
@@ -212,7 +242,8 @@ contains
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE
       dqdt_kernel_name = "CUDAFORTRAN_GEMM_CUTE"
-      call cuda_gemm_setup(cublas_emulation_enabled)
+      call cuda_gemm_setup(cublas_emulation_enabled, emulation_mantissa_fixed, &
+        emulation_mantissa_bits)
       call cuda_cutlass_set_mma_shape(cutlass_mma_shape_id)
     case ("CUDAFORTRAN_GEMM_OZAKI2")
       if (.not. cuda_dg_kernels_available) then
@@ -226,7 +257,7 @@ contains
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2
       dqdt_kernel_name = "CUDAFORTRAN_GEMM_OZAKI2"
       call cuda_gemm_setup(.false.)
-      call cuda_ozaki2_init(ozaki_moduli_count)
+      call cuda_ozaki2_init(ozaki_moduli_count, emulation_mantissa_fixed)
       Nq = nint(sqrt(real(NfpTot)/6.0_RP))
       call cuda_ozaki2_alloc_workspace(Nq, Ne, Np)
     case ("CUDAFORTRAN_GEMM_OZAKI1")
@@ -241,7 +272,7 @@ contains
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI1
       dqdt_kernel_name = "CUDAFORTRAN_GEMM_OZAKI1"
       call cuda_gemm_setup(.false.)
-      call cuda_ozaki1_init(ozaki_slice_count)
+      call cuda_ozaki1_init(ozaki_slice_count, emulation_mantissa_fixed)
       Nq = nint(sqrt(real(NfpTot)/6.0_RP))
       call cuda_ozaki1_alloc_workspace(Nq, Ne, Np)
       call setup_ozaki1_slice_stats_from_env()
@@ -453,7 +484,12 @@ contains
         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .or. &
         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
       if (cublas_emulation_enabled) then
-        write(*,'(A30,A24)') "Cublas FP emulation:", "on"
+        if (emulation_mantissa_fixed) then
+          write(*,'(A30,A24)') "Cublas FP emulation:", "on (FIXED)"
+        else
+          write(*,'(A30,A24)') "Cublas FP emulation:", "on (DYNAMIC/ADP)"
+        end if
+        write(*,'(A30,I10)') "  Emulation mantissa bits:", emulation_mantissa_bits
       else
         write(*,'(A30,A24)') "Cublas FP emulation:", "off"
       end if
@@ -493,9 +529,19 @@ contains
       else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2) then
         write(*,'(A30,ES24.5)') "  CUDA device Ozaki-II GEMM:", Timer_elapsed(timer_volume_deriv)
         write(*,'(A30,I10)') "  Ozaki moduli count:", ozaki_moduli_count
+        if (emulation_mantissa_fixed) then
+          write(*,'(A30,A24)') "  Ozaki mantissa control:", "FIXED"
+        else
+          write(*,'(A30,A24)') "  Ozaki mantissa control:", "DYNAMIC"
+        end if
       else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI1) then
         write(*,'(A30,ES24.5)') "  CUDA device Ozaki-I GEMM:", Timer_elapsed(timer_volume_deriv)
         write(*,'(A30,I10)') "  Ozaki slice count:", ozaki_slice_count
+        if (emulation_mantissa_fixed) then
+          write(*,'(A30,A24)') "  Ozaki mantissa control:", "FIXED"
+        else
+          write(*,'(A30,A24)') "  Ozaki mantissa control:", "DYNAMIC"
+        end if
         if (ozaki1_slice_stats_enabled) then
           call cuda_ozaki1_slice_stats_print()
         end if

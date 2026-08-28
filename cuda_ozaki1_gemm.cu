@@ -25,10 +25,13 @@ extern cudaStream_t dg_cuda_stream;
 
 static constexpr int kMaxSlices = 16;
 static constexpr int kMinSlices = 2;
-static constexpr int kDefaultSlices = 8;
+// 7 slices => mantissaBitCount = 8*7 - 1 = 55, matching cuBLAS FIXED 55.
+static constexpr int kDefaultSlices = 7;
+static constexpr double kSliceThreshold = 1.0;
 
 struct Ozaki1State {
   int slice_count = 0;
+  int fixed = 1;
   int inited = 0;
 };
 
@@ -65,8 +68,6 @@ struct BDecompCache {
 };
 
 static BDecompCache g_b_cache;
-
-static constexpr double kSliceThreshold = 1.0;
 
 struct StepSliceStats {
   int active = 0;
@@ -452,7 +453,7 @@ static int decompose_a_tn(const double *A, int m, int k, int lda, int batch,
     }
     used = si + 1;
     if (si + 1 >= g_state.slice_count) break;
-    if (!scales_need_next_slice(sc, m * batch)) break;
+    if (!g_state.fixed && !scales_need_next_slice(sc, m * batch)) break;
     if (batch == 1 && stride == 0) {
       const int blocks = static_cast<int>((plane + 255) / 256);
       ozaki1_residual_a_tn_kernel<<<blocks, 256, 0, dg_cuda_stream>>>(
@@ -493,7 +494,7 @@ static int decompose_b_nn(const double *B, int k, int n, int ldb, int *slices_us
     if (err) return err;
     used = sj + 1;
     if (sj + 1 >= g_state.slice_count) break;
-    if (!scales_need_next_slice(sc, n)) break;
+    if (!g_state.fixed && !scales_need_next_slice(sc, n)) break;
     ozaki1_residual_b_kernel<<<pack_blocks, 256, 0, dg_cuda_stream>>>(
         src, pack, sc, g_ws.res_b, k, n, ldb);
     err = check_cuda(cudaGetLastError(), "residual_b");
@@ -654,7 +655,7 @@ extern "C" void ozaki1_slice_stats_print(void)
       r.step_pairs_sum_min, r.step_pairs_sum_max, step_pairs_mean);
 }
 
-extern "C" int ozaki1_init(int slice_count)
+extern "C" int ozaki1_init(int slice_count, int fixed_mantissa)
 {
   if (slice_count < kMinSlices || slice_count > kMaxSlices) {
     std::fprintf(stderr,
@@ -663,7 +664,17 @@ extern "C" int ozaki1_init(int slice_count)
     return -1;
   }
   g_state.slice_count = slice_count;
+  g_state.fixed = fixed_mantissa ? 1 : 0;
   g_state.inited = 1;
+  if (g_state.fixed) {
+    std::printf(
+        "Ozaki-I: FIXED %d slices (%d mantissa bits, no residual early-exit)\n",
+        slice_count, 8 * slice_count - 1);
+  } else {
+    std::printf(
+        "Ozaki-I: DYNAMIC max %d slices (%d mantissa bits, residual early-exit)\n",
+        slice_count, 8 * slice_count - 1);
+  }
   return 0;
 }
 
@@ -677,7 +688,7 @@ extern "C" int ozaki1_finalize(void)
 extern "C" int ozaki1_alloc_workspace(int Nq, int Ne, int Np)
 {
   if (!g_state.inited) {
-    const int rc = ozaki1_init(kDefaultSlices);
+    const int rc = ozaki1_init(kDefaultSlices, 1);
     if (rc != 0) return rc;
   }
   ozaki1_free_workspace();

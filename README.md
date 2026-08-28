@@ -170,10 +170,15 @@ Volume flux and numerical flux stay pointwise CUDA kernels. Tensor-product
 derivatives and the separable `Lift1D` operator are evaluated with `cublasDgemm`
 / `cublasDgemmStridedBatched`. `CublasEmulation` switches cuBLAS FP64
 fixed-point emulation (Ozaki scheme) on or off at run time without rebuilding.
-The enabled mode deliberately selects the `EAGER` strategy: this repository
-uses the flag to compare native and emulated algorithms, not to let cuBLAS
-choose one automatically. An 8 GiB handle workspace is allocated once and
-reused. Example validation inputs are `input_p7_val_gemm.conf`,
+The enabled mode uses the `EAGER` strategy. `EmulationMantissaControl` selects
+**FIXED** (default) or **DYNAMIC** (ADP). FIXED uses `EmulationMantissaBits`
+(default 55, cuBLAS's FP64-class width, 7 INT8 slices) on every GEMM. DYNAMIC
+uses that value only as a maximum and may pick fewer bits, or fall back to
+native, from each input. The same control drives Ozaki-I residual early-exit
+and Ozaki-II extra A packs (`CUDAFORTRAN_GEMM_OZAKI1` / `_OZAKI2`). Width
+there is still `OzakiSliceCount` (default 7) and `OzakiModuliCount` (default 7).
+An 8 GiB handle workspace is allocated once and reused. Example validation
+inputs are `input_p7_val_gemm.conf`,
 `input_p7_val_gemm_emu.conf`, `input_p255_val_gemm.conf`,
 `input_p255_val_gemm_emu.conf`, `input_p511_val_gemm.conf`,
 `input_p575_val_gemm.conf`, `input_p767_val_gemm.conf`, and
@@ -290,6 +295,8 @@ Simulation parameters are specified in `input.conf`, including
 - DG operator optimization type (`DGOptrKernel_OptType`).
 - Tendency kernel type (`DqdtKernel_Type`).
 - cuBLAS floating-point emulation switch (`CublasEmulation`, used with `CUDAFORTRAN_GEMM`).
+- Emulation mantissa policy (`EmulationMantissaControl` = `FIXED` or `DYNAMIC`, `EmulationMantissaBits`).
+- Ozaki-I / Ozaki-II width (`OzakiSliceCount`, `OzakiModuliCount`).
 - CUDA graph replay of a time step (`UseCudaGraph`, default `.false.`).
 - Per-kernel CUDA event timing (`MeasureKernelTime`, default `.true.`).
 - Time step (`dt`)

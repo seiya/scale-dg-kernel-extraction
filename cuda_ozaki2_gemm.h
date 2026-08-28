@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-int ozaki2_init(int moduli_count);
+int ozaki2_init(int moduli_count, int fixed_mantissa);
 int ozaki2_finalize(void);
 int ozaki2_alloc_workspace(int Nq, int Ne, int Np);
 void ozaki2_free_workspace(void);

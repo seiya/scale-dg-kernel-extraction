@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-int ozaki1_init(int slice_count);
+int ozaki1_init(int slice_count, int fixed_mantissa);
 int ozaki1_finalize(void);
 int ozaki1_alloc_workspace(int Nq, int Ne, int Np);
 void ozaki1_free_workspace(void);

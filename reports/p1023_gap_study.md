@@ -284,3 +284,24 @@ p=767 では Scheme I が native を上回ったが、p=1023 では Ozaki worksp
 （free ≈ 6.2 GiB）。2 run は 268.7 / 407.6 ms/stage と run 間変動が大きい。
 入力は `input_p1023_val_gemm_emu.conf`。
 [`cublas_emulation_survey.md`](cublas_emulation_survey.md) §4 参照。
+
+## 10. なぜ emulation は p=1023 でも native GEMM より遅いか（2026-08-29）
+
+孤立 GEMM ベンチ（`bench_ozaki2/p1023_emu_why.cu`、GB200、176 GiB の場は無し）で
+§9 の 1.74× を分解した。詳細表は
+[`cublas_emulation_survey.md`](cublas_emulation_survey.md) §6。
+
+- volume GEMM 3 本の native 合計は **170.0 ms**（各方向とも FP64 ピークの 96%）。
+  `CublasEmulation=.true.`（EAGER + ADP）は **385.3 ms（2.27×）**。
+  残り ~24 ms の flux/面/assembly は対象外なので、tendency 予測は
+  409 ms/stage。§9 の遅い run（407.6 ms/stage）と一致する。
+- ADP は 54 mantissa bit を選ぶ。同じ 55 bit を FIXED にすると x は
+  **0.495×** まで速くなる。負けの本体はスライス数ではなく
+  **DYNAMIC が毎呼び出しで 8 GiB の B を解析するコスト**。
+  同日、本体の `CublasEmulation=.true.` はこの FIXED 55 に切り替えた
+  （[`cublas_emulation_survey.md`](cublas_emulation_survey.md) §7）。
+- y だけは FIXED 55 でも **1.41× 遅い**（1024 本の 1024³。native が既に
+  ピーク 97% で、INT8 タイルが埋まらない）。x/z の勝ちを食う。
+- INT8 1 本の x 形状は 2464 TOP/s（native の 64 倍）なので、Scheme II なら
+  算術下限で勝つ。cuBLAS 13.1 は Scheme I。`OZAKI2` は workspace が payload に
+  乗って OOM（§8）。

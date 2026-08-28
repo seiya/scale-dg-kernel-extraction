@@ -15,6 +15,14 @@ static void *g_workspace = nullptr;
 // stage-level stream synchronizations cannot make cuBLAS allocate it again.
 static constexpr size_t kEmulationWorkspaceBytes = size_t{8} << 30;
 
+// Default FP64-class width (IEEE 53 + a few guard bits, 7 INT8 slices).
+// FIXED uses this count on every GEMM.  DYNAMIC (ADP) uses it only as the
+// maximum; cuBLAS may pick fewer bits, or fall back to native, per input.
+static constexpr int kDefaultMantissaBits = 55;
+
+static int g_mantissa_fixed = 1;
+static int g_mantissa_bits = kDefaultMantissaBits;
+
 static int apply_emulation(int enable)
 {
   if (!g_inited) {
@@ -24,7 +32,26 @@ static int apply_emulation(int enable)
 #if CUBLAS_VERSION >= 130002
   cublasStatus_t st;
   if (enable) {
+    st = cublasSetMathMode(g_handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+      return static_cast<int>(st);
+    }
     st = cublasSetEmulationStrategy(g_handle, CUBLAS_EMULATION_STRATEGY_EAGER);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+      return static_cast<int>(st);
+    }
+    if (g_mantissa_fixed) {
+      st = cublasSetFixedPointEmulationMantissaControl(
+          g_handle, CUDA_EMULATION_MANTISSA_CONTROL_FIXED);
+    } else {
+      st = cublasSetFixedPointEmulationMantissaControl(
+          g_handle, CUDA_EMULATION_MANTISSA_CONTROL_DYNAMIC);
+    }
+    if (st != CUBLAS_STATUS_SUCCESS) {
+      return static_cast<int>(st);
+    }
+    st = cublasSetFixedPointEmulationMaxMantissaBitCount(
+        g_handle, g_mantissa_bits);
     if (st != CUBLAS_STATUS_SUCCESS) {
       return static_cast<int>(st);
     }
@@ -64,14 +91,26 @@ static int configure_handle()
   return 0;
 }
 
-extern "C" int cublas_gemm_init(int emulate)
+extern "C" int cublas_gemm_init(int emulate, int mantissa_fixed,
+                                int mantissa_bits)
 {
+  g_mantissa_fixed = mantissa_fixed ? 1 : 0;
+  g_mantissa_bits =
+      mantissa_bits > 0 ? mantissa_bits : kDefaultMantissaBits;
+
   if (!emulate) {
     setenv("CUBLAS_EMULATE_DOUBLE_PRECISION", "0", 1);
     setenv("CUBLAS_EMULATE_SINGLE_PRECISION", "0", 1);
   } else {
     setenv("CUBLAS_EMULATION_STRATEGY", "eager", 1);
     setenv("CUBLAS_EMULATE_DOUBLE_PRECISION", "1", 1);
+    if (g_mantissa_fixed) {
+      char bits[16];
+      std::snprintf(bits, sizeof(bits), "%d", g_mantissa_bits);
+      setenv("CUBLAS_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT", bits, 1);
+    } else {
+      unsetenv("CUBLAS_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT");
+    }
   }
 
   if (!g_inited) {
@@ -92,7 +131,19 @@ extern "C" int cublas_gemm_init(int emulate)
       return static_cast<int>(st);
     }
   }
-  return configure_handle();
+  const int cfg = configure_handle();
+  if (cfg == 0 && emulate) {
+    if (g_mantissa_fixed) {
+      std::printf(
+          "cuBLAS FP64 emulation: EAGER, FIXED %d mantissa bits (no ADP)\n",
+          g_mantissa_bits);
+    } else {
+      std::printf(
+          "cuBLAS FP64 emulation: EAGER, DYNAMIC (ADP) max %d mantissa bits\n",
+          g_mantissa_bits);
+    }
+  }
+  return cfg;
 }
 
 extern "C" int cublas_gemm_set_emulation(int emulate)

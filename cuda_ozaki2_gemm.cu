@@ -34,7 +34,8 @@ extern cudaStream_t dg_cuda_stream;
 
 static constexpr int kMaxModuli = 20;
 static constexpr int kMinModuli = 2;
-static constexpr int kDefaultModuli = 14;
+// First 7 pool entries have log2(product) ≈ 55.7, matching cuBLAS FIXED 55.
+static constexpr int kDefaultModuli = 7;
 
 // INT8 moduli table aligned with RIKEN-RCCS/GEMMul8 (src/oz2/common/table.hpp).
 // Not all entries are prime; they are pairwise coprime CRT moduli.
@@ -42,10 +43,13 @@ static const int kModuliPool[] = {
     256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199,
     197, 193, 191, 181, 179, 173};
 
+static constexpr int kMaxASlices = 4;
+
 struct Ozaki2State {
   int moduli_count = 0;
   int moduli[kMaxModuli] = {};
   int64_t garner_inv[kMaxModuli] = {};
+  int fixed = 1;
   int inited = 0;
 };
 
@@ -671,7 +675,7 @@ static int launch_crt(double *C, const int *residues, int m, int n, int ldc,
   return check_cuda(cudaGetLastError(), "crt");
 }
 
-extern "C" int ozaki2_init(int moduli_count)
+extern "C" int ozaki2_init(int moduli_count, int fixed_mantissa)
 {
   if (moduli_count < kMinModuli || moduli_count > kMaxModuli) {
     std::fprintf(stderr,
@@ -680,11 +684,26 @@ extern "C" int ozaki2_init(int moduli_count)
     return -1;
   }
   g_state.moduli_count = moduli_count;
+  g_state.fixed = fixed_mantissa ? 1 : 0;
   for (int i = 0; i < moduli_count; ++i) {
     g_state.moduli[i] = kModuliPool[i];
   }
   precompute_garner_inverses(g_state);
   g_state.inited = 1;
+  unsigned __int128 prod = 1;
+  for (int i = 0; i < moduli_count; ++i) {
+    prod *= static_cast<unsigned __int128>(g_state.moduli[i]);
+  }
+  const double bits = std::log2(static_cast<double>(prod));
+  if (g_state.fixed) {
+    std::printf(
+        "Ozaki-II: FIXED %d moduli (CRT product %.1f bits, single A pack)\n",
+        moduli_count, bits);
+  } else {
+    std::printf(
+        "Ozaki-II: DYNAMIC %d moduli (CRT product %.1f bits, A residual up to %d)\n",
+        moduli_count, bits, kMaxASlices);
+  }
   return 0;
 }
 
@@ -698,7 +717,7 @@ extern "C" int ozaki2_finalize(void)
 extern "C" int ozaki2_alloc_workspace(int Nq, int Ne, int Np)
 {
   if (!g_state.inited) {
-  const int rc = ozaki2_init(kDefaultModuli);
+  const int rc = ozaki2_init(kDefaultModuli, 1);
     if (rc != 0) return rc;
   }
 
@@ -803,7 +822,8 @@ extern "C" int ozaki2_dgemm(int transa, int transb, int m, int n, int k,
   if (err) return err;
 
   const double *cur_a = A;
-  for (int slice = 0; slice < 4; ++slice) {
+  const int max_a_slices = g_state.fixed ? 1 : kMaxASlices;
+  for (int slice = 0; slice < max_a_slices; ++slice) {
     if (slice > 0) {
       cur_a = g_ws.res_a;
     }
@@ -813,7 +833,8 @@ extern "C" int ozaki2_dgemm(int transa, int transb, int m, int n, int k,
     if (err) return err;
     err = run_int8_gemm_crt(m, n, k, C, ldc, slice > 0);
     if (err) return err;
-    if (!matrix_needs_second_slice(m, 1) || slice == 3) {
+    if (g_state.fixed || !matrix_needs_second_slice(m, 1) ||
+        slice == max_a_slices - 1) {
       break;
     }
     const long long mk = static_cast<long long>(m) * k;
@@ -866,7 +887,8 @@ extern "C" int ozaki2_dgemm_strided_batched(int transa, int transb, int m, int n
   if (err) return err;
 
   const double *cur_a = A;
-  for (int slice = 0; slice < 4; ++slice) {
+  const int max_a_slices = g_state.fixed ? 1 : kMaxASlices;
+  for (int slice = 0; slice < max_a_slices; ++slice) {
     if (slice > 0) {
       cur_a = g_ws.res_a;
     }
@@ -883,7 +905,8 @@ extern "C" int ozaki2_dgemm_strided_batched(int transa, int transb, int m, int n
                                     batch, slice > 0);
     if (err) return err;
 
-    if (!matrix_needs_second_slice(m, batch) || slice == 3) {
+    if (g_state.fixed || !matrix_needs_second_slice(m, batch) ||
+        slice == max_a_slices - 1) {
       break;
     }
     if (!g_ws.res_a) {

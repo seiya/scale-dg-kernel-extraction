@@ -14,7 +14,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`h100_report.md`](h100_report.md) | H100（TSUBAME 4）で同じコードを走らせた記録。経路横断の GB200 比、FP64 Tensor Core ピークが 2 倍あることの帰結、H100 では `CutlassMmaShape = "16x8x4"` を選ぶこと |
 | [`sm90_mma_shape_survey.md`](sm90_mma_shape_survey.md) | CUTLASS volume GEMM の MMA 命令形状（8x8x4 / 16x8x4 / 16x8x8 / 16x8x16）を namelist で選べるようにして実測した記録。GB200 では ptxas が SM90 の f64 MMA を `DMMA.8x8x4` に展開するため得るものが無く、H100 では 16x8x4 が最速（cuBLAS が選ぶ 16x8x8 ではない）。kK>4 を CUTLASS 2.x で正しく動かすための warp tile iterator も含む |
 | [`tma_survey.md`](tma_survey.md) | TMA の適用可能性を候補ごとに実測した記録。採用ゼロだが、FP64 での受理条件・帯域・L1 挙動と、2 候補それぞれの構造的な不採用理由 |
-| [`cublas_emulation_survey.md`](cublas_emulation_survey.md) | cuBLAS FP64 fixed-point emulation の見かけのストール調査。EAGER 強制、永続 8 GiB workspace、p=7/p=255 の速度と数値検証 |
+| [`cublas_emulation_survey.md`](cublas_emulation_survey.md) | cuBLAS FP64 fixed-point emulation の見かけのストール調査。EAGER 強制、永続 8 GiB workspace、p=7/p=255 の速度と数値検証。**§6（2026-08-29）は p=1023 でも 1.74× 遅い理由**: ADP が 54 bit を選ぶ一方 FIXED 55 の x は 0.495×、y の 1024³ batch は FIXED 55 でも 1.41× 負け。INT8 算術は 64 倍足りている |
 | [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md) | arXiv:2504.08009v3（Ozaki Scheme II、INT8 Tensor Core による FP64 GEMM エミュレーション）の適用調査。不採用だが、成立条件が `p ≳ 500-650` であること、およびハードウェア条件が 3.82 FLOP/byte であることを実測から確定した |
 | [`ozaki2_implementation_report.md`](ozaki2_implementation_report.md) | `feature/ozaki` の `CUDAFORTRAN_GEMM_OZAKI2` 本体実装。GEMMul8 参照実装との差分整理、moduli テーブル整合、数値・性能検証。性能結論は調査どおり不採用だが計測可能な経路として統合 |
 | [`ozaki1_implementation_report.md`](ozaki1_implementation_report.md) | 同 worktree の `CUDAFORTRAN_GEMM_OZAKI1`（Ozaki Scheme I）。A/B 両スライス・最大 s² 本 INT8 GEMM・CRT なし FP64 加算。`scale_a` の z 方向バッファ修正を含む。p=7 で native 比 max abs ≈21（OZAKI2 と同オーダー）、device 時間は OZAKI2 より遅い典型 |
@@ -49,10 +49,20 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   device 約 3.2× native）。数値は OZAKI2 と同オーダーの量子化誤差。
 
 - **cuBLAS FP64 emulation（2026-08-27）**: `CublasEmulation=.true.` は比較実験の
-  ため `EAGER` を明示的に強制する。p=7 では native FP64 の **約131倍遅い**ため、
+  ため `EAGER` を明示的に強制する。既定の仮数幅は **FIXED 55 bit**。
+  `EmulationMantissaControl=DYNAMIC` で当時の ADP に戻せる。
+  p=7 では native FP64 の **約131倍遅い**ため、
   計測は `nstep=1--10` に制限する。8 GiB workspace は初期化時に一度だけ確保して
   再利用するが、cuBLAS 13.2.1 の内部 `cudaMallocAsync` は残り、p=7 の不利は
   解消しない。詳細は `cublas_emulation_survey.md`。
+  **（追記 2026-08-29）p=1023 でも EAGER+ADP は volume GEMM 3 本で 2.27× 遅い。**
+  INT8 算術は 64 倍足り、FIXED 55 bit の x は 0.495× まで勝つ。負けは
+  ADP の入力解析と、y の 1024³ batched が INT8 タイルを埋めないこと。
+  同日、本体の既定を **FIXED 55** にし、namelist で DYNAMIC に切り替えられる
+  ようにした（`cublas_emulation_survey.md` §6–§7）。
+  本体の FIXED 55 vs native（3 run 中央値）は §8: p=511 / p=767 は勝ち
+  （0.95× / 0.91×）、p=575 は 1.31×、p=7 は 305×。p=1023 native は
+  193.1 ms/stage、FIXED 55 は 8 GiB workspace 先行確保で場コピー時 OOM。
 
 - **p=7, `Ne=32^3`**: `CUDAFORTRAN_FUSED_TC` が最速（commit `e22dda1` 以降）。
   現時点の device 時間は 0.806 秒 / Main 1.066 秒（下の ±x 面の項目）。
