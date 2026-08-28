@@ -141,3 +141,37 @@ extern "C" int cublas_dgemm_strided_batched_impl(
       g_handle, opA, opB, m, n, k, &alpha, A, lda, strideA, B, ldb, strideB,
       &beta, C, ldc, strideC, batch));
 }
+
+extern "C" int cublas_gemm_ex_impl(int transa, int transb, int m, int n, int k,
+                                   const int *alpha, const signed char *A,
+                                   int lda, const signed char *B, int ldb,
+                                   const int *beta, int *C, int ldc)
+{
+  if (!g_inited) {
+    return static_cast<int>(CUBLAS_STATUS_NOT_INITIALIZED);
+  }
+  const cublasOperation_t opA = transa ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const cublasOperation_t opB = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
+  return static_cast<int>(
+      cublasGemmEx(g_handle, opA, opB, m, n, k, alpha, A, CUDA_R_8I, lda, B,
+                   CUDA_R_8I, ldb, beta, C, CUDA_R_32I, ldc, CUBLAS_COMPUTE_32I,
+                   CUBLAS_GEMM_DEFAULT));
+}
+
+extern "C" int cublas_gemm_strided_batched_ex_impl(
+    int transa, int transb, int m, int n, int k, const int *alpha,
+    const signed char *A, int lda, long long strideA, const signed char *B,
+    int ldb, long long strideB, const int *beta, int *C, int ldc,
+    long long strideC, int batch)
+{
+  if (!g_inited) {
+    return static_cast<int>(CUBLAS_STATUS_NOT_INITIALIZED);
+  }
+  const cublasOperation_t opA = transa ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const cublasOperation_t opB = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
+  return static_cast<int>(
+      cublasGemmStridedBatchedEx(g_handle, opA, opB, m, n, k, alpha, A,
+                                 CUDA_R_8I, lda, strideA, B, CUDA_R_8I, ldb,
+                                 strideB, beta, C, CUDA_R_32I, ldc, strideC,
+                                 batch, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
+}

@@ -18,6 +18,8 @@ module mod_advect3d_eq
     cuda_cal_dqdt_fused_tc, cuda_cal_dqdt_fused_p63_tc, &
     cuda_cal_dqdt_fused_p255_tc, &
     cuda_cal_dqdt_gemm, cuda_cal_dqdt_gemm_fused, cuda_cal_dqdt_gemm_cute, &
+    cuda_cal_dqdt_gemm_ozaki2, cuda_ozaki2_init, cuda_ozaki2_alloc_workspace, &
+    cuda_ozaki2_finalize, &
     cuda_gemm_setup, cuda_cutlass_set_mma_shape, cuda_gemm_finalize, &
     cuda_cal_elembnd_flux, cuda_dg_bind_acc_stream, &
     cuda_dg_flush_kernel_time, cuda_dg_set_event_timing, &
@@ -70,9 +72,11 @@ module mod_advect3d_eq
   integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_GEMM = 6
   integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED = 7
   integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE = 8
+  integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2 = 9
   integer :: dqdt_kernel_typeid
   character(len=24) :: dqdt_kernel_name
   logical :: cublas_emulation_enabled = .false.
+  integer :: ozaki_moduli_count = 14
   !> MMA instruction shape of the CUTLASS volume GEMMs (GEMM_CUTE / GEMM_FUSED).
   !! 0 = SM80 8x8x4, 1 = SM90 16x8x4, 2 = SM90 16x8x8, 3 = SM90 16x8x16.
   integer :: cutlass_mma_shape_id = 0
@@ -90,15 +94,19 @@ contains
   !> Setup
 !OCL SERIAL
   subroutine setup_advect3d_eq_setup(NfpTot, Np, Ne, dqdt_kernel_type, cublas_emulation, &
-    cutlass_mma_shape)
+    cutlass_mma_shape, ozaki_moduli_count_in)
     implicit none
     integer, intent(in) :: NfpTot, Np, Ne
     character(len=*), intent(in) :: dqdt_kernel_type
     logical, intent(in), optional :: cublas_emulation
     character(len=*), intent(in), optional :: cutlass_mma_shape
+    integer, intent(in), optional :: ozaki_moduli_count_in
+    integer :: Nq
     !------------------------------------------------------------------------------
     cublas_emulation_enabled = .false.
     if (present(cublas_emulation)) cublas_emulation_enabled = cublas_emulation
+    ozaki_moduli_count = 14
+    if (present(ozaki_moduli_count_in)) ozaki_moduli_count = ozaki_moduli_count_in
 
     cutlass_mma_shape_id = 0
     if (present(cutlass_mma_shape)) then
@@ -194,6 +202,21 @@ contains
       dqdt_kernel_name = "CUDAFORTRAN_GEMM_CUTE"
       call cuda_gemm_setup(cublas_emulation_enabled)
       call cuda_cutlass_set_mma_shape(cutlass_mma_shape_id)
+    case ("CUDAFORTRAN_GEMM_OZAKI2")
+      if (.not. cuda_dg_kernels_available) then
+        write(*,*) "CUDAFORTRAN_GEMM_OZAKI2 requires a build with CUDA=1"
+        error stop
+      end if
+      if (ozaki_moduli_count < 2 .or. ozaki_moduli_count > 20) then
+        write(*,*) "OzakiModuliCount must be in [2, 20], got", ozaki_moduli_count
+        error stop
+      end if
+      dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2
+      dqdt_kernel_name = "CUDAFORTRAN_GEMM_OZAKI2"
+      call cuda_gemm_setup(.false.)
+      call cuda_ozaki2_init(ozaki_moduli_count)
+      Nq = nint(sqrt(real(NfpTot)/6.0_RP))
+      call cuda_ozaki2_alloc_workspace(Nq, Ne, Np)
     case default
       write(*,*) "Unsupported dqdt_kernel_type: ", trim(dqdt_kernel_type)
       error stop
@@ -223,8 +246,9 @@ contains
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
-        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
-      error stop "PolyOrder=255 currently requires CUDAFORTRAN_FUSED, CUDAFORTRAN_FUSED_TC, CUDAFORTRAN_GEMM, CUDAFORTRAN_GEMM_FUSED, or CUDAFORTRAN_GEMM_CUTE"
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2) then
+      error stop "PolyOrder=255 currently requires CUDAFORTRAN_FUSED, CUDAFORTRAN_FUSED_TC, CUDAFORTRAN_GEMM, CUDAFORTRAN_GEMM_FUSED, CUDAFORTRAN_GEMM_CUTE, or CUDAFORTRAN_GEMM_OZAKI2"
     end if
 
     if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
@@ -265,7 +289,8 @@ contains
         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_SPLIT .or. &
         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM .or. &
         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .or. &
-        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE .or. &
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2) then
       allocate(volume_flux_x(Np,Ne), volume_flux_y(Np,Ne), volume_flux_z(Np,Ne))
       !$acc enter data create(volume_flux_x,volume_flux_y,volume_flux_z)
     end if
@@ -282,7 +307,8 @@ contains
     !------------------------------------------------------------
 
     advect3d_eq_graph_supported = &
-      cuda_dg_kernels_available .and. (.not. tend_uses_acc_kernels)
+      cuda_dg_kernels_available .and. (.not. tend_uses_acc_kernels) .and. &
+      dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2
 
     return
   end function advect3d_eq_graph_supported
@@ -358,7 +384,8 @@ contains
       write(*,'(A30,1X,A23)') "Element boundary flux:", "included in fused kernel"
     else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM .or. &
              dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .or. &
-             dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
+             dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE .or. &
+             dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2) then
       write(*,'(A30,1X,A23)') "Element boundary flux:", "included in GEMM path"
     else
       write(*,'(A30,ES24.5)') "Element boundary flux:", Timer_elapsed(timer_ebnd_flux)
@@ -376,6 +403,9 @@ contains
         write(*,'(A30,ES24.5)') "  CUDA device fused tendency:", Timer_elapsed(timer_volume_deriv)
       else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM) then
         write(*,'(A30,ES24.5)') "  CUDA device GEMM tendency:", Timer_elapsed(timer_volume_deriv)
+      else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2) then
+        write(*,'(A30,ES24.5)') "  CUDA device Ozaki-II GEMM:", Timer_elapsed(timer_volume_deriv)
+        write(*,'(A30,I10)') "  Ozaki moduli count:", ozaki_moduli_count
       else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED) then
         write(*,'(A30,ES24.5)') "  CUDA device GEMM fused:", Timer_elapsed(timer_volume_deriv)
         write(*,'(A30,ES24.5)') "  FUSED volume GEMM only:", Timer_elapsed(timer_surface_lift)
@@ -417,8 +447,12 @@ contains
     end if
     if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM .or. &
         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .or. &
-        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE .or. &
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2) then
       call cuda_gemm_finalize()
+    end if
+    if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2) then
+      call cuda_ozaki2_finalize()
     end if
     return
   end subroutine setup_advect3d_eq_finalize
@@ -440,7 +474,8 @@ contains
       call Timer_add(timer_volume_deriv,kernel_time(1))
       call Timer_add(timer_volume_flux,kernel_time(2))
     case (DQDT_KERNEL_CUDAFORTRAN_FUSED, DQDT_KERNEL_CUDAFORTRAN_FUSED_TC, &
-          DQDT_KERNEL_CUDAFORTRAN_GEMM, DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED)
+          DQDT_KERNEL_CUDAFORTRAN_GEMM, DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED, &
+          DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2)
       call Timer_add(timer_volume_deriv,kernel_time(1))
       call Timer_add(timer_surface_lift,kernel_time(2))
     end select
@@ -490,7 +525,8 @@ contains
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
-        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2) then
       call cal_elembnd_flux( ebnd_flux,   & ! (out)
          q, u, v, w,                      & ! (in)
          VMapM, VMapP, normal_fn, Fscale, & ! (in)
@@ -534,6 +570,12 @@ contains
          Escale, Nq, Np, NfpTot, Ne, NeA )    ! (in)
     else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE) then
       call cal_dqdt_cudafortran_gemm_cute( dqdt, & ! (out)
+         q, u, v, w,                         & ! (in)
+         D1D, D1D_tr, Lift1D,               & ! (in)
+         VMapM, VMapP, normal_fn, Fscale,   & ! (in)
+         Escale, Nq, Np, NfpTot, Ne, NeA )    ! (in)
+    else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2) then
+      call cal_dqdt_cudafortran_gemm_ozaki2( dqdt, & ! (out)
          q, u, v, w,                         & ! (in)
          D1D, D1D_tr, Lift1D,               & ! (in)
          VMapM, VMapP, normal_fn, Fscale,   & ! (in)
@@ -914,6 +956,43 @@ contains
 
     return
   end subroutine cal_dqdt_cudafortran_gemm
+
+  !> Tendency path using Ozaki Scheme II INT8 GEMM emulation for volume derivatives.
+!OCL SERIAL
+  subroutine cal_dqdt_cudafortran_gemm_ozaki2( dqdt, & ! (out)
+    q, u, v, w,                               & ! (in)
+    D1D, D1D_tr, Lift1D,                      & ! (in)
+    VMapM, VMapP, normal_fn, Fscale, Escale,  & ! (in)
+    Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), intent(out) :: dqdt(Np,NeA)
+    real(RP), intent(in) :: q(Np,NeA)
+    real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
+    real(RP), intent(in) :: Lift1D(Nq,6)
+    real(RP), intent(in) :: Escale(Np,Ne,3)
+    integer, intent(in) :: VMapM(NfpTot,Ne), VMapP(NfpTot,Ne)
+    real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+    real(RP) :: kernel_time(2)
+    !------------------------------------------------------------
+
+    !$acc host_data use_device(dqdt,q,u,v,w,D1D,D1D_tr,Lift1D,VMapM,VMapP) &
+    !$acc& use_device(normal_fn,Fscale,Escale,ebnd_flux) &
+    !$acc& use_device(volume_flux_x,volume_flux_y,volume_flux_z) &
+    !$acc& use_device(volume_deriv_x,volume_deriv_y,volume_deriv_z,surface_lift)
+    call cuda_cal_dqdt_gemm_ozaki2( &
+      dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &
+      normal_fn, Fscale, Escale, ebnd_flux, &
+      volume_flux_x, volume_flux_y, volume_flux_z, &
+      volume_deriv_x, volume_deriv_y, volume_deriv_z, surface_lift, &
+      Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    !$acc end host_data
+
+    call accumulate_kernel_time(kernel_time)
+
+    return
+  end subroutine cal_dqdt_cudafortran_gemm_ozaki2
 
   !> Same pipeline as CUDAFORTRAN_GEMM, but volume derivatives use the tiled GEMM.
 !OCL SERIAL
