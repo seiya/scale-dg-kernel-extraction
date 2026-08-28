@@ -1225,6 +1225,17 @@ extern "C" void launch_tendency_fused_p15_tc(
   check_cuda("tendency_fused_p15_tc_kernel");
 }
 
+// One 16-byte global-to-shared copy that never passes through a register.
+// The y epilogue's read-modify-write of dqdt is the one load in these kernels
+// that the mma cannot cover, and staging it in registers is blocked by the
+// register file (section 16.6); cp.async is the way in that costs nothing.
+__device__ __forceinline__ void cp_async_16(void *dst, const void *src)
+{
+  const unsigned sm = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sm),
+               "l"(src));
+}
+
 //============================================================================
 // p=31 (Nq=32) fused Tensor Core tendency
 //============================================================================
@@ -1504,6 +1515,10 @@ __global__ __launch_bounds__(512, 1) void tendency_fused_p31_y_tc_kernel(
     const double *__restrict__ Escale, int Ne)
 {
   __shared__ __align__(16) double sFV[1024];
+  // Two 8 KB stages for the dqdt tile the epilogue reads back.  Each thread
+  // asks for the single 16-byte slot it will read, so the buffer needs no
+  // barrier of its own; see section 19.4 of p63_gap_study.md.
+  __shared__ __align__(16) double sDQ[2 * 1024];
 
   const int elem = (int)blockIdx.x >> 1;
   if (elem >= Ne) {
@@ -1540,6 +1555,11 @@ __global__ __launch_bounds__(512, 1) void tendency_fused_p31_y_tc_kernel(
   double2 qp = *reinterpret_cast<const double2 *>(q + gidx);
   double2 vp = *reinterpret_cast<const double2 *>(v + gidx);
 
+  const int dqslot = 2 * tid;
+  const int nidx0 = elem_offset + i0 + NQ31 * jout + (NQ31 * NQ31) * k0;
+  cp_async_16(sDQ + dqslot, dqdt + nidx0);
+  asm volatile("cp.async.commit_group;\n" ::);
+
   for (int kl = 0; kl < JSLAB31; ++kl) {
     *reinterpret_cast<double2 *>(sFV + ldsh) =
         make_double2(qp.x * vp.x, qp.y * vp.y);
@@ -1548,6 +1568,11 @@ __global__ __launch_bounds__(512, 1) void tendency_fused_p31_y_tc_kernel(
       qp = *reinterpret_cast<const double2 *>(q + gidx);
       vp = *reinterpret_cast<const double2 *>(v + gidx);
     }
+    if (kl + 1 < JSLAB31) {
+      cp_async_16(sDQ + 1024 * ((kl + 1) & 1) + dqslot,
+                  dqdt + nidx0 + (NQ31 * NQ31) * (kl + 1));
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
     __syncthreads();
 
     double c0, c1;
@@ -1561,7 +1586,9 @@ __global__ __launch_bounds__(512, 1) void tendency_fused_p31_y_tc_kernel(
         elem_offset + i0 + NQ31 * jout + (NQ31 * NQ31) * (k0 + kl);
     const double2 ey =
         *reinterpret_cast<const double2 *>(Escale + nidx + npoint);
-    double2 out = *reinterpret_cast<const double2 *>(dqdt + nidx);
+    asm volatile("cp.async.wait_group 1;\n" ::);
+    double2 out = *reinterpret_cast<const double2 *>(
+        sDQ + 1024 * (kl & 1) + dqslot);
     out.x -= ey.x * c0;
     out.y -= ey.y * c1;
     *reinterpret_cast<double2 *>(dqdt + nidx) = out;
@@ -1581,17 +1608,6 @@ extern "C" void launch_tendency_fused_p31_tc(
   tendency_fused_p31_y_tc_kernel<<<2 * Ne, 512, 0, dg_cuda_stream>>>(
       dqdt, D1D, q, v, Escale, Ne);
   check_cuda("tendency_fused_p31_tc kernels");
-}
-
-// One 16-byte global-to-shared copy that never passes through a register.
-// The y epilogue's read-modify-write of dqdt is the one load in these kernels
-// that the mma cannot cover, and staging it in registers is blocked by the
-// register file (section 16.6); cp.async is the way in that costs nothing.
-__device__ __forceinline__ void cp_async_16(void *dst, const void *src)
-{
-  const unsigned sm = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sm),
-               "l"(src));
 }
 
 //============================================================================
@@ -2137,6 +2153,7 @@ __device__ __forceinline__ int swt128(int idx)
 {
   return idx ^ (((idx >> 7) & 3) << 2);
 }
+
 
 __device__ __forceinline__ int sw127(int idx)
 {
