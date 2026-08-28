@@ -344,19 +344,6 @@ __global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
 
 // p=255 (Nq=256) tendency, one direction per launch.
 //
-// The previous kernels here ran one warp per block on a single 8x8 output tile
-// and reloaded BOTH mma operands from global for every one of the 64 k-steps,
-// so each mma moved 96 doubles for 512 FLOP: 0.67 FLOP/B, about 39 GB/stage
-// through L1.  ncu (Slurm job 59500) found all three pinned at 98-99% L1/TEX
-// with SM throughput at 18%, which is that arithmetic and nothing else.
-//
-// This is the same limiter the Nq=32 kernels had, but the cure is different:
-// there the operands were already in shared and the fix was to hoist the D1D
-// fragment into registers; here they come straight from global and the fix is
-// to stage a tile of each in shared and amortize it over a 64x64 output block.
-// A 64-wide block reads each operand once for 64 columns instead of once per
-// column, which is an 8x cut in operand traffic.
-//
 // Every direction is written as the transposed product
 //
 //     C^T[m][n] = sum_l A[m][l] * B[n][l]
@@ -364,21 +351,39 @@ __global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
 // which makes both operands the same shape -- [outer][l] with outer taken from
 // lane/4 and l from lane%4 -- so one shared layout and one loader serve both.
 // The transpose is free with m8n8k4 (it is the operand order) and it is what
-// makes the epilogue coalesce: a lane ends up owning two nodes adjacent in the
-// fastest index, where the old kernels owned two nodes 256 or 65536 apart.
+// makes the epilogue coalesce: a lane owns two nodes adjacent in the fastest
+// index, where the one-warp-per-block kernels this replaced owned two nodes
+// 256 or 65536 apart.
 //
 //   x: C^T[j][i], A[j][l] = q*u at (l,j,k)   B[i][l] = D1D(i,l)
 //   y: C^T[j][i], A[j][l] = D1D(j,l)         B[i][l] = q*v at (i,l,k)
 //   z: C^T[k][p], A[k][l] = D1D(k,l)         B[p][l] = q*w at (p + Nq^2*l)
 //
 // where p is the linear (i,j) index, so z contracts the whole element at once
-// and needs no plane loop.  Faces stay split two per direction exactly as
-// before: x lifts faces 2 and 4, y faces 1 and 3, z faces 5 and 6.
+// and needs no plane loop.  Faces are split two per direction: x lifts faces 2
+// and 4, y faces 1 and 3, z faces 5 and 6.
+//
+// The block owns a 64x64 output tile with 128 threads (four warps in a 2 by 2
+// grid), each warp holding 4x4 mma tiles, and the chunk loop is double
+// buffered.  How that shape was chosen is in reports/p255_gap_study.md; the
+// two facts that decide it are that the mma loop pays (TM+TN) shared operand
+// loads per TM*TN mma, so 4x4 is a third cheaper than the 2x4 it replaced, and
+// that 4x4 costs 32 accumulator doubles, which only fits three blocks per SM.
+// At that occupancy the un-pipelined loop lost more in exposed global latency
+// than the cheaper mma loop won, so the two changes only pay together.
 
 #define NQ255 256
 #define BM255 64
 #define BN255 64
 #define BK255 16
+#define TM255 4
+#define TN255 4
+#define TH255 128
+// Three blocks per SM is the most that fits without spilling: ptxas lands on
+// 168 registers and 3 * 128 * 168 = 64512 of the 65536 register file.  Asking
+// for four (128 registers) spills and costs 27%, asking for two wastes a third
+// of the machine.
+#define MINB255 3
 
 // Shared tiles are stored as l + 16*outer, l in bits 0-3 and outer in bits
 // 4-9.  Three different access patterns hit these arrays: the mma read (l from
@@ -393,46 +398,164 @@ __device__ __forceinline__ int sw255(int idx)
   return idx ^ (((idx >> 4) & 3) << 2) ^ (((idx >> 6) & 3) << 0);
 }
 
+// Epilogue: scale the accumulators by Escale, add the two lifted faces this
+// direction owns, and write (or accumulate onto) dqdt.
+//
+// The loop is nested b-outer / a-inner rather than flat over the TM*TN tiles,
+// because half of what it loads does not depend on both indices.  For x the
+// two face fluxes are indexed by m (the tile row) and the four lift
+// coefficients by n (the tile column); for y and z it is the other way round.
+// Written flat the compiler reloaded them for every tile -- 112 LDG for the
+// sixteen output pairs of one warp at DIR=0.  Hoisting the m-side into
+// registers and lifting the n-side out of the inner loop leaves only Escale,
+// dqdt and the store inside, and the lift coefficients arrive as double2
+// because the node pair a lane owns is adjacent in n.  That is 112 -> 32 LDG
+// at DIR=0 and 96 -> 48 at DIR=1/2, worth 8.7% of the kernel; an ablation that
+// strips the epilogue to a bare store prices what is left at 9.7%, which is
+// the Escale and dqdt traffic the numerical contract requires.
+template <int DIR, int BM, int BN, int TM, int TN>
+__device__ __forceinline__ void p255_epilogue(
+    double *dqdt, const double *Lift1D, const double *flux_bnd,
+    const double *Escale, const double *acc, int m0, int n0, int wm, int wn,
+    int row, int colk, int eo, int efo, int npoint, int plane_off, int kplane)
+{
+  const int NQ = NQ255;
+  const int NQ2 = NQ * NQ;
+
+  // Per-row (m) quantities: the two face flux values for x, the two lift
+  // coefficients for y and z.
+  double ra[TM], rb2[TM];
+#pragma unroll
+  for (int a = 0; a < TM; ++a) {
+    const int m = m0 + 8 * (TM * wm + a) + row;
+    if (DIR == 0) {
+      const int fp = m + NQ * kplane;
+      ra[a] = flux_bnd[efo + NQ2 + fp];
+      rb2[a] = flux_bnd[efo + 3 * NQ2 + fp];
+    } else if (DIR == 1) {
+      ra[a] = Lift1D[m];
+      rb2[a] = Lift1D[m + 2 * NQ];
+    } else {
+      ra[a] = Lift1D[m + 4 * NQ];
+      rb2[a] = Lift1D[m + 5 * NQ];
+    }
+  }
+
+#pragma unroll
+  for (int bb = 0; bb < TN; ++bb) {
+    const int n = n0 + 8 * (TN * wn + bb) + 2 * colk;
+    // Per-column (n) quantities: the lift coefficient pairs for x, the face
+    // flux pairs for y and z.  Both are adjacent in n, hence double2.
+    double2 c0n, c1n;
+    if (DIR == 0) {
+      c0n = *reinterpret_cast<const double2 *>(Lift1D + n + NQ);
+      c1n = *reinterpret_cast<const double2 *>(Lift1D + n + 3 * NQ);
+    } else if (DIR == 1) {
+      const int fp = n + NQ * kplane;
+      c0n = *reinterpret_cast<const double2 *>(flux_bnd + efo + fp);
+      c1n = *reinterpret_cast<const double2 *>(flux_bnd + efo + 2 * NQ2 + fp);
+    } else {
+      c0n = *reinterpret_cast<const double2 *>(flux_bnd + efo + 4 * NQ2 + n);
+      c1n = *reinterpret_cast<const double2 *>(flux_bnd + efo + 5 * NQ2 + n);
+    }
+#pragma unroll
+    for (int a = 0; a < TM; ++a) {
+      const int e8 = TN * a + bb;
+      const int m = m0 + 8 * (TM * wm + a) + row;
+      const double c0 = acc[2 * e8];
+      const double c1 = acc[2 * e8 + 1];
+      const int node =
+          (DIR == 2) ? (eo + n + NQ2 * m) : (eo + n + NQ * m + plane_off);
+      if (DIR == 0) {
+        // Faces 2 and 4 vary in (j,k), so the node pair shares the flux value
+        // and differs only through the Lift1D coefficient, which varies in i.
+        const double2 es = *reinterpret_cast<const double2 *>(Escale + node);
+        const double l0 = c0n.x * ra[a] + c1n.x * rb2[a];
+        const double l1 = c0n.y * ra[a] + c1n.y * rb2[a];
+        *reinterpret_cast<double2 *>(dqdt + node) =
+            make_double2(-(es.x * c0 + l0), -(es.y * c1 + l1));
+      } else {
+        // Faces 1 and 3 vary in (i,k) and faces 5 and 6 in the linear (i,j)
+        // point: here the pair shares the coefficient and the two flux values
+        // are one aligned double2.
+        const double2 es = *reinterpret_cast<const double2 *>(
+            Escale + node + (DIR == 1 ? npoint : 2 * npoint));
+        double2 out = *reinterpret_cast<const double2 *>(dqdt + node);
+        out.x -= es.x * c0 + ra[a] * c0n.x + rb2[a] * c1n.x;
+        out.y -= es.y * c1 + ra[a] * c0n.y + rb2[a] * c1n.y;
+        *reinterpret_cast<double2 *>(dqdt + node) = out;
+      }
+    }
+  }
+}
+
 // DIR: 0 = x, 1 = y, 2 = z.
+//
+// The chunk loop is double buffered:
+//
+//   issue(k+1) -> mma(buf) -> store(buf^1) -> barrier
+//
+// One barrier per chunk instead of two, and the next chunk's global loads are
+// in flight across the whole mma loop.  The loaded values stay raw in
+// registers and the q*vel multiply happens at the store, because multiplying
+// at issue time would make the pipeline wait on the loads exactly where it is
+// trying not to.  Against the single-buffered loop this is worth 27.8% here,
+// and it is what makes the 4x4 warp shape usable at all.
+//
+// Measured and rejected (reports/p255_gap_study.md):
+//   - moving the barrier to the head of the body, which is what won at p=63
+//     and p=127: +10.7% here, because with sixteen chunks the barrier saved is
+//     one of many while the guard is a branch in every iteration;
+//   - hoisting the staging addresses out of the chunk loop (the shared
+//     destinations do not move and the global sources are affine in the chunk
+//     index): -34% instructions in the loop body, +2.5% time;
+//   - bigger tiles (64x128, 128x64, 128x128) in every thread-count and
+//     launch-bound combination that fits: 10-35% slower, all of them through
+//     registers and occupancy, never through the operand traffic they save.
 template <int DIR>
-// The p=127 and p=63 kernels moved this loop's barrier to the head of the
-// body, which removes the one that would otherwise run after the last chunk.
-// Measured here too and it loses: 1487.4 -> 1647.2 us/stage (+10.7%).  With
-// NQ/BK255 chunks the saving is one barrier out of many, while the guard adds
-// a branch to every iteration; the p=127 win came from 2 chunks and the p=63
-// one from a single chunk, where the removed barrier is half or all of them.
-__global__ __launch_bounds__(256, 4) void tendency_p255_tc_kernel(
+__global__ __launch_bounds__(TH255, MINB255) void tendency_p255_tc_kernel(
     double *dqdt, const double *q, const double *velocity, const double *D1D,
     const double *Lift1D, const double *flux_bnd, const double *Escale, int Ne)
 {
-  __shared__ __align__(16) double sA[BM255 * BK255];
-  __shared__ __align__(16) double sB[BN255 * BK255];
+  constexpr int BM = BM255;
+  constexpr int BN = BN255;
+  constexpr int BK = BK255;
+  constexpr int TM = TM255;
+  constexpr int TN = TN255;
+  constexpr int THREADS = TH255;
+  constexpr int WM = BM / (8 * TM);
+  constexpr int WN = BN / (8 * TN);
+  // Staging iterations per thread.  Each one moves a double2, so the pair a
+  // thread holds is adjacent in whichever index runs fastest in global and the
+  // wavefront stays fully coalesced with half the addresses formed.
+  constexpr int NA = (BM * BK) / THREADS;
+  constexpr int NB = (BN * BK) / THREADS;
+  static_assert(THREADS == 32 * WM * WN, "warp grid must tile the block");
+  static_assert(NA % 2 == 0 && NB % 2 == 0, "staging is vectorized");
+
+  __shared__ __align__(16) double sA[2][BM * BK];
+  __shared__ __align__(16) double sB[2][BN * BK];
 
   const int NQ = NQ255;
   const int NP = NQ * NQ * NQ;
   const int NQ2 = NQ * NQ;
-  // x and y: (Nq/64) m-tiles * (Nq/64) n-tiles * Nq planes.
-  // z:       (Nq/64) m-tiles * (Nq^2/64) n-tiles, no plane loop.  Both are
-  // 4096, so the grid is the same shape for all three.
-  const int blocks_per_elem = 4096;
+  // x and y: (Nq/BM) m-tiles * (Nq/BN) n-tiles * Nq planes.
+  // z:       (Nq/BM) m-tiles * (Nq^2/BN) n-tiles, no plane loop.  Both are
+  // Nq^3/(BM*BN), so the grid is the same shape for all three.
+  const int blocks_per_elem = (NQ / BM) * (NQ2 / BN);
 
   const int elem = (int)blockIdx.x / blocks_per_elem;
   if (elem >= Ne) {
     return;
   }
   const int b = (int)blockIdx.x - elem * blocks_per_elem;
-  int tm, tn, kplane;
-  if (DIR == 2) {
-    tm = b & 3;
-    tn = b >> 2;
-    kplane = 0;
-  } else {
-    tm = b & 3;
-    tn = (b >> 2) & 3;
-    kplane = b >> 4;
-  }
-  const int m0 = tm * BM255;
-  const int n0 = tn * BN255;
+  constexpr int MTILES = NQ255 / BM;
+  constexpr int NTILES = (DIR == 2) ? (NQ255 * NQ255 / BN) : (NQ255 / BN);
+  const int tm = b % MTILES;
+  const int tn = (b / MTILES) % NTILES;
+  const int kplane = (DIR == 2) ? 0 : (b / MTILES) / NTILES;
+  const int m0 = tm * BM;
+  const int n0 = tn * BN;
 
   const int tid = (int)threadIdx.x;
   const int lane = tid & 31;
@@ -445,138 +568,184 @@ __global__ __launch_bounds__(256, 4) void tendency_p255_tc_kernel(
   const int npoint = NP * Ne;
   const int plane_off = kplane * NQ2;
 
-  // Eight 8x8 output tiles per warp, arranged 2 rows by 4 columns rather than
-  // 1 by 8.  Both shapes hold eight accumulator pairs, but 2x4 needs 2 + 4 = 6
-  // operand loads per k-step where 1x8 needs 1 + 8 = 9, so the same registers
-  // buy a third fewer shared loads.  The warp grid is 4 (rows) by 2 (columns).
-  const int wm = warp & 3;
-  const int wn = warp >> 2;
-  double acc[16];
+  const int wm = warp % WM;
+  const int wn = warp / WM;
+  // Which half of the vectorized pair a lane stores first.  The two elements a
+  // lane holds in an outer-fast panel are o and o+1, and c(o+1) = c(o) ^ 4 in
+  // the swizzle, so if every lane stored its even element first the sixteen
+  // lanes of a half warp would reach only eight banks -- the 2-way store
+  // conflict ncu found once the staging was vectorized (8.45 M conflicts on
+  // 16.8 M store wavefronts).  Letting the upper eight lanes of each half warp
+  // store their odd element first makes both store instructions cover all
+  // sixteen banks.  Worth 0.9%.
+  const bool pswap = (lane & 8) != 0;
+
+  double acc[2 * TM * TN];
 #pragma unroll
-  for (int i = 0; i < 16; ++i) {
+  for (int i = 0; i < 2 * TM * TN; ++i) {
     acc[i] = 0.0;
   }
 
-  for (int kk = 0; kk < NQ; kk += BK255) {
-    //- stage A --------------------------------------------------------
-    if (DIR == 0) {
-      // q*u at (l, j, k): l-fast in global, so lanes walk l.
-#pragma unroll
-      for (int p = 0; p < 4; ++p) {
-        const int ll = tid & 15;
-        const int o = (tid >> 4) + 16 * p;
-        const int g = eo + (kk + ll) + NQ * (m0 + o) + plane_off;
-        sA[sw255(ll + 16 * o)] = q[g] * velocity[g];
-      }
-    } else {
-      // D1D(m, l): m-fast in global, so lanes walk m.
-#pragma unroll
-      for (int p = 0; p < 4; ++p) {
-        const int o = tid & 63;
-        const int ll = (tid >> 6) + 4 * p;
-        sA[sw255(ll + 16 * o)] = D1D[(m0 + o) + NQ * (kk + ll)];
-      }
-    }
-    //- stage B --------------------------------------------------------
-#pragma unroll
-    for (int p = 0; p < 4; ++p) {
-      const int o = tid & 63;
-      const int ll = (tid >> 6) + 4 * p;
-      double val;
-      if (DIR == 0) {
-        val = D1D[(n0 + o) + NQ * (kk + ll)];
-      } else if (DIR == 1) {
-        const int g = eo + (n0 + o) + NQ * (kk + ll) + plane_off;
-        val = q[g] * velocity[g];
-      } else {
-        const int g = eo + (n0 + o) + NQ2 * (kk + ll);
-        val = q[g] * velocity[g];
-      }
-      sB[sw255(ll + 16 * o)] = val;
-    }
-    __syncthreads();
+  // Prefetch registers.  The panel that is a flux needs q and the velocity
+  // held separately until the store; the panel that is D1D needs one value.
+  double raq[NA], rav[NA], rb[NB], rbv[NB];
 
+  // Hoisted shared addresses for the mma loop.  sw255 only ever touches the
+  // low four bits of the index, so with l = 4*ks + colk and outer = 8*t + row
+  //
+  //   sw255(l + 16*outer) = 16*outer + (colk ^ c) + ((4*ks) ^ ((row & 3) << 2))
+  //
+  // where c = (2*t + (row >> 2)) & 3: the three fields land in disjoint bits,
+  // colk in 0-1, 4*ks in 2-3, 16*outer above.  Both terms are loop invariant.
+  // Worth 1.7% -- but only once the loop was pipelined; on the single-buffered
+  // loop the same change cost 4.6%, which is the clearest evidence here that
+  // this kernel is not bound by instruction issue.
+  int abase[TM], bbase[TN], koff[BK / 4];
 #pragma unroll
-    for (int ks = 0; ks < BK255 / 4; ++ks) {
-      const int l = 4 * ks + colk;
-      double av[2], bv[4];
+  for (int a = 0; a < TM; ++a) {
+    const int t = TM * wm + a;
+    abase[a] = 16 * (8 * t + row) + (colk ^ ((2 * t + (row >> 2)) & 3));
+  }
 #pragma unroll
-      for (int a = 0; a < 2; ++a) {
-        av[a] = sA[sw255(l + 16 * (8 * (2 * wm + a) + row))];
+  for (int bb = 0; bb < TN; ++bb) {
+    const int t = TN * wn + bb;
+    bbase[bb] = 16 * (8 * t + row) + (colk ^ ((2 * t + (row >> 2)) & 3));
+  }
+#pragma unroll
+  for (int ks = 0; ks < BK / 4; ++ks) {
+    koff[ks] = (4 * ks) ^ ((row & 3) << 2);
+  }
+
+#define P255_ISSUE(KK)                                                        \
+  do {                                                                        \
+    _Pragma("unroll") for (int p = 0; p < NA / 2; ++p)                        \
+    {                                                                         \
+      const int pr = tid + THREADS * p;                                       \
+      if (DIR == 0) {                                                         \
+        const int ll = 2 * (pr % (BK / 2));                                   \
+        const int o = pr / (BK / 2);                                          \
+        const int g = eo + ((KK) + ll) + NQ * (m0 + o) + plane_off;           \
+        const double2 vq = *reinterpret_cast<const double2 *>(q + g);         \
+        const double2 vv = *reinterpret_cast<const double2 *>(velocity + g);  \
+        raq[2 * p] = vq.x;                                                    \
+        raq[2 * p + 1] = vq.y;                                                \
+        rav[2 * p] = vv.x;                                                    \
+        rav[2 * p + 1] = vv.y;                                                \
+      } else {                                                                \
+        const int o = 2 * (pr % (BM / 2));                                    \
+        const int ll = pr / (BM / 2);                                         \
+        const double2 vd = *reinterpret_cast<const double2 *>(                \
+            D1D + (m0 + o) + NQ * ((KK) + ll));                               \
+        raq[2 * p] = vd.x;                                                    \
+        raq[2 * p + 1] = vd.y;                                                \
+      }                                                                       \
+    }                                                                         \
+    _Pragma("unroll") for (int p = 0; p < NB / 2; ++p)                        \
+    {                                                                         \
+      const int pr = tid + THREADS * p;                                       \
+      const int o = 2 * (pr % (BN / 2));                                      \
+      const int ll = pr / (BN / 2);                                           \
+      if (DIR == 0) {                                                         \
+        const double2 vd = *reinterpret_cast<const double2 *>(                \
+            D1D + (n0 + o) + NQ * ((KK) + ll));                               \
+        rb[2 * p] = vd.x;                                                     \
+        rb[2 * p + 1] = vd.y;                                                 \
+      } else {                                                                \
+        const int g = (DIR == 1)                                              \
+                          ? eo + (n0 + o) + NQ * ((KK) + ll) + plane_off      \
+                          : eo + (n0 + o) + NQ2 * ((KK) + ll);                \
+        const double2 vq = *reinterpret_cast<const double2 *>(q + g);         \
+        const double2 vv = *reinterpret_cast<const double2 *>(velocity + g);  \
+        rb[2 * p] = vq.x;                                                     \
+        rb[2 * p + 1] = vq.y;                                                 \
+        rbv[2 * p] = vv.x;                                                    \
+        rbv[2 * p + 1] = vv.y;                                                \
+      }                                                                       \
+    }                                                                         \
+  } while (0)
+
+#define P255_STORE(BUF)                                                       \
+  do {                                                                        \
+    _Pragma("unroll") for (int p = 0; p < NA / 2; ++p)                        \
+    {                                                                         \
+      const int pr = tid + THREADS * p;                                       \
+      if (DIR == 0) {                                                         \
+        /* An adjacent l pair stays adjacent in shared under sw255, so it      \
+           goes out as one 16-byte store; the xor may swap the two halves. */ \
+        const int ll = 2 * (pr % (BK / 2));                                   \
+        const int o = pr / (BK / 2);                                          \
+        const int i0 = sw255(ll + 16 * o);                                    \
+        const double v0 = raq[2 * p] * rav[2 * p];                            \
+        const double v1 = raq[2 * p + 1] * rav[2 * p + 1];                    \
+        *reinterpret_cast<double2 *>(&sA[BUF][i0 & ~1]) =                     \
+            (i0 & 1) ? make_double2(v1, v0) : make_double2(v0, v1);           \
+      } else {                                                                \
+        const int o = 2 * (pr % (BM / 2));                                    \
+        const int ll = pr / (BM / 2);                                         \
+        const int i0 = sw255(ll + 16 * o);                                    \
+        const int i1 = sw255(ll + 16 * (o + 1));                              \
+        sA[BUF][pswap ? i1 : i0] = pswap ? raq[2 * p + 1] : raq[2 * p];       \
+        sA[BUF][pswap ? i0 : i1] = pswap ? raq[2 * p] : raq[2 * p + 1];       \
+      }                                                                       \
+    }                                                                         \
+    _Pragma("unroll") for (int p = 0; p < NB / 2; ++p)                        \
+    {                                                                         \
+      const int pr = tid + THREADS * p;                                       \
+      const int o = 2 * (pr % (BN / 2));                                      \
+      const int ll = pr / (BN / 2);                                           \
+      const double w0 = (DIR == 0) ? rb[2 * p] : rb[2 * p] * rbv[2 * p];      \
+      const double w1 =                                                       \
+          (DIR == 0) ? rb[2 * p + 1] : rb[2 * p + 1] * rbv[2 * p + 1];        \
+      const int j0 = sw255(ll + 16 * o);                                      \
+      const int j1 = sw255(ll + 16 * (o + 1));                                \
+      sB[BUF][pswap ? j1 : j0] = pswap ? w1 : w0;                             \
+      sB[BUF][pswap ? j0 : j1] = pswap ? w0 : w1;                             \
+    }                                                                         \
+  } while (0)
+
+  P255_ISSUE(0);
+  P255_STORE(0);
+  __syncthreads();
+
+  int cur = 0;
+  for (int kk = 0; kk < NQ; kk += BK) {
+    const bool more = (kk + BK) < NQ;
+    if (more) {
+      P255_ISSUE(kk + BK);
+    }
+#pragma unroll
+    for (int ks = 0; ks < BK / 4; ++ks) {
+      double av[TM], bv[TN];
+#pragma unroll
+      for (int a = 0; a < TM; ++a) {
+        av[a] = sA[cur][abase[a] + koff[ks]];
       }
 #pragma unroll
-      for (int bb = 0; bb < 4; ++bb) {
-        bv[bb] = sB[sw255(l + 16 * (8 * (4 * wn + bb) + row))];
+      for (int bb = 0; bb < TN; ++bb) {
+        bv[bb] = sB[cur][bbase[bb] + koff[ks]];
       }
 #pragma unroll
-      for (int a = 0; a < 2; ++a) {
+      for (int a = 0; a < TM; ++a) {
 #pragma unroll
-        for (int bb = 0; bb < 4; ++bb) {
-          const int e = 2 * (4 * a + bb);
+        for (int bb = 0; bb < TN; ++bb) {
+          const int e = 2 * (TN * a + bb);
           mma_m8n8k4_f64(acc[e], acc[e + 1], av[a], bv[bb], acc[e],
                          acc[e + 1]);
         }
       }
     }
-    __syncthreads();
-  }
-
-  //- epilogue ---------------------------------------------------------
-#pragma unroll
-  for (int e8 = 0; e8 < 8; ++e8) {
-    const int a = e8 >> 2;
-    const int bb = e8 & 3;
-    const int m = m0 + 8 * (2 * wm + a) + row;
-    const int n = n0 + 8 * (4 * wn + bb) + 2 * colk;
-    const double c0 = acc[2 * e8];
-    const double c1 = acc[2 * e8 + 1];
-    if (DIR == 0) {
-      // Faces 2 and 4 vary in (j,k), so the node pair shares the flux value
-      // and differs only through the Lift1D coefficient, which varies in i.
-      const int node = eo + n + NQ * m + plane_off;
-      const int fp = m + NQ * kplane;
-      const double fb2 = flux_bnd[efo + NQ2 + fp];
-      const double fb4 = flux_bnd[efo + 3 * NQ2 + fp];
-      const double2 es = *reinterpret_cast<const double2 *>(Escale + node);
-      const double l0 = Lift1D[n + NQ] * fb2 + Lift1D[n + 3 * NQ] * fb4;
-      const double l1 =
-          Lift1D[n + 1 + NQ] * fb2 + Lift1D[n + 1 + 3 * NQ] * fb4;
-      *reinterpret_cast<double2 *>(dqdt + node) =
-          make_double2(-(es.x * c0 + l0), -(es.y * c1 + l1));
-    } else if (DIR == 1) {
-      // Faces 1 and 3 vary in (i,k): here the pair shares the coefficient and
-      // the two flux values are one aligned double2.
-      const int node = eo + n + NQ * m + plane_off;
-      const int fp = n + NQ * kplane;
-      const double2 fb1 = *reinterpret_cast<const double2 *>(flux_bnd + efo + fp);
-      const double2 fb3 =
-          *reinterpret_cast<const double2 *>(flux_bnd + efo + 2 * NQ2 + fp);
-      const double2 es =
-          *reinterpret_cast<const double2 *>(Escale + node + npoint);
-      const double lc1 = Lift1D[m];
-      const double lc3 = Lift1D[m + 2 * NQ];
-      double2 out = *reinterpret_cast<const double2 *>(dqdt + node);
-      out.x -= es.x * c0 + lc1 * fb1.x + lc3 * fb3.x;
-      out.y -= es.y * c1 + lc1 * fb1.y + lc3 * fb3.y;
-      *reinterpret_cast<double2 *>(dqdt + node) = out;
-    } else {
-      // Faces 5 and 6 are indexed by the linear (i,j) point, which is exactly
-      // the n index here.
-      const int node = eo + n + NQ2 * m;
-      const double2 fb5 =
-          *reinterpret_cast<const double2 *>(flux_bnd + efo + 4 * NQ2 + n);
-      const double2 fb6 =
-          *reinterpret_cast<const double2 *>(flux_bnd + efo + 5 * NQ2 + n);
-      const double2 es =
-          *reinterpret_cast<const double2 *>(Escale + node + 2 * npoint);
-      const double lc5 = Lift1D[m + 4 * NQ];
-      const double lc6 = Lift1D[m + 5 * NQ];
-      double2 out = *reinterpret_cast<const double2 *>(dqdt + node);
-      out.x -= es.x * c0 + lc5 * fb5.x + lc6 * fb6.x;
-      out.y -= es.y * c1 + lc5 * fb5.y + lc6 * fb6.y;
-      *reinterpret_cast<double2 *>(dqdt + node) = out;
+    if (more) {
+      P255_STORE(cur ^ 1);
+      __syncthreads();
+      cur ^= 1;
     }
   }
+#undef P255_ISSUE
+#undef P255_STORE
+
+  p255_epilogue<DIR, BM, BN, TM, TN>(dqdt, Lift1D, flux_bnd, Escale, acc, m0,
+                                     n0, wm, wn, row, colk, eo, efo, npoint,
+                                     plane_off, kplane);
 }
 
 static void check_cuda(const char *what)
@@ -610,17 +779,18 @@ extern "C" void launch_tendency_fused_p7_tc(
   check_cuda("tendency_fused_p7_tc_kernel");
 }
 
+
 extern "C" void launch_tendency_xyz_p255_tc(
     double *dqdt, const double *q, const double *u, const double *v,
     const double *w, const double *D1D, const double *Lift1D,
     const double *flux_bnd, const double *Escale, int Ne)
 {
-  const int nblock = 4096 * Ne;
-  tendency_p255_tc_kernel<0><<<nblock, 256, 0, dg_cuda_stream>>>(
+  const int nblock = (NQ255 * NQ255 * NQ255 / (BM255 * BN255)) * Ne;
+  tendency_p255_tc_kernel<0><<<nblock, TH255, 0, dg_cuda_stream>>>(
       dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, Ne);
-  tendency_p255_tc_kernel<1><<<nblock, 256, 0, dg_cuda_stream>>>(
+  tendency_p255_tc_kernel<1><<<nblock, TH255, 0, dg_cuda_stream>>>(
       dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, Ne);
-  tendency_p255_tc_kernel<2><<<nblock, 256, 0, dg_cuda_stream>>>(
+  tendency_p255_tc_kernel<2><<<nblock, TH255, 0, dg_cuda_stream>>>(
       dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, Ne);
   check_cuda("p255 tensor-core tendency kernels");
 }
