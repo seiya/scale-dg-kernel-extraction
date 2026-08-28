@@ -1313,7 +1313,7 @@ contains
 
     if (.not. use_side) then
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     end if
 
     call launch_volume_flux( &
@@ -1322,7 +1322,7 @@ contains
     if (use_side) then
       call dg_side_fork()
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     end if
 
     istat = ozaki2_dgemm(0, 0, Nq, nq2*Ne, Nq, D1D, Nq, flux_x, Nq, deriv_x, Nq)
@@ -1435,7 +1435,7 @@ contains
 
     if (.not. use_side) then
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     end if
 
     call launch_volume_flux( &
@@ -1444,7 +1444,7 @@ contains
     if (use_side) then
       call dg_side_fork()
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     end if
 
     istat = ozaki1_dgemm(0, 0, Nq, nq2*Ne, Nq, D1D, Nq, flux_x, Nq, deriv_x, Nq)
