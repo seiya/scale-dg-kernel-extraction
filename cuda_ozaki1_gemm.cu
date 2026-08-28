@@ -41,6 +41,7 @@ struct Ozaki1Workspace {
   int max_m = 0;
   long long mn = 0;
   int max_batch = 0;
+  long long scale_a_plane = 0;
   signed char *iA = nullptr;
   signed char *iB = nullptr;
   double *scale_a = nullptr;
@@ -421,7 +422,7 @@ static int decompose_a_tn(const double *A, int m, int k, int lda, int batch,
   int used = 0;
   for (int si = 0; si < g_state.slice_count; ++si) {
     double *sc =
-        g_ws.scale_a + static_cast<long long>(si) * g_ws.max_m * g_ws.max_batch;
+        g_ws.scale_a + static_cast<long long>(si) * g_ws.scale_a_plane;
     signed char *pack = g_ws.iA + static_cast<long long>(si) * plane * batch;
     if (batch == 1 && stride == 0) {
       const int row_blocks = (m + 255) / 256;
@@ -538,7 +539,7 @@ static int run_slice_pairs(int m, int n, int k, double *C, int ldc, int sa, int 
           g_ws.iA + static_cast<long long>(si) * plane_a * batch;
       const signed char *iBp = g_ws.iB + static_cast<long long>(sj) * plane_b;
       const double *scA = g_ws.scale_a +
-                          static_cast<long long>(si) * g_ws.max_m * g_ws.max_batch;
+                          static_cast<long long>(si) * g_ws.scale_a_plane;
       const double *scB = g_ws.scale_b + static_cast<long long>(sj) * n;
 
       if (!batched) {
@@ -687,19 +688,20 @@ extern "C" int ozaki1_alloc_workspace(int Nq, int Ne, int Np)
   g_ws.max_m = Nq * Nq;
   g_ws.mn = static_cast<long long>(Np) * Ne;
   g_ws.max_batch = std::max(Nq * Ne, Ne);
+  g_ws.scale_a_plane =
+      static_cast<long long>(g_ws.max_m) * static_cast<long long>(Ne);
 
   const long long k_rows = static_cast<long long>(Nq) * Nq;
   const long long mn = g_ws.mn;
   const int slices = g_state.slice_count;
   const int max_batch = g_ws.max_batch;
-  const int max_m = g_ws.max_m;
 
   const size_t iA_bytes =
       static_cast<size_t>(slices) * k_rows * static_cast<size_t>(max_batch);
   const size_t iB_bytes = static_cast<size_t>(slices) * static_cast<size_t>(mn);
   const size_t scale_a_bytes = static_cast<size_t>(slices) *
-                               static_cast<size_t>(max_m) *
-                               static_cast<size_t>(max_batch) * sizeof(double);
+                               static_cast<size_t>(g_ws.scale_a_plane) *
+                               sizeof(double);
   const size_t scale_b_bytes =
       static_cast<size_t>(slices) * static_cast<size_t>(mn) * sizeof(double);
   const size_t prod_bytes = static_cast<size_t>(mn) * sizeof(int);
@@ -721,8 +723,9 @@ extern "C" int ozaki1_alloc_workspace(int Nq, int Ne, int Np)
   err = check_cuda(cudaMalloc(&g_ws.res_b, res_bytes), "malloc res_b");
   if (err) return err;
 
-  std::printf("ozaki1 workspace: Nq=%d Ne=%d Np=%d slices=%d iB=%.1f MB\n", Nq, Ne,
-              Np, slices, iB_bytes / 1.0e6);
+  std::printf(
+      "ozaki1 workspace: Nq=%d Ne=%d Np=%d slices=%d iB=%.1f MB scale_a=%.1f MB\n",
+      Nq, Ne, Np, slices, iB_bytes / 1.0e6, scale_a_bytes / 1.0e6);
   return 0;
 }
 
