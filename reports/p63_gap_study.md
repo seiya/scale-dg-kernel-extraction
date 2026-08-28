@@ -1683,3 +1683,17 @@ M 側と P 側で 2 回読まれるので、L2 ヒット 14.3% を見て「そ�
 残るコストは **M 側の飛び方そのもの**で、これは
 「i 平面に連続方向が無い」（20.4）ことの帰結である。**shared も TMA も、
 再利用が無いところでは何も減らせない。**
+
+## 21. Ozaki Scheme I / II（2026-08-28 追記）
+
+同一 DOF（`Ne=4³`）で `CUDAFORTRAN_GEMM` を基準に Ozaki 比較経路を計測。
+commit `38952e4`、`nstep=100`、`WarmupStep=1`、
+`OzakiSliceCount=8` / `OzakiModuliCount=14`、GB200 login ノード。
+
+| 経路 | µs/stage | native GEMM 比 |
+|---|---:|---:|
+| `CUDAFORTRAN_GEMM` | **1843** | 1.00 |
+| `CUDAFORTRAN_GEMM_OZAKI1` | **7990** | **4.3×** |
+| `CUDAFORTRAN_GEMM_OZAKI2` | **38.6 ms** | **21.0×** |
+
+最速は `FUSED_TC`（477.2 µs/stage）のまま。

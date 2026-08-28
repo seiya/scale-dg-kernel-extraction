@@ -209,3 +209,21 @@ assemblyを既に融合済みだったため、未使用`surface_lift`を除い�
 出力を`dqdt`へ直接置き、assemblyが同じ場所を読んで上書きすることで`deriv_z`も
 除いた。p=511では各1 GiB、計2 GiBのdevice allocation削減である。演算順と定常時の
 write/read回数は変わらず、p=1023の全点比較とp=511点変化smoke testで確認した。
+
+## 8. Ozaki Scheme I / II（2026-08-28 追記）
+
+`mod_advect3d_eq.f90` の p=511 ゲートに `CUDAFORTRAN_GEMM_OZAKI1/2` を追加し、
+同一 DOF（`Ne=1`）で `CUDAFORTRAN_GEMM` を基準に計測。commit `38952e4`、
+`nstep=20`、`WarmupStep=2`（§6 と同条件）、
+`OzakiSliceCount=8` / `OzakiModuliCount=14`、GB200 login ノード。
+
+| 経路 | µs/stage | native GEMM 比 |
+|---|---:|---:|
+| `CUDAFORTRAN_GEMM` | **40.0 ms** | 1.00 |
+| `CUDAFORTRAN_GEMM_OZAKI1` | **45.7 ms** | **1.14×** |
+| `CUDAFORTRAN_GEMM_OZAKI2` | **124.7 ms** | **3.1×** |
+
+[`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md) の成立条件
+（演算強度 ≳ 3.82 FLOP/byte、p ≳ 500–650）に p=511 が近づき、
+**Scheme I が native volume GEMM に 1.14 倍**まで縮む。最速は `GEMM_FUSED`
+（13.2 ms/stage）のまま。

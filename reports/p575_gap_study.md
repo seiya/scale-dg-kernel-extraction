@@ -166,3 +166,18 @@ lift、assembly も含まれる。
   host-side境界は対処済みだが、残る32-bit device添字とメモリ容量を別途検証する必要がある。
 
 上記p=1023の残課題は`p1023_gap_study.md`で解決し、両GEMM経路を実機検証した。
+
+## 8. Ozaki Scheme I / II（2026-08-28 追記）
+
+p=511 と同様に Ozaki 経路を開放し、同一 DOF（`Ne=1`）で計測。
+commit `38952e4`、`nstep=20`、`WarmupStep=2`、
+`OzakiSliceCount=8` / `OzakiModuliCount=14`、GB200 login ノード。
+
+| 経路 | µs/stage | native GEMM 比 |
+|---|---:|---:|
+| `CUDAFORTRAN_GEMM` | **63.1 ms** | 1.00 |
+| `CUDAFORTRAN_GEMM_OZAKI1` | **65.8 ms** | **1.04×** |
+| `CUDAFORTRAN_GEMM_OZAKI2` | **182.4 ms** | **2.9×** |
+
+Scheme I は native GEMM と **実質互角**（1.04×）。最速は `GEMM_FUSED`
+（20.5 ms/stage）のまま。

@@ -613,3 +613,18 @@ shared 往復の後ろへ回す、epilogue のアクセスを 16 バイトにす
 命令数だけでなく「どのカーネルがどの体積テンソルを読むか」という配分にも
 余地がある**という点である。詳細と p=127 でのアブレーションは
 `p127_gap_study.md` §13。
+
+## 11. Ozaki Scheme I / II（2026-08-28 追記）
+
+同一 DOF（`Ne=1`）で `CUDAFORTRAN_GEMM` を基準に Ozaki 比較経路を計測。
+commit `38952e4`、`nstep=100`、`WarmupStep=1`、
+`OzakiSliceCount=8` / `OzakiModuliCount=14`、GB200 login ノード。
+
+| 経路 | µs/stage | native GEMM 比 |
+|---|---:|---:|
+| `CUDAFORTRAN_GEMM` | **3189** | 1.00 |
+| `CUDAFORTRAN_GEMM_OZAKI1` | **7020** | **2.2×** |
+| `CUDAFORTRAN_GEMM_OZAKI2` | **19.5 ms** | **6.1×** |
+
+[`ozaki2_implementation_report.md`](ozaki2_implementation_report.md) の p=255 単発
+測定（OZAKI2 **2.25×**）と整合。最速は `FUSED_TC`（1014 µs/stage）のまま。

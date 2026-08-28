@@ -252,3 +252,20 @@ flux、全6面のnumerical flux、lift、assemblyも含まれる。
 - 両経路の主要device配列は144 GiBである。
 - 点変化係数を含む全2^30点の`dqdt`は丸め誤差範囲で一致した。
 - p=1023でも最速は`CUDAFORTRAN_GEMM_FUSED`で、device時間の優位は3.32%だった。
+
+## 8. Ozaki Scheme I / II（2026-08-28 追記）
+
+p=511 以降のゲート拡張後、同一 DOF（`Ne=1`）で Ozaki 経路を試した。
+commit `38952e4`、`nstep=20`、`WarmupStep=2`、
+`OzakiSliceCount=8` / `OzakiModuliCount=14`、GB200 login ノード。
+
+| 経路 | µs/stage | 結果 |
+|---|---:|---|
+| `CUDAFORTRAN_GEMM` | **575.5 ms** | 成功 |
+| `CUDAFORTRAN_GEMM_OZAKI1` | — | **OOM**（`cuMemAlloc`、workspace 確保時） |
+| `CUDAFORTRAN_GEMM_OZAKI2` | — | **OOM**（同上） |
+
+p=767 では Scheme I が native を上回ったが、p=1023 では Ozaki workspace
+（`iB` / `scale_a` / OZAKI2 residue 等）が **144 GiB payload に上乗せ**され、
+189 GiB GPU で setup 中に OOM となる。`OzakiSliceCount` / `OzakiModuliCount`
+の削減、または workspace 分割は未実施。

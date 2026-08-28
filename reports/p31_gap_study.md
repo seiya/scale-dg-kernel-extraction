@@ -749,3 +749,17 @@ Nq が倍になると差も 4 倍前後になり、`Ne` とともに増えるの
   どちらも 1 である。`p15_gap_study.md` §11 は占有率を上げる価値が −0.8% だと
   測っているが、それは 49% → 97% の話で、25% → 50% は射程外である。
 - y カーネルは DRAM 64.3% で屋根に近い。ここは伸びしろが小さい。
+
+## 15. Ozaki Scheme I / II（2026-08-28 追記）
+
+同一 DOF（`Ne=8³`）で `CUDAFORTRAN_GEMM` を基準に Ozaki 比較経路を計測。
+commit `38952e4`、`NeX/Y/Z=8`、`nstep=100`、`WarmupStep=1`、
+`OzakiSliceCount=8` / `OzakiModuliCount=14`、GB200 login ノード。
+
+| 経路 | µs/stage | native GEMM 比 |
+|---|---:|---:|
+| `CUDAFORTRAN_GEMM` | **1887** | 1.00 |
+| `CUDAFORTRAN_GEMM_OZAKI1` | **18.2 ms** | **9.6×** |
+| `CUDAFORTRAN_GEMM_OZAKI2` | **40.7 ms** | **21.6×** |
+
+最速は `FUSED_TC`（374.8 µs/stage）のまま。Ozaki は参考比較のみ。

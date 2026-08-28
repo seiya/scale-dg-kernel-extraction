@@ -1112,3 +1112,28 @@ p=15 以外は `__restrict__` 1 行だけの差である。**p=63 の −11.6% �
 
 3 パネル化と M 側常駐は p=15 に固有である: p=31 以上は要素が shared に
 載らないのでパネルを 3 枚持つ前提が無く、p=7 は既に専用バッファを持っている。
+
+## 17. Ozaki Scheme I / II（2026-08-28 追記）
+
+volume 導関数 GEMM を INT8 Tensor Core エミュレーションで置換する比較経路
+（[`ozaki1_implementation_report.md`](ozaki1_implementation_report.md)、
+[`ozaki2_implementation_report.md`](ozaki2_implementation_report.md)）を、
+同一 DOF（`Ne=16³`）・`CUDAFORTRAN_GEMM` 基準で計測した。本節の最速経路
+`FUSED_TC`（272.4 µs/stage）とは別系統の比較である。
+
+| 項目 | 値 |
+|---|---|
+| commit | `38952e4`（gate 拡張含む未コミット差分） |
+| GPU | NVIDIA GB200 `GPU-c2143dd7-8943-be76-38c3-7d7bd71f8c9f` |
+| 入力 | `tmp_ozaki_p15_*.conf`（`NeX/Y/Z=16`, `nstep=100`, `WarmupStep=1`） |
+| Ozaki パラメータ | `OzakiSliceCount=8`（I）、`OzakiModuliCount=14`（II） |
+| CUDA graph | off |
+
+| 経路 | device 合計 / 99 step | µs/stage | native GEMM 比 |
+|---|---:|---:|---:|
+| `CUDAFORTRAN_GEMM` | 248.4 ms | **2508** | 1.00 |
+| `CUDAFORTRAN_GEMM_OZAKI1` | 4367.5 ms | **44.1 ms** | **17.6×** |
+| `CUDAFORTRAN_GEMM_OZAKI2` | 4557.1 ms | **46.0 ms** | **18.3×** |
+
+低次数では s² 本の INT8 GEMM（Scheme I）と CRT オーバーヘッド（Scheme II）が
+支配的で、いずれも本番最速経路としては不採用。

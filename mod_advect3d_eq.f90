@@ -283,8 +283,10 @@ contains
     if ((Np == 512**3 .or. Np == 576**3 .or. Np == 768**3 .or. &
          Np == 1024**3) .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
-        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED) then
-      error stop "PolyOrder=511, 575, 767, or 1023 requires CUDAFORTRAN_GEMM or CUDAFORTRAN_GEMM_FUSED"
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2 .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI1) then
+      error stop "PolyOrder=511, 575, 767, or 1023 requires CUDAFORTRAN_GEMM, CUDAFORTRAN_GEMM_FUSED, CUDAFORTRAN_GEMM_OZAKI2, or CUDAFORTRAN_GEMM_OZAKI1"
     end if
 
     if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &

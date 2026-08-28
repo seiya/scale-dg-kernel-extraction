@@ -1227,3 +1227,19 @@ y GEMM の CTA は `(k, e)` のバッチと `(i, j)` タイルを持つので、
 それだけで **+6 µs**（730.7 → 736.0 µs/stage）かかる。§13.1 のタイムラインで
 `elembnd` が x GEMM の 3.6 µs 後に終わっていたとおりの値である。
 この分割は棄却と一緒に戻した。
+
+## 14. Ozaki Scheme I / II（2026-08-28 追記）
+
+同一 DOF（`Ne=2³`）で `CUDAFORTRAN_GEMM` を基準に Ozaki 比較経路を計測。
+commit `38952e4`、`nstep=100`、`WarmupStep=1`、
+`OzakiSliceCount=8` / `OzakiModuliCount=14`、GB200 login ノード。
+
+| 経路 | µs/stage | native GEMM 比 |
+|---|---:|---:|
+| `CUDAFORTRAN_GEMM` | **2215** | 1.00 |
+| `CUDAFORTRAN_GEMM_OZAKI1` | **6490** | **2.9×** |
+| `CUDAFORTRAN_GEMM_OZAKI2` | **17.9 ms** | **8.1×** |
+
+最速は `GEMM_FUSED`（730.7 µs/stage）のまま。Ozaki II の不利は p=255 向け
+調査（[`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md)）と同方向だが、
+次数を上げるほど比率は縮む。

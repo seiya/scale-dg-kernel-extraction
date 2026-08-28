@@ -167,3 +167,19 @@ lift、assemblyも含まれる。
   残る32-bit device添字とメモリ容量を別途検証する必要がある。
 
 上記p=1023の残課題は`p1023_gap_study.md`で解決し、両GEMM経路を実機検証した。
+
+## 8. Ozaki Scheme I / II（2026-08-28 追記）
+
+p=511 と同様に Ozaki 経路を開放し、同一 DOF（`Ne=1`）で計測。
+commit `38952e4`、`nstep=20`、`WarmupStep=2`、
+`OzakiSliceCount=8` / `OzakiModuliCount=14`、GB200 login ノード。
+
+| 経路 | µs/stage | native GEMM 比 |
+|---|---:|---:|
+| `CUDAFORTRAN_GEMM` | **188.4 ms** | 1.00 |
+| `CUDAFORTRAN_GEMM_OZAKI1` | **160.6 ms** | **0.85×** |
+| `CUDAFORTRAN_GEMM_OZAKI2` | **434.1 ms** | **2.3×** |
+
+**Scheme I が native volume GEMM を上回る最初の次数**（device 160.6 対 188.4 ms/stage）。
+ただし最速は `GEMM_FUSED`（60.4 ms/stage）のままで、Ozaki は volume GEMM 置換の
+参考比較にとどまる。
