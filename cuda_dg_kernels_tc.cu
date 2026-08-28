@@ -395,6 +395,12 @@ __device__ __forceinline__ int sw255(int idx)
 
 // DIR: 0 = x, 1 = y, 2 = z.
 template <int DIR>
+// The p=127 and p=63 kernels moved this loop's barrier to the head of the
+// body, which removes the one that would otherwise run after the last chunk.
+// Measured here too and it loses: 1487.4 -> 1647.2 us/stage (+10.7%).  With
+// NQ/BK255 chunks the saving is one barrier out of many, while the guard adds
+// a branch to every iteration; the p=127 win came from 2 chunks and the p=63
+// one from a single chunk, where the removed barrier is half or all of them.
 __global__ __launch_bounds__(256, 4) void tendency_p255_tc_kernel(
     double *dqdt, const double *q, const double *velocity, const double *D1D,
     const double *Lift1D, const double *flux_bnd, const double *Escale, int Ne)
@@ -1502,6 +1508,9 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
   }
 
   for (int kk = 0; kk < NQ63; kk += BK63) {
+    if (kk) {
+      __syncthreads();
+    }
     // sFU[k][l] = q*u at (l, jp, k).  l is fast in global, so sixteen lanes
     // walk l and cover one 128-byte run.
 #pragma unroll
@@ -1549,7 +1558,6 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_xz_tc_kerne
         }
       }
     }
-    __syncthreads();
   }
 
   // j is block uniform, so the faces 1 and 3 coefficients and the whole (i,j)
@@ -1639,6 +1647,9 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_y_tc_kernel
   }
 
   for (int kk = 0; kk < NQ63; kk += BK63) {
+    if (kk) {
+      __syncthreads();
+    }
 #pragma unroll
     for (int p = 0; p < P63_STAGE_ITERS; ++p) {
       const int o = tid & 63;
@@ -1670,7 +1681,6 @@ __global__ __launch_bounds__(P63_THREADS, 1) void tendency_fused_p63_y_tc_kernel
         }
       }
     }
-    __syncthreads();
   }
 
 #pragma unroll
@@ -1714,4 +1724,442 @@ extern "C" void launch_tendency_fused_p63_tc(
                                    dg_cuda_stream>>>(
       dqdt, D1D, q, v, Escale, Ne);
   check_cuda("tendency_fused_p63_tc kernels");
+}
+
+//============================================================================
+// p=127 (Nq=128) fused Tensor Core tendency
+//============================================================================
+//
+// Same three-kernel shape as p=63: elembnd_flux_kernel evaluates the six face
+// fluxes once, then an xz kernel writes dqdt and a y kernel accumulates onto
+// it.  A 128x128 output plane cannot be one block, so both volume kernels
+// tile it 128x64 -- the whole contraction index m, half the output index n --
+// and run two blocks per plane, 1024 threads in an 8 by 4 warp grid with 2x2
+// mma tiles per warp.
+//
+//   x: C[m=k][n=i] = sum_l FU[k][l] * D[i][l]      A = sFU, B = sD
+//   z: C[m=k][n=i] = sum_l D[k][l]  * FW[i][l]     A = sD,  B = sFW
+//   y: C[m=j][n=i] = sum_l D[j][l] * FV[i][l]      A = sD,  B = sFV
+//
+// Keeping m over the whole 128 is what makes one sD panel serve both operands
+// of the xz kernel, exactly as at p=63; a 64x64 tile splits the operator rows
+// (x wants rows i, z wants rows k) and needs two panels.  It also gives the
+// warp 2x2 tiles instead of 2x1, which is a third fewer shared loads per unit
+// of mma -- and the mma loop is what this kernel spends its time in, so that
+// is the ratio that matters.  A 64x64 tile with the same 1024 threads was
+// measured at 784.2 us/stage against 757 for this one.
+//
+// The panels are not staged alike.  q, u, v and w are 134 MB per field and
+// miss to DRAM; D1D is 128 KB and every block reads all of it, so it is L2
+// resident.  Each kernel therefore keeps its n-indexed flux panel -- sFW or
+// sFV, the one it reads exactly once per plane -- in shared at the full
+// contraction depth, staged before any mma, and chunks only the panels that
+// are re-read anyway (sFU) or come from L2 (sD).  That is what a cp.async
+// prologue would buy, and cp.async cannot be used here at all, because the
+// panels hold the product q*u rather than a copy of anything.  Chunking the
+// resident panel instead of sFU was measured and loses badly (834.3).
+//
+// Two things that did not work, both measured, both instructive:
+//
+//   - Staging the block-uniform epilogue data (the four Lift1D slices and the
+//     four face planes that are constant along one tile index, 4 KB) into
+//     shared before the mma loop, the way the p=7 kernel stages sLift: 844.6
+//     against 784.2.  The note on sLift above says why -- at one block per SM
+//     the epilogue is bound by L1/TEX, which serves shared and global alike.
+//   - Moving the y kernel's read-modify-write of dqdt onto the xz kernel,
+//     which has twice the mma to hide it behind: 806.8 against 784.0, the
+//     same answer p=63 section 16.6 got.
+
+#define NQ127 128
+#define NP127 2097152
+#define NQ2_127 16384
+#define NFPTOT127 98304
+
+// Depth of the chunked panels.  The first version chunked every panel
+// together, the p=63 arrangement, and deeper was monotonically better (999.0
+// / 934.7 / 866.2 us/stage at 16 / 32 / 64 on the 64x64 tile) for the reason
+// p=63 section 16 gives: with no prefetch the loads of chunk k+1 are not
+// issued until the mma of chunk k has consumed chunk k.  With the resident
+// flux panel that pressure is off the DRAM path, and what is left is an L2
+// round trip per chunk:
+//
+//   BKD127   xz shared   us/stage
+//     32       128 KB      794.9
+//     64       192 KB      757.2   <- kept
+//
+// 128 would remove the chunk loop but needs 320 KB against the 227 KB a
+// Blackwell block can hold.  The y kernel holds one chunked panel instead of
+// two, so 128 does fit there, and it loses anyway (765.6 against 756.1).
+//
+// The register-blocking ratio is where this design stops.  Going from 2x2 to
+// 4x2 mma tiles per warp would cut the operand loads per tile from 1.0 to
+// 0.75, and it is reachable only for the y kernel -- the xz kernel carries
+// two accumulator sets, so 4x2 is 32 doubles a lane and 1024 threads have 64
+// registers.  It was written for the y kernel, one block per whole 128x128
+// plane, 192 KB, no spills, and it changes nothing: 759.3 against 757.2.
+// Together with the ablation that removes the mma itself for no gain, that
+// says the mma loop is bound by neither the mma nor the count of shared
+// loads, and nothing further is diagnosable without ncu.
+#ifndef BKD127
+#define BKD127 64
+#endif
+
+// The panels are 64 outer in the tile index, exactly the p=63 shape, so the
+// swizzles carry over unchanged.  swt127 is for outer-fast panels (idx =
+// outer + 64*l): the read has the outer index in bits 0-2 and l in bits 6-11,
+// so l's low two bits fold into bits 3-4 -- the fold has to land inside the
+// low four bits because an 8-byte shared access is serviced in half-warp
+// phases of 16 lanes.  sw127 is for the one l-fast panel (idx = l + 64*outer).
+__device__ __forceinline__ int swt127(int idx)
+{
+  return idx ^ (((idx >> 6) & 3) << 2);
+}
+
+// Outer-fast panel with 128 rows: idx = outer + 128*l, so l's low two bits
+// sit in bits 7-8 and fold into bits 3-4 rather than 2-3.
+__device__ __forceinline__ int swt128(int idx)
+{
+  return idx ^ (((idx >> 7) & 3) << 2);
+}
+
+__device__ __forceinline__ int sw127(int idx)
+{
+  return idx ^ (((idx / NQ127) & 7) << 2);
+}
+
+// Both volume kernels run 1024 threads, 32 warps in an 8 by 4 grid with 2x2
+// mma tiles per warp, which covers the 128x64 tile of either kernel.
+//
+// The xz warp shape was swept twice.  With the first arrangement -- every
+// panel chunked together, a 64x64 tile, four blocks per plane -- occupancy
+// decided it (Ne=2**3, nstep=400):
+//
+//   grid        threads  blocking  reg  occupancy  us/stage
+//   4x2 warps       256       2x4  128      12.5%    1369.4
+//   4x4 warps       512       2x2  128      25.0%    1138.8
+//   4x8 warps      1024       2x1   64      50.0%     866.2
+//
+// After the staging split below the same sweep is nearly flat -- 817.5 /
+// 796.6 / 783.6 -- because the load latency the extra warps were hiding is
+// no longer there.  What is left is the operand-load ratio, and that is what
+// the 128x64 tile buys: 2x2 tiles per warp costs 2+2 operand loads per k-step
+// for four mma tiles against the 2+1 for two of a 2x1 shape, so a third fewer
+// shared loads per unit of mma, at the same 50% occupancy.
+#define P127_MT 64
+#define P127_Y_THREADS 1024
+#define P127_Y_FSTAGE_ITERS (P127_MT * NQ127 / P127_Y_THREADS)
+
+__global__ __launch_bounds__(1024, 1) void tendency_fused_p127_xz_tc_kernel(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *w, const double *flux_bnd,
+    const double *Escale, int Ne)
+{
+  extern __shared__ __align__(16) double smem127[];
+  double *const sFW = smem127;                       //  64 x NQ, full depth
+  double *const sFU = smem127 + P127_MT * NQ127;     // 128 x BKD
+  double *const sD = smem127 + P127_MT * NQ127 + NQ127 * BKD127;  // 128 x BKD
+
+  const int block = (int)blockIdx.x;
+  const int ntile = block & 1;
+  const int jp = (block >> 1) & (NQ127 - 1);
+  const int elem = block >> 8;
+  if (elem >= Ne) {
+    return;
+  }
+  const int ibase = ntile * P127_MT;
+
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int wm = warp & 7;
+  const int wn = warp >> 3;
+  const int row = lane >> 2;
+  const int colk = lane & 3;
+
+  const int eo = elem * NP127;
+  const int efo = elem * NFPTOT127;
+  const int npoint = NP127 * Ne;
+  const int plane_off = NQ127 * jp;
+
+  double ax[2 * 2 * 2], az[2 * 2 * 2];
+#pragma unroll
+  for (int e = 0; e < 2 * 2 * 2; ++e) {
+    ax[e] = 0.0;
+    az[e] = 0.0;
+  }
+
+  // The swizzle collapses inside the mma loop.  Every operand address there
+  // has the form row_index + stride*l with l = 4*ks + colk, so the field the
+  // swizzle folds -- bits 6-7 or 7-8 of the address, which is l's low two
+  // bits -- is colk, a per-lane constant.  The fold therefore reduces to one
+  // XOR of the row index by colk*4, loop invariant, and what is left is a
+  // base plus a compile-time offset once the loop is unrolled.  Written in
+  // the general swt127/swt128 form instead, ptxas emits four integer ops per
+  // operand load; ncu (Slurm 62173) measured 122.5 M instructions against
+  // 16.8 M mma, 66% of them address arithmetic, with the DMMA pipe starved at
+  // 53.1%.  See section 11.10 of p127_gap_study.md.
+  const int cx = colk << 2;
+  int amx[2], bnx[2];
+#pragma unroll
+  for (int a = 0; a < 2; ++a) {
+    amx[a] = (8 * (2 * wm + a) + row) ^ cx;
+  }
+#pragma unroll
+  for (int bb = 0; bb < 2; ++bb) {
+    bnx[bb] = (8 * (2 * wn + bb) + row) ^ cx;
+  }
+
+  // sFW[i][l] = q*w at (ibase+i, jp, l), the panel this tile reads exactly
+  // once per plane, so it is the one staged at full depth.
+#pragma unroll
+  for (int p = 0; p < P127_MT * NQ127 / 1024; ++p) {
+    const int o = tid & (P127_MT - 1);
+    const int ll = (tid / P127_MT) + (1024 / P127_MT) * p;
+    const int g = eo + (ibase + o) + plane_off + NQ2_127 * ll;
+    sFW[swt127(o + P127_MT * ll)] = q[g] * w[g];
+  }
+
+  for (int kk = 0; kk < NQ127; kk += BKD127) {
+    // The barrier that protects the panels from being overwritten belongs
+    // here, not at the end of the body: written at the end it also runs after
+    // the last chunk, where nothing follows it.  Three barriers per block
+    // instead of four.  ncu (Slurm 62193) put 9.83 of the 32 warps in the
+    // barrier stall once the swizzle collapse of section 11.10 removed the
+    // integer work that used to cover it.
+    if (kk) {
+      __syncthreads();
+    }
+    // sFU[k][l] = q*u at (kk+l, jp, k), all 128 k.  l is fast in global.
+#pragma unroll
+    for (int p = 0; p < NQ127 * BKD127 / 1024; ++p) {
+      const int ll = tid & (BKD127 - 1);
+      const int o = (tid / BKD127) + (1024 / BKD127) * p;
+      const int g = eo + (kk + ll) + plane_off + NQ2_127 * o;
+      sFU[swt128(o + NQ127 * ll)] = q[g] * u[g];
+    }
+    // sD[r][l] = D1D(r, kk+l), all 128 rows: m runs over the whole range and
+    // n sits inside it, so one panel serves both operands as it did at p=63.
+#pragma unroll
+    for (int p = 0; p < NQ127 * BKD127 / 1024; ++p) {
+      const int o = tid & (NQ127 - 1);
+      const int ll = (tid / NQ127) + (1024 / NQ127) * p;
+      sD[swt128(o + NQ127 * ll)] = D1D[o + NQ127 * (kk + ll)];
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int ks = 0; ks < BKD127 / 4; ++ks) {
+      const int lc = 4 * ks + colk;
+      const int lg = kk + lc;
+      double av[2], bv[2], avz[2], bvz[2];
+#pragma unroll
+      for (int a = 0; a < 2; ++a) {
+        av[a] = sFU[amx[a] + NQ127 * lc];
+        avz[a] = sD[amx[a] + NQ127 * lc];
+      }
+#pragma unroll
+      for (int bb = 0; bb < 2; ++bb) {
+        bv[bb] = sD[ibase + bnx[bb] + NQ127 * lc];
+        bvz[bb] = sFW[bnx[bb] + P127_MT * lg];
+      }
+#pragma unroll
+      for (int a = 0; a < 2; ++a) {
+#pragma unroll
+        for (int bb = 0; bb < 2; ++bb) {
+          const int e = 2 * (2 * a + bb);
+          mma_m8n8k4_f64(ax[e], ax[e + 1], av[a], bv[bb], ax[e], ax[e + 1]);
+          mma_m8n8k4_f64(az[e], az[e + 1], avz[a], bvz[bb], az[e], az[e + 1]);
+        }
+      }
+    }
+  }
+
+  const double lf1 = Lift1D[jp];
+  const double lf3 = Lift1D[jp + 2 * NQ127];
+
+#pragma unroll
+  for (int e8 = 0; e8 < 4; ++e8) {
+    const int a = e8 / 2;
+    const int bb = e8 % 2;
+    const int m = 8 * (2 * wm + a) + row;                 // k
+    const int n = ibase + 8 * (2 * wn + bb) + 2 * colk;   // i, and i+1
+    const int node = eo + n + plane_off + NQ2_127 * m;
+
+    const double2 ex = *reinterpret_cast<const double2 *>(Escale + node);
+    const double2 ez =
+        *reinterpret_cast<const double2 *>(Escale + node + 2 * npoint);
+
+    const int fp13 = n + NQ127 * m;
+    const double2 fb1 = *reinterpret_cast<const double2 *>(flux_bnd + efo + fp13);
+    const double2 fb3 =
+        *reinterpret_cast<const double2 *>(flux_bnd + efo + 2 * NQ2_127 + fp13);
+    const int fp24 = jp + NQ127 * m;
+    const double fb2 = flux_bnd[efo + NQ2_127 + fp24];
+    const double fb4 = flux_bnd[efo + 3 * NQ2_127 + fp24];
+    const int fp56 = n + plane_off;
+    const double2 fb5 =
+        *reinterpret_cast<const double2 *>(flux_bnd + efo + 4 * NQ2_127 + fp56);
+    const double2 fb6 =
+        *reinterpret_cast<const double2 *>(flux_bnd + efo + 5 * NQ2_127 + fp56);
+    const double lf2a = Lift1D[n + NQ127];
+    const double lf2b = Lift1D[n + 1 + NQ127];
+    const double lf4a = Lift1D[n + 3 * NQ127];
+    const double lf4b = Lift1D[n + 1 + 3 * NQ127];
+    const double lf5 = Lift1D[m + 4 * NQ127];
+    const double lf6 = Lift1D[m + 5 * NQ127];
+
+    // Same summation order as tendency_fused_p127_xz_kernel.
+    *reinterpret_cast<double2 *>(dqdt + node) = make_double2(
+        -(ex.x * ax[2 * e8] + ez.x * az[2 * e8] + lf1 * fb1.x + lf2a * fb2 +
+          lf3 * fb3.x + lf4a * fb4 + lf5 * fb5.x + lf6 * fb6.x),
+        -(ex.y * ax[2 * e8 + 1] + ez.y * az[2 * e8 + 1] + lf1 * fb1.y +
+          lf2b * fb2 + lf3 * fb3.y + lf4b * fb4 + lf5 * fb5.y + lf6 * fb6.y));
+  }
+}
+
+//> p=127 y volume term, accumulated onto what the xz kernel wrote.
+//
+// One block per (element, k plane, j tile, i tile).
+// C[m=j][n=i] = sum_l D[j][l] * FV[i][l], the z contraction of the first
+// kernel with (i,j) in place of (i,k), so only the A panel of the two is
+// needed and the block holds 64 KB.
+__global__ __launch_bounds__(P127_Y_THREADS, 1) void tendency_fused_p127_y_tc_kernel(
+    double *dqdt, const double *D1D, const double *q, const double *v,
+    const double *Escale, int Ne)
+{
+  extern __shared__ __align__(16) double smem127[];
+  double *const sDm = smem127;
+  double *const sFV = smem127 + NQ127 * BKD127;
+
+  const int block = (int)blockIdx.x;
+  const int ntile = block & 1;
+  const int kp = (block >> 1) & (NQ127 - 1);
+  const int elem = block >> 8;
+  if (elem >= Ne) {
+    return;
+  }
+  const int ibase = ntile * P127_MT;
+
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int wm = warp & 7;
+  const int wn = warp >> 3;
+  const int row = lane >> 2;
+  const int colk = lane & 3;
+
+  const int eo = elem * NP127;
+  const int npoint = NP127 * Ne;
+  const int plane_off = NQ2_127 * kp;
+
+  double acc[2 * 2 * 2];
+#pragma unroll
+  for (int e = 0; e < 2 * 2 * 2; ++e) {
+    acc[e] = 0.0;
+  }
+
+  // Same collapse as the xz kernel.  sFV is the l-fast panel, so the field
+  // its swizzle folds is the row index's low three bits, which is row -- also
+  // a per-lane constant -- and the XOR moves onto l instead.
+  const int cx = colk << 2;
+  const int rx = row << 2;
+  int amx[2], boff[2];
+#pragma unroll
+  for (int a = 0; a < 2; ++a) {
+    amx[a] = (8 * (2 * wm + a) + row) ^ cx;
+  }
+#pragma unroll
+  for (int bb = 0; bb < 2; ++bb) {
+    boff[bb] = NQ127 * (8 * (2 * wn + bb) + row);
+  }
+
+  // sFV[i][l] = q*v at (ibase+i, l, kp), staged once at the full depth.
+#pragma unroll
+  for (int p = 0; p < P127_Y_FSTAGE_ITERS; ++p) {
+    const int o = tid & (P127_MT - 1);
+    const int ll = (tid / P127_MT) + (P127_Y_THREADS / P127_MT) * p;
+    const int g = eo + (ibase + o) + NQ127 * ll + plane_off;
+    sFV[sw127(ll + NQ127 * o)] = q[g] * v[g];
+  }
+
+  for (int kk = 0; kk < NQ127; kk += BKD127) {
+    if (kk) {
+      __syncthreads();
+    }
+#pragma unroll
+    for (int p = 0; p < BKD127 * NQ127 / P127_Y_THREADS; ++p) {
+      const int o = tid & (NQ127 - 1);
+      const int ll = (tid / NQ127) + (P127_Y_THREADS / NQ127) * p;
+      sDm[swt128(o + NQ127 * ll)] = D1D[o + NQ127 * (kk + ll)];
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int ks = 0; ks < BKD127 / 4; ++ks) {
+      const int lc = 4 * ks + colk;
+      const int lg = kk + lc;
+      double av[2], bv[2];
+#pragma unroll
+      for (int a = 0; a < 2; ++a) {
+        av[a] = sDm[amx[a] + NQ127 * lc];
+      }
+#pragma unroll
+      for (int bb = 0; bb < 2; ++bb) {
+        bv[bb] = sFV[(lg ^ rx) + boff[bb]];
+      }
+#pragma unroll
+      for (int a = 0; a < 2; ++a) {
+#pragma unroll
+        for (int bb = 0; bb < 2; ++bb) {
+          const int e = 2 * (2 * a + bb);
+          mma_m8n8k4_f64(acc[e], acc[e + 1], av[a], bv[bb], acc[e], acc[e + 1]);
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int e8 = 0; e8 < 4; ++e8) {
+    const int a = e8 / 2;
+    const int bb = e8 % 2;
+    const int m = 8 * (2 * wm + a) + row;                     // j
+    const int n = ibase + 8 * (2 * wn + bb) + 2 * colk;       // i, and i+1
+    const int node = eo + n + NQ127 * m + plane_off;
+    const double2 ey =
+        *reinterpret_cast<const double2 *>(Escale + node + npoint);
+    double2 out = *reinterpret_cast<const double2 *>(dqdt + node);
+    out.x -= ey.x * acc[2 * e8];
+    out.y -= ey.y * acc[2 * e8 + 1];
+    *reinterpret_cast<double2 *>(dqdt + node) = out;
+  }
+}
+
+extern "C" void launch_tendency_fused_p127_tc(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const double *flux_bnd,
+    const double *Escale, int Ne)
+{
+  const int nblock = 2 * NQ127 * Ne;
+  const int nblock_y = 2 * NQ127 * Ne;
+  const size_t smem_xz =
+      (P127_MT * NQ127 + 2 * NQ127 * BKD127) * sizeof(double);
+  const size_t smem_y =
+      (NQ127 * BKD127 + P127_MT * NQ127) * sizeof(double);
+  static bool opted_in = false;
+  if (!opted_in) {
+    cudaFuncSetAttribute(tendency_fused_p127_xz_tc_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)smem_xz);
+    cudaFuncSetAttribute(tendency_fused_p127_y_tc_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)smem_y);
+    opted_in = true;
+  }
+  tendency_fused_p127_xz_tc_kernel<<<nblock, 1024, smem_xz,
+                                     dg_cuda_stream>>>(
+      dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
+  tendency_fused_p127_y_tc_kernel<<<nblock_y, P127_Y_THREADS, smem_y,
+                                    dg_cuda_stream>>>(
+      dqdt, D1D, q, v, Escale, Ne);
+  check_cuda("tendency_fused_p127_tc kernels");
 }

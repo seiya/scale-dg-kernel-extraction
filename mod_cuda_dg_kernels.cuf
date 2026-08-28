@@ -16,10 +16,15 @@ module mod_cuda_dg_kernels
   integer, parameter :: CUDA_FUSED_P31_NQ = 32
   integer, parameter :: CUDA_FUSED_P63_BLOCK_SIZE = 1024
   integer, parameter :: CUDA_FUSED_P63_NQ = 64
+  integer, parameter :: CUDA_FUSED_P127_BLOCK_SIZE = 1024
+  integer, parameter :: CUDA_FUSED_P127_NQ = 128
   !- One block per (element, plane).  Ne is only 4**3 at the same-DOF point,
   !  so the plane has to carry the parallelism: 64*64 = 4096 blocks is 27
   !  waves over the 152 SMs of a GB200.
   integer, parameter :: CUDA_FUSED_P63_BLOCKS_PER_ELEMENT = 64
+  !- Four 64x64 tiles cover one 128x128 plane; see
+  !  tendency_fused_p127_xz_kernel.
+  integer, parameter :: CUDA_FUSED_P127_BLOCKS_PER_ELEMENT = 512
   integer, parameter :: CUDA_P255_NQ = 256
   integer, parameter :: CUDA_P255_TILE = 16
   integer, parameter :: CUDA_P255_BLOCKS_PER_ELEMENT = 65536
@@ -96,9 +101,11 @@ module mod_cuda_dg_kernels
   public :: cuda_cal_dqdt_split
   public :: cuda_cal_dqdt_fused
   public :: cuda_cal_dqdt_fused_p63
+  public :: cuda_cal_dqdt_fused_p127
   public :: cuda_cal_dqdt_fused_p255
   public :: cuda_cal_dqdt_fused_tc
   public :: cuda_cal_dqdt_fused_p63_tc
+  public :: cuda_cal_dqdt_fused_p127_tc
   public :: cuda_cal_dqdt_fused_p255_tc
   public :: cuda_cal_dqdt_gemm
   public :: cuda_cal_dqdt_gemm_fused
@@ -169,6 +176,16 @@ module mod_cuda_dg_kernels
       real(c_double), device :: q(*), u(*), v(*), w(*)
       real(c_double), device :: flux_bnd(*), Escale(*)
     end subroutine launch_tendency_fused_p63_tc
+
+    subroutine launch_tendency_fused_p127_tc( &
+      dqdt, D1D, Lift1D, q, u, v, w, flux_bnd, Escale, Ne) &
+      bind(C, name="launch_tendency_fused_p127_tc")
+      import
+      integer(c_int), value :: Ne
+      real(c_double), device :: dqdt(*), D1D(*), Lift1D(*)
+      real(c_double), device :: q(*), u(*), v(*), w(*)
+      real(c_double), device :: flux_bnd(*), Escale(*)
+    end subroutine launch_tendency_fused_p127_tc
 
     subroutine launch_tendency_xyz_p255_tc( &
       dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, Ne) &
@@ -686,6 +703,57 @@ contains
     kernel_time(2) = dg_kernel_time(2)
   end subroutine cuda_cal_dqdt_fused_p63
 
+
+  !> p=127 fused tendency.  Same three-kernel shape as cuda_cal_dqdt_fused_p63;
+  !! the volume kernels tile the 128x128 plane into four 64x64 blocks.
+  subroutine cuda_cal_dqdt_fused_p127( &
+    dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, flux_bnd, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), device, intent(out) :: dqdt(Np,NeA)
+    real(RP), device, intent(in) :: q(Np,NeA)
+    real(RP), device, intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), device, intent(in) :: D1D(Nq,Nq)
+    real(RP), device, intent(in) :: Lift1D(Nq,6)
+    integer, device, intent(in) :: VMapM(NfpTot,Ne)
+    integer, device, intent(in) :: VMapP(NfpTot,Ne)
+    real(RP), device, intent(in) :: normal_fn(NfpTot,Ne,3)
+    real(RP), device, intent(in) :: Fscale(NfpTot,Ne)
+    real(RP), device, intent(in) :: Escale(Np,Ne,3)
+    real(RP), device, intent(out) :: flux_bnd(NfpTot,Ne)
+    real(RP), intent(out) :: kernel_time(2)
+
+    integer :: istat, nface, nblock_face, nblock_vol
+
+    if (Nq /= CUDA_FUSED_P127_NQ .or. Np /= CUDA_FUSED_P127_NQ**3) then
+      error stop "cuda_cal_dqdt_fused_p127 requires PolyOrder=127"
+    end if
+    call dg_ev_begin()
+
+    nface = NfpTot*Ne
+    nblock_face = (nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    nblock_vol = CUDA_FUSED_P127_BLOCKS_PER_ELEMENT*Ne
+
+    call dg_ev_record(1)
+    call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    call tendency_fused_p127_xz_kernel &
+      <<<nblock_vol,CUDA_FUSED_P127_BLOCK_SIZE,0,dg_stream>>>( &
+      dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne )
+    call tendency_fused_p127_y_kernel &
+      <<<nblock_vol,CUDA_FUSED_P127_BLOCK_SIZE,0,dg_stream>>>( &
+      dqdt, D1D, q, v, Escale, Ne )
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) call cuda_failure("p=127 tendency kernels",istat)
+    call dg_ev_record(2)
+    call dg_ev_end(DG_EV_SINGLE)
+
+    kernel_time(1) = dg_kernel_time(1)
+    kernel_time(2) = dg_kernel_time(2)
+  end subroutine cuda_cal_dqdt_fused_p127
+
   subroutine cuda_cal_dqdt_fused_p255( &
     dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
     normal_fn, Fscale, Escale, flux_bnd, &
@@ -842,6 +910,55 @@ contains
     kernel_time(1) = dg_kernel_time(1)
     kernel_time(2) = dg_kernel_time(2)
   end subroutine cuda_cal_dqdt_fused_p63_tc
+
+
+  !> p=127 tensor-core fused tendency.  Same three-kernel shape as
+  !! cuda_cal_dqdt_fused_p127; only the two volume kernels differ.
+  subroutine cuda_cal_dqdt_fused_p127_tc( &
+    dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, flux_bnd, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), device, intent(out) :: dqdt(Np,NeA)
+    real(RP), device, intent(in) :: q(Np,NeA)
+    real(RP), device, intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), device, intent(in) :: D1D(Nq,Nq)
+    real(RP), device, intent(in) :: Lift1D(Nq,6)
+    integer, device, intent(in) :: VMapM(NfpTot,Ne)
+    integer, device, intent(in) :: VMapP(NfpTot,Ne)
+    real(RP), device, intent(in) :: normal_fn(NfpTot,Ne,3)
+    real(RP), device, intent(in) :: Fscale(NfpTot,Ne)
+    real(RP), device, intent(in) :: Escale(Np,Ne,3)
+    real(RP), device, intent(out) :: flux_bnd(NfpTot,Ne)
+    real(RP), intent(out) :: kernel_time(2)
+
+    integer :: istat, nface, nblock_face
+
+    if (Nq /= CUDA_FUSED_P127_NQ .or. Np /= CUDA_FUSED_P127_NQ**3) then
+      error stop "cuda_cal_dqdt_fused_p127_tc requires PolyOrder=127"
+    end if
+    call dg_ev_begin()
+
+    nface = NfpTot*Ne
+    nblock_face = (nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+
+    call dg_ev_record(1)
+    call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) call cuda_failure("elembnd_flux_kernel",istat)
+    call launch_tendency_fused_p127_tc( &
+      dqdt, D1D, Lift1D, q, u, v, w, flux_bnd, Escale, int(Ne,c_int) )
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) call cuda_failure( &
+      "tendency_fused_p127_tc kernels",istat)
+    call dg_ev_record(2)
+    call dg_ev_end(DG_EV_SINGLE)
+
+    kernel_time(1) = dg_kernel_time(1)
+    kernel_time(2) = dg_kernel_time(2)
+  end subroutine cuda_cal_dqdt_fused_p127_tc
 
   subroutine cuda_cal_dqdt_fused_p255_tc( &
     dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
@@ -2416,6 +2533,173 @@ contains
       dqdt(idx) = dqdt(idx) - Escale(idx+npoint)*sy(m)
     end do
   end subroutine tendency_fused_p63_y_kernel
+
+  !> p=127 x and z volume terms plus all six face lifts.  One block per
+  !! (element, j plane, k tile, i tile).
+  !!
+  !! Nq=128 keeps the p=63 arrangement and adds one thing: a 128x128 output
+  !! plane is 16384 nodes, so a 1024-thread block would need 16 accumulators
+  !! per direction and would spill.  The plane is split into four 64x64 tiles
+  !! instead, which restores the four accumulators per direction of the p=63
+  !! kernel; the tile index is the two fastest bits of blockIdx, so the four
+  !! blocks of a plane run adjacent and re-read the same q out of L2.
+  !!
+  !! The tiling splits the operator rows as well.  The x term contracts with
+  !! D1D rows i and the z term with D1D rows k, and those are now different
+  !! 64-row ranges, so sD becomes the two panels sDn and sDm.  With BK=16 the
+  !! four panels are 32 KB, inside the static limit, and l runs in eight
+  !! chunks.
+  !!
+  !! Threads are (i, k mod 16) with four k values per thread, exactly as at
+  !! p=63: k is warp uniform, i runs over 64 consecutive lanes, sDn(i,l) and
+  !! sFW(i,l) are read across consecutive i, sFU(l,k) and sDm(k,l) are
+  !! warp-uniform broadcasts, and every staging store lands at the thread's
+  !! own index, so all shared accesses are conflict free without a swizzle.
+  attributes(global) launch_bounds(1024,1) subroutine tendency_fused_p127_xz_kernel( &
+    dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne )
+    implicit none
+    integer, value :: Ne
+    real(RP), device :: dqdt(*), D1D(*), Lift1D(*)
+    real(RP), device :: q(*), u(*), w(*), flux_bnd(*), Escale(*)
+
+    real(RP), shared :: sDn(64,16), sDm(64,16), sFU(16,64), sFW(64,16)
+    integer :: elem, j, tid, i, kb, k, l0, lc, m, sl, sk, bidx
+    integer :: ibase, kbase, ig
+    integer :: elem_offset, face_offset, npoint, idx, gidx
+    integer :: kk(4)
+    real(RP) :: sx(4), sz(4), dxi, fwi
+    real(RP) :: lf1, lf2, lf3, lf4, fb5, fb6
+
+    bidx = blockIdx%x - 1
+    ibase = mod(bidx,2)*64
+    kbase = mod(bidx/2,2)*64
+    j = mod(bidx/4,CUDA_FUSED_P127_NQ) + 1
+    elem = bidx/(4*CUDA_FUSED_P127_NQ) + 1
+    if (elem > Ne) return
+
+    tid = threadIdx%x
+    i  = mod(tid-1,64) + 1
+    kb = (tid-1)/64
+    ig = ibase + i
+    elem_offset = (elem-1)*2097152
+    face_offset = (elem-1)*98304
+    npoint = 2097152*Ne
+
+    do m = 1, 4
+      kk(m) = kb + 1 + 16*(m-1)
+      sx(m) = 0.0_RP
+      sz(m) = 0.0_RP
+    end do
+
+    !- Staging indices for sFU.  Sixteen lanes walk l, which is one 128-byte
+    !  global run, and the shared address is the thread index itself.
+    sl = mod(tid-1,16) + 1
+    sk = (tid-1)/16 + 1
+
+    do l0 = 0, 112, 16
+      sDn(i,kb+1) = D1D(ig+(l0+kb)*128)
+      sDm(i,kb+1) = D1D(kbase+i+(l0+kb)*128)
+      gidx = elem_offset + (l0+sl) + (j-1)*128 + (kbase+sk-1)*16384
+      sFU(sl,sk) = q(gidx)*u(gidx)
+      gidx = elem_offset + ig + (j-1)*128 + (l0+kb)*16384
+      sFW(i,kb+1) = q(gidx)*w(gidx)
+      call syncthreads()
+
+      do lc = 1, 16
+        dxi = sDn(i,lc)
+        fwi = sFW(i,lc)
+        do m = 1, 4
+          sx(m) = sx(m) + dxi*sFU(lc,kk(m))
+          sz(m) = sz(m) + fwi*sDm(kk(m),lc)
+        end do
+      end do
+      call syncthreads()
+    end do
+
+    !- Faces 1 and 3 are (i,k) planes and vary in j, faces 2 and 4 are (j,k)
+    !  planes and vary in i, faces 5 and 6 are (i,j) planes and vary in k.  j is
+    !  bidx uniform, so four of the eight coefficients and both of the (i,j)
+    !  face values are constant over the k loop.
+    lf1 = Lift1D(j)
+    lf2 = Lift1D(ig+128)
+    lf3 = Lift1D(j+256)
+    lf4 = Lift1D(ig+384)
+    fb5 = flux_bnd(face_offset+65536+ig+(j-1)*128)
+    fb6 = flux_bnd(face_offset+81920+ig+(j-1)*128)
+
+    do m = 1, 4
+      k = kbase + kk(m)
+      idx = elem_offset + ig + (j-1)*128 + (k-1)*16384
+      !- Same summation order as tendency_fused_p63_xz_kernel.
+      dqdt(idx) = -(Escale(idx)*sx(m) + Escale(idx+2*npoint)*sz(m) &
+        + lf1*flux_bnd(face_offset+ig+(k-1)*128) &
+        + lf2*flux_bnd(face_offset+16384+j+(k-1)*128) &
+        + lf3*flux_bnd(face_offset+32768+ig+(k-1)*128) &
+        + lf4*flux_bnd(face_offset+49152+j+(k-1)*128) &
+        + Lift1D(k+512)*fb5 + Lift1D(k+640)*fb6)
+    end do
+  end subroutine tendency_fused_p127_xz_kernel
+
+  !> p=127 y volume term, accumulated onto what the xz kernel wrote.
+  !!
+  !! One bidx per (element, k plane, j tile, i tile).  The contraction is the
+  !! z one of the first kernel with (i,j) in place of (i,k), so the same
+  !! chunked panels and the same conflict-free access pattern serve it; only
+  !! two panels are needed because there is no second direction to pair with.
+  attributes(global) launch_bounds(1024,1) subroutine tendency_fused_p127_y_kernel( &
+    dqdt, D1D, q, v, Escale, Ne )
+    implicit none
+    integer, value :: Ne
+    real(RP), device :: dqdt(*), D1D(*)
+    real(RP), device :: q(*), v(*), Escale(*)
+
+    real(RP), shared :: sDm(64,16), sFV(64,16)
+    integer :: elem, k, tid, i, jb, j, l0, lc, m, bidx
+    integer :: ibase, jbase, ig
+    integer :: elem_offset, npoint, idx, gidx
+    integer :: jj(4)
+    real(RP) :: sy(4), fvi
+
+    bidx = blockIdx%x - 1
+    ibase = mod(bidx,2)*64
+    jbase = mod(bidx/2,2)*64
+    k = mod(bidx/4,CUDA_FUSED_P127_NQ) + 1
+    elem = bidx/(4*CUDA_FUSED_P127_NQ) + 1
+    if (elem > Ne) return
+
+    tid = threadIdx%x
+    i  = mod(tid-1,64) + 1
+    jb = (tid-1)/64
+    ig = ibase + i
+    elem_offset = (elem-1)*2097152
+    npoint = 2097152*Ne
+
+    do m = 1, 4
+      jj(m) = jb + 1 + 16*(m-1)
+      sy(m) = 0.0_RP
+    end do
+
+    do l0 = 0, 112, 16
+      sDm(i,jb+1) = D1D(jbase+i+(l0+jb)*128)
+      gidx = elem_offset + ig + (l0+jb)*128 + (k-1)*16384
+      sFV(i,jb+1) = q(gidx)*v(gidx)
+      call syncthreads()
+
+      do lc = 1, 16
+        fvi = sFV(i,lc)
+        do m = 1, 4
+          sy(m) = sy(m) + fvi*sDm(jj(m),lc)
+        end do
+      end do
+      call syncthreads()
+    end do
+
+    do m = 1, 4
+      j = jbase + jj(m)
+      idx = elem_offset + ig + (j-1)*128 + (k-1)*16384
+      dqdt(idx) = dqdt(idx) - Escale(idx+npoint)*sy(m)
+    end do
+  end subroutine tendency_fused_p127_y_kernel
 
 
   !> x-direction p=255 tensor-product derivative and x-face lift.
