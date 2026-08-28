@@ -104,8 +104,9 @@ z-GEMMの `deriv_z` は直後のassemblyが各点を一度読んで `dqdt`へ上
 GEMMの浮動小数点演算、縮約順、global memoryのwrite/read回数は変わらない。
 変わるのは同じz中間値を置くallocationの名前だけである。
 
-p=1023、`Ne=1`の主要device allocationは両経路とも次となる。小さい演算子、
-geometry、mapping、runtime allocationは含めない。
+p=1023、`Ne=1`の主要device allocationは両経路とも次となる。この表の144 GiBは
+概算に便利な主要配列のpayloadであり、deviceの必要容量ではない。小さい演算子、
+geometry、mapping、OpenACC allocatorの予約領域は含めない。
 
 | 配列群 | bytes / `Np` | GiB |
 |---|---:|---:|
@@ -117,6 +118,61 @@ geometry、mapping、runtime allocationは含めない。
 | 合計 | `144*Np` | **144** |
 
 この配置で通常GEMMとGEMM_FUSEDがともに実機で完走した。
+
+### 4.3 配列payloadと実使用量の校正
+
+前節のような配列和だけでは必要容量を過小評価する。全device配列をbyte単位で
+数えると、両経路のapplication-requested payloadは
+`154,962,804,744 byte = 144.320 GiB`である。一方、CUDA `cudaMemGetInfo`を
+初期化前、equation setup後、mainのOpenACC data配置後、最初のstep後、解放後に
+記録すると次になった。GPU index 1、上記のvalidation input、`nstep=1`を使用した。
+
+| 経路 | startup used | setup後 used | data配置後 peak used | startupからのpeak増分 | payloadとの差 | peak時free |
+|---|---:|---:|---:|---:|---:|---:|
+| `GEMM` | 0.842 GiB | 40.991 GiB | 177.259 GiB | **176.416 GiB** | **32.096 GiB** | 6.741 GiB |
+| `GEMM_FUSED` | 0.878 GiB | 41.001 GiB | 177.236 GiB | **176.358 GiB** | **32.038 GiB** | 6.764 GiB |
+
+初回step後の追加確保はなく、両経路の差は58 MiBで測定時の外部使用量の揺らぎと
+同程度である。したがって、現在のGEMMとGEMM_FUSEDはpayloadだけでなく実際の
+必要量も同じとみなせる。`acc end data`後もusedが約177 GiBのままだったが、process
+終了後の`nvidia-smi`ではGPU 1は158 MiBへ戻った。これはリークではなく、NVHPCの
+OpenACC allocatorがprocess内で解放済みblockをpoolに保持しているためである。
+
+次数依存性を確認するため、同じGEMM allocation sequenceを追加で測定した。
+
+| p | requested payload | startupからのpeak増分 | allocator/runtime差 | payload比 |
+|---:|---:|---:|---:|---:|
+| 511 | 18.080 GiB | 22.167 GiB | 4.087 GiB | 22.60% |
+| 575 | 25.730 GiB | 30.105 GiB | 4.375 GiB | 17.00% |
+| 767 | 60.930 GiB | 71.173 GiB | 10.243 GiB | 16.81% |
+| 1023 | 144.320 GiB | 176.416 GiB | 32.096 GiB | 22.24% |
+
+差は固定費ではなくallocation sizeとpool bucketに依存する。この4点では
+`payload * 1.25`が実測peak増分をすべて上から覆う。そのため、事前判定は次を使う。
+
+```text
+required = exact_array_payload * 1.25 + 2 GiB safety
+feasible = required <= cudaMemGetInfo startup free
+```
+
+p=1023では保守見積もりが182.400 GiB、実測開始時freeが183.158 GiBなのでfit、
+実測peak増分は176.416 GiBだった。以前の主要配列だけの160 GiB、未使用surfaceを
+消した後の152 GiBという値に同じallowanceを適用すると、それぞれ約200.4 GiB、
+190.4 GiBとなり、実測startup freeを越える。従来配置がOOMし、現配置だけが通る
+結果とも整合する。
+
+再現用に`SCALE_DG_REPORT_DEVICE_MEMORY=1`を追加した。通常実行では呼ばれないため
+性能への影響はない。出力を保存し、次でpayload内訳、実測差、余裕を同時に確認できる。
+
+```bash
+SCALE_DG_REPORT_DEVICE_MEMORY=1 ./scale-dg_extraction input_p1023_val_gemm.conf \
+  | tee /tmp/p1023_memory.log
+python3 estimate_device_memory.py --poly-order 1023 --path GEMM \
+  --memory-log /tmp/p1023_memory.log
+```
+
+25%は今回のNVHPC 26.3、driver 580.173.02、同じallocation sequenceに対する経験的な
+上限であり、compiler、driver、allocator mode、配列の確保順を変えた場合は再校正する。
 
 ## 5. 数値検証
 

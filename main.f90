@@ -27,6 +27,7 @@ program main
     cuda_dg_set_event_timing, cuda_dg_set_side_stream, &
     cuda_dg_graph_capture_begin, &
     cuda_dg_graph_capture_end, cuda_dg_graph_launch, cuda_dg_graph_is_ready
+  use mod_cuda_dg_kernels, only: cuda_dg_report_memory
   implicit none
 
   !-----------------------------------------------------------------------------
@@ -56,6 +57,8 @@ program main
   !! only the wall time; a CUDA graph replay cannot report it either, so
   !! UseCudaGraph turns it off as well.
   logical :: MeasureKernelTime = .true.
+  logical :: ReportDeviceMemory = .false.
+  character(len=32) :: report_memory_env
 
   real(RP), allocatable :: q(:,:)
   real(RP), allocatable :: q0(:,:)
@@ -73,10 +76,24 @@ program main
 
   !- Main program ----------------------------------------------------------
 
+  report_memory_env = ''
+  call get_environment_variable('SCALE_DG_REPORT_DEVICE_MEMORY', &
+    report_memory_env)
+  ReportDeviceMemory = len_trim(report_memory_env) > 0 .and. &
+    trim(report_memory_env) /= '0'
+
+  if (ReportDeviceMemory) call cuda_dg_report_memory('startup')
   call init()
+  if (ReportDeviceMemory) then
+    write(*,'(A,4(1X,A,I0))') 'DEVICE_MEMORY_CONFIG', &
+      'poly_order=', PolyOrder, 'np=', Np, 'ne=', Ne, 'nea=', NeA
+    call cuda_dg_report_memory('after_equation_setup')
+  end if
 
   !$acc data copyin(q,u,v,w,D1D,D1D_tr,Lift_mat,Lift1D,VMapM,VMapP) &
   !$acc& copyin(normal_fn,Escale,Fscale) create(q0,dqdt)
+
+  if (ReportDeviceMemory) call cuda_dg_report_memory('after_field_data')
 
   call update_halo(u)
   call update_halo(v)
@@ -142,6 +159,11 @@ program main
       call advance_step()
     end if
 
+    if (ReportDeviceMemory .and. istep == 1) then
+      !$acc wait(ACC_QUEUE)
+      call cuda_dg_report_memory('after_first_step')
+    end if
+
     if (mod(istep,output_interval) == 0) then
       q_min = huge(q_min)
       q_max = -huge(q_max)
@@ -166,7 +188,10 @@ program main
 
   !$acc end data
 
+  if (ReportDeviceMemory) call cuda_dg_report_memory('after_field_release')
+
   call final()
+  if (ReportDeviceMemory) call cuda_dg_report_memory('after_finalize')
 contains
   !> Initialize modules with DG mesh and DG operator kernel
   subroutine init()

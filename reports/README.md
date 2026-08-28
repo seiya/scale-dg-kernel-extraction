@@ -24,7 +24,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`p511_gap_study.md`](p511_gap_study.md) | p=511 (Nq=512, Ne=1) の `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_FUSED` 対応。packed halo allocation で主場6配列を host/device 各42→12 GiBへ削減。点変化係数を含む全134,217,728点の `dqdt` を最大絶対差3.55e-15で検証。GB200では `GEMM_FUSED` が13.159対13.528 ms/stageで2.73%速い |
 | [`p575_gap_study.md`](p575_gap_study.md) | p=575 (Nq=576, Ne=1) の `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_FUSED` 対応。点変化係数を含む全191,102,976点の `dqdt` を最大絶対差3.55e-15で検証。GB200の3-run中央値では `GEMM_FUSED` が20.453対20.912 ms/stageで2.20%速い |
 | [`p767_gap_study.md`](p767_gap_study.md) | p=767 (Nq=768, Ne=1) の `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_FUSED` 対応。点変化係数を含む全452,984,832点の `dqdt` を最大絶対差3.55e-15で検証。GB200の3-run中央値では `GEMM_FUSED` が60.362対62.817 ms/stageで3.91%速い |
-| [`p1023_gap_study.md`](p1023_gap_study.md) | p=1023 (Nq=1024, Ne=1) の `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_FUSED` 対応。Escale方向offsetだけを64-bit安全化し、未使用surfaceとz中間配列を除いて両経路144 GiBに収めた。点変化係数を含む全1,073,741,824点を最大絶対差3.55e-15で検証。GB200では `GEMM_FUSED` が187.617対194.058 ms/stageで3.32%速い |
+| [`p1023_gap_study.md`](p1023_gap_study.md) | p=1023 (Nq=1024, Ne=1) の `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_FUSED` 対応。Escale方向offsetだけを64-bit安全化し、未使用surfaceとz中間配列を除いた。正確な配列payloadは144.320 GiBだが、OpenACC allocator込みの実測peak増分はGEMM 176.416 GiB / FUSED 176.358 GiB。p=511/575/767/1023実測を覆う事前見積もりを`payload*1.25+2 GiB`とした。点変化係数を含む全1,073,741,824点を最大絶対差3.55e-15で検証。GB200では `GEMM_FUSED` が187.617対194.058 ms/stageで3.32%速い |
 | [`index64_boundary_validation.md`](index64_boundary_validation.md) | 高次数の host-side extent / pointer offset を64-bit安全化。p=7/15/511 の全 owned `dqdt` は変更前後でビット一致、device SASSも一致。性能差は −0.19%〜+0.02%で既存経路への影響なし |
 | [`p31_gap_study.md`](p31_gap_study.md) | 同一 DOF の 6 点目にして最後の点 p=31 (Nq=32)。**最速は `CUDAFORTRAN_FUSED_TC`**（§14、374.8 µs/stage）。Nq=32 の Tensor Core 融合カーネル 2 本で CUDA core 融合版の **2.66 倍**、`GEMM` の 1.67 倍。x と z が同じ出力写像を共有するので z の shared 往復が無く、転置形にすると D1D がレジスタに載る。**「p=31 は曲線の極大点」「融合が勝つ上限は p=15」という当初の結論はこれで否定された**（§14.2、§14.1 に訂正注記）。Nq=32 の CUDA core 融合カーネル 2 本、CUTLASS 経路は p=31 で使えるという訂正、**lift と assembly の融合で `GEMM` / `GEMM_CUTE` 経路を全次数 1 割速く**した（p=31 −11.7%、p=63 −12.0%、p=127 −10.2%、ビット一致） |
 
@@ -365,8 +365,9 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 - **p=1023, `Ne=1`（2026-08-28、`p1023_gap_study.md`）**:
   `CUDAFORTRAN_GEMM_FUSED`が最速。3-run中央値のwarm-up後device tendencyは
   **187.617 ms/stage**、`CUDAFORTRAN_GEMM`の194.058 ms/stageより**3.32%**短い。
-  両経路の主要device配列を144 GiBへ揃え、点変化係数を含む全1,073,741,824点の
-  `dqdt`を最大絶対差3.55e-15で検証した。
+  両経路のrequested payloadは144.320 GiBだが、OpenACC allocator込みの実測peak
+  増分は176.4 GiB。p=511/575/767/1023を覆う保守見積もりは`payload*1.25+2 GiB`。
+  点変化係数を含む全1,073,741,824点の`dqdt`を最大絶対差3.55e-15で検証した。
 - 同じ体積 DOF 数でも、p=7 と p=255 で最適戦略は逆転する。
 - **p=15, `Ne=16^3`（2026-08-27）**: 同一 DOF の 3 点目。同一 DOF を立方一様メッシュで
   保つ条件 `NeX*Nq = 256` から、間を埋められる次数は **p = 15, 31, 63, 127 の 2 冪だけ**で、

@@ -141,6 +141,7 @@ module mod_cuda_dg_kernels
   public :: cuda_dg_graph_launch
   public :: cuda_dg_graph_is_ready
   public :: cuda_dg_graph_finalize
+  public :: cuda_dg_report_memory
 
   interface
     subroutine dg_set_cuda_stream(stream) &
@@ -392,6 +393,29 @@ module mod_cuda_dg_kernels
   end interface
 
 contains
+
+  !> Report CUDA-visible device memory at a caller-selected phase boundary.
+  !! This includes allocations and reserves owned by CUDA, OpenACC, and
+  !! libraries, unlike a sum of the application array extents.
+  subroutine cuda_dg_report_memory(label)
+    implicit none
+    character(len=*), intent(in) :: label
+    integer(kind=cuda_count_kind) :: free_bytes, total_bytes
+    integer :: ierr
+    !------------------------------------------------------------
+
+    ierr = cudaMemGetInfo(free_bytes, total_bytes)
+    if (ierr /= cudaSuccess) then
+      write(*,'(A,1X,A,1X,A,I0)') 'DEVICE_MEMORY', trim(label), &
+        'cuda_error=', ierr
+      return
+    end if
+    write(*,'(A,1X,A,3(1X,A,I0))') 'DEVICE_MEMORY', trim(label), &
+      'total=', total_bytes, 'used=', total_bytes-free_bytes, &
+      'free=', free_bytes
+
+    return
+  end subroutine cuda_dg_report_memory
 
   !> Launch the kernels of this module on the stream of an OpenACC queue.
   !!

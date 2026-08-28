@@ -48,8 +48,17 @@ module mod_cuda_dg_kernels
   public :: cuda_dg_graph_launch
   public :: cuda_dg_graph_is_ready
   public :: cuda_dg_graph_finalize
+  public :: cuda_dg_report_memory
 
 contains
+  !> No CUDA device exists in this build, so memory reporting is a no-op.
+  subroutine cuda_dg_report_memory(label)
+    implicit none
+    character(len=*), intent(in) :: label
+
+    return
+  end subroutine cuda_dg_report_memory
+
   !> No-op counterpart of the CUDA Fortran routine: without CUDA kernels the
   !! OpenACC queue does not have to share a stream with anything.
   subroutine cuda_dg_bind_acc_stream(queue)
