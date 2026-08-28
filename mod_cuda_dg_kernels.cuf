@@ -119,6 +119,10 @@ module mod_cuda_dg_kernels
   public :: cuda_ozaki2_init
   public :: cuda_ozaki2_alloc_workspace
   public :: cuda_ozaki2_finalize
+  public :: cuda_cal_dqdt_gemm_ozaki1
+  public :: cuda_ozaki1_init
+  public :: cuda_ozaki1_alloc_workspace
+  public :: cuda_ozaki1_finalize
   public :: cuda_gemm_setup
   public :: cuda_cutlass_set_mma_shape
   public :: cuda_gemm_finalize
@@ -275,6 +279,42 @@ module mod_cuda_dg_kernels
       real(c_double), device :: A(*), B(*), C(*)
       integer(c_int) :: ozaki2_dgemm_strided_batched
     end function ozaki2_dgemm_strided_batched
+
+    function ozaki1_init(slice_count) bind(C, name="ozaki1_init")
+      import
+      integer(c_int), value :: slice_count
+      integer(c_int) :: ozaki1_init
+    end function ozaki1_init
+
+    function ozaki1_finalize() bind(C, name="ozaki1_finalize")
+      import
+      integer(c_int) :: ozaki1_finalize
+    end function ozaki1_finalize
+
+    function ozaki1_alloc_workspace(Nq, Ne, Np) &
+      bind(C, name="ozaki1_alloc_workspace")
+      import
+      integer(c_int), value :: Nq, Ne, Np
+      integer(c_int) :: ozaki1_alloc_workspace
+    end function ozaki1_alloc_workspace
+
+    function ozaki1_dgemm(transa, transb, m, n, k, A, lda, B, ldb, C, ldc) &
+      bind(C, name="ozaki1_dgemm")
+      import
+      integer(c_int), value :: transa, transb, m, n, k, lda, ldb, ldc
+      real(c_double), device :: A(*), B(*), C(*)
+      integer(c_int) :: ozaki1_dgemm
+    end function ozaki1_dgemm
+
+    function ozaki1_dgemm_strided_batched(transa, transb, m, n, k, A, lda, &
+      strideA, B, ldb, strideB, C, ldc, strideC, batch) &
+      bind(C, name="ozaki1_dgemm_strided_batched")
+      import
+      integer(c_int), value :: transa, transb, m, n, k, lda, ldb, ldc, batch
+      integer(c_long_long), value :: strideA, strideB, strideC
+      real(c_double), device :: A(*), B(*), C(*)
+      integer(c_int) :: ozaki1_dgemm_strided_batched
+    end function ozaki1_dgemm_strided_batched
 
     function launch_volume_gemm_xy(deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, &
       escale, Nq, Ne, mma_shape) bind(C, name="launch_volume_gemm_xy")
@@ -1312,6 +1352,128 @@ contains
     kernel_time(1) = dg_kernel_time(1)
     kernel_time(2) = dg_kernel_time(2)
   end subroutine cuda_cal_dqdt_gemm_ozaki2
+
+  subroutine cuda_ozaki1_init(slice_count)
+    implicit none
+    integer, intent(in) :: slice_count
+    integer :: istat
+
+    istat = ozaki1_init(slice_count)
+    if (istat /= 0) call cuda_failure("ozaki1_init", istat)
+
+    return
+  end subroutine cuda_ozaki1_init
+
+  subroutine cuda_ozaki1_alloc_workspace(Nq, Ne, Np)
+    implicit none
+    integer, intent(in) :: Nq, Ne, Np
+    integer :: istat
+
+    istat = ozaki1_alloc_workspace(Nq, Ne, Np)
+    if (istat /= 0) call cuda_failure("ozaki1_alloc_workspace", istat)
+
+    return
+  end subroutine cuda_ozaki1_alloc_workspace
+
+  subroutine cuda_ozaki1_finalize()
+    implicit none
+    integer :: istat
+
+    istat = ozaki1_finalize()
+    if (istat /= 0) call cuda_failure("ozaki1_finalize", istat)
+
+    return
+  end subroutine cuda_ozaki1_finalize
+
+  subroutine cuda_cal_dqdt_gemm_ozaki1( &
+    dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, flux_bnd, &
+    flux_x, flux_y, flux_z, deriv_x, deriv_y, deriv_z, lift_out, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), device, intent(out) :: dqdt(Np,NeA)
+    real(RP), device, intent(in) :: q(Np,NeA)
+    real(RP), device, intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), device, intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
+    real(RP), device, intent(in) :: Lift1D(Nq,6)
+    integer, device, intent(in) :: VMapM(NfpTot,Ne), VMapP(NfpTot,Ne)
+    real(RP), device, intent(in) :: normal_fn(NfpTot,Ne,3)
+    real(RP), device, intent(in) :: Fscale(NfpTot,Ne)
+    real(RP), device, intent(in) :: Escale(Np,Ne,3)
+    real(RP), device, intent(out) :: flux_bnd(NfpTot,Ne)
+    real(RP), device, intent(out) :: flux_x(Np,Ne), flux_y(Np,Ne), flux_z(Np,Ne)
+    real(RP), device, intent(out) :: deriv_x(Np,Ne), deriv_y(Np,Ne), deriv_z(Np,Ne)
+    real(RP), device, intent(out) :: lift_out(Np,Ne)
+    real(RP), intent(out) :: kernel_time(2)
+
+    integer :: istat, nface, npoint, nblock, nblock_face
+    integer :: nq2, plane_batch
+    integer(c_long_long) :: stride_plane, stride_elem, stride_zero, stride_vol
+    logical :: use_side
+
+    if (.not. gemm_inited) then
+      call cuda_gemm_setup(.false.)
+    end if
+
+    call dg_ev_begin()
+
+    nq2 = Nq*Nq
+    nface = NfpTot*Ne
+    npoint = Np*Ne
+    nblock = (npoint+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    nblock_face = (nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    plane_batch = Nq*Ne
+    stride_plane = int(nq2,c_long_long)
+    stride_elem = int(NfpTot,c_long_long)
+    stride_zero = 0_c_long_long
+    stride_vol = int(Np,c_long_long)
+
+    call dg_ev_record(1)
+
+    use_side = dg_side_enabled .and. (Nq >= 64)
+
+    if (.not. use_side) then
+      call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    end if
+
+    call launch_volume_flux( &
+      flux_x, flux_y, flux_z, q, u, v, w, npoint )
+
+    if (use_side) then
+      call dg_side_fork()
+      call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface )
+    end if
+
+    istat = ozaki1_dgemm(0, 0, Nq, nq2*Ne, Nq, D1D, Nq, flux_x, Nq, deriv_x, Nq)
+    if (istat /= 0) call cuda_failure("ozaki1_dgemm x-deriv", istat)
+
+    istat = ozaki1_dgemm_strided_batched(0, 0, Nq, Nq, Nq, &
+      flux_y, Nq, stride_plane, D1D_tr, Nq, stride_zero, &
+      deriv_y, Nq, stride_plane, plane_batch)
+    if (istat /= 0) call cuda_failure("ozaki1_dgemm y-deriv", istat)
+
+    istat = ozaki1_dgemm_strided_batched(0, 0, nq2, Nq, Nq, &
+      flux_z, nq2, stride_vol, D1D_tr, Nq, stride_zero, &
+      deriv_z, nq2, stride_vol, Ne)
+    if (istat /= 0) call cuda_failure("ozaki1_dgemm z-deriv", istat)
+
+    if (use_side) call dg_side_join()
+
+    call separable_lift_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+      dqdt, Escale, deriv_x, deriv_y, deriv_z, flux_bnd, Lift1D, &
+      Nq, Np, npoint )
+
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) call cuda_failure("CUDAFORTRAN_GEMM_OZAKI1 kernels",istat)
+    call dg_ev_record(2)
+    call dg_ev_end(DG_EV_SINGLE)
+
+    kernel_time(1) = dg_kernel_time(1)
+    kernel_time(2) = dg_kernel_time(2)
+  end subroutine cuda_cal_dqdt_gemm_ozaki1
 
   subroutine cuda_cal_dqdt_gemm_cute( &
     dqdt, q, u, v, w, D1D, D1D_tr, Lift1D, VMapM, VMapP, &

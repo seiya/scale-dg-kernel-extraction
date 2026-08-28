@@ -12,7 +12,7 @@ GPUNVCCFLAGS ?= -arch=native
 NVCCFLAGS ?= -O3 -std=c++17 $(GPUNVCCFLAGS)
 CUTLASS_HOME ?= third_party/cutlass
 NVCCFLAGS += -I$(CUTLASS_HOME)/include --expt-relaxed-constexpr
-CUDA_KERNEL_OBJ = mod_cuda_dg_kernels.o cuda_dg_kernels_tc.o cuda_cublas_gemm.o cuda_cutlass_gemm_fused.o cuda_ozaki2_gemm.o
+CUDA_KERNEL_OBJ = mod_cuda_dg_kernels.o cuda_dg_kernels_tc.o cuda_cublas_gemm.o cuda_cutlass_gemm_fused.o cuda_ozaki2_gemm.o cuda_ozaki1_gemm.o
 LDLIBS ?= -c++libs -lcublas
 else ifeq ($(ACC),1)
 ifeq ($(origin FC), default)
@@ -72,13 +72,16 @@ cuda_cutlass_gemm_fused.o: cuda_cutlass_gemm_fused.cu
 cuda_ozaki2_gemm.o: cuda_ozaki2_gemm.cu
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
+cuda_ozaki1_gemm.o: cuda_ozaki1_gemm.cu
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
 
 # Dependency
 cuda_cutlass_gemm_fused.o: cutlass_z_gemm_assembly.h cutlass_f64_kdeep_mma.h
 mod_mesh.o: mod_common.o
 mod_dg_optr_kernel_opt1.o: mod_common.o
 mod_dg_optr_kernel.o: mod_common.o mod_dg_optr_kernel_opt1.o
-mod_cuda_dg_kernels.o: mod_common.o cuda_dg_kernels_tc.o cuda_cublas_gemm.o cuda_cutlass_gemm_fused.o cuda_ozaki2_gemm.o
+mod_cuda_dg_kernels.o: mod_common.o cuda_dg_kernels_tc.o cuda_cublas_gemm.o cuda_cutlass_gemm_fused.o cuda_ozaki2_gemm.o cuda_ozaki1_gemm.o
 mod_cuda_dg_kernels_stub.o: mod_common.o
 mod_advect3d_eq.o: mod_common.o mod_dg_optr_kernel.o $(CUDA_KERNEL_OBJ)
 main.o: mod_mesh.o mod_advect3d_eq.o
