@@ -145,7 +145,14 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
   (2)(3) を p=63 の枝にも当てると、ビット一致のまま **+2.7% / +0.8%** と遅くなる。
   不採用の記録: z を 2 テンソル化（+8.1%）、z のタイル・warp・stage・padding 掃引、
   x GEMM の batched 化（+0.7%）・cuBLAS 化（+0.7%）・タイル掃引、
-  epilogue への `__restrict__`（±0）。
+  epilogue への `__restrict__`（±0）。**§10.8 で残りも閉じた**: lift の shared
+  ステージは命令発行律速なので賞金ゼロ、lift を x/y GEMM へ移す案は
+  1 要素あたりのロードが z 3 本・y 3 本・x 5 本で z が最良の宿主、K 拡張で
+  GEMM 本体に載せる手は**その GEMM の epilogue が `Escale` 乗算に使えなくなる**
+  ため 4 通りすべてでロード数が変わらず差し引き +3.4 µs、エポローグ全展開 +1.0%、
+  占有率を上げる `__launch_bounds__` は 4/5 ブロックともスピルして +24〜40%。
+  **残るのは 3 本の GEMM の mainloop（ピーク比 84〜86%）だけで、同じ形状で
+  cuBLAS も同じ 85% しか出ない。**
 
 - **p=255, `Ne=1`（2026-08-28、`p255_gap_study.md`）**: **最速は `CUDAFORTRAN_FUSED_TC`**
   （Main **3.1265** 対 `GEMM_FUSED` 3.2346 ms/step、**1.035 倍**。
