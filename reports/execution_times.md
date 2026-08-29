@@ -744,3 +744,10 @@ elembnd）。冒頭の `nstep=1000` 表と、追記の `FUSED_TC` 再測定は�
 は RK 最適化前で、同一 conf では 5.088 ms/step。C++ `FUSED`（UseTc=false）の
 427.8 µs は旧 Fortran 融合（device 〜324 µs）より遅く、TC 版との対照は同一
 C++ ソースに限る。FLOP/s と DRAM は [`README.md`](README.md) のまとめ表。
+
+### 追記 17: p=7 TC の z 往復天井（2026-08-29、不採用）
+
+`sDz` のストア/ロードとバリア 2 本を消す不正アブレーション。数値は壊れる。
+device 中央値 **274.14 → 270.50 µs/stage（−1.3%）**。天井が 4 µs なので
+写像を直す実装はしない。詳細は `tc_paper_survey_2407.09621.md` §16。
+コードはベースに戻してある。
