@@ -60,7 +60,7 @@ mod_dg_optr_kernel_opt1.f90: mod_dg_optr_kernel_opt1.F90.erb
 %.o: %.cuf
 	$(FC) $(FFLAGS) -c $<
 
-cuda_dg_kernels_tc.o: cuda_dg_kernels_tc.cu
+cuda_dg_kernels_tc.o: cuda_dg_kernels_tc.cu fused_kernel_geom.h
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 cuda_cublas_gemm.o: cuda_cublas_gemm.cu

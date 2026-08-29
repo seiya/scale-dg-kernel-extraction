@@ -357,32 +357,40 @@ int run_volume_gemm_y(double *deriv_y, const double *flux_y,
 }
 
 template <class Set>
+int run_volume_gemm_x(double *deriv_x, const double *flux_x, const double *D1D,
+                      int Nq, int Ne)
+{
+  const int nq2 = Nq * Nq;
+  return run_gemm_nn<typename Set::GemmX>(Nq, nq2 * Ne, Nq, D1D, Nq, flux_x,
+                                          Nq, deriv_x, Nq);
+}
+
+template <class Set>
+int run_volume_gemm_z(double *deriv_z, const double *flux_z,
+                      const double *D1D_tr, int Nq, int Ne)
+{
+  const int nq2 = Nq * Nq;
+  const long long stride_vol = static_cast<long long>(nq2) * Nq;
+  return run_gemm_batched_nn<typename Set::GemmZ>(
+      nq2, Nq, Nq, flux_z, nq2, stride_vol, D1D_tr, Nq, 0, deriv_z, nq2,
+      stride_vol, Ne);
+}
+
+template <class Set>
 int run_volume_gemms(double *deriv_x, double *deriv_y, double *deriv_z,
                      const double *flux_x, const double *flux_y,
                      const double *flux_z, const double *D1D,
                      const double *D1D_tr, int Nq, int Ne)
 {
-  const int nq2 = Nq * Nq;
-  const int Np = nq2 * Nq;
-  const long long stride_vol = Np;
-
-  //- The CUTE path assembles in a separate kernel, so its x and y GEMMs stay
-  //- unweighted: deriv_x = Dx, deriv_y = Dy.
-  int st = run_gemm_nn<typename Set::GemmX>(Nq, nq2 * Ne, Nq, D1D, Nq, flux_x,
-                                            Nq, deriv_x, Nq);
+  int st = run_volume_gemm_x<Set>(deriv_x, flux_x, D1D, Nq, Ne);
   if (st != 0) {
     return st;
   }
-
-  st = run_gemm_batched_nn<typename Set::GemmY>(
-      Nq, Nq, Nq, flux_y, Nq, nq2, D1D_tr, Nq, 0, deriv_y, Nq, nq2, Nq * Ne);
+  st = run_volume_gemm_y<Set>(deriv_y, flux_y, D1D_tr, Nq, Ne);
   if (st != 0) {
     return st;
   }
-
-  return run_gemm_batched_nn<typename Set::GemmZ>(
-      nq2, Nq, Nq, flux_z, nq2, stride_vol, D1D_tr, Nq, 0, deriv_z, nq2,
-      stride_vol, Ne);
+  return run_volume_gemm_z<Set>(deriv_z, flux_z, D1D_tr, Nq, Ne);
 }
 
 template <class Set, bool kWeighted>
@@ -470,6 +478,48 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
 }
 
 } // namespace
+
+extern "C" int launch_volume_gemm_x(double *deriv_x, const double *flux_x,
+                                    const double *D1D, int Nq, int Ne,
+                                    int mma_shape)
+{
+  if (Nq <= 0 || Ne <= 0) {
+    return 1;
+  }
+  switch (mma_shape) {
+  case 0:
+    return run_volume_gemm_x<MmaSet_884>(deriv_x, flux_x, D1D, Nq, Ne);
+  case 1:
+    return run_volume_gemm_x<MmaSet_1684>(deriv_x, flux_x, D1D, Nq, Ne);
+  case 2:
+    return run_volume_gemm_x<MmaSet_1688>(deriv_x, flux_x, D1D, Nq, Ne);
+  case 3:
+    return run_volume_gemm_x<MmaSet_16816>(deriv_x, flux_x, D1D, Nq, Ne);
+  default:
+    return bad_mma_shape(mma_shape);
+  }
+}
+
+extern "C" int launch_volume_gemm_z(double *deriv_z, const double *flux_z,
+                                    const double *D1D_tr, int Nq, int Ne,
+                                    int mma_shape)
+{
+  if (Nq <= 0 || Ne <= 0) {
+    return 1;
+  }
+  switch (mma_shape) {
+  case 0:
+    return run_volume_gemm_z<MmaSet_884>(deriv_z, flux_z, D1D_tr, Nq, Ne);
+  case 1:
+    return run_volume_gemm_z<MmaSet_1684>(deriv_z, flux_z, D1D_tr, Nq, Ne);
+  case 2:
+    return run_volume_gemm_z<MmaSet_1688>(deriv_z, flux_z, D1D_tr, Nq, Ne);
+  case 3:
+    return run_volume_gemm_z<MmaSet_16816>(deriv_z, flux_z, D1D_tr, Nq, Ne);
+  default:
+    return bad_mma_shape(mma_shape);
+  }
+}
 
 extern "C" int launch_volume_gemm_cute(
     double *deriv_x, double *deriv_y, double *deriv_z, const double *flux_x,

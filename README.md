@@ -138,23 +138,26 @@ Select it at run time with
 DqdtKernel_Type = "CUDAFORTRAN_SPLIT"
 ```
 
-An additional specialized fused variant is selected with
+Hand-written fused tendency kernels live in `cuda_dg_kernels_tc.cu` and are
+selected with
 
 ```fortran
 DqdtKernel_Type = "CUDAFORTRAN_FUSED"
 ```
 
-An additional Tensor Core variant is selected with
+or
 
 ```fortran
 DqdtKernel_Type = "CUDAFORTRAN_FUSED_TC"
 ```
 
-It keeps the original fused CUDA Fortran kernels for comparison and launches
-FP64 Tensor Core (`mma.sync.aligned.m8n8k4.f64`) implementations from
-`cuda_dg_kernels_tc.cu`. Volume fluxes remain pointwise `q*u`, `q*v`, and `q*w`,
-and all six faces are evaluated. On GB200, compile the C++ kernels with
-`NVCCFLAGS=-O3 -std=c++17 -arch=sm_100` together with
+They share one C++ source. `CUDAFORTRAN_FUSED_TC` uses FP64 Tensor Core
+`mma.sync.aligned.m8n8k4.f64`. `CUDAFORTRAN_FUSED` is the same kernel with
+that MMA replaced by DFMA on the same fragment layout; it exists to measure
+the Tensor Core effect, not as a separately tuned CUDA-core path. Geometry
+constants are in `fused_kernel_geom.h`. Volume fluxes remain pointwise
+`q*u`, `q*v`, and `q*w`, and all six faces are evaluated. On GB200, compile
+the C++ kernels with `NVCCFLAGS=-O3 -std=c++17 -arch=sm_100` together with
 `GPUFLAGS=-gpu=cc100`. Hopper/Ampere FP64 Tensor Cores (`sm_80`/`sm_90`) are
 also valid targets. Example inputs are `input_large_fused_tc.conf` (p=7) and
 `input_large_ne1_tc.conf` (p=255).
@@ -191,12 +194,17 @@ run look stalled. `input_p7_perf_gemm_emu.conf` is the corresponding one-step
 performance input. See `reports/cublas_emulation_survey.md` for timings and the
 remaining cuBLAS-internal allocation cost.
 
-A fused-volume GEMM variant keeps `volume_flux` materialization and the same
-lift `cublasDgemm` calls as `CUDAFORTRAN_GEMM_CUTE`. Volume x/y derivatives use
-the CUTLASS d884 TensorOp GEMMs unchanged. The z GEMM uses the same Tensor Core
-mainloop, then a custom epilogue that forms
-`dqdt = -(Ex*Dx + Ey*Dy + Ez*Dz + lift)` so the separate assembly kernel is not
-launched. Pointwise `q*velocity` is not fused into the GEMM mainloop.
+`CUDAFORTRAN_GEMM_OZAKI1` and `CUDAFORTRAN_GEMM_OZAKI2` use that same unfused
+GEMM driver and replace only the three volume GEMMs. Compare them to native
+cuBLAS and to `CublasEmulation`; they are not CUTLASS or fused-epilogue paths.
+
+A fused-volume GEMM variant keeps `volume_flux` materialization. Volume x/y
+derivatives use the CUTLASS d884 TensorOp GEMMs (cuBLAS for x when
+`Nq<=64`). The z GEMM uses the same Tensor Core mainloop, then a custom
+epilogue that forms `dqdt = -(Ex*Dx + Ey*Dy + Ez*Dz + lift)` so the separate
+assembly kernel is not launched. At `Nq>64` the x/y epilogues also fold in
+`Escale` and `deriv_x`. Pointwise `q*velocity` is not fused into the GEMM
+mainloop.
 
 ```fortran
 DqdtKernel_Type = "CUDAFORTRAN_GEMM_FUSED"
@@ -206,12 +214,11 @@ Its CUTLASS y GEMM puts `Nq*Ne` batches on `grid.z`, so it requires
 `Nq*Ne <= 65535`. Example inputs are `input_p255_val_gemm_fused.conf`,
 `input_p511_val_gemm_fused.conf`, `input_p575_val_gemm_fused.conf`,
 `input_p767_val_gemm_fused.conf`, and `input_p1023_val_gemm_fused.conf`.
-The unfused `CUDAFORTRAN_GEMM` path can be timed side by side.
 
-`CUDAFORTRAN_GEMM_CUTE` keeps flux, lift, and assembly identical to
-`CUDAFORTRAN_GEMM`, but replaces only the three volume `cublasDgemm` calls with
-the same tiled GEMM used by the fused path (no prologue/epilogue). Use it to
-measure tiled-GEMM quality against cuBLAS. Example:
+`CUDAFORTRAN_GEMM_CUTE` is the unfused twin of that CUTLASS GEMM: same tiles,
+same `Nq<=64` cuBLAS-x switch, then `separable_lift_assembly` instead of the
+fused z epilogue. Use `GEMM` vs `GEMM_CUTE` for library/mainloop quality and
+`GEMM_CUTE` vs `GEMM_FUSED` for the fusion package. Example:
 `input_p255_val_gemm_cute.conf`.
 
 The p=255 Legendre-Gauss-Lobatto nodes and operators are generated at startup;

@@ -2,20 +2,44 @@
 #include <cstdio>
 #include <cstdint>
 
+#include "fused_kernel_geom.h"
+
 // FP64 Tensor Core GEMM helpers: mma.sync.aligned.m8n8k4.f64
 // Fragment map (SM80+):
 //   lane = thread % 32
 //   A(8x4): A[lane/4][lane%4]
 //   B(4x8): B[lane%4][lane/4]
 //   C(8x8): C[lane/4][(lane%4)*2] and +1
+//
+// UseTc=false walks the same fragments with DFMA and warp shuffles so
+// CUDAFORTRAN_FUSED and CUDAFORTRAN_FUSED_TC share every other instruction.
 
+template <bool UseTc>
 __device__ __forceinline__ void mma_m8n8k4_f64(
     double &d0, double &d1, double a, double b, double c0, double c1)
 {
-  asm volatile(
-      "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0, %1}, {%2}, {%3}, {%4, %5};"
-      : "=d"(d0), "=d"(d1)
-      : "d"(a), "d"(b), "d"(c0), "d"(c1));
+  if constexpr (UseTc) {
+    asm volatile(
+        "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0, %1}, {%2}, {%3}, {%4, %5};"
+        : "=d"(d0), "=d"(d1)
+        : "d"(a), "d"(b), "d"(c0), "d"(c1));
+  } else {
+    const int lane = (int)threadIdx.x & 31;
+    const int row = lane >> 2;
+    const int col0 = (lane & 3) * 2;
+    double acc0 = c0;
+    double acc1 = c1;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const double ak = __shfl_sync(0xffffffff, a, (row << 2) + k);
+      const double bk0 = __shfl_sync(0xffffffff, b, (col0 << 2) + k);
+      const double bk1 = __shfl_sync(0xffffffff, b, ((col0 + 1) << 2) + k);
+      acc0 = fma(ak, bk0, acc0);
+      acc1 = fma(ak, bk1, acc1);
+    }
+    d0 = acc0;
+    d1 = acc1;
+  }
 }
 
 __device__ __forceinline__ void mma_reset(double &c0, double &c1)
@@ -116,7 +140,8 @@ __device__ __forceinline__ void stage_xface(double *sM, int node, double q,
   }
 }
 
-__global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
+template <bool UseTc>
+__global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
@@ -249,8 +274,8 @@ __global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
   {
     const int fz = sw_z(((warp << 3) + row) + (colk << 6));
     mma_reset(c0, c1);
-    mma_m8n8k4_f64(c0, c1, sDfrag[frag], sFluxZ[fz], c0, c1);
-    mma_m8n8k4_f64(c0, c1, sDfrag[frag + 32], sFluxZ[fz ^ 256], c0, c1);
+    mma_m8n8k4_f64<UseTc>(c0, c1, sDfrag[frag], sFluxZ[fz], c0, c1);
+    mma_m8n8k4_f64<UseTc>(c0, c1, sDfrag[frag + 32], sFluxZ[fz ^ 256], c0, c1);
   }
   // sw_z() and sw_dz() permute across warp boundaries, so the z panel needs a
   // block-wide barrier before it overwrites the flux it was read from.
@@ -289,8 +314,8 @@ __global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
     const int fx = sw_xy(colk + (row << 3) + (k << 6));
     const double2 es = *reinterpret_cast<const double2 *>(Escale + nidx0);
     mma_reset(c0, c1);
-    mma_m8n8k4_f64(c0, c1, sFluxX[fx], sDfrag[frag], c0, c1);
-    mma_m8n8k4_f64(c0, c1, sFluxX[fx ^ 4], sDfrag[frag + 32], c0, c1);
+    mma_m8n8k4_f64<UseTc>(c0, c1, sFluxX[fx], sDfrag[frag], c0, c1);
+    mma_m8n8k4_f64<UseTc>(c0, c1, sFluxX[fx ^ 4], sDfrag[frag + 32], c0, c1);
     acc0 = es.x * c0;
     acc1 = es.y * c1;
   }
@@ -302,8 +327,8 @@ __global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
     const double2 es =
         *reinterpret_cast<const double2 *>(Escale + nidx0 + npoint);
     mma_reset(c0, c1);
-    mma_m8n8k4_f64(c0, c1, sDfrag[frag], sFluxY[fy], c0, c1);
-    mma_m8n8k4_f64(c0, c1, sDfrag[frag + 32], sFluxY[fy ^ 32], c0, c1);
+    mma_m8n8k4_f64<UseTc>(c0, c1, sDfrag[frag], sFluxY[fy], c0, c1);
+    mma_m8n8k4_f64<UseTc>(c0, c1, sDfrag[frag + 32], sFluxY[fy ^ 32], c0, c1);
     acc0 += es.x * c0;
     acc1 += es.y * c1;
   }
@@ -371,19 +396,6 @@ __global__ __launch_bounds__(256, 8) void tendency_fused_p7_tc_kernel(
 // that 4x4 costs 32 accumulator doubles, which only fits three blocks per SM.
 // At that occupancy the un-pipelined loop lost more in exposed global latency
 // than the cheaper mma loop won, so the two changes only pay together.
-
-#define NQ255 256
-#define BM255 64
-#define BN255 64
-#define BK255 16
-#define TM255 4
-#define TN255 4
-#define TH255 128
-// Three blocks per SM is the most that fits without spilling: ptxas lands on
-// 168 registers and 3 * 128 * 168 = 64512 of the 65536 register file.  Asking
-// for four (128 registers) spills and costs 27%, asking for two wastes a third
-// of the machine.
-#define MINB255 3
 
 // Shared tiles are stored as l + 16*outer, l in bits 0-3 and outer in bits
 // 4-9.  Three different access patterns hit these arrays: the mma read (l from
@@ -512,8 +524,8 @@ __device__ __forceinline__ void p255_epilogue(
 //   - bigger tiles (64x128, 128x64, 128x128) in every thread-count and
 //     launch-bound combination that fits: 10-35% slower, all of them through
 //     registers and occupancy, never through the operand traffic they save.
-template <int DIR>
-__global__ __launch_bounds__(TH255, MINB255) void tendency_p255_tc_kernel(
+template <int DIR, bool UseTc>
+__global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
     double *__restrict__ dqdt, const double *__restrict__ q,
     const double *__restrict__ velocity, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ flux_bnd,
@@ -731,7 +743,7 @@ __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_tc_kernel(
 #pragma unroll
         for (int bb = 0; bb < TN; ++bb) {
           const int e = 2 * (TN * a + bb);
-          mma_m8n8k4_f64(acc[e], acc[e + 1], av[a], bv[bb], acc[e],
+          mma_m8n8k4_f64<UseTc>(acc[e], acc[e + 1], av[a], bv[bb], acc[e],
                          acc[e + 1]);
         }
       }
@@ -769,32 +781,71 @@ extern "C" void dg_set_cuda_stream(void *stream)
   dg_cuda_stream = static_cast<cudaStream_t>(stream);
 }
 
+template <bool UseTc>
+void launch_tendency_fused_p7_impl(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale,
+    const double *Escale, int Ne)
+{
+  tendency_fused_p7_kernel<UseTc><<<Ne, P7_THREADS, 0, dg_cuda_stream>>>(
+      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
+      Ne);
+  check_cuda("tendency_fused_p7_kernel");
+}
+
+extern "C" void launch_tendency_fused_p7(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale,
+    const double *Escale, int Ne)
+{
+  launch_tendency_fused_p7_impl<false>(dqdt, D1D, Lift1D, q, u, v, w, VMapM,
+                                       VMapP, normal_fn, Fscale, Escale, Ne);
+}
+
 extern "C" void launch_tendency_fused_p7_tc(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
     const double *Escale, int Ne)
 {
-  tendency_fused_p7_tc_kernel<<<Ne, 256, 0, dg_cuda_stream>>>(
-      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
-      Ne);
-  check_cuda("tendency_fused_p7_tc_kernel");
+  launch_tendency_fused_p7_impl<true>(dqdt, D1D, Lift1D, q, u, v, w, VMapM,
+                                      VMapP, normal_fn, Fscale, Escale, Ne);
 }
 
+template <bool UseTc>
+void launch_tendency_xyz_p255_impl(
+    double *dqdt, const double *q, const double *u, const double *v,
+    const double *w, const double *D1D, const double *Lift1D,
+    const double *flux_bnd, const double *Escale, int Ne)
+{
+  const int nblock = (NQ255 * NQ255 * NQ255 / (BM255 * BN255)) * Ne;
+  tendency_p255_kernel<0, UseTc><<<nblock, TH255, 0, dg_cuda_stream>>>(
+      dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, Ne);
+  tendency_p255_kernel<1, UseTc><<<nblock, TH255, 0, dg_cuda_stream>>>(
+      dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, Ne);
+  tendency_p255_kernel<2, UseTc><<<nblock, TH255, 0, dg_cuda_stream>>>(
+      dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, Ne);
+  check_cuda("p255 fused tendency kernels");
+}
+
+extern "C" void launch_tendency_xyz_p255(
+    double *dqdt, const double *q, const double *u, const double *v,
+    const double *w, const double *D1D, const double *Lift1D,
+    const double *flux_bnd, const double *Escale, int Ne)
+{
+  launch_tendency_xyz_p255_impl<false>(dqdt, q, u, v, w, D1D, Lift1D, flux_bnd,
+                                       Escale, Ne);
+}
 
 extern "C" void launch_tendency_xyz_p255_tc(
     double *dqdt, const double *q, const double *u, const double *v,
     const double *w, const double *D1D, const double *Lift1D,
     const double *flux_bnd, const double *Escale, int Ne)
 {
-  const int nblock = (NQ255 * NQ255 * NQ255 / (BM255 * BN255)) * Ne;
-  tendency_p255_tc_kernel<0><<<nblock, TH255, 0, dg_cuda_stream>>>(
-      dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, Ne);
-  tendency_p255_tc_kernel<1><<<nblock, TH255, 0, dg_cuda_stream>>>(
-      dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, Ne);
-  tendency_p255_tc_kernel<2><<<nblock, TH255, 0, dg_cuda_stream>>>(
-      dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, Ne);
-  check_cuda("p255 tensor-core tendency kernels");
+  launch_tendency_xyz_p255_impl<true>(dqdt, q, u, v, w, D1D, Lift1D, flux_bnd,
+                                      Escale, Ne);
 }
 
 //============================================================================
@@ -818,9 +869,6 @@ extern "C" void launch_tendency_xyz_p255_tc(
 // operand D[i][l], y as the A operand D[j_out][j_in] and z as the A operand
 // D[k_out][l]; in every case a lane wants D[tile*8 + row][colk + 4*ks], so one
 // layout indexed by (tile, ks, row, colk) covers them all.
-#define NQ15 16
-#define NP15 4096
-#define NFPTOT15 1536
 
 // x reads the panel at (i = colk + 4*ks, j = tm*8 + row): colk lands in bits
 // 0-1 and row in bits 4-5, leaving bits 2-3 dead for a 4-way conflict.  y
@@ -888,7 +936,8 @@ __device__ __forceinline__ int sw_f15(int fp)
     }                                                                          \
   }
 
-__global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
+template <bool UseTc>
+__global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ v,
@@ -1083,8 +1132,8 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
 #pragma unroll
     for (int ks = 0; ks < 4; ++ks) {
       const double a = sbufX[ax ^ (4 * ks)];
-      mma_m8n8k4_f64(c0, c1, a, sDfrag[(ks * 8 << 2) + fbase], c0, c1);
-      mma_m8n8k4_f64(c2, c3, a, sDfrag[128 + (ks * 8 << 2) + fbase], c2, c3);
+      mma_m8n8k4_f64<UseTc>(c0, c1, a, sDfrag[(ks * 8 << 2) + fbase], c0, c1);
+      mma_m8n8k4_f64<UseTc>(c2, c3, a, sDfrag[128 + (ks * 8 << 2) + fbase], c2, c3);
     }
     const double2 ea = *reinterpret_cast<const double2 *>(Escale + gA);
     const double2 eb = *reinterpret_cast<const double2 *>(Escale + gB);
@@ -1106,8 +1155,8 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
 #pragma unroll
     for (int ks = 0; ks < 4; ++ks) {
       const double a = sDfrag[(ks * 8 << 2) + fbase];
-      mma_m8n8k4_f64(c0, c1, a, sbufY[byA ^ (64 * ks)], c0, c1);
-      mma_m8n8k4_f64(c2, c3, a, sbufY[byB ^ (64 * ks)], c2, c3);
+      mma_m8n8k4_f64<UseTc>(c0, c1, a, sbufY[byA ^ (64 * ks)], c0, c1);
+      mma_m8n8k4_f64<UseTc>(c2, c3, a, sbufY[byB ^ (64 * ks)], c2, c3);
     }
     const double2 ea = *reinterpret_cast<const double2 *>(Escale + gA + npoint);
     const double2 eb = *reinterpret_cast<const double2 *>(Escale + gB + npoint);
@@ -1129,8 +1178,8 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
 #pragma unroll
     for (int ks = 0; ks < 4; ++ks) {
       const double b = sbufZ[bz ^ (1024 * ks)];
-      mma_m8n8k4_f64(c0, c1, sDfrag[(ks * 8 << 2) + fbase], b, c0, c1);
-      mma_m8n8k4_f64(c2, c3, sDfrag[128 + (ks * 8 << 2) + fbase], b, c2, c3);
+      mma_m8n8k4_f64<UseTc>(c0, c1, sDfrag[(ks * 8 << 2) + fbase], b, c0, c1);
+      mma_m8n8k4_f64<UseTc>(c2, c3, sDfrag[128 + (ks * 8 << 2) + fbase], b, c2, c3);
     }
     // The 128 nodes this warp writes are exactly the 128 it just read: the z
     // mma covers ij in [8*warp, 8*warp+8) for every k, and so does the round
@@ -1205,7 +1254,8 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p15_tc_kernel(
   }
 }
 
-extern "C" void launch_tendency_fused_p15_tc(
+template <bool UseTc>
+void launch_tendency_fused_p15_impl(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
@@ -1215,14 +1265,35 @@ extern "C" void launch_tendency_fused_p15_tc(
       (3 * NP15 + NFPTOT15 + 256 + 96 + 2048) * (int)sizeof(double);
   static bool p15_optin = false;
   if (!p15_optin) {
-    cudaFuncSetAttribute(tendency_fused_p15_tc_kernel,
+    cudaFuncSetAttribute(tendency_fused_p15_kernel<UseTc>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, p15_smem);
     p15_optin = true;
   }
-  tendency_fused_p15_tc_kernel<<<Ne, 1024, p15_smem, dg_cuda_stream>>>(
-      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
-      Ne);
-  check_cuda("tendency_fused_p15_tc_kernel");
+  tendency_fused_p15_kernel<UseTc>
+      <<<Ne, P15_THREADS, p15_smem, dg_cuda_stream>>>(
+          dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale,
+          Escale, Ne);
+  check_cuda("tendency_fused_p15_kernel");
+}
+
+extern "C" void launch_tendency_fused_p15(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale,
+    const double *Escale, int Ne)
+{
+  launch_tendency_fused_p15_impl<false>(dqdt, D1D, Lift1D, q, u, v, w, VMapM,
+                                        VMapP, normal_fn, Fscale, Escale, Ne);
+}
+
+extern "C" void launch_tendency_fused_p15_tc(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale,
+    const double *Escale, int Ne)
+{
+  launch_tendency_fused_p15_impl<true>(dqdt, D1D, Lift1D, q, u, v, w, VMapM,
+                                       VMapP, normal_fn, Fscale, Escale, Ne);
 }
 
 // One 16-byte global-to-shared copy that never passes through a register.
@@ -1279,11 +1350,6 @@ __device__ __forceinline__ void cp_async_16(void *dst, const void *src)
 // evaluated by both slabs; the face phase is about 28 us of the CUDA-core
 // kernel, so that redundancy is affordable at two slabs and not at four.
 
-#define NQ31 32
-#define NP31 32768
-#define NFPTOT31 6144
-#define JSLAB31 16
-
 // Every plane in this kernel is addressed as low + 32*high, and every mma
 // operand read has the contraction index in one of those two fields and the
 // tile row in the other.  Whichever way round it is, address bits 2-3 are
@@ -1320,7 +1386,8 @@ __device__ __forceinline__ double p31_face_flux_tc(
   return 0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
 }
 
-__global__ __launch_bounds__(512, 1) void tendency_fused_p31_xz_tc_kernel(
+template <bool UseTc>
+__global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_xz_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ v,
@@ -1473,8 +1540,8 @@ __global__ __launch_bounds__(512, 1) void tendency_fused_p31_xz_tc_kernel(
     mma_reset(cz0, cz1);
 #pragma unroll
     for (int ks = 0; ks < 8; ++ks) {
-      mma_m8n8k4_f64(cx0, cx1, sFU[ax ^ (4 * ks)], Dx[ks], cx0, cx1);
-      mma_m8n8k4_f64(cz0, cz1, Dz[ks], sFW[bz + 128 * ks], cz0, cz1);
+      mma_m8n8k4_f64<UseTc>(cx0, cx1, sFU[ax ^ (4 * ks)], Dx[ks], cx0, cx1);
+      mma_m8n8k4_f64<UseTc>(cz0, cz1, Dz[ks], sFW[bz + 128 * ks], cz0, cz1);
     }
 
     const int j = j0 + jl;
@@ -1509,7 +1576,8 @@ __global__ __launch_bounds__(512, 1) void tendency_fused_p31_xz_tc_kernel(
 // first kernel: transposed it wants D as the A operand from registers and the
 // plane as the B operand from shared, under the same address map and the same
 // swizzle.  The block owns half an element in k, for the same wave reason.
-__global__ __launch_bounds__(512, 1) void tendency_fused_p31_y_tc_kernel(
+template <bool UseTc>
+__global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_y_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
@@ -1579,7 +1647,7 @@ __global__ __launch_bounds__(512, 1) void tendency_fused_p31_y_tc_kernel(
     mma_reset(c0, c1);
 #pragma unroll
     for (int ks = 0; ks < 8; ++ks) {
-      mma_m8n8k4_f64(c0, c1, Dy[ks], sFV[by + 128 * ks], c0, c1);
+      mma_m8n8k4_f64<UseTc>(c0, c1, Dy[ks], sFV[by + 128 * ks], c0, c1);
     }
 
     const int nidx =
@@ -1596,18 +1664,39 @@ __global__ __launch_bounds__(512, 1) void tendency_fused_p31_y_tc_kernel(
   }
 }
 
+template <bool UseTc>
+void launch_tendency_fused_p31_impl(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale,
+    const double *Escale, int Ne)
+{
+  tendency_fused_p31_xz_kernel<UseTc><<<2 * Ne, P31_THREADS, 0, dg_cuda_stream>>>(
+      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
+      Ne);
+  tendency_fused_p31_y_kernel<UseTc><<<2 * Ne, P31_THREADS, 0, dg_cuda_stream>>>(
+      dqdt, D1D, q, v, Escale, Ne);
+  check_cuda("tendency_fused_p31 kernels");
+}
+
+extern "C" void launch_tendency_fused_p31(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale,
+    const double *Escale, int Ne)
+{
+  launch_tendency_fused_p31_impl<false>(dqdt, D1D, Lift1D, q, u, v, w, VMapM,
+                                        VMapP, normal_fn, Fscale, Escale, Ne);
+}
+
 extern "C" void launch_tendency_fused_p31_tc(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
     const double *Escale, int Ne)
 {
-  tendency_fused_p31_xz_tc_kernel<<<2 * Ne, 512, 0, dg_cuda_stream>>>(
-      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
-      Ne);
-  tendency_fused_p31_y_tc_kernel<<<2 * Ne, 512, 0, dg_cuda_stream>>>(
-      dqdt, D1D, q, v, Escale, Ne);
-  check_cuda("tendency_fused_p31_tc kernels");
+  launch_tendency_fused_p31_impl<true>(dqdt, D1D, Lift1D, q, u, v, w, VMapM,
+                                       VMapP, normal_fn, Fscale, Escale, Ne);
 }
 
 //============================================================================
@@ -1639,10 +1728,6 @@ extern "C" void launch_tendency_fused_p31_tc(
 //   z: C[m=k][n=i] = sum_l D[k][l]  * FW[i][l]     A = sD,  B = sFW
 // Escale differs by direction, so the two accumulator sets stay separate.
 
-#define NQ63 64
-#define NP63 262144
-#define NQ2_63 4096
-#define NFPTOT63 24576
 // Depth of the contraction chunk.  All three legal values were measured
 // (Slurm 60560, Ne=4**3, nstep=20):
 //
@@ -1658,7 +1743,6 @@ extern "C" void launch_tendency_fused_p31_tc(
 // is no chunk loop at all, so every global load of the plane is in flight
 // before the first mma and the memory-level parallelism is the whole panel
 // instead of a quarter of it.  Section 16 of p63_gap_study.md.
-#define BK63 64
 
 // Two shared layouts, because the transpose between global and the mma has to
 // be paid somewhere.  A flux panel arrives from global with i fast and is
@@ -1750,24 +1834,15 @@ __device__ __forceinline__ int swu63(int idx)
 // 2x2 for half the tiles, so the extra warps spend their slots on shared
 // traffic.  Occupancy is worth chasing only until the operand loads start
 // paying for it.
-#define P63_WN 4
-#define P63_TN (8 / P63_WN)
-#define P63_THREADS (32 * 4 * P63_WN)
-#define P63_STAGE_ITERS (NQ63 * BK63 / P63_THREADS)
-#define P63_BPSM 1
 
 // The y kernel carries one accumulator set where the xz kernel carries two,
 // so its shape is set separately.  Two blocks per SM is what that buys: 512
 // threads asking for 64 registers is exactly the register file twice over,
 // and the y kernel reaches 64 with no spill where the xz kernel spills 128 to
 // 176 bytes and loses 8%.  Section 19 of p63_gap_study.md.
-#define P63Y_WN 4
-#define P63Y_TN (8 / P63Y_WN)
-#define P63Y_THREADS (32 * 4 * P63Y_WN)
-#define P63Y_STAGE_ITERS (NQ63 * BK63 / P63Y_THREADS)
-#define P63Y_BPSM 2
 
-__global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_tc_kernel(
+template <bool UseTc>
+__global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ w,
@@ -1862,8 +1937,8 @@ __global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_t
 #pragma unroll
         for (int bb = 0; bb < P63_TN; ++bb) {
           const int e = 2 * (P63_TN * a + bb);
-          mma_m8n8k4_f64(ax[e], ax[e + 1], av[a], bv[bb], ax[e], ax[e + 1]);
-          mma_m8n8k4_f64(az[e], az[e + 1], avz[a], bvz[bb], az[e], az[e + 1]);
+          mma_m8n8k4_f64<UseTc>(ax[e], ax[e + 1], av[a], bv[bb], ax[e], ax[e + 1]);
+          mma_m8n8k4_f64<UseTc>(az[e], az[e + 1], avz[a], bvz[bb], az[e], az[e + 1]);
         }
       }
     }
@@ -1923,7 +1998,8 @@ __global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_t
 // One block per (element, k plane).  C[m=j][n=i] = sum_l D[j][l] * FV[i][l],
 // which is the z contraction of the first kernel with (i,j) in place of (i,k),
 // so the same two panel shapes and the same swizzle serve it.
-__global__ __launch_bounds__(P63Y_THREADS, P63Y_BPSM) void tendency_fused_p63_y_tc_kernel(
+template <bool UseTc>
+__global__ __launch_bounds__(P63Y_THREADS, P63Y_BPSM) void tendency_fused_p63_y_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
@@ -2007,7 +2083,7 @@ __global__ __launch_bounds__(P63Y_THREADS, P63Y_BPSM) void tendency_fused_p63_y_
 #pragma unroll
         for (int bb = 0; bb < P63Y_TN; ++bb) {
           const int e = 2 * (P63Y_TN * a + bb);
-          mma_m8n8k4_f64(acc[e], acc[e + 1], av[a], bv[bb], acc[e], acc[e + 1]);
+          mma_m8n8k4_f64<UseTc>(acc[e], acc[e + 1], av[a], bv[bb], acc[e], acc[e + 1]);
         }
       }
     }
@@ -2031,7 +2107,8 @@ __global__ __launch_bounds__(P63Y_THREADS, P63Y_BPSM) void tendency_fused_p63_y_
   }
 }
 
-extern "C" void launch_tendency_fused_p63_tc(
+template <bool UseTc>
+void launch_tendency_fused_p63_impl(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const double *flux_bnd,
     const double *Escale, int Ne)
@@ -2041,21 +2118,39 @@ extern "C" void launch_tendency_fused_p63_tc(
   const size_t smem_y = (2 * NQ63 * BK63 + NQ2_63) * sizeof(double);
   static bool opted_in = false;
   if (!opted_in) {
-    cudaFuncSetAttribute(tendency_fused_p63_xz_tc_kernel,
+    cudaFuncSetAttribute(tendency_fused_p63_xz_kernel<UseTc>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)smem_xz);
-    cudaFuncSetAttribute(tendency_fused_p63_y_tc_kernel,
+    cudaFuncSetAttribute(tendency_fused_p63_y_kernel<UseTc>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)smem_y);
     opted_in = true;
   }
-  tendency_fused_p63_xz_tc_kernel<<<nblock, P63_THREADS, smem_xz,
-                                    dg_cuda_stream>>>(
-      dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
-  tendency_fused_p63_y_tc_kernel<<<nblock, P63Y_THREADS, smem_y,
-                                   dg_cuda_stream>>>(
-      dqdt, D1D, q, v, Escale, Ne);
-  check_cuda("tendency_fused_p63_tc kernels");
+  tendency_fused_p63_xz_kernel<UseTc>
+      <<<nblock, P63_THREADS, smem_xz, dg_cuda_stream>>>(
+          dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
+  tendency_fused_p63_y_kernel<UseTc>
+      <<<nblock, P63Y_THREADS, smem_y, dg_cuda_stream>>>(dqdt, D1D, q, v,
+                                                         Escale, Ne);
+  check_cuda("tendency_fused_p63 kernels");
+}
+
+extern "C" void launch_tendency_fused_p63(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const double *flux_bnd,
+    const double *Escale, int Ne)
+{
+  launch_tendency_fused_p63_impl<false>(dqdt, D1D, Lift1D, q, u, v, w, flux_bnd,
+                                        Escale, Ne);
+}
+
+extern "C" void launch_tendency_fused_p63_tc(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const double *flux_bnd,
+    const double *Escale, int Ne)
+{
+  launch_tendency_fused_p63_impl<true>(dqdt, D1D, Lift1D, q, u, v, w, flux_bnd,
+                                       Escale, Ne);
 }
 
 //============================================================================
@@ -2102,11 +2197,6 @@ extern "C" void launch_tendency_fused_p63_tc(
 //     which has twice the mma to hide it behind: 806.8 against 784.0, the
 //     same answer p=63 section 16.6 got.
 
-#define NQ127 128
-#define NP127 2097152
-#define NQ2_127 16384
-#define NFPTOT127 98304
-
 // Depth of the chunked panels.  The first version chunked every panel
 // together, the p=63 arrangement, and deeper was monotonically better (999.0
 // / 934.7 / 866.2 us/stage at 16 / 32 / 64 on the 64x64 tile) for the reason
@@ -2132,9 +2222,6 @@ extern "C" void launch_tendency_fused_p63_tc(
 // Together with the ablation that removes the mma itself for no gain, that
 // says the mma loop is bound by neither the mma nor the count of shared
 // loads, and nothing further is diagnosable without ncu.
-#ifndef BKD127
-#define BKD127 64
-#endif
 
 // The panels are 64 outer in the tile index, exactly the p=63 shape, so the
 // swizzles carry over unchanged.  swt127 is for outer-fast panels (idx =
@@ -2178,11 +2265,9 @@ __device__ __forceinline__ int sw127(int idx)
 // the 128x64 tile buys: 2x2 tiles per warp costs 2+2 operand loads per k-step
 // for four mma tiles against the 2+1 for two of a 2x1 shape, so a third fewer
 // shared loads per unit of mma, at the same 50% occupancy.
-#define P127_MT 64
-#define P127_Y_THREADS 1024
-#define P127_Y_FSTAGE_ITERS (P127_MT * NQ127 / P127_Y_THREADS)
 
-__global__ __launch_bounds__(1024, 1) void tendency_fused_p127_xz_tc_kernel(
+template <bool UseTc>
+__global__ __launch_bounds__(P127_XZ_THREADS, 1) void tendency_fused_p127_xz_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ w,
@@ -2302,8 +2387,8 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p127_xz_tc_kernel(
 #pragma unroll
         for (int bb = 0; bb < 2; ++bb) {
           const int e = 2 * (2 * a + bb);
-          mma_m8n8k4_f64(ax[e], ax[e + 1], av[a], bv[bb], ax[e], ax[e + 1]);
-          mma_m8n8k4_f64(az[e], az[e + 1], avz[a], bvz[bb], az[e], az[e + 1]);
+          mma_m8n8k4_f64<UseTc>(ax[e], ax[e + 1], av[a], bv[bb], ax[e], ax[e + 1]);
+          mma_m8n8k4_f64<UseTc>(az[e], az[e + 1], avz[a], bvz[bb], az[e], az[e + 1]);
         }
       }
     }
@@ -2358,7 +2443,8 @@ __global__ __launch_bounds__(1024, 1) void tendency_fused_p127_xz_tc_kernel(
 // C[m=j][n=i] = sum_l D[j][l] * FV[i][l], the z contraction of the first
 // kernel with (i,j) in place of (i,k), so only the A panel of the two is
 // needed and the block holds 64 KB.
-__global__ __launch_bounds__(P127_Y_THREADS, 1) void tendency_fused_p127_y_tc_kernel(
+template <bool UseTc>
+__global__ __launch_bounds__(P127_Y_THREADS, 1) void tendency_fused_p127_y_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
@@ -2448,7 +2534,7 @@ __global__ __launch_bounds__(P127_Y_THREADS, 1) void tendency_fused_p127_y_tc_ke
 #pragma unroll
         for (int bb = 0; bb < 2; ++bb) {
           const int e = 2 * (2 * a + bb);
-          mma_m8n8k4_f64(acc[e], acc[e + 1], av[a], bv[bb], acc[e], acc[e + 1]);
+          mma_m8n8k4_f64<UseTc>(acc[e], acc[e + 1], av[a], bv[bb], acc[e], acc[e + 1]);
         }
       }
     }
@@ -2470,7 +2556,8 @@ __global__ __launch_bounds__(P127_Y_THREADS, 1) void tendency_fused_p127_y_tc_ke
   }
 }
 
-extern "C" void launch_tendency_fused_p127_tc(
+template <bool UseTc>
+void launch_tendency_fused_p127_impl(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const double *flux_bnd,
     const double *Escale, int Ne)
@@ -2483,19 +2570,37 @@ extern "C" void launch_tendency_fused_p127_tc(
       (NQ127 * BKD127 + P127_MT * NQ127) * sizeof(double);
   static bool opted_in = false;
   if (!opted_in) {
-    cudaFuncSetAttribute(tendency_fused_p127_xz_tc_kernel,
+    cudaFuncSetAttribute(tendency_fused_p127_xz_kernel<UseTc>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)smem_xz);
-    cudaFuncSetAttribute(tendency_fused_p127_y_tc_kernel,
+    cudaFuncSetAttribute(tendency_fused_p127_y_kernel<UseTc>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)smem_y);
     opted_in = true;
   }
-  tendency_fused_p127_xz_tc_kernel<<<nblock, 1024, smem_xz,
-                                     dg_cuda_stream>>>(
-      dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
-  tendency_fused_p127_y_tc_kernel<<<nblock_y, P127_Y_THREADS, smem_y,
-                                    dg_cuda_stream>>>(
-      dqdt, D1D, q, v, Escale, Ne);
-  check_cuda("tendency_fused_p127_tc kernels");
+  tendency_fused_p127_xz_kernel<UseTc>
+      <<<nblock, P127_XZ_THREADS, smem_xz, dg_cuda_stream>>>(
+          dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
+  tendency_fused_p127_y_kernel<UseTc>
+      <<<nblock_y, P127_Y_THREADS, smem_y, dg_cuda_stream>>>(
+          dqdt, D1D, q, v, Escale, Ne);
+  check_cuda("tendency_fused_p127 kernels");
+}
+
+extern "C" void launch_tendency_fused_p127(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const double *flux_bnd,
+    const double *Escale, int Ne)
+{
+  launch_tendency_fused_p127_impl<false>(dqdt, D1D, Lift1D, q, u, v, w, flux_bnd,
+                                         Escale, Ne);
+}
+
+extern "C" void launch_tendency_fused_p127_tc(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const double *flux_bnd,
+    const double *Escale, int Ne)
+{
+  launch_tendency_fused_p127_impl<true>(dqdt, D1D, Lift1D, q, u, v, w, flux_bnd,
+                                        Escale, Ne);
 }

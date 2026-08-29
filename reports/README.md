@@ -28,6 +28,37 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | [`index64_boundary_validation.md`](index64_boundary_validation.md) | 高次数の host-side extent / pointer offset を64-bit安全化。p=7/15/511 の全 owned `dqdt` は変更前後でビット一致、device SASSも一致。性能差は −0.19%〜+0.02%で既存経路への影響なし |
 | [`p31_gap_study.md`](p31_gap_study.md) | 同一 DOF の 6 点目にして最後の点 p=31 (Nq=32)。**最速は `CUDAFORTRAN_FUSED_TC`**（§14、374.8 µs/stage）。Nq=32 の Tensor Core 融合カーネル 2 本で CUDA core 融合版の **2.66 倍**、`GEMM` の 1.67 倍。x と z が同じ出力写像を共有するので z の shared 往復が無く、転置形にすると D1D がレジスタに載る。**「p=31 は曲線の極大点」「融合が勝つ上限は p=15」という当初の結論はこれで否定された**（§14.2、§14.1 に訂正注記）。Nq=32 の CUDA core 融合カーネル 2 本、CUTLASS 経路は p=31 で使えるという訂正、**lift と assembly の融合で `GEMM` / `GEMM_CUTE` 経路を全次数 1 割速く**した（p=31 −11.7%、p=63 −12.0%、p=127 −10.2%、ビット一致） |
 
+## 経路の役割（2026-08-29 以降）
+
+最速を取りに行く本番経路は次数ごとの `CUDAFORTRAN_GEMM_FUSED` または
+`CUDAFORTRAN_FUSED_TC` である。次の 2 つは対照用であり、独立に最速化しない。
+
+- `CUDAFORTRAN_GEMM_CUTE`: `GEMM_FUSED` と同じ CUTLASS volume GEMM 本体
+  （`Nq<=64` では x を cuBLAS）で、融合エピローグが無い版。`GEMM` との差は
+  ライブラリ、`GEMM_FUSED` との差は融合パッケージ。
+- `CUDAFORTRAN_FUSED`: `FUSED_TC` と同一の C++ カーネルで内積だけ DFMA。
+  旧 Fortran FUSED の表の数値とは別物なので、このリファクタ後の FUSED と
+  当時値を並べない。
+
+`CUDAFORTRAN_GEMM_OZAKI1` / `_OZAKI2` は未融合 `GEMM` と同じ周囲で volume
+GEMM だけを差し替える。cuBLAS native および `CublasEmulation` との比較用。
+
+下の「現時点の結論」と各レポートの表は書かれた時点の値のまま残す。
+
+### C++ 化した FUSED と共通ドライバ（2026-08-29）
+
+`CUDAFORTRAN_FUSED` は Fortran カーネルを捨て、`FUSED_TC` と同一の
+`cuda_dg_kernels_tc.cu`（`UseTc=false`）になった。旧 Fortran FUSED の表の
+数値とは比較しない。login ノード、`conf_perf_p63_fused.conf` の 3-run 中央値は
+Main **2.767 ms/step**、device fused **48.30 ms**（19 measured steps）。
+同一 conf の `FUSED_TC` は Main 1.500 ms/step、device 23.87 ms。点変化係数では
+p=7/15/31/63/127/255 で FUSED と FUSED_TC の `dqdt` はビット一致。
+
+`GEMM_CUTE` / `GEMM_FUSED` は `fuse_epilogue` 付きの単一ドライバ。HEAD
+（`fd091fc`）と同じ `conf_perf_p63_gemm_fused.conf` / `conf_perf_p63_tc.conf`
+で測り直すと、device 時間の中央値差は GEMM_FUSED **−0.3%**、FUSED_TC **−0.3%**
+で測定誤差の範囲。本番カーネルのタイルと MMA ループは動かしていない。
+
 ## 現時点の結論
 
 - **計測区間（2026-08-27）**: `WarmupStep`（namelist、既定 1）で指定した先頭
