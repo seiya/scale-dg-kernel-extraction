@@ -51,7 +51,8 @@ module mod_cuda_dg_kernels
   !! Measured on a CUDA graph replay the same structure is a small loss
   !! instead of a gain, so the host turns it off before capturing a step.
   integer(kind=cuda_stream_kind), save :: dg_side_stream = 0
-  type(cudaEvent), save :: dg_side_fork_ev, dg_side_join_ev
+  integer(kind=cuda_stream_kind), save :: dg_side2_stream = 0
+  type(cudaEvent), save :: dg_side_fork_ev, dg_side_join_ev, dg_side2_join_ev
   logical, save :: dg_side_ready = .false.
   logical, save :: dg_side_enabled = .true.
   ! Lift1D columns 5 and 6 interleaved, so that the p>64 GEMM_FUSED z epilogue
@@ -595,7 +596,9 @@ contains
     return
   end subroutine cuda_dg_set_event_timing
 
-  !> Create the second stream and its two events on first use.
+  !> Create the side streams and their events on first use.
+  !! side2 carries an independent consumer of the same fork (y GEMM at
+  !! Nq<=64), so x on the main stream can run beside it.
   subroutine dg_side_stream_init()
     implicit none
 
@@ -606,18 +609,26 @@ contains
 
     istat = cudaStreamCreateWithFlags(dg_side_stream,cudaStreamNonBlocking)
     if (istat /= cudaSuccess) call cuda_failure("cudaStreamCreateWithFlags",istat)
+    istat = cudaStreamCreateWithFlags(dg_side2_stream,cudaStreamNonBlocking)
+    if (istat /= cudaSuccess) call cuda_failure("cudaStreamCreateWithFlags(side2)",istat)
     istat = cudaEventCreateWithFlags(dg_side_fork_ev,cudaEventDisableTiming)
     if (istat /= cudaSuccess) call cuda_failure("cudaEventCreateWithFlags",istat)
     istat = cudaEventCreateWithFlags(dg_side_join_ev,cudaEventDisableTiming)
     if (istat /= cudaSuccess) call cuda_failure("cudaEventCreateWithFlags",istat)
+    istat = cudaEventCreateWithFlags(dg_side2_join_ev,cudaEventDisableTiming)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventCreateWithFlags(side2)",istat)
     dg_side_ready = .true.
 
     return
   end subroutine dg_side_stream_init
 
-  !> Let the second stream start on what the main stream has queued so far.
-  subroutine dg_side_fork()
+  !> Let the face-flux side stream, and optionally side2, start on the
+  !! main stream's work so far.  side2 is only waited when the caller will
+  !! actually queue on it (y GEMM beside x at Nq<=64); otherwise the extra
+  !! event would sit on the Nq>64 fused path for free.
+  subroutine dg_side_fork(with_side2)
     implicit none
+    logical, intent(in) :: with_side2
 
     integer :: istat
     !------------------------------------------------------------
@@ -628,13 +639,18 @@ contains
     if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord(fork)",istat)
     istat = cudaStreamWaitEvent(dg_side_stream,dg_side_fork_ev,0)
     if (istat /= cudaSuccess) call cuda_failure("cudaStreamWaitEvent(fork)",istat)
+    if (with_side2) then
+      istat = cudaStreamWaitEvent(dg_side2_stream,dg_side_fork_ev,0)
+      if (istat /= cudaSuccess) call cuda_failure("cudaStreamWaitEvent(fork2)",istat)
+    end if
 
     return
   end subroutine dg_side_fork
 
-  !> Hold the main stream until the second stream has finished its work.
-  subroutine dg_side_join()
+  !> Hold the main stream until the side stream(s) used this call have finished.
+  subroutine dg_side_join(with_side2)
     implicit none
+    logical, intent(in) :: with_side2
 
     integer :: istat
     !------------------------------------------------------------
@@ -643,6 +659,12 @@ contains
     if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord(join)",istat)
     istat = cudaStreamWaitEvent(dg_stream,dg_side_join_ev,0)
     if (istat /= cudaSuccess) call cuda_failure("cudaStreamWaitEvent(join)",istat)
+    if (with_side2) then
+      istat = cudaEventRecord(dg_side2_join_ev,dg_side2_stream)
+      if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord(join2)",istat)
+      istat = cudaStreamWaitEvent(dg_stream,dg_side2_join_ev,0)
+      if (istat /= cudaSuccess) call cuda_failure("cudaStreamWaitEvent(join2)",istat)
+    end if
 
     return
   end subroutine dg_side_join
@@ -1621,7 +1643,7 @@ contains
       flux_x, flux_y, flux_z, q, u, v, w, npoint )
 
     if (use_side) then
-      call dg_side_fork()
+      call dg_side_fork(.false.)
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
         flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
     end if
@@ -1630,7 +1652,7 @@ contains
       stride_plane, stride_zero, stride_vol, D1D, D1D_tr, &
       flux_x, flux_y, flux_z, deriv_x, deriv_y, dqdt)
 
-    if (use_side) call dg_side_join()
+    if (use_side) call dg_side_join(.false.)
 
     call separable_lift_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       dqdt, Escale(1,1,1), Escale(1,1,2), Escale(1,1,3), &
@@ -1883,7 +1905,7 @@ contains
 
     integer :: istat, nface, npoint, nblock, nblock_face
     integer :: nq2, xy_weighted, pair_nq2
-    logical :: use_side
+    logical :: use_side, overlap_y
 
     ! The CUTLASS batched GEMMs put the batch on grid.z, which CUDA caps at
     ! 65535.  The y GEMM batches over Nq*Ne planes, so this path is available
@@ -1927,6 +1949,7 @@ contains
     ! time is unchanged.  fuse off matches CUDAFORTRAN_GEMM (Nq >= 64).
     use_side = dg_side_enabled
     if (.not. fuse_epilogue) use_side = use_side .and. (Nq >= 64)
+    overlap_y = fuse_epilogue .and. use_side .and. (Nq <= 64)
 
     call dg_ev_record(1)
 
@@ -1941,20 +1964,32 @@ contains
     call dg_ev_record(2)
 
     if (use_side) then
-      call dg_side_fork()
+      call dg_side_fork(overlap_y)
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
         flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
     end if
 
     if (fuse_epilogue) then
       if (Nq <= 64) then
+        ! x and y are independent once flux_* exist.  Launch y on side2 so it
+        ! runs beside cuBLAS x (and beside elembnd on side).
+        if (overlap_y) then
+          call dg_set_cuda_stream(dg_side2_stream)
+          istat = launch_volume_gemm_y( &
+            deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
+          call dg_set_cuda_stream(dg_stream)
+          if (istat /= 0) call cuda_failure("launch_volume_gemm_y(side2)",istat)
+        end if
+
         istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
           D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
         if (istat /= 0) call cuda_failure("cublasDgemm x-deriv (fused)",istat)
 
-        istat = launch_volume_gemm_y( &
-          deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
-        if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
+        if (.not. use_side) then
+          istat = launch_volume_gemm_y( &
+            deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
+          if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
+        end if
       else
         istat = launch_volume_gemm_xy( &
           deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, Escale, Nq, Ne, &
@@ -1980,7 +2015,7 @@ contains
     end if
     call dg_ev_record(3)
 
-    if (use_side) call dg_side_join()
+    if (use_side) call dg_side_join(overlap_y)
 
     if (fuse_epilogue) call dg_ev_record(4)
 

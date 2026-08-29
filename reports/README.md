@@ -368,6 +368,12 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の x/y 重ね（2026-08-29、`p63_gap_study.md` §24）**:
+  y GEMM を side2 で cuBLAS x と重ね、占有 GPU 12 回交互で device **−0.28%**
+  （596.2 → 594.5 µs/stage、ビット一致、レンジ非重複）。両方 SM ~68% なので
+  91 µs の y はほぼ隠れない。加重 z への移植は y が `deriv_x` を読むため重ねと
+  両立せず **+2.9%**。最速は `FUSED_TC` のまま。上表の 634.6 µs は §22 の
+  別セッションで、書き換えない。
 - **p=31 `CUDAFORTRAN_FUSED`（2026-08-30、`p31_gap_study.md` §20）**: CUDA-core
   融合を **992.5 → 718.2 µs/stage（−27.6%、ビット一致）**にした。job `69623`
   （c390）12 回交互 A/B。律速は長さ 32 の shared 内積の MIO。効いたのは

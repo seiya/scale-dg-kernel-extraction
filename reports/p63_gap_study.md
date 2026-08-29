@@ -1910,3 +1910,42 @@ L1/TEX は 94% → **97%** まで張り付く。1 文: **xz は依然 L1/TEX（s
 
 横展開: p=127 CC は 1024 スレッドのまま。チャンクを残したまま 512 スレッド ×
 より長い k ベクトルにする案は別次数の課題。
+
+## 24. `GEMM_FUSED` の x/y 重ね（2026-08-29、採用 −0.28%）
+
+対象は `CUDAFORTRAN_GEMM_FUSED`（この次数の最速は `FUSED_TC` のまま）。
+親 `9a2b887`、`conf_perf_p63_gemm_fused.conf`（`Ne=4³`、`nstep=20`、graph off、
+57 measured stages）。ncu/nsys job `68929`（c398）。占有 GPU A/B job `68974`
+（c386、12 回交互）。点変化係数の owned `dqdt` は改修前とビット一致。
+
+nsys 中央値（1 stage）: z assembly 218 µs / `volume_flux` 129 / cuBLAS x 108 /
+CUTLASS y 91 / `elembnd` 71。ncu: x と y はどちらも SM 発行 ~68%、DRAM ~18%。
+z は SM 38% / DRAM 36% のレイテンシ。`volume_flux` は DRAM 83% /
+`long_scoreboard` 45%。
+
+x と y は `flux_*` が揃ったあと独立なので、y を `side2` に出して cuBLAS x および
+既存の `elembnd` side stream と同時に走らせた。`Nq>64` では side2 を fork/join
+しない。
+
+| | device 中央値 | µs/stage | Main 中央値 |
+|---|---:|---:|---:|
+| 改修前 | 3.40350e-2 | 596.2 | 2.0252 ms/step |
+| **x \|\| y** | **3.39390e-2** | **594.5** | 2.0227 ms/step |
+
+device はレンジ非重複（改修前 3.399–3.407、改修後 3.389–3.397）。**−0.28%**。
+Main のレンジは重なる。理論上は y の 91 µs が隠れるが、両方 SM 発行律速なので
+同居せず、残った 1.7 µs は端の重なりだけである。
+
+### 24.1 落とした候補
+
+| 候補 | 結果 | 機構 |
+|---|---|---|
+| kWeighted=false に lift-behind（p=127 §13.5） | ビット一致、**+58%** | 面ロードをバリア越しに生かすと z（254 レジスタ）が壊れる |
+| C++ `double2` `volume_flux` | ~+0.2% | セクタは既に埋まっている。グリッド半減が損 |
+| Fortran 4 点/スレッド MLP | **+24%** | 占有率が 4 分の 1 になる |
+| C++ スカラー + `__restrict__` `volume_flux` | 引き分け | コンパイラ差は無い |
+| cuBLAS x のあと `Escale_x` を掛けて y scaleadd + 加重 z | 丸め 1.78e-15、**+2.9%** | y が `deriv_x` を読むので重ねと両立しない。scale カーネルと `GemmZWide` が z で返す分より高い。§12 の「消しても 2.6%」は移すと赤字、という確認 |
+
+残る天井: `volume_flux` を DRAM 100% まで上げても ~22 µs、z のオペランド削除アブレーション 15 µs は y に移すと重ねを捨てる。契約内で実装コストに見合う手は、重ねの 1.7 µs を採ったあと尽きた。**最速は `FUSED_TC` のまま。**
+
+p=31 `GEMM_FUSED`（login 3-run）も device が同程度短くなる。`Nq>64` の加重枝は触っていない。
