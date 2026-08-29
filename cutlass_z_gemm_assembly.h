@@ -21,8 +21,9 @@
 // Escale_y in their own epilogues (PointwiseScaleV, cuda_cutlass_gemm_fused.cu)
 // and whether the y GEMM also added deriv_x into deriv_y
 // (cutlass_y_gemm_scaleadd.h). When they have, this epilogue reads two volume
-// tensors instead of five. It is false on the Nq <= 64 branch, whose x GEMM is
-// the cuBLAS one and has no epilogue to weight in.
+// tensors instead of five. Nq <= 64 uses the same kWeighted path after the y
+// epilogue does Ey*acc + Ex*Dx; its x GEMM is still cuBLAS. GemmZWide stays
+// off at Nq = 64 (that change alone is +2.8%).
 //
 // This epilogue is instruction-issue bound: removing the lift drops its
 // instruction count by 13.0% and its duration by 12.8%, while the stall
@@ -40,10 +41,8 @@
 //     which is why elembnd_flux_kernel interleaves the face planes in pairs
 //     and why the two z-face lift coefficients arrive in their own packed
 //     table.
-// They ride on one template parameter because they stand or fall together:
-// the shallow branch runs its x GEMM on cuBLAS, which has no epilogue to
-// weight Escale into, and measuring the other two there gave +0.8% and +2.7%
-// for bit-identical results.
+// kWeighted and GemmZWide used to ride together. They no longer do: at Nq = 64
+// kWeighted is on (y folds Ex*Dx) and GemmZWide stays off.
 //
 // The user problem is (m=Nq*Nq, n=Nq) column-major, which CUTLASS solves as
 // the transposed row-major problem. So an epilogue tile row is the z index k

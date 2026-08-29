@@ -368,6 +368,12 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の `Ey*acc+Ex*Dx`（2026-08-29、`p63_gap_study.md` §25）**:
+  y エピローグで Ex も掛けて加重 z に渡し、scale カーネルと `GemmZWide` は使わない。
+  占有 GPU 12 回交互で device **−4.1%**（595.2 → 570.9 µs/stage、max abs 3.55e-15）。
+  nsys: z −64 µs、y +41 µs。p=31 では +2.3% なので `Nq==64` だけ。最速は
+  `FUSED_TC` のまま。上表の 634.6 µs は §22 の別セッションで、書き換えない。
+
 - **p=63 `GEMM_FUSED` の x/y 重ね（2026-08-29、`p63_gap_study.md` §24）**:
   y GEMM を side2 で cuBLAS x と重ね、占有 GPU 12 回交互で device **−0.28%**
   （596.2 → 594.5 µs/stage、ビット一致、レンジ非重複）。両方 SM ~68% なので
@@ -381,6 +387,7 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
   512 スレッド `double2` + 要素 2 スラブ、xz 次平面の先読み、パネル二重バッファ。
   最速は `FUSED_TC`（359.7 µs）のまま。論文の主比は 2.78× → **2.00×**。
   内積を消した天井は −56% で、契約内の CC スケジュールでは探索終了。
+  scale 無しの折り込みは §25。最速は `FUSED_TC` のまま。
 
 - **計測区間（2026-08-27）**: `WarmupStep`（namelist、既定 1）で指定した先頭
   ステップは実行はするが計時に含めない。CUDA graph 経路では step 1 が直接

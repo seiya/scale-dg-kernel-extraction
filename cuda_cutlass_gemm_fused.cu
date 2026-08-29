@@ -261,19 +261,22 @@ int run_gemm_batched_nn_scaled(int m, int n, int k, double const *A, int lda,
 }
 
 //- y GEMM whose epilogue takes two sources: D = Escale_y * acc + deriv_x.
+//- kMulAddend multiplies the addend by Escale_x (cuBLAS x has no epilogue).
 //- Same tiles, warps, stages and mainloop as GemmYScale; only the epilogue
 //- differs.  cutlass_y_gemm_scaleadd.h says why deriv_x is read here.
-template <class Set>
+template <class Set, bool kMulAddend>
 int run_volume_gemm_y_scaleadd(double *deriv_xy, const double *flux_y,
                                const double *D1D_tr, const double *escale_y,
-                               const double *deriv_x, int Nq, int Ne)
+                               const double *deriv_x, const double *escale_x,
+                               int Nq, int Ne)
 {
   const int nq2 = Nq * Nq;
   const long long stride_plane = nq2;
 
   using GemmY = typename Set::GemmYScale;
   using Kernel = GemmBatchedScaleAdd<typename GemmY::GemmKernel::Mma,
-                                     typename GemmY::GemmKernel::Epilogue, BatchedSwizzle>;
+                                     typename GemmY::GemmKernel::Epilogue, BatchedSwizzle,
+                                     kMulAddend>;
 
   cutlass::TensorRef<double const, ColumnMajor> ref_A(flux_y, Nq);
   cutlass::TensorRef<double const, ColumnMajor> ref_B(D1D_tr, Nq);
@@ -302,8 +305,10 @@ int run_volume_gemm_y_scaleadd(double *deriv_xy, const double *flux_y,
       uargs.stride_C, uargs.ref_D, uargs.stride_D, uargs.epilogue, uargs.batch_count);
   params.ptr_scale = escale_y;
   params.ptr_add = deriv_x;
+  params.ptr_mul = escale_x;
   params.stride_scale = stride_plane;
   params.stride_add = stride_plane;
+  params.stride_mul = stride_plane;
 
   dim3 grid = swizzle.get_grid_shape(grid_shape);
   dim3 block(Kernel::kThreadCount, 1, 1);
@@ -338,13 +343,13 @@ int run_volume_gemms_xy(double *deriv_x, double *deriv_y, const double *flux_x,
   //- deriv_y comes out holding Escale_y * D(flux_y) + deriv_x, so the z
   //- epilogue reads one volume tensor instead of two.  See
   //- cutlass_y_gemm_scaleadd.h.
-  return run_volume_gemm_y_scaleadd<Set>(deriv_y, flux_y, D1D_tr, escale + npoint,
-                                         deriv_x, Nq, Ne);
+  return run_volume_gemm_y_scaleadd<Set, false>(deriv_y, flux_y, D1D_tr, escale + npoint,
+                                                deriv_x, nullptr, Nq, Ne);
 }
 
-//- The Nq <= 64 branch runs the x GEMM on cuBLAS, which has no epilogue to
-//- weight Escale_x into, so its y GEMM stays unweighted too and the z epilogue
-//- keeps carrying both fields (kWeighted = false).
+//- The Nq <= 64 fused branch still uses cuBLAS for x (no Escale epilogue).
+//- y then does Ey*acc + Ex*Dx in one epilogue so z can run kWeighted without
+//- a separate scale kernel.  GemmZWide stays off: at Nq = 64 it is +2.8%.
 template <class Set>
 int run_volume_gemm_y(double *deriv_y, const double *flux_y,
                       const double *D1D_tr, int Nq, int Ne)
@@ -393,7 +398,7 @@ int run_volume_gemms(double *deriv_x, double *deriv_y, double *deriv_z,
   return run_volume_gemm_z<Set>(deriv_z, flux_z, D1D_tr, Nq, Ne);
 }
 
-template <class Set, bool kWeighted>
+template <class Set, bool kWeighted, bool kWide = kWeighted>
 int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr,
                         const double *deriv_x, const double *deriv_y,
                         const double *flux_bnd, const double *lift1d,
@@ -412,7 +417,7 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
   const int k = Nq;
 
   using GemmZ = typename cutlass::platform::conditional<
-      kWeighted, typename Set::GemmZWide, typename Set::GemmZ>::type;
+      kWide, typename Set::GemmZWide, typename Set::GemmZ>::type;
   //- Same epilogue, with the accumulator staging tile padded so the stores are
   //- bank-conflict free. See RepadEpilogue in cutlass_z_gemm_assembly.h.
   using ZEpilogue = RepadEpilogue<typename GemmZ::GemmKernel::Epilogue, 8>;
@@ -598,8 +603,34 @@ extern "C" int launch_volume_gemm_y(double *deriv_y, const double *flux_y,
   }
 }
 
-//- xy_weighted says the x and y GEMM epilogues already multiplied by Escale_x
-//- and Escale_y, so this kernel reads three volume tensors instead of five.
+extern "C" int launch_volume_gemm_y_scaleadd(
+    double *deriv_y, const double *flux_y, const double *D1D_tr,
+    const double *escale_y, const double *deriv_x, const double *escale_x,
+    int Nq, int Ne, int mma_shape)
+{
+  if (Nq <= 0 || Ne <= 0 || escale_x == nullptr) {
+    return 1;
+  }
+  switch (mma_shape) {
+  case 0:
+    return run_volume_gemm_y_scaleadd<MmaSet_884, true>(
+        deriv_y, flux_y, D1D_tr, escale_y, deriv_x, escale_x, Nq, Ne);
+  case 1:
+    return run_volume_gemm_y_scaleadd<MmaSet_1684, true>(
+        deriv_y, flux_y, D1D_tr, escale_y, deriv_x, escale_x, Nq, Ne);
+  case 2:
+    return run_volume_gemm_y_scaleadd<MmaSet_1688, true>(
+        deriv_y, flux_y, D1D_tr, escale_y, deriv_x, escale_x, Nq, Ne);
+  case 3:
+    return run_volume_gemm_y_scaleadd<MmaSet_16816, true>(
+        deriv_y, flux_y, D1D_tr, escale_y, deriv_x, escale_x, Nq, Ne);
+  default:
+    return bad_mma_shape(mma_shape);
+  }
+}
+
+//- xy_weighted says deriv_y already holds Ex*Dx + Ey*Dy, so this kernel reads
+//- two volume tensors instead of five.  GemmZWide only when Nq > 64.
 extern "C" int launch_z_gemm_assembly(
     double *dqdt, const double *flux_z, const double *D1D_tr,
     const double *deriv_x, const double *deriv_y, const double *flux_bnd,
@@ -627,6 +658,28 @@ extern "C" int launch_z_gemm_assembly(
       return run_z_gemm_assembly<MmaSet_16816, false>(dqdt, flux_z, D1D_tr, deriv_x,
                                                       deriv_y, flux_bnd, lift1d,
                                                       lift_zpair, escale, Nq, Ne);
+    default:
+      return bad_mma_shape(mma_shape);
+    }
+  }
+  if (Nq == 64) {
+    switch (mma_shape) {
+    case 0:
+      return run_z_gemm_assembly<MmaSet_884, true, false>(
+          dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d, lift_zpair,
+          escale, Nq, Ne);
+    case 1:
+      return run_z_gemm_assembly<MmaSet_1684, true, false>(
+          dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d, lift_zpair,
+          escale, Nq, Ne);
+    case 2:
+      return run_z_gemm_assembly<MmaSet_1688, true, false>(
+          dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d, lift_zpair,
+          escale, Nq, Ne);
+    case 3:
+      return run_z_gemm_assembly<MmaSet_16816, true, false>(
+          dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d, lift_zpair,
+          escale, Nq, Ne);
     default:
       return bad_mma_shape(mma_shape);
     }

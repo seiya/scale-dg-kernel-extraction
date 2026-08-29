@@ -494,6 +494,16 @@ module mod_cuda_dg_kernels
       integer(c_int) :: launch_volume_gemm_x
     end function launch_volume_gemm_x
 
+    function launch_volume_gemm_y_scaleadd(deriv_y, flux_y, D1D_tr, &
+      escale_y, deriv_x, escale_x, Nq, Ne, mma_shape) &
+      bind(C, name="launch_volume_gemm_y_scaleadd")
+      import
+      integer(c_int), value :: Nq, Ne, mma_shape
+      real(c_double), device :: deriv_y(*), flux_y(*), D1D_tr(*)
+      real(c_double), device :: escale_y(*), deriv_x(*), escale_x(*)
+      integer(c_int) :: launch_volume_gemm_y_scaleadd
+    end function launch_volume_gemm_y_scaleadd
+
     function launch_volume_gemm_y(deriv_y, flux_y, D1D_tr, &
       Nq, Ne, mma_shape) bind(C, name="launch_volume_gemm_y")
       import
@@ -1924,12 +1934,12 @@ contains
     call dg_ev_begin()
 
     nq2 = Nq*Nq
-    ! The deep-order branch is the one whose x GEMM is CUTLASS and therefore has
-    ! an epilogue to weight Escale into.  The z epilogue's three other savings
-    ! ride on the same condition; see cutlass_z_gemm_assembly.h.
+    ! Weighted z + packed faces: Nq>64 (CUTLASS x/y scale) and Nq=64 (cuBLAS x
+    ! plus y epilogue Ey*acc + Ex*Dx). Nq<64 stays unweighted; at p=31 the
+    ! same fold is +2.3% on login.
     xy_weighted = 0
     pair_nq2 = 0
-    if (fuse_epilogue .and. Nq > 64) then
+    if (fuse_epilogue .and. Nq >= 64) then
       xy_weighted = 1
       pair_nq2 = nq2
       if (dg_lift_zpair_nq /= Nq) then
@@ -1949,7 +1959,9 @@ contains
     ! time is unchanged.  fuse off matches CUDAFORTRAN_GEMM (Nq >= 64).
     use_side = dg_side_enabled
     if (.not. fuse_epilogue) use_side = use_side .and. (Nq >= 64)
-    overlap_y = fuse_epilogue .and. use_side .and. (Nq <= 64)
+    ! y is independent of x only while it does not read deriv_x.  Nq=64 fold
+    ! reads it; Nq<64 keeps the unweighted y and can overlap.
+    overlap_y = fuse_epilogue .and. use_side .and. (Nq < 64)
 
     call dg_ev_record(1)
 
@@ -1971,24 +1983,31 @@ contains
 
     if (fuse_epilogue) then
       if (Nq <= 64) then
-        ! x and y are independent once flux_* exist.  Launch y on side2 so it
-        ! runs beside cuBLAS x (and beside elembnd on side).
-        if (overlap_y) then
-          call dg_set_cuda_stream(dg_side2_stream)
-          istat = launch_volume_gemm_y( &
-            deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
-          call dg_set_cuda_stream(dg_stream)
-          if (istat /= 0) call cuda_failure("launch_volume_gemm_y(side2)",istat)
-        end if
-
-        istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
-          D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
-        if (istat /= 0) call cuda_failure("cublasDgemm x-deriv (fused)",istat)
-
-        if (.not. use_side) then
-          istat = launch_volume_gemm_y( &
-            deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
-          if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
+        if (Nq == 64) then
+          ! y reads unweighted deriv_x, so it cannot run beside cuBLAS x.
+          istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
+            D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
+          if (istat /= 0) call cuda_failure("cublasDgemm x-deriv (fused)",istat)
+          istat = launch_volume_gemm_y_scaleadd( &
+            deriv_y, flux_y, D1D_tr, Escale(1,1,2), deriv_x, Escale(1,1,1), &
+            Nq, Ne, cutlass_mma_shape_id )
+          if (istat /= 0) call cuda_failure("launch_volume_gemm_y_scaleadd",istat)
+        else
+          if (overlap_y) then
+            call dg_set_cuda_stream(dg_side2_stream)
+            istat = launch_volume_gemm_y( &
+              deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
+            call dg_set_cuda_stream(dg_stream)
+            if (istat /= 0) call cuda_failure("launch_volume_gemm_y(side2)",istat)
+          end if
+          istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
+            D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
+          if (istat /= 0) call cuda_failure("cublasDgemm x-deriv (fused)",istat)
+          if (.not. use_side) then
+            istat = launch_volume_gemm_y( &
+              deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
+            if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
+          end if
         end if
       else
         istat = launch_volume_gemm_xy( &

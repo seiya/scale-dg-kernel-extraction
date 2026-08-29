@@ -11,6 +11,11 @@
 //
 //   deriv_xy = Escale_y * acc + deriv_x
 //
+// kMulAddend (Nq <= 64) multiplies the addend by Escale_x as well:
+//   deriv_xy = Escale_y * acc + Escale_x * deriv_x
+// because that branch's x GEMM is cuBLAS and cannot weight Escale_x itself.
+// The Nq > 64 branch leaves kMulAddend false: deriv_x already holds Ex*Dx.
+//
 // The point is not the arithmetic -- the same two multiplies and one add used
 // to happen, split between this epilogue (Escale_y) and the z epilogue (the
 // dx + dy sum). The point is which kernel reads deriv_x.
@@ -26,7 +31,7 @@
 //
 // The sum order is unchanged: dqdt = -((dx + dy) + Ez*Dz + lift), and floating
 // point addition is commutative, so dy + dx here gives the same bits.
-template <typename Epilogue>
+template <typename Epilogue, bool kMulAddend>
 class EpilogueScaleAdd : public Epilogue {
 public:
   using OutputTileIterator = typename Epilogue::OutputTileIterator;
@@ -80,18 +85,22 @@ public:
   CUTLASS_DEVICE
   void apply_scale_add(OutputTileIterator destination_iterator,
                        AccumulatorTile const &accumulators, OutputTileIterator it_scale,
-                       OutputTileIterator it_add)
+                       OutputTileIterator it_add, OutputTileIterator it_mul)
   {
     AccumulatorFragmentIterator accum_fragment_iterator(accumulators);
     SharedLoadIterator sli(this->shared_storage_.reference(), thread_idx_);
 
     #pragma unroll(1)
     for (int iter = 0; iter < OutputTileIterator::kIterations; ++iter) {
-      typename OutputTileIterator::Fragment frag_scale, frag_add;
+      typename OutputTileIterator::Fragment frag_scale, frag_add, frag_mul;
       it_scale.load(frag_scale);
       it_add.load(frag_add);
       ++it_scale;
       ++it_add;
+      if constexpr (kMulAddend) {
+        it_mul.load(frag_mul);
+        ++it_mul;
+      }
 
       __syncthreads();
       acc2smem<cutlass::make_index_sequence<OutputTileIterator::kIterations>>::push(
@@ -116,10 +125,15 @@ public:
       auto const *acc = reinterpret_cast<double const *>(&aligned_accum_fragment[0]);
       auto const *sc = reinterpret_cast<double const *>(&frag_scale);
       auto const *ad = reinterpret_cast<double const *>(&frag_add);
+      auto const *mu = reinterpret_cast<double const *>(&frag_mul);
       auto *out = reinterpret_cast<double *>(&output_fragment);
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < OutputTileIterator::Fragment::kElements; ++i) {
-        out[i] = ad[i] + acc[i] * sc[i];
+        if constexpr (kMulAddend) {
+          out[i] = ad[i] * mu[i] + acc[i] * sc[i];
+        } else {
+          out[i] = ad[i] + acc[i] * sc[i];
+        }
       }
 
       destination_iterator.store(output_fragment);
@@ -128,13 +142,14 @@ public:
   }
 };
 
-template <typename Mma_, typename Epilogue_, typename ThreadblockSwizzle_>
+template <typename Mma_, typename Epilogue_, typename ThreadblockSwizzle_,
+          bool kMulAddend>
 struct GemmBatchedScaleAdd {
   using Mma = Mma_;
   using Epilogue = Epilogue_;
   using ThreadblockSwizzle = ThreadblockSwizzle_;
   using BaseKernel = cutlass::gemm::kernel::GemmBatched<Mma, Epilogue, ThreadblockSwizzle>;
-  using ScaleAddEpilogue = EpilogueScaleAdd<Epilogue>;
+  using ScaleAddEpilogue = EpilogueScaleAdd<Epilogue, kMulAddend>;
   using WarpCount = typename Mma::WarpCount;
   static int const kThreadCount = 32 * WarpCount::kCount;
 
@@ -142,8 +157,10 @@ struct GemmBatchedScaleAdd {
     typename BaseKernel::Params gemm{};
     double const *ptr_scale{nullptr};
     double const *ptr_add{nullptr};
+    double const *ptr_mul{nullptr};
     long long stride_scale{0};
     long long stride_add{0};
+    long long stride_mul{0};
   };
 
   union SharedStorage {
@@ -203,8 +220,16 @@ struct GemmBatchedScaleAdd {
           threadblock_offset);
       it_add.add_pointer_offset(params.stride_add * batch_idx);
 
+      typename Epilogue::OutputTileIterator it_mul(
+          gp.params_D,
+          const_cast<double *>(kMulAddend ? params.ptr_mul : params.ptr_add),
+          gp.problem_size.mn(), thread_idx, threadblock_offset);
+      if constexpr (kMulAddend) {
+        it_mul.add_pointer_offset(params.stride_mul * batch_idx);
+      }
+
       ScaleAddEpilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
-      epilogue.apply_scale_add(iterator_D, accumulators, it_scale, it_add);
+      epilogue.apply_scale_add(iterator_D, accumulators, it_scale, it_add, it_mul);
     }
   }
 };
