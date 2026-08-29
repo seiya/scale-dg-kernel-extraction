@@ -118,6 +118,9 @@ likewise a defect.
 - `reports/`: committed performance and optimization reports. See
   `reports/README.md` for the index and the current fastest path per
   polynomial order.
+- `.claude/skills/dg-optimize/` and `.cursor/skills/dg-optimize/`: the
+  kernel-optimization procedure for Claude Code and Cursor. Same tree
+  (Cursor path is a symlink). It follows this file and does not add rules.
 
 ## Builds
 
@@ -225,6 +228,25 @@ that change.
   shared-memory bank conflicts. Add `--set full` or the
   `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_*` metrics when a kernel
   is L1/TEX bound.
+- **`ncu` locks the clocks, and that biases every comparison it makes.** With
+  the SM clock held down, a global memory access costs fewer SM cycles than it
+  does at boost, so `ncu` prices shared-memory, register and instruction work
+  relatively high and global-memory waits relatively cheap. It therefore
+  overstates the gain from removing shared traffic or instructions, and
+  understates the gain from spending them to hide a global load. Its kernel
+  times also understate how much of a stage a DRAM-latency-bound kernel really
+  costs.
+  **Use `ncu` to identify the mechanism -- which stall moved, whether the
+  conflicts went away, how many bytes DRAM actually moved -- and decide whether
+  to adopt a change on wall time, from an interleaved A/B on a GPU the job
+  owns.** Comparisons across two `ncu` jobs are not reliable either; put the
+  variants in one job.
+  Six measurements support this, five of them in one direction and one in the
+  other, which is what pins the mechanism rather than a constant offset
+  (`p63_gap_study.md` §19.10, §20.3, §20.6): a shared-conflict fix that `ncu`
+  scored at −8.3% lost 1.0% of wall time; a prefetch that `ncu` scored at
+  +8.3% won 0.51%; and the face flux kernel that `ncu` put at 10% of a stage
+  is 13.45% of it.
 
 ### reports/
 
