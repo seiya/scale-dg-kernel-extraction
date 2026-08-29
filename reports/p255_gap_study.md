@@ -668,5 +668,12 @@ C++ に戻した。login GPU 1、`conf_perf_p255_tc.conf` の type だけ
 
 CC 5252.8 µs は旧 Fortran 〜4970 µs と同水準。fragment 日程の DFMA より遅い。
 論文の主比は **TC / FUSED = 918.9 / 5252.8 = 5.72×**。
-点変化係数の owned `dqdt` は `FUSED` と `FUSED_TC` が `Ne=1`（16,777,216 点）
-および `Ne=2`（33,554,432 点）でビット一致。
+点変化係数の owned `dqdt` は `FUSED` / `FUSED_DFMA` / `FUSED_TC` が `Ne=1`
+（16,777,216 点）で全点ビット一致。`FUSED` 対 `FUSED_TC` は `Ne=2`
+（33,554,432 点）でもビット一致。
+独立再測（login GPU 1、`conf_perf_p255_tc.conf` の type 差し替え、3-run 中央値）:
+FUSED Main 15.75 ms / 5251 µs/stage、DFMA 6.21 ms / 2015 µs/stage、
+TC 2.96 ms / 913 µs/stage。表の 5252.8 / 1998.0 / 918.9 は書き換えない
+（DFMA の 1% 差はセッション散らばり）。FUSED は DFMA の約 2.6 倍遅いので
+経路の取り違えではない。旧 Fortran CC バイナリは残っておらず、〜4970 µs
+との約 6% は再確認できない。

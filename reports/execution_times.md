@@ -786,4 +786,21 @@ CC 326.8 µs は旧 Fortran 〜324 µs と同水準。TC は 1.19×（CC 比）�
 | 255 | `conf_perf_p255_tc.conf` 相当 | 15.755 | 5252.8 | 5.72× |
 
 点変化係数の owned `dqdt`: p=15 は SPLIT / TC とも 1.78e-15。p=31/63 `Ne=2³`、
-p=127 `Ne=1`、p=255 `Ne=1` と `Ne=2` は TC とビット一致。
+p=127 は性能と同じ `Ne=2³`、p=255 `Ne=1` と `Ne=2` は TC とビット一致。
+独立確認は追記 20。
+
+### 追記 20: CC / DFMA 取り違えの独立確認（2026-08-29）
+
+login GPU 1（`GPU-d5214545-6d82-2be9-a314-442682ff446b`）、既存
+`scale-dg_extraction`（作業ツリー、親 `959ad50`）。`SCALE_DG_VARYING_COEFF=1`、
+`SCALE_DG_DUMP_DQDT`、`nstep=1`。上の表は書き換えない。
+
+- **p=15**: `FUSED` と `FUSED_DFMA` は別カーネル。owned 32,768 点のうち 3,078 点が
+  差あり（最大絶対差 1.78e-15）。`FUSED_DFMA` と `FUSED_TC` はビット一致。
+  `conf_perf_p15.conf` の 3-run 中央値は FUSED 446.4 µs/stage、DFMA 447.6 µs/stage
+  （追記 19 の 446.7 / 446.6 と同水準）。速さは同じだが namelist の取り違えではない。
+- **p=127**: 性能と同じ `Ne=2³`（16,777,216 点）で `FUSED` / `FUSED_DFMA` /
+  `FUSED_TC` が全点ビット一致。`nstep=1` の device は 5.08 / 6.86 / 2.61 ms。
+- **p=255**: `Ne=1` で 3 経路が全点ビット一致、`Ne=2` で FUSED 対 TC もビット一致。
+  `conf_perf_p255_tc.conf` の type 差し替え 3-run 中央値は FUSED 5251 / DFMA 2015 /
+  TC 913 µs/stage。FUSED は DFMA の約 2.6 倍遅く、CC 経路である。

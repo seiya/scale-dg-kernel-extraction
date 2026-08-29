@@ -8,7 +8,7 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 | ファイル | 内容 |
 |---|---|
 | [`overall_summary_report.md`](overall_summary_report.md) | 全実装パスの横断まとめ。時間内訳、ncu 効率分析、理論仕事量に対する達成率、不採用にした最適化とその理由。**最初に読むならこれ。** |
-| [`execution_times.md`](execution_times.md) | `nstep=1000` の同一条件でのパス別実行時間。**追記 16（2026-08-29）は p=7 の経路横断再測定**。追記 18 は p=7 CC 復活、追記 19 は p=15…255 の CC 測定 |
+| [`execution_times.md`](execution_times.md) | `nstep=1000` の同一条件でのパス別実行時間。**追記 16（2026-08-29）は p=7 の経路横断再測定**。追記 18 は p=7 CC 復活、追記 19 は p=15…255 の CC 測定、追記 20 は CC/DFMA 取り違えの独立確認 |
 | [`gpu_optimization_session_report.md`](gpu_optimization_session_report.md) | OpenACC → CUDA Fortran → Tensor Core / GEMM に至る実装の変遷と、途中で踏んだ誤り（代表スカラー特殊化）の記録 |
 | [`p255_gap_study.md`](p255_gap_study.md) | p=255 の `CUDAFORTRAN_FUSED_TC` を **1563.9 → 968.8 µs/stage（−38.1%、全段ビット一致）**にした記録。チャンクループの二重バッファ化と 1 ワープ 4×4 mma タイルは**組でしか効かない**、エピローグを b 外 / a 内に組み替えると LDG が 112 → 32 本になる、ストアのペア格納順で 2-way バンクコンフリクトが消える。**これで p=255 の最速は `GEMM_FUSED` から `FUSED_TC` に替わった。**命令数を 17〜34% 減らす変更が 2 度とも遅くなったことの記録も含む。**§10（同日）は逆に `GEMM_FUSED` 側を 1048.8 → 1021.2 µs/stage（−2.6%）にした**: z の assembly epilogue は**命令発行律速**（lift を消すと命令 −13.0% で時間 −12.8%、stall 内訳も占有率も不変）で、`Escale_x/y` を x/y GEMM の標準 epilogue に前送りし、添字クランプをタイル原点へ集約し、lift の 6 本のロードを 3 本の `double2` にした。手書き epilogue で標準 epilogue を置き換えると**それだけで +72 µs** かかる |
 | [`p255_gemm_fusion_session_report.md`](p255_gemm_fusion_session_report.md) | p=255 の volume GEMM と z-epilogue 融合の詳細実験。末尾に **p=255 Tensor Core カーネルのタイル化**（2026-08-27）: 1 warp/block・オペランド全再読み込みで L1/TEX 99% に張り付いていた 3 本を、64×64 タイル・warp 2×4 register blocking の 1 本に統合して **2.86 倍**（4474.3 → 1566 µs/stage、ピーク比 14.6% → 41.6%）。それでも `GEMM_FUSED` には 1.57 倍負けるので **p=255 の最速は `GEMM_FUSED` のまま** |
@@ -212,7 +212,10 @@ device 326.8 µs）。`FUSED_DFMA` の 427.8 µs は 2026-08-29 の iso-schedule
 
 `GEMM_FUSED` / `GEMM_CUTE` は `Nq*Ne = 65536` でバッチ上限ちょうど外。
 `CUDAFORTRAN_FUSED` は CC 復活（login GPU 1、3-run 中央値）。device 446.7 µs は
-iso-schedule DFMA の 446.6 と測定誤差内。論文の主比は
+iso-schedule DFMA の 446.6 と測定誤差内。これは同一カーネルの二重測定ではない
+（点変化係数の `dqdt` は FUSED と DFMA で 1 ulp、DFMA と TC はビット一致。
+独立再測は [`execution_times.md`](execution_times.md) 追記 20）。この次数では
+論文の主比 B とメカニズム比 A が同じ数字になる。
 **TC / FUSED = 271.8 / 446.7 = 1.64×**。
 
 #### p=31（`Ne=8³`、`nstep=200`）
@@ -262,6 +265,8 @@ iso-schedule DFMA の 446.6 と測定誤差内。論文の主比は
 
 `CUDAFORTRAN_FUSED` は旧 Fortran CC（〜1585 µs）と同水準で、iso-schedule DFMA
 より速い。論文の主比は **TC / FUSED = 706.1 / 1593.5 = 2.26×**。
+点変化係数の owned `dqdt` は性能と同じ `Ne=2³`（16,777,216 点）で FUSED /
+DFMA / TC が全点ビット一致（[`p127_gap_study.md`](p127_gap_study.md) §16）。
 
 #### p=255（`Ne=1`、`nstep=20`）
 
@@ -275,7 +280,8 @@ iso-schedule DFMA の 446.6 と測定誤差内。論文の主比は
 | `CUDAFORTRAN_GEMM_FUSED` | 3.110 | 963.4 | 27.11 | 67.6% | 1.13 | 14.3% | 2.55 | 32.3% |
 
 `CUDAFORTRAN_FUSED` は 16×16 タイルの CC（旧 Fortran 〜4970 µs と同水準）。
-fragment 日程の DFMA より遅い。論文の主比は
+fragment 日程の DFMA より遅い（独立再測でも FUSED 〜5251 µs 対 DFMA 〜2015 µs。
+旧 Fortran バイナリは残っていないので 〜6% 差は再確認できない）。論文の主比は
 **TC / FUSED = 918.9 / 5252.8 = 5.72×**。
 
 #### p=511 / 575 / 767 / 1023（`Ne=1`、各 gap study の値。今回は再測定していない）

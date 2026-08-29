@@ -1180,6 +1180,11 @@ C++ に戻した。login GPU 1（`GPU-d5214545-6d82-2be9-a314-442682ff446b`）�
 | `CUDAFORTRAN_FUSED_TC`（§18） | 1.068 | 271.8 |
 
 CC 446.7 µs は iso-schedule DFMA と測定誤差内。論文の主比は
-**TC / FUSED = 271.8 / 446.7 = 1.64×**。
-点変化係数、`Ne=2³`、`nstep=1` の owned `dqdt` は `FUSED` 対 `FUSED_TC` および
-`CUDAFORTRAN_SPLIT` とも最大絶対差 **1.78e-15**。
+**TC / FUSED = 271.8 / 446.7 = 1.64×**。この次数ではメカニズム比
+**TC / FUSED_DFMA** も同じ数字になる。
+点変化係数、`Ne=2³`、`nstep=1` の owned `dqdt`（32,768 点）:
+`FUSED` 対 `FUSED_DFMA` は一致しない（3,078 点が差、最大絶対差 1.78e-15）。
+`FUSED_DFMA` 対 `FUSED_TC` はビット一致。`FUSED` 対 `FUSED_TC` / `SPLIT` は
+最大絶対差 1.78e-15。時間は近いが namelist の取り違えではない。
+独立再測（login GPU 1、`conf_perf_p15.conf`、3-run 中央値）は FUSED 446.4 µs /
+DFMA 447.6 µs。表の 446.7 / 446.6 は書き換えない。

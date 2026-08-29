@@ -1285,5 +1285,7 @@ xz+y カーネルとして C++ に戻した。login GPU 1、`conf_perf_p127_fuse
 
 CC 1593.5 µs は旧 Fortran 〜1585 µs と同水準で、iso-schedule DFMA より速い。
 論文の主比は **TC / FUSED = 706.1 / 1593.5 = 2.26×**。
-点変化係数、`Ne=1` の owned `dqdt` は `FUSED` と `FUSED_TC` がビット一致。
-`Ne=2` の FUSED スモークも通った。
+点変化係数、`nstep=1` の owned `dqdt` は性能と同じ `Ne=2³`（16,777,216 点）で
+`FUSED` / `FUSED_DFMA` / `FUSED_TC` が全点ビット一致。`nstep=1` の device 時間は
+FUSED 5.08 ms / DFMA 6.86 ms / TC 2.61 ms と分かれるので、同一カーネルの
+三重測定ではない。
