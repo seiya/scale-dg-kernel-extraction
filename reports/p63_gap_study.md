@@ -1697,3 +1697,28 @@ commit `38952e4`、`nstep=100`、`WarmupStep=1`、
 | `CUDAFORTRAN_GEMM_OZAKI2` | **38.6 ms** | **21.0×** |
 
 最速は `FUSED_TC`（477.2 µs/stage）のまま。
+
+> **（訂正 2026-08-29）** 上表の native **1843 µs/stage** は 1 step の device 合計で、
+> RK 3 stage で割っていない。1 stage は約 614 µs。Ozaki 比はそのまま読める。
+
+## 22. 経路横断の再測定（2026-08-29）
+
+[`reports/README.md`](README.md) 用。commit `2dadc41`、login node GPU 1、
+3-run 中央値。`conf_perf_p63_tc.conf`（`Ne=4³`、`nstep=20`、graph off）の
+`DqdtKernel_Type` だけを差し替え。µs/stage は `CUDA device *`（SPLIT は
+elembnd 込み）。§19 の 487.8 µs は `Cal_tend` / 1197 stage で、表は残す。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `CUDAFORTRAN_SPLIT` | 12.01 | 3967.2 |
+| `CUDAFORTRAN_FUSED` | 2.766 | 846.2 |
+| **`CUDAFORTRAN_FUSED_TC`** | **1.512** | **421.7** |
+| `CUDAFORTRAN_GEMM` | 2.102 | 622.0 |
+| `CUDAFORTRAN_GEMM_CUTE` | 2.144 | 636.6 |
+| `CUDAFORTRAN_GEMM_FUSED` | 2.139 | 634.6 |
+
+**最速は `CUDAFORTRAN_FUSED_TC` のまま。** device 421.7 µs に対し §19 の
+487.8 は launch 込みの `Cal_tend`。Main 1.512 ms/step は §19 の 1.511 と一致する。
+`GEMM` と `GEMM_FUSED` は 2% 以内。C++ 化した `FUSED`（846 µs）は
+`FUSED_TC` の 2.0 倍で、README に書いた 2.766 ms/step の再掲である。
+FLOP/s と DRAM は README のまとめ表。

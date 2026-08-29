@@ -270,6 +270,10 @@ p=767 では Scheme I が native を上回ったが、p=1023 では Ozaki worksp
 189 GiB GPU で setup 中に OOM となる。`OzakiSliceCount` / `OzakiModuliCount`
 の削減、または workspace 分割は未実施。
 
+> **（訂正 2026-08-29）** 上表の native **575.5 ms** は 1 step の device 合計で、
+> RK 3 stage で割っていない。1 stage は約 192 ms で、§6 の GEMM 194.058 ms/stage
+> と整合する。OOM の結論は変わらない。
+
 ## 9. cuBLAS FP64 emulation（2026-08-28 追記）
 
 `CublasEmulation = .true.`、`CUDAFORTRAN_GEMM` のみ。commit `a1cdb57`、
@@ -305,3 +309,9 @@ p=767 では Scheme I が native を上回ったが、p=1023 では Ozaki worksp
 - INT8 1 本の x 形状は 2464 TOP/s（native の 64 倍）なので、Scheme II なら
   算術下限で勝つ。cuBLAS 13.1 は Scheme I。`OZAKI2` は workspace が payload に
   乗って OOM（§8）。
+
+## 11. 2026-08-29 の経路横断について
+
+p=7…255 は同一実行ファイルで再測定したが、**p=1023 は再実行していない**。
+[`README.md`](README.md) まとめ表の p=1023 行は本レポート §6 の
+`GEMM` 194.058 / `GEMM_FUSED` 187.617 ms/stage のまま。

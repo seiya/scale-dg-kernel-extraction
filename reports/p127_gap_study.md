@@ -1243,3 +1243,28 @@ commit `38952e4`、`nstep=100`、`WarmupStep=1`、
 最速は `GEMM_FUSED`（730.7 µs/stage）のまま。Ozaki II の不利は p=255 向け
 調査（[`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md)）と同方向だが、
 次数を上げるほど比率は縮む。
+
+> **（訂正 2026-08-29）** 上表の native **2215 µs/stage** は 1 step の device 合計で、
+> RK 3 stage で割っていない。1 stage は約 738 µs。Ozaki 比はそのまま読める。
+
+## 15. 経路横断の再測定（2026-08-29）
+
+[`reports/README.md`](README.md) 用。commit `2dadc41`、login node GPU 1、
+3-run 中央値。`conf_perf_p127_gemm_fused.conf`（`Ne=2³`、`nstep=100`、graph off）
+の `DqdtKernel_Type` だけを差し替え。µs/stage は `CUDA device *`（SPLIT は
+elembnd 込み）。§13 の 731.7 µs は `Volume derivate + surface lift` で、表は残す。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `CUDAFORTRAN_SPLIT` | 20.99 | 6916.1 |
+| `CUDAFORTRAN_FUSED` | 6.660 | 2137.3 |
+| `CUDAFORTRAN_FUSED_TC` | 2.380 | 706.1 |
+| `CUDAFORTRAN_GEMM` | 2.473 | 737.3 |
+| `CUDAFORTRAN_GEMM_CUTE` | 2.508 | 749.6 |
+| **`CUDAFORTRAN_GEMM_FUSED`** | **2.283** | **674.0** |
+
+**最速は `CUDAFORTRAN_GEMM_FUSED` のまま**（`FUSED_TC` に 1.048 倍）。
+device 674 µs に対し §13 の 731.7 は volume wall（launch 込み）。
+同一セッションでは `FUSED_TC` 706 / `GEMM` 737 で、§11 と §13 を別日に
+採ったときの 787 対 732 という食い違いはタイマーとセッションの差だった。
+FLOP/s と DRAM は README のまとめ表。

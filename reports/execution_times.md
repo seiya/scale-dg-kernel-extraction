@@ -722,3 +722,25 @@ Slurm job `49674` の nsys でカーネル単位に分けると、z GEMM が
 4 通り（FMA を両向きに明示、契約なし）に書き分けても同じ 1 ulp だったので、
 差は更新の算術ではなく、epilogue の融合版・非融合版でテンデンシー式の
 スケジューリングが変わることに由来する。
+
+### 追記 16: p=7 経路横断の再測定（2026-08-29）
+
+p=7 専用の gap study は無いので、ここに現行ツリーの横断測定を置く。
+commit `2dadc41`、login node GPU 1、3-run 中央値。入力は `conf_perf_p7.conf`
+（`Ne=32³`、`nstep=20`、graph off）の `DqdtKernel_Type` だけを差し替え。
+µs/stage は `CUDA device *`（SPLIT は 4 本 + elembnd、OpenACC は volume wall +
+elembnd）。冒頭の `nstep=1000` 表と、追記の `FUSED_TC` 再測定は当時の値のまま残す。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `OPENACC_ASIS` | 3.492 | 1065.8 |
+| `OPENACC_SPLIT` | 2.708 | 807.8 |
+| `CUDAFORTRAN_SPLIT` | 2.565 | 764.1 |
+| `CUDAFORTRAN_FUSED` | 1.528 | 427.8 |
+| **`CUDAFORTRAN_FUSED_TC`** | **1.073** | **274.9** |
+| `CUDAFORTRAN_GEMM` | 5.088 | 1635.4 |
+
+**最速は `CUDAFORTRAN_FUSED_TC` のまま。** 冒頭表の GEMM Main 9.271 s（nstep=1000）
+は RK 最適化前で、同一 conf では 5.088 ms/step。C++ `FUSED`（UseTc=false）の
+427.8 µs は旧 Fortran 融合（device 〜324 µs）より遅く、TC 版との対照は同一
+C++ ソースに限る。FLOP/s と DRAM は [`README.md`](README.md) のまとめ表。

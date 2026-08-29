@@ -2,11 +2,13 @@
 
 GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上での測定で、
 ビルドは `make CUDA=1 GPUFLAGS=-gpu=cc100`（nvcc は `-arch=sm_100`）。
+経路×次数の最新時間・アルゴリズム FLOP/s・DRAM スループットは下の
+**「最新結果のまとめ」**。
 
 | ファイル | 内容 |
 |---|---|
 | [`overall_summary_report.md`](overall_summary_report.md) | 全実装パスの横断まとめ。時間内訳、ncu 効率分析、理論仕事量に対する達成率、不採用にした最適化とその理由。**最初に読むならこれ。** |
-| [`execution_times.md`](execution_times.md) | `nstep=1000` の同一条件でのパス別実行時間 |
+| [`execution_times.md`](execution_times.md) | `nstep=1000` の同一条件でのパス別実行時間。**追記 16（2026-08-29）は p=7 の経路横断再測定**（`nstep=20`、3-run 中央値） |
 | [`gpu_optimization_session_report.md`](gpu_optimization_session_report.md) | OpenACC → CUDA Fortran → Tensor Core / GEMM に至る実装の変遷と、途中で踏んだ誤り（代表スカラー特殊化）の記録 |
 | [`p255_gap_study.md`](p255_gap_study.md) | p=255 の `CUDAFORTRAN_FUSED_TC` を **1563.9 → 968.8 µs/stage（−38.1%、全段ビット一致）**にした記録。チャンクループの二重バッファ化と 1 ワープ 4×4 mma タイルは**組でしか効かない**、エピローグを b 外 / a 内に組み替えると LDG が 112 → 32 本になる、ストアのペア格納順で 2-way バンクコンフリクトが消える。**これで p=255 の最速は `GEMM_FUSED` から `FUSED_TC` に替わった。**命令数を 17〜34% 減らす変更が 2 度とも遅くなったことの記録も含む。**§10（同日）は逆に `GEMM_FUSED` 側を 1048.8 → 1021.2 µs/stage（−2.6%）にした**: z の assembly epilogue は**命令発行律速**（lift を消すと命令 −13.0% で時間 −12.8%、stall 内訳も占有率も不変）で、`Escale_x/y` を x/y GEMM の標準 epilogue に前送りし、添字クランプをタイル原点へ集約し、lift の 6 本のロードを 3 本の `double2` にした。手書き epilogue で標準 epilogue を置き換えると**それだけで +72 µs** かかる |
 | [`p255_gemm_fusion_session_report.md`](p255_gemm_fusion_session_report.md) | p=255 の volume GEMM と z-epilogue 融合の詳細実験。末尾に **p=255 Tensor Core カーネルのタイル化**（2026-08-27）: 1 warp/block・オペランド全再読み込みで L1/TEX 99% に張り付いていた 3 本を、64×64 タイル・warp 2×4 register blocking の 1 本に統合して **2.86 倍**（4474.3 → 1566 µs/stage、ピーク比 14.6% → 41.6%）。それでも `GEMM_FUSED` には 1.57 倍負けるので **p=255 の最速は `GEMM_FUSED` のまま** |
@@ -58,6 +60,219 @@ p=7/15/31/63/127/255 で FUSED と FUSED_TC の `dqdt` はビット一致。
 （`fd091fc`）と同じ `conf_perf_p63_gemm_fused.conf` / `conf_perf_p63_tc.conf`
 で測り直すと、device 時間の中央値差は GEMM_FUSED **−0.3%**、FUSED_TC **−0.3%**
 で測定誤差の範囲。本番カーネルのタイルと MMA ループは動かしていない。
+
+## 最新結果のまとめ（2026-08-29）
+
+GB200 1 GPU（login node GPU 1）、`make CUDA=1 GPUFLAGS=-gpu=cc100`、
+`UseCudaGraph = .false.`。p=7…255 の経路表は **2026-08-29 に同一実行ファイルで
+3-run 中央値を採り直した値**（各次数の既存 `conf_perf_p*` から
+`DqdtKernel_Type` だけを差し替え。`Ne` / `dt` / `nstep` は変えていない）。
+p≥511 は各 gap study の測定のまま（再実行していない）。
+次数別の再測定節: p=7 は [`execution_times.md`](execution_times.md) 追記 16、
+p=15 §18、p=31 §16、p=63 §22、p=127 §15、p=255 §12。
+
+太字は次数ごとの最速（Main ms/step）。空欄はその次数では経路が無い
+（`GEMM_FUSED` / `GEMM_CUTE` は `Nq*Ne <= 65535`、p≥511 は
+`GEMM` / `GEMM_FUSED` のみ）。`CUDAFORTRAN_GEMM_OZAKI1` / `_OZAKI2` は
+本番最速ではないので表に入れない。
+
+p=7…255 は同一体積 DOF（`NeX*Nq = 256`、16,777,216 点）。p≥511 は `Ne=1`。
+
+**µs/stage のタイマー**: CUDA 経路は実行ファイルの `CUDA device *`（SPLIT は
+4 本の device 時間 + `Element boundary flux`）。OpenACC は
+`Volume derivate + surface lift` + `Element boundary flux`。
+以前の表の一部は `Cal_tend`（launch 込み）だったので、同じカーネルでも
+数 %〜十数 % 遅めに出ていた。FLOP/s と TB/s はすべてこの µs/stage で割る。
+Main ms/step は `Main per step:`（RK 更新と halo を含む）。
+
+### カウントの定義（全経路共通の FLOP、2 種類の DRAM）
+
+FLOP と unique DRAM は実装に依らない。パス列の DRAM だけ経路で変わる。
+
+**FLOP / RK stage**（全パス同一。multiply/add = 1、FMA = 2。ncu の発行命令ではない）:
+
+- 体積: `(6*Nq + 20) * Np * Ne`（3 方向の縮約 `3*2*Nq`、流束積 3、`Escale` / lift / 和で 20）
+- 面: `21 * 6 * Nq² * Ne`（数値流束 1 面点あたり 21）
+- SSP-RK3 なので 1 step の演算量は 3 stage 分。下の TFLOP/s は
+  **tendency 1 stage の時間**（µs/stage）で割った値。Main には RK 更新と halo が乗る。
+- ピーク分母は GB200 FP64 **40.1 TFLOP/s**（CUDA core と Tensor Core で同じ）。
+
+**DRAM unique / RK stage**（全パス同一。「各配列を 1 RK stage で一度だけ読み書き」）:
+
+- 体積 8 本: `q, u, v, w` 読み、`Escale` 3 方向読み、`dqdt` 書き → `64 B/node`
+- 面だけの入力: `normal_fn` 3 成分 + `Fscale` + `VMapM`/`VMapP`（int32×2）
+  → `40 B/face-pt` = `240/Nq B/node`
+- 合計 `64 + 240/Nq` B/node。同一点を体積と面で二度数えない。
+- RK 更新（`q0`/`q`/`dqdt`）は tendency に含めない。
+
+**DRAM path / RK stage**（経路ごとのアルゴリズム上の R/W。L2 ヒットも数える）:
+
+| 経路 | 体積 | 面 |
+|---|---|---|
+| `OPENACC_ASIS` | unique と同じ（要素ローカル一時は DRAM に出さない） | unique と同じ |
+| `FUSED` / `FUSED_TC` | unique の 8 本 | unique の面入力に加え、M/P の `q,u,v,w` gather `64 B/face-pt` |
+| `GEMM` / `GEMM_CUTE` | `volume_flux` 7V + 3 GEMM 6V + assembly 7V = **20V**（160 B/node） | `elembnd` 112 B/face-pt |
+| `GEMM_FUSED` | 中間を 1 本畳んだ **18V**（144 B/node） | 同上 112 B/face-pt |
+| `OPENACC_SPLIT` / `CUDAFORTRAN_SPLIT` | flux 7V + deriv 6V + lift_out 1V + assembly 8V = 22V。`Nq<=128` では dense `Lift_mat` 追加 6V | 112 B/face-pt |
+
+`V = 8*Np*Ne`。112 B/face-pt は VMap 8 + `q,u,v,w`×M/P 64 + 法線 24 + `Fscale` 8 + `flux_bnd` 書き 8。
+
+path 側の TB/s は **モデル転送量 ÷ 時間**であり、DRAM ピーク 7.9 TB/s の達成率ではない。
+p=7 `FUSED_TC` のように gather が L2 に載る次数では、path 値がピークを超えて見える。
+DRAM 屋根との比較は unique 列を使う。
+
+今回埋めた欠測・訂正した不自然な値:
+
+- p=255 の Main は µs/stage からの換算をやめ、実測した。`FUSED` と `GEMM_CUTE` を追加。
+- p=15 `GEMM` の 2508 µs/stage は、device 合計を RK 3 stage で割っていなかった。実測は **848 µs**。
+- p=7 `GEMM` の Main 9.27 ms は RK 最適化前の `nstep=1000` 値。同一 conf では **5.09 ms**。
+- SPLIT / OpenACC の µs/stage（† だった行）を実測した。
+- p=7 の C++ `FUSED`（`UseTc=false`）は旧 Fortran 融合（device 〜324 µs）より遅く **428 µs**。TC 版との対照は同一 C++ ソースなので、旧 Fortran の 324 µs とは並べない。
+
+### 仕事量（パス非依存）
+
+| p | Nq | Ne | 体積点 | FLOP / RK stage | unique DRAM / RK stage | B/node |
+|---:|---:|---:|---:|---:|---:|---:|
+| 7 | 8 | 32³ | 16,777,216 | 1.405e9 | 1577 MB | 94.00 |
+| 15 | 16 | 16³ | 16,777,216 | 2.078e9 | 1325 MB | 79.00 |
+| 31 | 32 | 8³ | 16,777,216 | 3.623e9 | 1200 MB | 71.50 |
+| 63 | 64 | 4³ | 16,777,216 | 6.811e9 | 1137 MB | 67.75 |
+| 127 | 128 | 2³ | 16,777,216 | 1.324e10 | 1105 MB | 65.88 |
+| 255 | 256 | 1 | 16,777,216 | 2.611e10 | 1089 MB | 64.94 |
+| 511 | 512 | 1 | 134,217,728 | 4.150e11 | 8653 MB | 64.47 |
+| 575 | 576 | 1 | 191,102,976 | 6.643e11 | 12310 MB | 64.42 |
+| 767 | 768 | 1 | 452,984,832 | 2.097e12 | 29133 MB | 64.31 |
+| 1023 | 1024 | 1 | 1,073,741,824 | 6.619e12 | 68971 MB | 64.23 |
+
+path 側の B/node（上表の unique 列と対になる）:
+
+| p | unique | FUSED / TC | GEMM / CUTE | GEMM_FUSED | SPLIT |
+|---:|---:|---:|---:|---:|---:|
+| 7 | 94.0 | 142.0 | 244.0 | — | 308.0 |
+| 15 | 79.0 | 103.0 | 202.0 | — | 266.0 |
+| 31 | 71.5 | 83.5 | 181.0 | 165.0 | 245.0 |
+| 63 | 67.8 | 73.8 | 170.5 | 154.5 | 234.5 |
+| 127 | 65.9 | 68.9 | 165.2 | 149.2 | 229.2 |
+| 255 | 64.9 | 66.4 | 162.6 | 146.6 | — |
+| 511 | 64.5 | — | 161.3 | 145.3 | — |
+| 575 | 64.4 | — | 161.2 | 145.2 | — |
+| 767 | 64.3 | — | 160.9 | 144.9 | — |
+| 1023 | 64.2 | — | 160.7 | 144.7 | — |
+
+### 経路 × 次数
+
+ピーク比の分母は 40.1 TFLOP/s と 7.9 TB/s。
+
+#### p=7（`Ne=32³`、`nstep=20`）
+
+| 経路 | ms/step | µs/stage | TFLOP/s | vs 40.1 | TB/s unique | vs 7.9 | TB/s path | vs 7.9 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `OPENACC_ASIS` | 3.492 | 1065.8 | 1.32 | 3.3% | 1.48 | 18.7% | 1.48 | 18.7% |
+| `OPENACC_SPLIT` | 2.708 | 807.8 | 1.74 | 4.3% | 1.95 | 24.7% | 6.40 | 81.0% |
+| `CUDAFORTRAN_SPLIT` | 2.565 | 764.1 | 1.84 | 4.6% | 2.06 | 26.1% | 6.76 | 85.6% |
+| `CUDAFORTRAN_FUSED` | 1.528 | 427.8 | 3.28 | 8.2% | 3.69 | 46.7% | 5.57 | 70.5% |
+| **`CUDAFORTRAN_FUSED_TC`** | **1.073** | **274.9** | **5.11** | **12.7%** | **5.74** | **72.6%** | 8.67 | 110% |
+| `CUDAFORTRAN_GEMM` | 5.088 | 1635.4 | 0.86 | 2.1% | 0.96 | 12.2% | 2.50 | 31.7% |
+
+`GEMM_FUSED` / `GEMM_CUTE` は `Nq*Ne = 262144 > 65535` のため無し。
+path 列 110% は面 gather をアルゴリズム通り数えた結果で、実 DRAM は unique の 72.6%。
+
+#### p=15（`Ne=16³`、`nstep=20`）
+
+| 経路 | ms/step | µs/stage | TFLOP/s | vs 40.1 | TB/s unique | vs 7.9 | TB/s path | vs 7.9 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `OPENACC_SPLIT` | 3.335 | 1015.1 | 2.05 | 5.1% | 1.31 | 16.5% | 4.40 | 55.7% |
+| `CUDAFORTRAN_SPLIT` | 5.468 | 1747.1 | 1.19 | 3.0% | 0.76 | 9.6% | 2.55 | 32.3% |
+| `CUDAFORTRAN_FUSED` | 1.583 | 446.6 | 4.65 | 11.6% | 2.97 | 37.6% | 3.87 | 49.0% |
+| **`CUDAFORTRAN_FUSED_TC`** | **1.068** | **271.8** | **7.65** | **19.1%** | **4.88** | **61.7%** | 6.36 | 80.5% |
+| `CUDAFORTRAN_GEMM` | 2.766 | 847.5 | 2.45 | 6.1% | 1.56 | 19.8% | 4.00 | 50.6% |
+
+`GEMM_FUSED` / `GEMM_CUTE` は `Nq*Ne = 65536` でバッチ上限ちょうど外。
+
+#### p=31（`Ne=8³`、`nstep=200`）
+
+| 経路 | ms/step | µs/stage | TFLOP/s | vs 40.1 | TB/s unique | vs 7.9 | TB/s path | vs 7.9 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `CUDAFORTRAN_SPLIT` | 8.196 | 2634.6 | 1.38 | 3.4% | 0.46 | 5.8% | 1.56 | 19.7% |
+| `CUDAFORTRAN_FUSED` | 2.634 | 790.1 | 4.59 | 11.4% | 1.52 | 19.2% | 1.77 | 22.4% |
+| **`CUDAFORTRAN_FUSED_TC`** | **1.342** | **359.7** | **10.07** | **25.1%** | **3.33** | **42.2%** | 3.89 | 49.3% |
+| `CUDAFORTRAN_GEMM` | 2.139 | 625.7 | 5.79 | 14.4% | 1.92 | 24.3% | 4.85 | 61.4% |
+| `CUDAFORTRAN_GEMM_CUTE` | 2.685 | 808.6 | 4.48 | 11.2% | 1.48 | 18.8% | 3.76 | 47.5% |
+| `CUDAFORTRAN_GEMM_FUSED` | 3.083 | 940.6 | 3.85 | 9.6% | 1.28 | 16.1% | 2.94 | 37.3% |
+
+この次数だけ `GEMM_FUSED` が素の `GEMM` より遅い（浅い `K=32` で z epilogue 融合の方が高い）。
+
+#### p=63（`Ne=4³`、`nstep=20`）
+
+| 経路 | ms/step | µs/stage | TFLOP/s | vs 40.1 | TB/s unique | vs 7.9 | TB/s path | vs 7.9 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `CUDAFORTRAN_SPLIT` | 12.01 | 3967.2 | 1.72 | 4.3% | 0.29 | 3.6% | 0.99 | 12.6% |
+| `CUDAFORTRAN_FUSED` | 2.766 | 846.2 | 8.05 | 20.1% | 1.34 | 17.0% | 1.46 | 18.5% |
+| **`CUDAFORTRAN_FUSED_TC`** | **1.512** | **421.7** | **16.15** | **40.3%** | **2.70** | **34.1%** | 2.93 | 37.1% |
+| `CUDAFORTRAN_GEMM` | 2.102 | 622.0 | 10.95 | 27.3% | 1.83 | 23.1% | 4.60 | 58.2% |
+| `CUDAFORTRAN_GEMM_CUTE` | 2.144 | 636.6 | 10.70 | 26.7% | 1.79 | 22.6% | 4.49 | 56.9% |
+| `CUDAFORTRAN_GEMM_FUSED` | 2.139 | 634.6 | 10.73 | 26.8% | 1.79 | 22.7% | 4.08 | 51.7% |
+
+以前の `FUSED_TC` 487.8 µs は `Cal_tend`。device 時間は 422 µs。`GEMM` と
+`GEMM_FUSED` は 2% 以内で、最速は `FUSED_TC` のまま。
+
+#### p=127（`Ne=2³`、`nstep=100`）
+
+| 経路 | ms/step | µs/stage | TFLOP/s | vs 40.1 | TB/s unique | vs 7.9 | TB/s path | vs 7.9 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `CUDAFORTRAN_SPLIT` | 20.99 | 6916.1 | 1.91 | 4.8% | 0.16 | 2.0% | 0.56 | 7.0% |
+| `CUDAFORTRAN_FUSED` | 6.660 | 2137.3 | 6.19 | 15.4% | 0.52 | 6.5% | 0.54 | 6.8% |
+| `CUDAFORTRAN_FUSED_TC` | 2.380 | 706.1 | 18.75 | 46.8% | 1.57 | 19.8% | 1.64 | 20.7% |
+| `CUDAFORTRAN_GEMM` | 2.473 | 737.3 | 17.95 | 44.8% | 1.50 | 19.0% | 3.76 | 47.6% |
+| `CUDAFORTRAN_GEMM_CUTE` | 2.508 | 749.6 | 17.66 | 44.0% | 1.47 | 18.7% | 3.70 | 46.8% |
+| **`CUDAFORTRAN_GEMM_FUSED`** | **2.283** | **674.0** | **19.64** | **49.0%** | **1.64** | **20.8%** | 3.71 | 47.0% |
+
+#### p=255（`Ne=1`、`nstep=20`）
+
+| 経路 | ms/step | µs/stage | TFLOP/s | vs 40.1 | TB/s unique | vs 7.9 | TB/s path | vs 7.9 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `CUDAFORTRAN_FUSED` | 6.160 | 1998.0 | 13.07 | 32.6% | 0.55 | 6.9% | 0.56 | 7.1% |
+| **`CUDAFORTRAN_FUSED_TC`** | **2.978** | **918.9** | **28.42** | **70.9%** | **1.19** | **15.0%** | 1.21 | 15.4% |
+| `CUDAFORTRAN_GEMM` | 3.441 | 1075.7 | 24.28 | 60.5% | 1.01 | 12.8% | 2.54 | 32.1% |
+| `CUDAFORTRAN_GEMM_CUTE` | 3.432 | 1072.9 | 24.34 | 60.7% | 1.02 | 12.9% | 2.54 | 32.2% |
+| `CUDAFORTRAN_GEMM_FUSED` | 3.110 | 963.4 | 27.11 | 67.6% | 1.13 | 14.3% | 2.55 | 32.3% |
+
+#### p=511 / 575 / 767 / 1023（`Ne=1`、各 gap study の値。今回は再測定していない）
+
+| p | 経路 | ms/step | µs/stage | TFLOP/s | vs 40.1 | TB/s unique | vs 7.9 | TB/s path | vs 7.9 |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 511 | `CUDAFORTRAN_GEMM` | 41.80 | 13528 | 30.68 | 76.5% | 0.64 | 8.1% | 1.60 | 20.3% |
+| 511 | **`CUDAFORTRAN_GEMM_FUSED`** | **40.70** | **13159** | **31.54** | **78.7%** | 0.66 | 8.3% | 1.48 | 18.8% |
+| 575 | `CUDAFORTRAN_GEMM` | 64.96 | 20912 | 31.77 | 79.2% | 0.59 | 7.5% | 1.47 | 18.6% |
+| 575 | **`CUDAFORTRAN_GEMM_FUSED`** | **63.58** | **20453** | **32.48** | **81.0%** | 0.60 | 7.6% | 1.36 | 17.2% |
+| 767 | `CUDAFORTRAN_GEMM` | 192.2 | 62817 | 33.37 | 83.2% | 0.46 | 5.9% | 1.16 | 14.7% |
+| 767 | **`CUDAFORTRAN_GEMM_FUSED`** | **185.0** | **60362** | **34.73** | **86.6%** | 0.48 | 6.1% | 1.09 | 13.8% |
+| 1023 | `CUDAFORTRAN_GEMM` | 578.9 | 194058 | 34.11 | 85.1% | 0.36 | 4.5% | 0.89 | 11.3% |
+| 1023 | **`CUDAFORTRAN_GEMM_FUSED`** | **562.5** | **187617** | **35.28** | **88.0%** | 0.37 | 4.7% | 0.83 | 10.5% |
+
+### 最速経路だけ横断
+
+| p | 最速 | ms/step | µs/stage | TFLOP/s | vs 40.1 | TB/s unique | vs 7.9 |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 7 | `FUSED_TC` | 1.073 | 274.9 | 5.11 | 12.7% | 5.74 | 72.6% |
+| 15 | `FUSED_TC` | 1.068 | 271.8 | 7.65 | 19.1% | 4.88 | 61.7% |
+| 31 | `FUSED_TC` | 1.342 | 359.7 | 10.07 | 25.1% | 3.33 | 42.2% |
+| 63 | `FUSED_TC` | 1.512 | 421.7 | 16.15 | 40.3% | 2.70 | 34.1% |
+| 127 | `GEMM_FUSED` | 2.283 | 674.0 | 19.64 | 49.0% | 1.64 | 20.8% |
+| 255 | `FUSED_TC` | 2.978 | 918.9 | 28.42 | 70.9% | 1.19 | 15.0% |
+| 511 | `GEMM_FUSED` | 40.70 | 13159 | 31.54 | 78.7% | 0.66 | 8.3% |
+| 575 | `GEMM_FUSED` | 63.58 | 20453 | 32.48 | 81.0% | 0.60 | 7.6% |
+| 767 | `GEMM_FUSED` | 185.0 | 60362 | 34.73 | 86.6% | 0.48 | 6.1% |
+| 1023 | `GEMM_FUSED` | 562.5 | 187617 | 35.28 | 88.0% | 0.37 | 4.7% |
+
+同一 DOF（p=7…255）では次数が上がるほど unique 転送は面点率 `6/Nq` で減り、
+FLOP は `6*Nq` で増える。達成 FLOP 比は 13% → 71% と単調に上がり、unique
+帯域比は 73% → 15% と下がる。p≥511 は点が 8〜64 倍なので Main は ms から
+数百 ms へ跳ね、演算屋根（76–88%）に張り付く。
+
+p=7…255 の一次ソースは 2026-08-29 の login-node 再測定（上表）。gap study の
+当時値（特に `Cal_tend` ベースの µs/stage）は書き換えない。p≥511 は
+`p511_gap_study.md` ほか §性能。
 
 ## 現時点の結論
 

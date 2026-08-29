@@ -628,3 +628,26 @@ commit `38952e4`、`nstep=100`、`WarmupStep=1`、
 
 [`ozaki2_implementation_report.md`](ozaki2_implementation_report.md) の p=255 単発
 測定（OZAKI2 **2.25×**）と整合。最速は `FUSED_TC`（1014 µs/stage）のまま。
+
+> **（訂正 2026-08-29）** 上表の native **3189 µs/stage** は 1 step の device 合計で、
+> RK 3 stage で割っていない。1 stage は約 1063 µs。Ozaki 比はそのまま読める。
+
+## 12. 経路横断の再測定（2026-08-29）
+
+[`reports/README.md`](README.md) 用。commit `2dadc41`、login node GPU 1、
+3-run 中央値。`conf_perf_p255_tc.conf` / `conf_perf_p255.conf`（`Ne=1`、
+`nstep=20`、graph off）の `DqdtKernel_Type` だけを差し替え。µs/stage は
+`CUDA device *`。§5 の Main 3.1265 / 1014.2 µs と §10 の 961.0 / 1004.5 は
+当時の計測で、表は残す。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `CUDAFORTRAN_FUSED` | 6.160 | 1998.0 |
+| **`CUDAFORTRAN_FUSED_TC`** | **2.978** | **918.9** |
+| `CUDAFORTRAN_GEMM` | 3.441 | 1075.7 |
+| `CUDAFORTRAN_GEMM_CUTE` | 3.432 | 1072.9 |
+| `CUDAFORTRAN_GEMM_FUSED` | 3.110 | 963.4 |
+
+**最速は `CUDAFORTRAN_FUSED_TC` のまま**（`GEMM_FUSED` に 1.045 倍、§13 と同じ比）。
+Main は換算せず実測した。C++ の `FUSED`（DFMA）は 1998 µs で TC 版の 2.17 倍。
+`GEMM` と `GEMM_CUTE` は 0.3% 以内。FLOP/s と DRAM は README のまとめ表。

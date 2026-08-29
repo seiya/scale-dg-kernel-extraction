@@ -1137,3 +1137,28 @@ volume 導関数 GEMM を INT8 Tensor Core エミュレーションで置換す�
 
 低次数では s² 本の INT8 GEMM（Scheme I）と CRT オーバーヘッド（Scheme II）が
 支配的で、いずれも本番最速経路としては不採用。
+
+> **（訂正 2026-08-29）** 上表の native **2508 µs/stage** は device 合計 248.4 ms を
+> 99 step で割った値で、RK 3 stage で割っていない。1 stage に直すと約 836 µs。
+> Ozaki 比（17.6× / 18.3×）は同じ取り方同士なのでそのまま読める。
+
+## 18. 経路横断の再測定（2026-08-29）
+
+[`reports/README.md`](README.md) のまとめ表用に、現行ツリー（commit `2dadc41`）
+を login node GPU 1 で 3-run 中央値した。入力は `conf_perf_p15_tc.conf` の
+`Ne/dt/nstep` のまま `DqdtKernel_Type` だけを差し替え（`nstep=20`、graph off）。
+µs/stage は `CUDA device *`（SPLIT は 4 本 + `Element boundary flux`、
+OpenACC は volume wall + elembnd）。過去の表は書き換えない。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `OPENACC_SPLIT` | 3.335 | 1015.1 |
+| `CUDAFORTRAN_SPLIT` | 5.468 | 1747.1 |
+| `CUDAFORTRAN_FUSED` | 1.583 | 446.6 |
+| **`CUDAFORTRAN_FUSED_TC`** | **1.068** | **271.8** |
+| `CUDAFORTRAN_GEMM` | 2.766 | 847.5 |
+
+**最速は `CUDAFORTRAN_FUSED_TC` のまま**（§16 の 272.4 µs と 0.2%）。
+`GEMM` の 847.5 は §17 を 1 stage に直した 836 と整合する。
+`GEMM_FUSED` / `GEMM_CUTE` は `Nq*Ne = 65536` でこの次数では使えない。
+FLOP/s と unique/path DRAM は README のまとめ表。

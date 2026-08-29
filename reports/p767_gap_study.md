@@ -184,6 +184,11 @@ commit `38952e4`、`nstep=20`、`WarmupStep=2`、
 ただし最速は `GEMM_FUSED`（60.4 ms/stage）のままで、Ozaki は volume GEMM 置換の
 参考比較にとどまる。
 
+> **（訂正 2026-08-29）** 上表の native **188.4 ms** は 1 step の device 合計で、
+> RK 3 stage で割っていない。1 stage は約 62.8 ms で、§5 の GEMM 62.817 ms/stage
+> と整合する。Ozaki 比はそのまま読める。Scheme I が volume GEMM を上回る、という
+> 結論は比が同じなので変わらない。
+
 ## 9. cuBLAS FP64 emulation（2026-08-28 追記）
 
 `CublasEmulation = .true.`、`CUDAFORTRAN_GEMM` のみ。commit `a1cdb57`、
@@ -196,3 +201,9 @@ commit `38952e4`、`nstep=20`、`WarmupStep=2`、
 
 入力は `input_p767_val_gemm_emu.conf`。
 [`cublas_emulation_survey.md`](cublas_emulation_survey.md) §4 参照。
+
+## 10. 2026-08-29 の経路横断について
+
+p=7…255 は同一実行ファイルで再測定したが、**p=767 は再実行していない**。
+[`README.md`](README.md) まとめ表の p=767 行は本レポートの
+`GEMM` 62.817 / `GEMM_FUSED` 60.362 ms/stage のまま。

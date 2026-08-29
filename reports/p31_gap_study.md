@@ -763,3 +763,28 @@ commit `38952e4`、`NeX/Y/Z=8`、`nstep=100`、`WarmupStep=1`、
 | `CUDAFORTRAN_GEMM_OZAKI2` | **40.7 ms** | **21.6×** |
 
 最速は `FUSED_TC`（374.8 µs/stage）のまま。Ozaki は参考比較のみ。
+
+> **（訂正 2026-08-29）** 上表の native **1887 µs/stage** は 1 step の device 合計で、
+> RK 3 stage で割っていない。1 stage は約 629 µs。Ozaki 比はそのまま読める。
+
+## 16. 経路横断の再測定（2026-08-29）
+
+[`reports/README.md`](README.md) 用。commit `2dadc41`、login node GPU 1、
+3-run 中央値。`conf_perf_p31_tc.conf`（`Ne=8³`、`nstep=200`、graph off）の
+`DqdtKernel_Type` だけを差し替え。µs/stage は `CUDA device *`（SPLIT は
+elembnd 込み）。§14 の 374.8 µs は当時の計測で、表は残す。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `CUDAFORTRAN_SPLIT` | 8.196 | 2634.6 |
+| `CUDAFORTRAN_FUSED` | 2.634 | 790.1 |
+| **`CUDAFORTRAN_FUSED_TC`** | **1.342** | **359.7** |
+| `CUDAFORTRAN_GEMM` | 2.139 | 625.7 |
+| `CUDAFORTRAN_GEMM_CUTE` | 2.685 | 808.6 |
+| `CUDAFORTRAN_GEMM_FUSED` | 3.083 | 940.6 |
+
+**最速は `CUDAFORTRAN_FUSED_TC` のまま。** device 359.7 µs は §14 の 374.8 より
+4% 短い（その後入った `__restrict__` と `dqdt` 先読みを含む現行バイナリ）。
+この次数だけ `GEMM_FUSED` が素の `GEMM` より遅い（`K=32` で z epilogue 融合の
+方が高い）という §6 / §14 の結論は変わらない。
+FLOP/s と DRAM は README のまとめ表。

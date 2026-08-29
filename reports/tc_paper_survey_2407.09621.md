@@ -1327,3 +1327,11 @@ p=7 のカーネルは要素まるごとを shared に載せる別構造で、
 同じ手には 12 double = 24 レジスタが要る。512 スレッド化とセットでなければ
 入らず、shared は既に LSU の 41.1%（L1/TEX 67.9%、job `59436`）まで下がっている
 ので、見返りは p=7 より薄い。**着手しない。**
+
+## 15. 経路横断の再測定（2026-08-29）
+
+p=7 の現行時間は本調査メモではなく
+[`execution_times.md`](execution_times.md) 追記 16 と
+[`README.md`](README.md) のまとめ表。commit `2dadc41`、login GPU 1、
+3-run 中央値。**最速は `CUDAFORTRAN_FUSED_TC`（Main 1.073 ms/step、device 274.9 µs/stage）のまま。**
+本文 §0 の ncu 時間は当時のカーネルのまま残す。
