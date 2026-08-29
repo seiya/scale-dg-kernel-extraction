@@ -642,7 +642,7 @@ commit `38952e4`、`nstep=100`、`WarmupStep=1`、
 
 | 経路 | Main [ms/step] | µs/stage |
 |---|---:|---:|
-| `CUDAFORTRAN_FUSED` | 6.160 | 1998.0 |
+| `CUDAFORTRAN_FUSED_DFMA` | 6.160 | 1998.0 |
 | **`CUDAFORTRAN_FUSED_TC`** | **2.978** | **918.9** |
 | `CUDAFORTRAN_GEMM` | 3.441 | 1075.7 |
 | `CUDAFORTRAN_GEMM_CUTE` | 3.432 | 1072.9 |
@@ -650,4 +650,23 @@ commit `38952e4`、`nstep=100`、`WarmupStep=1`、
 
 **最速は `CUDAFORTRAN_FUSED_TC` のまま**（`GEMM_FUSED` に 1.045 倍、§13 と同じ比）。
 Main は換算せず実測した。C++ の `FUSED`（DFMA）は 1998 µs で TC 版の 2.17 倍。
+この節の経路名は `CUDAFORTRAN_FUSED_DFMA` と読む。
 `GEMM` と `GEMM_CUTE` は 0.3% 以内。FLOP/s と DRAM は README のまとめ表。
+
+## 13. CUDA-core 融合の復活（2026-08-29）
+
+`CUDAFORTRAN_FUSED` を Fortran `2dadc41^` の 16×16 タイル x/y/z 3 本として
+C++ に戻した。login GPU 1、`conf_perf_p255_tc.conf` の type だけ
+`CUDAFORTRAN_FUSED`（`Ne=1`、`nstep=20`、graph off）、3-run 中央値。
+作業ツリーは親 `959ad50`。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `CUDAFORTRAN_FUSED`（CC） | 15.755 | 5252.8 |
+| `CUDAFORTRAN_FUSED_DFMA`（§12） | 6.160 | 1998.0 |
+| `CUDAFORTRAN_FUSED_TC`（§12） | 2.978 | 918.9 |
+
+CC 5252.8 µs は旧 Fortran 〜4970 µs と同水準。fragment 日程の DFMA より遅い。
+論文の主比は **TC / FUSED = 918.9 / 5252.8 = 5.72×**。
+点変化係数の owned `dqdt` は `FUSED` と `FUSED_TC` が `Ne=1`（16,777,216 点）
+および `Ne=2`（33,554,432 点）でビット一致。

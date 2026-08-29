@@ -15,10 +15,15 @@ description: 指定した多項式次数 p と実装パス (DqdtKernel_Type) の
 - path 未指定なら `reports/README.md` の「現時点の結論」で**その次数の最速パス**を
   対象にする。最速でないパスを最適化する場合は、それが**最速を抜きうる**根拠か、
   モデルを埋めるための測定であることを最初に述べる。
-- `CUDAFORTRAN_FUSED` と `CUDAFORTRAN_FUSED_TC` は同一 C++ ソース
-  （`cuda_dg_kernels_tc.cu`、`UseTc` だけが違う）。FUSED を触る依頼は TC 効果の
-  対照を同期させることが目的であり、最速抜きを目標にしない。変更は必ず両方に
-  同時に入る。
+- `CUDAFORTRAN_FUSED` は CUDA core 向け融合（`cuda_dg_kernels_fused.cu` /
+  `cuda_dg_kernels_fused_highp.cu`）。指定したらそのカーネルだけを起動する。
+  `FUSED_DFMA` や `FUSED_TC` で代行してはならない。未実装次数なら error stop。
+  独立に最速レースしない。`FUSED_TC` 効果の対照はこれであり、iso-schedule
+  の DFMA ではない。
+- `CUDAFORTRAN_FUSED_DFMA` と `CUDAFORTRAN_FUSED_TC` は同一 C++ ソース
+  （`cuda_dg_kernels_tc.cu`、`UseTc` だけが違う）。DFMA を触る依頼は MMA
+  命令の有無だけを測ることが目的であり、最速抜きを目標にしない。変更は
+  必ず両方に同時に入る。TC の fragment レイアウトを `FUSED` に持ち込まない。
 - `CUDAFORTRAN_GEMM_CUTE` は `GEMM_FUSED` の GEMM 本体（未融合）の対照である。
   独立に最速化しない。volume GEMM のタイルや `Nq<=64` の x ライブラリ分岐を
   変えるなら `GEMM_FUSED` と同じドライバ経由で変える。

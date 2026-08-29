@@ -1335,6 +1335,7 @@ p=7 の現行時間は本調査メモではなく
 [`README.md`](README.md) のまとめ表。commit `2dadc41`、login GPU 1、
 3-run 中央値。**最速は `CUDAFORTRAN_FUSED_TC`（Main 1.073 ms/step、device 274.9 µs/stage）のまま。**
 本文 §0 の ncu 時間は当時のカーネルのまま残す。
+この日の namelist `CUDAFORTRAN_FUSED` は iso-schedule DFMA である。
 
 ## 16. p=7 TC: z の shared 往復の天井（2026-08-29、不採用）
 

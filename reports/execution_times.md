@@ -736,14 +736,17 @@ elembnd）。冒頭の `nstep=1000` 表と、追記の `FUSED_TC` 再測定は�
 | `OPENACC_ASIS` | 3.492 | 1065.8 |
 | `OPENACC_SPLIT` | 2.708 | 807.8 |
 | `CUDAFORTRAN_SPLIT` | 2.565 | 764.1 |
-| `CUDAFORTRAN_FUSED` | 1.528 | 427.8 |
+| `CUDAFORTRAN_FUSED_DFMA` | 1.528 | 427.8 |
 | **`CUDAFORTRAN_FUSED_TC`** | **1.073** | **274.9** |
 | `CUDAFORTRAN_GEMM` | 5.088 | 1635.4 |
 
 **最速は `CUDAFORTRAN_FUSED_TC` のまま。** 冒頭表の GEMM Main 9.271 s（nstep=1000）
-は RK 最適化前で、同一 conf では 5.088 ms/step。C++ `FUSED`（UseTc=false）の
-427.8 µs は旧 Fortran 融合（device 〜324 µs）より遅く、TC 版との対照は同一
-C++ ソースに限る。FLOP/s と DRAM は [`README.md`](README.md) のまとめ表。
+は RK 最適化前で、同一 conf では 5.088 ms/step。
+
+この節の `CUDAFORTRAN_FUSED` 行は iso-schedule DFMA（`UseTc=false`）の測定である。
+経路名は `CUDAFORTRAN_FUSED_DFMA` と読む。旧 Fortran 融合（device 〜324 µs）は
+CC 最適の旧測であり、DFMA の 427.8 µs とは並べない。FLOP/s と DRAM は
+[`README.md`](README.md) のまとめ表。
 
 ### 追記 17: p=7 TC の z 往復天井（2026-08-29、不採用）
 
@@ -751,3 +754,36 @@ C++ ソースに限る。FLOP/s と DRAM は [`README.md`](README.md) のまと�
 device 中央値 **274.14 → 270.50 µs/stage（−1.3%）**。天井が 4 µs なので
 写像を直す実装はしない。詳細は `tc_paper_survey_2407.09621.md` §16。
 コードはベースに戻してある。
+
+### 追記 18: p=7 CUDA-core 融合の C++ 復活（2026-08-29）
+
+`CUDAFORTRAN_FUSED` を Fortran `2dadc41^` の自然順・長さ 8 内積カーネルとして
+C++ に戻した。login GPU 1、`conf_perf_p7.conf` の `DqdtKernel_Type` だけ
+`CUDAFORTRAN_FUSED`、3-run 中央値。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `CUDAFORTRAN_FUSED`（CC） | 1.227 | 326.8 |
+| `CUDAFORTRAN_FUSED_DFMA` | 1.517 | 424.1 |
+| `CUDAFORTRAN_FUSED_TC` | 1.074 | 274.9 |
+
+CC 326.8 µs は旧 Fortran 〜324 µs と同水準。TC は 1.19×（CC 比）、DFMA 比では 1.54×。
+点変化係数、`Ne=2³`、`nstep=1` の owned `dqdt` は `FUSED` と `FUSED_TC` がビット一致、
+`CUDAFORTRAN_SPLIT` との最大絶対差 1.78e-15。
+
+### 追記 19: p=15…255 CUDA-core 融合の測定（2026-08-29）
+
+同じ CC カーネルを p=15 / 31 / 63 / 127 / 255 に戻した作業ツリー（親 `959ad50`）で、
+各次数の既存 `conf_perf_p*` の `DqdtKernel_Type` だけが `CUDAFORTRAN_FUSED` の
+3-run 中央値。login GPU 1。FLOP/s は [`README.md`](README.md) まとめ表。
+
+| p | conf | Main [ms/step] | µs/stage | TC / FUSED |
+|---:|---|---:|---:|---:|
+| 15 | `conf_perf_p15.conf` | 1.583 | 446.7 | 1.64× |
+| 31 | `conf_perf_p31_fused.conf` | 3.255 | 998.4 | 2.78× |
+| 63 | `conf_perf_p63_fused.conf` | 3.117 | 966.5 | 2.29× |
+| 127 | `conf_perf_p127_fused.conf` | 5.033 | 1593.5 | 2.26× |
+| 255 | `conf_perf_p255_tc.conf` 相当 | 15.755 | 5252.8 | 5.72× |
+
+点変化係数の owned `dqdt`: p=15 は SPLIT / TC とも 1.78e-15。p=31/63 `Ne=2³`、
+p=127 `Ne=1`、p=255 `Ne=1` と `Ne=2` は TC とビット一致。

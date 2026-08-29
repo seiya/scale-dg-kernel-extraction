@@ -777,7 +777,7 @@ elembnd 込み）。§14 の 374.8 µs は当時の計測で、表は残す。
 | 経路 | Main [ms/step] | µs/stage |
 |---|---:|---:|
 | `CUDAFORTRAN_SPLIT` | 8.196 | 2634.6 |
-| `CUDAFORTRAN_FUSED` | 2.634 | 790.1 |
+| `CUDAFORTRAN_FUSED_DFMA` | 2.634 | 790.1 |
 | **`CUDAFORTRAN_FUSED_TC`** | **1.342** | **359.7** |
 | `CUDAFORTRAN_GEMM` | 2.139 | 625.7 |
 | `CUDAFORTRAN_GEMM_CUTE` | 2.685 | 808.6 |
@@ -788,3 +788,22 @@ elembnd 込み）。§14 の 374.8 µs は当時の計測で、表は残す。
 この次数だけ `GEMM_FUSED` が素の `GEMM` より遅い（`K=32` で z epilogue 融合の
 方が高い）という §6 / §14 の結論は変わらない。
 FLOP/s と DRAM は README のまとめ表。
+この節の `CUDAFORTRAN_FUSED` は iso-schedule DFMA の測定である（経路名は
+`CUDAFORTRAN_FUSED_DFMA`）。
+
+## 17. CUDA-core 融合の復活（2026-08-29）
+
+`CUDAFORTRAN_FUSED` を Fortran `2dadc41^` の 1024 スレッド xz+y カーネルとして
+C++ に戻した（TC の `P31_THREADS=512` ではない）。login GPU 1、
+`conf_perf_p31_fused.conf`（`Ne=8³`、`nstep=200`、graph off）、3-run 中央値。
+作業ツリーは親 `959ad50`。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `CUDAFORTRAN_FUSED`（CC） | 3.255 | 998.4 |
+| `CUDAFORTRAN_FUSED_DFMA`（§16） | 2.634 | 790.1 |
+| `CUDAFORTRAN_FUSED_TC`（§16） | 1.342 | 359.7 |
+
+CC 998.4 µs は旧 Fortran 〜995 µs と同水準。論文の主比は
+**TC / FUSED = 359.7 / 998.4 = 2.78×**。
+点変化係数、`Ne=2³` の owned `dqdt` は `FUSED` と `FUSED_TC` がビット一致。

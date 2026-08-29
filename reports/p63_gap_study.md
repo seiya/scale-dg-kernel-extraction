@@ -1711,7 +1711,7 @@ elembnd 込み）。§19 の 487.8 µs は `Cal_tend` / 1197 stage で、表は�
 | 経路 | Main [ms/step] | µs/stage |
 |---|---:|---:|
 | `CUDAFORTRAN_SPLIT` | 12.01 | 3967.2 |
-| `CUDAFORTRAN_FUSED` | 2.766 | 846.2 |
+| `CUDAFORTRAN_FUSED_DFMA` | 2.766 | 846.2 |
 | **`CUDAFORTRAN_FUSED_TC`** | **1.512** | **421.7** |
 | `CUDAFORTRAN_GEMM` | 2.102 | 622.0 |
 | `CUDAFORTRAN_GEMM_CUTE` | 2.144 | 636.6 |
@@ -1721,4 +1721,22 @@ elembnd 込み）。§19 の 487.8 µs は `Cal_tend` / 1197 stage で、表は�
 487.8 は launch 込みの `Cal_tend`。Main 1.512 ms/step は §19 の 1.511 と一致する。
 `GEMM` と `GEMM_FUSED` は 2% 以内。C++ 化した `FUSED`（846 µs）は
 `FUSED_TC` の 2.0 倍で、README に書いた 2.766 ms/step の再掲である。
+この節の `CUDAFORTRAN_FUSED` は iso-schedule DFMA である（経路名は
+`CUDAFORTRAN_FUSED_DFMA`）。
 FLOP/s と DRAM は README のまとめ表。
+
+## 23. CUDA-core 融合の復活（2026-08-29）
+
+`CUDAFORTRAN_FUSED` を Fortran `2dadc41^` の 1024 スレッド・64 block/element
+xz+y カーネルとして C++ に戻した。login GPU 1、`conf_perf_p63_fused.conf`
+（`Ne=4³`、`nstep=20`、graph off）、3-run 中央値。作業ツリーは親 `959ad50`。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `CUDAFORTRAN_FUSED`（CC） | 3.117 | 966.5 |
+| `CUDAFORTRAN_FUSED_DFMA`（§22） | 2.766 | 846.2 |
+| `CUDAFORTRAN_FUSED_TC`（§22） | 1.512 | 421.7 |
+
+CC 966.5 µs は旧 Fortran 〜971 µs と同水準。論文の主比は
+**TC / FUSED = 421.7 / 966.5 = 2.29×**。
+点変化係数、`Ne=2³` の owned `dqdt` は `FUSED` と `FUSED_TC` がビット一致。

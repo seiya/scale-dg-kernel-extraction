@@ -1154,7 +1154,7 @@ OpenACC は volume wall + elembnd）。過去の表は書き換えない。
 |---|---:|---:|
 | `OPENACC_SPLIT` | 3.335 | 1015.1 |
 | `CUDAFORTRAN_SPLIT` | 5.468 | 1747.1 |
-| `CUDAFORTRAN_FUSED` | 1.583 | 446.6 |
+| `CUDAFORTRAN_FUSED_DFMA` | 1.583 | 446.6 |
 | **`CUDAFORTRAN_FUSED_TC`** | **1.068** | **271.8** |
 | `CUDAFORTRAN_GEMM` | 2.766 | 847.5 |
 
@@ -1162,3 +1162,24 @@ OpenACC は volume wall + elembnd）。過去の表は書き換えない。
 `GEMM` の 847.5 は §17 を 1 stage に直した 836 と整合する。
 `GEMM_FUSED` / `GEMM_CUTE` は `Nq*Ne = 65536` でこの次数では使えない。
 FLOP/s と unique/path DRAM は README のまとめ表。
+
+この節の `CUDAFORTRAN_FUSED` は iso-schedule DFMA の測定である（経路名は
+`CUDAFORTRAN_FUSED_DFMA`）。
+
+## 19. CUDA-core 融合の復活（2026-08-29）
+
+`CUDAFORTRAN_FUSED` を Fortran `2dadc41^` の自然順・長さ 16 内積カーネルとして
+C++ に戻した。login GPU 1（`GPU-d5214545-6d82-2be9-a314-442682ff446b`）、
+`conf_perf_p15.conf`（`Ne=16³`、`nstep=20`、graph off）、3-run 中央値。
+作業ツリーは親 `959ad50`。過去の表は書き換えない。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `CUDAFORTRAN_FUSED`（CC） | 1.583 | 446.7 |
+| `CUDAFORTRAN_FUSED_DFMA`（§18） | 1.583 | 446.6 |
+| `CUDAFORTRAN_FUSED_TC`（§18） | 1.068 | 271.8 |
+
+CC 446.7 µs は iso-schedule DFMA と測定誤差内。論文の主比は
+**TC / FUSED = 271.8 / 446.7 = 1.64×**。
+点変化係数、`Ne=2³`、`nstep=1` の owned `dqdt` は `FUSED` 対 `FUSED_TC` および
+`CUDAFORTRAN_SPLIT` とも最大絶対差 **1.78e-15**。

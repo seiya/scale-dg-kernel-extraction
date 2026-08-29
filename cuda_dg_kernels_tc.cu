@@ -12,7 +12,7 @@
 //   C(8x8): C[lane/4][(lane%4)*2] and +1
 //
 // UseTc=false walks the same fragments with DFMA and warp shuffles so
-// CUDAFORTRAN_FUSED and CUDAFORTRAN_FUSED_TC share every other instruction.
+// CUDAFORTRAN_FUSED_DFMA and CUDAFORTRAN_FUSED_TC share every other instruction.
 
 template <bool UseTc>
 __device__ __forceinline__ void mma_m8n8k4_f64(
@@ -794,7 +794,7 @@ void launch_tendency_fused_p7_impl(
   check_cuda("tendency_fused_p7_kernel");
 }
 
-extern "C" void launch_tendency_fused_p7(
+extern "C" void launch_tendency_fused_p7_dfma(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
@@ -830,7 +830,7 @@ void launch_tendency_xyz_p255_impl(
   check_cuda("p255 fused tendency kernels");
 }
 
-extern "C" void launch_tendency_xyz_p255(
+extern "C" void launch_tendency_xyz_p255_dfma(
     double *dqdt, const double *q, const double *u, const double *v,
     const double *w, const double *D1D, const double *Lift1D,
     const double *flux_bnd, const double *Escale, int Ne)
@@ -1276,7 +1276,7 @@ void launch_tendency_fused_p15_impl(
   check_cuda("tendency_fused_p15_kernel");
 }
 
-extern "C" void launch_tendency_fused_p15(
+extern "C" void launch_tendency_fused_p15_dfma(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
@@ -1679,7 +1679,7 @@ void launch_tendency_fused_p31_impl(
   check_cuda("tendency_fused_p31 kernels");
 }
 
-extern "C" void launch_tendency_fused_p31(
+extern "C" void launch_tendency_fused_p31_dfma(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
@@ -2135,7 +2135,7 @@ void launch_tendency_fused_p63_impl(
   check_cuda("tendency_fused_p63 kernels");
 }
 
-extern "C" void launch_tendency_fused_p63(
+extern "C" void launch_tendency_fused_p63_dfma(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const double *flux_bnd,
     const double *Escale, int Ne)
@@ -2587,7 +2587,7 @@ void launch_tendency_fused_p127_impl(
   check_cuda("tendency_fused_p127 kernels");
 }
 
-extern "C" void launch_tendency_fused_p127(
+extern "C" void launch_tendency_fused_p127_dfma(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const double *flux_bnd,
     const double *Escale, int Ne)

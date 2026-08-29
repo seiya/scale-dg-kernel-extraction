@@ -83,15 +83,21 @@ speed-optimize a control path.
   folding `deriv_x` into y). Do not retune CUTE on its own.
 - `CUDAFORTRAN_GEMM_FUSED`: the fused-epilogue production GEMM path.
   CUTLASS tile types live in `VolumeGemmSet` in `cuda_cutlass_gemm_fused.cu`.
-- `CUDAFORTRAN_FUSED`: C++ fused kernels in `cuda_dg_kernels_tc.cu` with
-  `UseTc=false` (DFMA on the MMA fragment layout). It is the Tensor Core
-  ablation, not a separately optimized CUDA-core kernel. Geometry constants
-  are in `fused_kernel_geom.h`.
-- `CUDAFORTRAN_FUSED_TC`: the same source with `UseTc=true`
-  (`mma.sync.m8n8k4`). Changing that file always changes both FUSED paths.
+- `CUDAFORTRAN_FUSED`: CUDA-core fused kernels in `cuda_dg_kernels_fused.cu`
+  (natural-order shared panels, length-`Nq` inner products). This is the
+  paper's "CC fused" column. Do not retune it as a race against
+  `FUSED_TC`. Selecting `FUSED` must launch these kernels. Never dispatch
+  `FUSED_DFMA` or `FUSED_TC` in its place.
+- `CUDAFORTRAN_FUSED_TC`: Tensor Core fused kernels in
+  `cuda_dg_kernels_tc.cu` with `UseTc=true` (`mma.sync.m8n8k4`).
+- `CUDAFORTRAN_FUSED_DFMA`: the same source as `FUSED_TC` with
+  `UseTc=false` (DFMA on the MMA fragment layout). Iso-schedule ablation
+  of the MMA instruction only. Selecting `FUSED_DFMA` must launch that
+  instantiation; never treat it as `FUSED`.
 
-A change that would make FUSED and FUSED_TC diverge (except the inner
-product) is a defect. A change that would make GEMM_CUTE's GEMM launches
+A change that would make `FUSED_DFMA` and `FUSED_TC` diverge (except the
+inner product) is a defect. Do not copy the TC fragment layout or z
+shared roundtrip into `FUSED`. A change that would make GEMM_CUTE's GEMM launches
 diverge from GEMM_FUSED's mainloop tiles or `Nq<=64` x-library switch is
 likewise a defect.
 
@@ -101,7 +107,8 @@ likewise a defect.
   lifetime.
 - `mod_advect3d_eq.f90`: tendency dispatch and work-array management.
 - `mod_cuda_dg_kernels.cuf`: CUDA Fortran wrappers, GEMM drivers, split kernels.
-- `cuda_dg_kernels_tc.cu`: hand-written fused C++ kernels (`FUSED` / `FUSED_TC`).
+- `cuda_dg_kernels_tc.cu`: iso-schedule fused C++ kernels (`FUSED_DFMA` / `FUSED_TC`).
+- `cuda_dg_kernels_fused.cu`, `cuda_dg_kernels_fused_highp.cu`: CUDA-core fused kernels (`FUSED`).
 - `fused_kernel_geom.h`: shared fused-kernel geometry constants.
 - `mod_cuda_dg_kernels_stub.f90`: matching non-CUDA interfaces.
 - `mod_mesh.f90`: mesh, mappings, halo handling, and p=255 operator generation.
@@ -165,8 +172,8 @@ Leave the working executable in the build mode relevant to the current task.
 - For p=7, validate `CUDAFORTRAN_FUSED` against a split implementation.
 - For p=255, test both the intended `Ne=1` case and an `Ne>1` smoke case when
   memory permits. The p=255 path currently requires `CUDAFORTRAN_FUSED`,
-  `CUDAFORTRAN_FUSED_TC`, `CUDAFORTRAN_GEMM`, `CUDAFORTRAN_GEMM_FUSED`, or
-  `CUDAFORTRAN_GEMM_CUTE`.
+  `CUDAFORTRAN_FUSED_TC`, `CUDAFORTRAN_FUSED_DFMA`, `CUDAFORTRAN_GEMM`,
+  `CUDAFORTRAN_GEMM_FUSED`, or `CUDAFORTRAN_GEMM_CUTE`.
 - After interface changes, verify both a CUDA build and a non-CUDA build so the
   stub remains synchronized.
 - Run `git diff --check` before committing.

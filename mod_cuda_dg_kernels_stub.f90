@@ -12,9 +12,13 @@ module mod_cuda_dg_kernels
   public :: cuda_assemble_dqdt
   public :: cuda_cal_dqdt_split
   public :: cuda_cal_dqdt_fused
+  public :: cuda_cal_dqdt_fused_dfma
   public :: cuda_cal_dqdt_fused_p63
+  public :: cuda_cal_dqdt_fused_p63_dfma
   public :: cuda_cal_dqdt_fused_p127
+  public :: cuda_cal_dqdt_fused_p127_dfma
   public :: cuda_cal_dqdt_fused_p255
+  public :: cuda_cal_dqdt_fused_p255_dfma
   public :: cuda_cal_dqdt_fused_tc
   public :: cuda_cal_dqdt_fused_p63_tc
   public :: cuda_cal_dqdt_fused_p127_tc
@@ -161,6 +165,24 @@ contains
     error stop "CUDA Fortran kernels are not available in this build"
   end subroutine cuda_cal_dqdt_fused
 
+  subroutine cuda_cal_dqdt_fused_dfma( &
+    dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), intent(out) :: dqdt(Np,Ne), kernel_time(2)
+    real(RP), intent(in) :: q(Np,NeA), u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), intent(in) :: D1D(Nq,Nq)
+    real(RP), intent(in) :: Lift1D(Nq,6)
+    integer, intent(in) :: VMapM(NfpTot,Ne)
+    integer, intent(in) :: VMapP(NfpTot,Ne)
+    real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+    real(RP), intent(in) :: Escale(Np,Ne,3)
+
+    error stop "CUDA Fortran kernels are not available in this build"
+  end subroutine cuda_cal_dqdt_fused_dfma
+
   subroutine cuda_cal_dqdt_fused_p63( &
     dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
     normal_fn, Fscale, Escale, flux_bnd, &
@@ -217,6 +239,63 @@ contains
 
     error stop "CUDA Fortran kernels are not available in this build"
   end subroutine cuda_cal_dqdt_fused_p255
+
+  subroutine cuda_cal_dqdt_fused_p63_dfma( &
+    dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, flux_bnd, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), intent(out) :: dqdt(Np,Ne), flux_bnd(NfpTot,Ne)
+    real(RP), intent(in) :: q(Np,NeA), u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), intent(in) :: D1D(Nq,Nq)
+    real(RP), intent(in) :: Lift1D(Nq,6)
+    integer, intent(in) :: VMapM(NfpTot,Ne)
+    integer, intent(in) :: VMapP(NfpTot,Ne)
+    real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+    real(RP), intent(in) :: Escale(Np,Ne,3)
+    real(RP), intent(out) :: kernel_time(2)
+
+    error stop "CUDA Fortran kernels are not available in this build"
+  end subroutine cuda_cal_dqdt_fused_p63_dfma
+
+  subroutine cuda_cal_dqdt_fused_p127_dfma( &
+    dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, flux_bnd, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), intent(out) :: dqdt(Np,NeA), flux_bnd(NfpTot,Ne)
+    real(RP), intent(in) :: q(Np,NeA), u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), intent(in) :: D1D(Nq,Nq)
+    real(RP), intent(in) :: Lift1D(Nq,6)
+    integer, intent(in) :: VMapM(NfpTot,Ne)
+    integer, intent(in) :: VMapP(NfpTot,Ne)
+    real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+    real(RP), intent(in) :: Escale(Np,Ne,3)
+    real(RP), intent(out) :: kernel_time(2)
+
+    error stop "CUDA Fortran kernels are not available in this build"
+  end subroutine cuda_cal_dqdt_fused_p127_dfma
+
+  subroutine cuda_cal_dqdt_fused_p255_dfma( &
+    dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+    normal_fn, Fscale, Escale, flux_bnd, &
+    Nq, Np, NfpTot, Ne, NeA, kernel_time )
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), intent(out) :: dqdt(Np,Ne), flux_bnd(NfpTot,Ne)
+    real(RP), intent(in) :: q(Np,NeA), u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), intent(in) :: D1D(Nq,Nq)
+    real(RP), intent(in) :: Lift1D(Nq,6)
+    integer, intent(in) :: VMapM(NfpTot,Ne)
+    integer, intent(in) :: VMapP(NfpTot,Ne)
+    real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+    real(RP), intent(in) :: Escale(Np,Ne,3)
+    real(RP), intent(out) :: kernel_time(2)
+
+    error stop "CUDA Fortran kernels are not available in this build"
+  end subroutine cuda_cal_dqdt_fused_p255_dfma
 
   subroutine cuda_cal_dqdt_fused_tc( &
     dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &

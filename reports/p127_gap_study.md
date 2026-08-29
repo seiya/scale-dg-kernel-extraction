@@ -1257,7 +1257,7 @@ elembnd 込み）。§13 の 731.7 µs は `Volume derivate + surface lift` で�
 | 経路 | Main [ms/step] | µs/stage |
 |---|---:|---:|
 | `CUDAFORTRAN_SPLIT` | 20.99 | 6916.1 |
-| `CUDAFORTRAN_FUSED` | 6.660 | 2137.3 |
+| `CUDAFORTRAN_FUSED_DFMA` | 6.660 | 2137.3 |
 | `CUDAFORTRAN_FUSED_TC` | 2.380 | 706.1 |
 | `CUDAFORTRAN_GEMM` | 2.473 | 737.3 |
 | `CUDAFORTRAN_GEMM_CUTE` | 2.508 | 749.6 |
@@ -1268,3 +1268,22 @@ device 674 µs に対し §13 の 731.7 は volume wall（launch 込み）。
 同一セッションでは `FUSED_TC` 706 / `GEMM` 737 で、§11 と §13 を別日に
 採ったときの 787 対 732 という食い違いはタイマーとセッションの差だった。
 FLOP/s と DRAM は README のまとめ表。
+この節の `CUDAFORTRAN_FUSED` は iso-schedule DFMA である（経路名は
+`CUDAFORTRAN_FUSED_DFMA`）。
+
+## 16. CUDA-core 融合の復活（2026-08-29）
+
+`CUDAFORTRAN_FUSED` を Fortran `2dadc41^` の 1024 スレッド・512 block/element
+xz+y カーネルとして C++ に戻した。login GPU 1、`conf_perf_p127_fused.conf`
+（`Ne=2³`、`nstep=100`、graph off）、3-run 中央値。作業ツリーは親 `959ad50`。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `CUDAFORTRAN_FUSED`（CC） | 5.033 | 1593.5 |
+| `CUDAFORTRAN_FUSED_DFMA`（§15） | 6.660 | 2137.3 |
+| `CUDAFORTRAN_FUSED_TC`（§15） | 2.380 | 706.1 |
+
+CC 1593.5 µs は旧 Fortran 〜1585 µs と同水準で、iso-schedule DFMA より速い。
+論文の主比は **TC / FUSED = 706.1 / 1593.5 = 2.26×**。
+点変化係数、`Ne=1` の owned `dqdt` は `FUSED` と `FUSED_TC` がビット一致。
+`Ne=2` の FUSED スモークも通った。

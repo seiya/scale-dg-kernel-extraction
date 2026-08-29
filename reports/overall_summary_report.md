@@ -1338,3 +1338,13 @@ p=7…255 を現行ツリー（commit `2dadc41`）で採り直した結果は
 [`README.md`](README.md) の「最新結果のまとめ」と、各次数レポート
 （p=7 は `execution_times.md` 追記 16、p=15 §18、p=31 §16、p=63 §22、
 p=127 §15、p=255 §12）にある。最速パスの順位は変わっていない。
+この日の namelist `CUDAFORTRAN_FUSED` は iso-schedule DFMA であり、表の経路名は
+`CUDAFORTRAN_FUSED_DFMA` と読む。
+
+## 15. CUDA-core 融合の復活（2026-08-29）
+
+`CUDAFORTRAN_FUSED` を次数ごとの自然順 CC カーネルとして C++ に戻した測定は
+[`README.md`](README.md) のまとめ表と、p=7 は `execution_times.md` 追記 18、
+p=15 §19、p=31 §17、p=63 §23、p=127 §16、p=255 §13。
+p=15 の CC は DFMA と誤差内、p=127 は CC の方が DFMA より速く、p=255 は
+16×16 タイル CC が fragment 日程の DFMA より遅い。最速パスの順位は変わらない。

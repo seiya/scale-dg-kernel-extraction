@@ -13,8 +13,10 @@ module mod_advect3d_eq
     cuda_dg_kernels_available,  &
     cuda_cal_volume_flux, cuda_cal_volume_deriv, &
     cuda_cal_surface_lift, cuda_assemble_dqdt, cuda_cal_dqdt_split, &
-    cuda_cal_dqdt_fused, cuda_cal_dqdt_fused_p63, cuda_cal_dqdt_fused_p255, &
-    cuda_cal_dqdt_fused_p127, cuda_cal_dqdt_fused_p127_tc, &
+    cuda_cal_dqdt_fused, cuda_cal_dqdt_fused_dfma, &
+    cuda_cal_dqdt_fused_p63, cuda_cal_dqdt_fused_p63_dfma, cuda_cal_dqdt_fused_p255, &
+    cuda_cal_dqdt_fused_p255_dfma, &
+    cuda_cal_dqdt_fused_p127, cuda_cal_dqdt_fused_p127_dfma, cuda_cal_dqdt_fused_p127_tc, &
     cuda_cal_dqdt_fused_tc, cuda_cal_dqdt_fused_p63_tc, &
     cuda_cal_dqdt_fused_p255_tc, &
     cuda_cal_dqdt_gemm, cuda_cal_dqdt_gemm_fused, cuda_cal_dqdt_gemm_cute, &
@@ -80,6 +82,7 @@ module mod_advect3d_eq
   integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE = 8
   integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2 = 9
   integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI1 = 10
+  integer, parameter :: DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA = 11
   integer :: dqdt_kernel_typeid
   character(len=24) :: dqdt_kernel_name
   logical :: cublas_emulation_enabled = .false.
@@ -196,6 +199,18 @@ contains
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_FUSED
       dqdt_kernel_name = "CUDAFORTRAN_FUSED"
+    case ("CUDAFORTRAN_FUSED_DFMA")
+      if (.not. cuda_dg_kernels_available) then
+        write(*,*) "CUDAFORTRAN_FUSED_DFMA requires a build with CUDA=1"
+        error stop
+      end if
+      if (Np /= 512 .and. Np /= 16**3 .and. Np /= 32**3 .and. &
+          Np /= 64**3 .and. Np /= 128**3 .and. Np /= 256**3) then
+        write(*,*) "CUDAFORTRAN_FUSED_DFMA requires PolyOrder=7, 15, 31, 63, 127 or 255"
+        error stop
+      end if
+      dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA
+      dqdt_kernel_name = "CUDAFORTRAN_FUSED_DFMA"
     case ("CUDAFORTRAN_FUSED_TC")
       if (.not. cuda_dg_kernels_available) then
         write(*,*) "CUDAFORTRAN_FUSED_TC requires a build with CUDA=1"
@@ -303,12 +318,13 @@ contains
     if (Np == 256**3 .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2 .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI1) then
-      error stop "PolyOrder=255 currently requires CUDAFORTRAN_FUSED, CUDAFORTRAN_FUSED_TC, CUDAFORTRAN_GEMM, CUDAFORTRAN_GEMM_FUSED, CUDAFORTRAN_GEMM_CUTE, CUDAFORTRAN_GEMM_OZAKI2, or CUDAFORTRAN_GEMM_OZAKI1"
+      error stop "PolyOrder=255 currently requires CUDAFORTRAN_FUSED, CUDAFORTRAN_FUSED_TC, CUDAFORTRAN_FUSED_DFMA, CUDAFORTRAN_GEMM, CUDAFORTRAN_GEMM_FUSED, CUDAFORTRAN_GEMM_CUTE, CUDAFORTRAN_GEMM_OZAKI2, or CUDAFORTRAN_GEMM_OZAKI1"
     end if
 
     if ((Np == 512**3 .or. Np == 576**3 .or. Np == 768**3 .or. &
@@ -321,7 +337,8 @@ contains
     end if
 
     if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
-        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC) then
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA) then
       allocate(ebnd_flux(NfpTot,Ne))
       !$acc enter data create(ebnd_flux)
     end if
@@ -331,7 +348,8 @@ contains
     !  be split over many blocks; evaluating the faces in the volume kernel
     !  would then repeat the (i,k) faces once per block.
     if ((dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED .or. &
-         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_TC) .and. &
+         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .or. &
+         dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA) .and. &
         (Np == 256**3 .or. Np == 128**3 .or. Np == 64**3)) then
       allocate(fused_flux_bnd(NfpTot,Ne))
       !$acc enter data create(fused_flux_bnd)
@@ -339,7 +357,8 @@ contains
 
     if (dqdt_kernel_typeid /= DQDT_KERNEL_OPENACC_ASIS .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
-        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC) then
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA) then
       if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM .or. &
           dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .or. &
           dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE .or. &
@@ -355,6 +374,7 @@ contains
     if (dqdt_kernel_typeid /= DQDT_KERNEL_OPENACC_ASIS .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE .and. &
@@ -507,7 +527,8 @@ contains
     end if
 
     if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED .or. &
-        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_TC) then
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .or. &
+        dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA) then
       write(*,'(A30,1X,A23)') "Element boundary flux:", "included in fused kernel"
     else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM .or. &
              dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .or. &
@@ -527,7 +548,8 @@ contains
         write(*,'(A30,ES24.5)') "  CUDA device surface lift:", Timer_elapsed(timer_surface_lift)
         write(*,'(A30,ES24.5)') "  CUDA device assembly:", Timer_elapsed(timer_dqdt_assemble)
       else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED .or. &
-               dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_TC) then
+               dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .or. &
+               dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA) then
         write(*,'(A30,ES24.5)') "  CUDA device fused tendency:", Timer_elapsed(timer_volume_deriv)
       else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_GEMM) then
         write(*,'(A30,ES24.5)') "  CUDA device GEMM tendency:", Timer_elapsed(timer_volume_deriv)
@@ -622,6 +644,7 @@ contains
       call Timer_add(timer_volume_deriv,kernel_time(1))
       call Timer_add(timer_volume_flux,kernel_time(2))
     case (DQDT_KERNEL_CUDAFORTRAN_FUSED, DQDT_KERNEL_CUDAFORTRAN_FUSED_TC, &
+          DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA, &
           DQDT_KERNEL_CUDAFORTRAN_GEMM, DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED, &
           DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2, &
           DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI1)
@@ -672,6 +695,7 @@ contains
     call Timer_start(timer_ebnd_flux)
     if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE .and. &
@@ -702,6 +726,12 @@ contains
          Escale, Nq, Np, NfpTot, Ne, NeA )    ! (in)
     else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED) then
       call cal_dqdt_cudafortran_fused( dqdt, & ! (out)
+         q, u, v, w,                         & ! (in)
+         D1D, D1D_tr, Lift_mat, Lift1D,     & ! (in)
+         VMapM, VMapP, normal_fn, Fscale,   & ! (in)
+         Escale, Nq, Np, NfpTot, Ne, NeA )    ! (in)
+    else if (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA) then
+      call cal_dqdt_cudafortran_fused_dfma( dqdt, & ! (out)
          q, u, v, w,                         & ! (in)
          D1D, D1D_tr, Lift_mat, Lift1D,     & ! (in)
          VMapM, VMapP, normal_fn, Fscale,   & ! (in)
@@ -1014,7 +1044,69 @@ contains
     return
   end subroutine cal_dqdt_cudafortran_fused
 
-  !> Tensor-core fused tendency; original CUDAFORTRAN_FUSED kernels stay unchanged.
+  !> Iso-schedule DFMA fused tendency (UseTc=false of the Tensor Core kernels).
+!OCL SERIAL
+  subroutine cal_dqdt_cudafortran_fused_dfma( dqdt, & ! (out)
+    q, u, v, w,                               & ! (in)
+    D1D, D1D_tr, Lift_mat, Lift1D,            & ! (in)
+    VMapM, VMapP, normal_fn, Fscale, Escale,  & ! (in)
+    Nq, Np, NfpTot, Ne, NeA                   ) ! (in)
+    implicit none
+    integer, intent(in) :: Nq, Np, NfpTot, Ne, NeA
+    real(RP), intent(out) :: dqdt(Np,Ne)
+    real(RP), intent(in) :: q(Np,NeA)
+    real(RP), intent(in) :: u(Np,NeA), v(Np,NeA), w(Np,NeA)
+    real(RP), intent(in) :: D1D(Nq,Nq), D1D_tr(Nq,Nq)
+    real(RP), intent(in) :: Lift_mat(:,:,:,:)
+    real(RP), intent(in) :: Lift1D(Nq,6)
+    real(RP), intent(in) :: Escale(Np,Ne,3)
+    integer, intent(in) :: VMapM(NfpTot,Ne), VMapP(NfpTot,Ne)
+    real(RP), intent(in) :: normal_fn(NfpTot,Ne,3), Fscale(NfpTot,Ne)
+    real(RP) :: kernel_time(2)
+    !------------------------------------------------------------
+
+    if (Nq == 8 .or. Nq == 16 .or. Nq == 32) then
+      !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
+      !$acc& use_device(normal_fn,Fscale,Escale)
+      call cuda_cal_dqdt_fused_dfma( &
+        dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+        normal_fn, Fscale, Escale, &
+        Nq, Np, NfpTot, Ne, NeA, kernel_time )
+      !$acc end host_data
+    else if (Nq == 64) then
+      !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
+      !$acc& use_device(normal_fn,Fscale,Escale,fused_flux_bnd)
+      call cuda_cal_dqdt_fused_p63_dfma( &
+        dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+        normal_fn, Fscale, Escale, fused_flux_bnd, &
+        Nq, Np, NfpTot, Ne, NeA, kernel_time )
+      !$acc end host_data
+    else if (Nq == 128) then
+      !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
+      !$acc& use_device(normal_fn,Fscale,Escale,fused_flux_bnd)
+      call cuda_cal_dqdt_fused_p127_dfma( &
+        dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+        normal_fn, Fscale, Escale, fused_flux_bnd, &
+        Nq, Np, NfpTot, Ne, NeA, kernel_time )
+      !$acc end host_data
+    else if (Nq == 256) then
+      !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
+      !$acc& use_device(normal_fn,Fscale,Escale,fused_flux_bnd)
+      call cuda_cal_dqdt_fused_p255_dfma( &
+        dqdt, q, u, v, w, D1D, Lift1D, VMapM, VMapP, &
+        normal_fn, Fscale, Escale, fused_flux_bnd, &
+        Nq, Np, NfpTot, Ne, NeA, kernel_time )
+      !$acc end host_data
+    else
+      error stop "CUDAFORTRAN_FUSED_DFMA requires Nq=8, 16, 32, 64, 128 or 256"
+    end if
+
+    call accumulate_kernel_time(kernel_time)
+
+    return
+  end subroutine cal_dqdt_cudafortran_fused_dfma
+
+  !> Tensor-core fused tendency. Shares cuda_dg_kernels_tc.cu with FUSED_DFMA.
 !OCL SERIAL
   subroutine cal_dqdt_cudafortran_fused_tc( dqdt, & ! (out)
     q, u, v, w,                               & ! (in)

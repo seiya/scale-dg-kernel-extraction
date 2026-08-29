@@ -1,8 +1,11 @@
 #ifndef FUSED_KERNEL_GEOM_H
 #define FUSED_KERNEL_GEOM_H
 
-// Shared launch geometry for CUDAFORTRAN_FUSED and CUDAFORTRAN_FUSED_TC.
-// Both instantiations of cuda_dg_kernels_tc.cu include this file.
+// Geometry constants for the iso-schedule fused C++ kernels.
+// CUDAFORTRAN_FUSED_DFMA and CUDAFORTRAN_FUSED_TC both instantiate
+// cuda_dg_kernels_tc.cu. CUDAFORTRAN_FUSED (CUDA-core schedule) lives in
+// cuda_dg_kernels_fused.cu / cuda_dg_kernels_fused_highp.cu and must not
+// reuse TC thread counts (p=31 CC is 1024 threads, not P31_THREADS).
 
 #define NQ7 8
 #define NP7 512
