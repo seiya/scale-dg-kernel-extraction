@@ -9,7 +9,7 @@
 
 extern cudaStream_t dg_cuda_stream;
 
-#define P31_CC_THREADS 1024
+#define P15_CC_THREADS 512
 #define P31_CC_XZ_THREADS 512
 #define P31_CC_Y_THREADS 512
 #define P31_CC_XZ_SMEM (58880)
@@ -48,17 +48,43 @@ static void check_cuda_cc_hp(const char *what)
   }
 }
 
-// Fortran 2dadc41^ had no launch_bounds; nvcc needs a cap or a 1024-thread
-// block will not launch.  minBlocks=1 matches the previous C++ port.
-__global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_cc_kernel(
-    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *v, const double *w, const int *VMapM,
-    const int *VMapP, const double *normal_fn, const double *Fscale,
-    const double *Escale, int Ne)
+__device__ double p15_face_flux_cc(int fidx, const double *__restrict__ q,
+                                   const double *__restrict__ u,
+                                   const double *__restrict__ v,
+                                   const double *__restrict__ w,
+                                   const int *__restrict__ VMapM,
+                                   const int *__restrict__ VMapP,
+                                   const double *__restrict__ normal_fn,
+                                   const double *__restrict__ Fscale,
+                                   int nface)
+{
+  const int iM = VMapM[fidx] - 1;
+  const int iP = VMapP[fidx] - 1;
+  const double qM = q[iM];
+  const double qP = q[iP];
+  const double VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
+                      w[iM] * normal_fn[fidx + 2 * nface];
+  const double VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
+                      w[iP] * normal_fn[fidx + 2 * nface];
+  const double alpha = 0.5 * fabs(VelP + VelM);
+  return 0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+}
+
+// p=15 CC: 512 threads x 8 k-nodes, 2 blocks/SM. Dedicated sFace is filled
+// after the x-panel store so face gathers overlap the three contractions.
+__global__ __launch_bounds__(P15_CC_THREADS, 2) void tendency_fused_p15_cc_kernel(
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ Lift1D, const double *__restrict__ q,
+    const double *__restrict__ u, const double *__restrict__ v,
+    const double *__restrict__ w, const int *__restrict__ VMapM,
+    const int *__restrict__ VMapP, const double *__restrict__ normal_fn,
+    const double *__restrict__ Fscale, const double *__restrict__ Escale,
+    int Ne)
 {
   __shared__ double sD1D[256];
   __shared__ double sLift[96];
   __shared__ double sbuf[4096];
+  __shared__ double sFace[1536];
 
   const int elem = (int)blockIdx.x;
   if (elem >= Ne) {
@@ -66,10 +92,9 @@ __global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_cc_kernel(
   }
 
   const int tid = (int)threadIdx.x;
-  const int nd1 = tid;
-  const int nd2 = tid + 1024;
-  const int nd3 = tid + 2048;
-  const int nd4 = tid + 3072;
+  const int i = tid % 16;
+  const int j = (tid / 16) % 16;
+  const int kbase = tid / 256;
   const int elem_offset = elem * 4096;
   const int face_offset = elem * 1536;
   const int npoint = 4096 * Ne;
@@ -81,135 +106,104 @@ __global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_cc_kernel(
     sLift[tid - 256] = Lift1D[tid - 256];
   }
 
-  const int idx1 = elem_offset + nd1;
-  const int idx2 = elem_offset + nd2;
-  const int idx3 = elem_offset + nd3;
-  const int idx4 = elem_offset + nd4;
-  const double qv1 = q[idx1];
-  const double qv2 = q[idx2];
-  const double qv3 = q[idx3];
-  const double qv4 = q[idx4];
-
-  const int i = tid % 16;
-  const int j = (tid / 16) % 16;
-  const int k1 = tid / 256;
-  const int k2 = k1 + 4;
-  const int k3 = k1 + 8;
-  const int k4 = k1 + 12;
-
-  sbuf[nd1] = qv1 * u[idx1];
-  sbuf[nd2] = qv2 * u[idx2];
-  sbuf[nd3] = qv3 * u[idx3];
-  sbuf[nd4] = qv4 * u[idx4];
+  int kk[8], nd[8], idx[8];
+  double qv[8], acc[8];
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    kk[m] = kbase + 2 * m;
+    nd[m] = i + j * 16 + kk[m] * 256;
+    idx[m] = elem_offset + nd[m];
+    qv[m] = q[idx[m]];
+    sbuf[nd[m]] = qv[m] * u[idx[m]];
+  }
   __syncthreads();
 
-  double s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0;
+  sFace[tid] = p15_face_flux_cc(face_offset + tid, q, u, v, w, VMapM, VMapP,
+                                normal_fn, Fscale, nface);
+  sFace[tid + 512] = p15_face_flux_cc(face_offset + tid + 512, q, u, v, w, VMapM,
+                                      VMapP, normal_fn, Fscale, nface);
+  sFace[tid + 1024] = p15_face_flux_cc(face_offset + tid + 1024, q, u, v, w,
+                                       VMapM, VMapP, normal_fn, Fscale, nface);
+
+  double s[8];
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    s[m] = 0.0;
+  }
 #pragma unroll
   for (int l = 0; l < 16; ++l) {
-    const int ib = l + j * 16 + k1 * 256;
     const double dm = sD1D[i + l * 16];
-    s1 += dm * sbuf[ib];
-    s2 += dm * sbuf[ib + 1024];
-    s3 += dm * sbuf[ib + 2048];
-    s4 += dm * sbuf[ib + 3072];
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+      s[m] += dm * sbuf[l + j * 16 + kk[m] * 256];
+    }
   }
-  double acc1 = Escale[idx1] * s1;
-  double acc2 = Escale[idx2] * s2;
-  double acc3 = Escale[idx3] * s3;
-  double acc4 = Escale[idx4] * s4;
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    acc[m] = Escale[idx[m]] * s[m];
+  }
   __syncthreads();
 
-  sbuf[nd1] = qv1 * v[idx1];
-  sbuf[nd2] = qv2 * v[idx2];
-  sbuf[nd3] = qv3 * v[idx3];
-  sbuf[nd4] = qv4 * v[idx4];
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    sbuf[nd[m]] = qv[m] * v[idx[m]];
+  }
   __syncthreads();
 
-  s1 = s2 = s3 = s4 = 0.0;
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    s[m] = 0.0;
+  }
 #pragma unroll
   for (int l = 0; l < 16; ++l) {
-    const int ib = i + l * 16 + k1 * 256;
     const double dm = sD1D[j + l * 16];
-    s1 += dm * sbuf[ib];
-    s2 += dm * sbuf[ib + 1024];
-    s3 += dm * sbuf[ib + 2048];
-    s4 += dm * sbuf[ib + 3072];
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+      s[m] += dm * sbuf[i + l * 16 + kk[m] * 256];
+    }
   }
-  acc1 += Escale[idx1 + npoint] * s1;
-  acc2 += Escale[idx2 + npoint] * s2;
-  acc3 += Escale[idx3 + npoint] * s3;
-  acc4 += Escale[idx4 + npoint] * s4;
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    acc[m] += Escale[idx[m] + npoint] * s[m];
+  }
   __syncthreads();
 
-  sbuf[nd1] = qv1 * w[idx1];
-  sbuf[nd2] = qv2 * w[idx2];
-  sbuf[nd3] = qv3 * w[idx3];
-  sbuf[nd4] = qv4 * w[idx4];
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    sbuf[nd[m]] = qv[m] * w[idx[m]];
+  }
   __syncthreads();
 
-  s1 = s2 = s3 = s4 = 0.0;
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    s[m] = 0.0;
+  }
 #pragma unroll
   for (int l = 0; l < 16; ++l) {
-    const int ib = i + j * 16 + l * 256;
-    const double bv = sbuf[ib];
-    s1 += sD1D[k1 + l * 16] * bv;
-    s2 += sD1D[k2 + l * 16] * bv;
-    s3 += sD1D[k3 + l * 16] * bv;
-    s4 += sD1D[k4 + l * 16] * bv;
+    const double bv = sbuf[i + j * 16 + l * 256];
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+      s[m] += sD1D[kk[m] + l * 16] * bv;
+    }
   }
-  acc1 += Escale[idx1 + 2 * npoint] * s1;
-  acc2 += Escale[idx2 + 2 * npoint] * s2;
-  acc3 += Escale[idx3 + 2 * npoint] * s3;
-  acc4 += Escale[idx4 + 2 * npoint] * s4;
-  __syncthreads();
-
-  int fp = tid;
-  int fidx = face_offset + fp;
-  int iM = VMapM[fidx] - 1;
-  int iP = VMapP[fidx] - 1;
-  double qM = q[iM];
-  double qP = q[iP];
-  double VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
-                w[iM] * normal_fn[fidx + 2 * nface];
-  double VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
-                w[iP] * normal_fn[fidx + 2 * nface];
-  double alpha = 0.5 * fabs(VelP + VelM);
-  sbuf[fp] = 0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
-  if (tid < 512) {
-    fp = tid + 1024;
-    fidx = face_offset + fp;
-    iM = VMapM[fidx] - 1;
-    iP = VMapP[fidx] - 1;
-    qM = q[iM];
-    qP = q[iP];
-    VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
-           w[iM] * normal_fn[fidx + 2 * nface];
-    VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
-           w[iP] * normal_fn[fidx + 2 * nface];
-    alpha = 0.5 * fabs(VelP + VelM);
-    sbuf[fp] = 0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    acc[m] += Escale[idx[m] + 2 * npoint] * s[m];
   }
   __syncthreads();
 
-  const int fa1 = i + k1 * 16;
-  const int fa2 = 256 + j + k1 * 16;
-  const int fa3 = 512 + i + k1 * 16;
-  const int fa4 = 768 + j + k1 * 16;
   const int fa5 = 1024 + i + j * 16;
   const int fa6 = 1280 + i + j * 16;
-
-  dqdt[idx1] = -(acc1 + sLift[j] * sbuf[fa1] + sLift[i + 16] * sbuf[fa2] +
-                 sLift[j + 32] * sbuf[fa3] + sLift[i + 48] * sbuf[fa4] +
-                 sLift[k1 + 64] * sbuf[fa5] + sLift[k1 + 80] * sbuf[fa6]);
-  dqdt[idx2] = -(acc2 + sLift[j] * sbuf[fa1 + 64] + sLift[i + 16] * sbuf[fa2 + 64] +
-                 sLift[j + 32] * sbuf[fa3 + 64] + sLift[i + 48] * sbuf[fa4 + 64] +
-                 sLift[k2 + 64] * sbuf[fa5] + sLift[k2 + 80] * sbuf[fa6]);
-  dqdt[idx3] = -(acc3 + sLift[j] * sbuf[fa1 + 128] + sLift[i + 16] * sbuf[fa2 + 128] +
-                 sLift[j + 32] * sbuf[fa3 + 128] + sLift[i + 48] * sbuf[fa4 + 128] +
-                 sLift[k3 + 64] * sbuf[fa5] + sLift[k3 + 80] * sbuf[fa6]);
-  dqdt[idx4] = -(acc4 + sLift[j] * sbuf[fa1 + 192] + sLift[i + 16] * sbuf[fa2 + 192] +
-                 sLift[j + 32] * sbuf[fa3 + 192] + sLift[i + 48] * sbuf[fa4 + 192] +
-                 sLift[k4 + 64] * sbuf[fa5] + sLift[k4 + 80] * sbuf[fa6]);
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    const int fa1 = i + kk[m] * 16;
+    const int fa2 = 256 + j + kk[m] * 16;
+    const int fa3 = 512 + i + kk[m] * 16;
+    const int fa4 = 768 + j + kk[m] * 16;
+    dqdt[idx[m]] = -(acc[m] + sLift[j] * sFace[fa1] + sLift[i + 16] * sFace[fa2] +
+                     sLift[j + 32] * sFace[fa3] + sLift[i + 48] * sFace[fa4] +
+                     sLift[kk[m] + 64] * sFace[fa5] + sLift[kk[m] + 80] * sFace[fa6]);
+  }
 }
 
 __device__ double p31_face_flux_cc(int fidx, const double *__restrict__ q,
@@ -1247,7 +1241,7 @@ extern "C" void launch_tendency_fused_p15(
     const int *VMapP, const double *normal_fn, const double *Fscale,
     const double *Escale, int Ne)
 {
-  tendency_fused_p15_cc_kernel<<<Ne, P15_THREADS, 0, dg_cuda_stream>>>(
+  tendency_fused_p15_cc_kernel<<<Ne, P15_CC_THREADS, 0, dg_cuda_stream>>>(
       dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
       Ne);
   check_cuda_cc_hp("tendency_fused_p15_cc_kernel");
