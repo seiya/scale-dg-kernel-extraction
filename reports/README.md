@@ -368,6 +368,14 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の契約内ノブ（2026-08-30、`p63_gap_study.md` §41）**:
+  flux DRAM 屋根・z 占有・y 隠し・persist 隔離まで測って閉じた。残るのは
+  RK 融合と配列パックで、どちらも範囲外。ベースライン 571 µs/stage。最速は
+  `FUSED_TC`。
+
+- **p=63 `GEMM_FUSED` の加重 y 5 stage（2026-08-30、`p63_gap_study.md` §40）**:
+  device **+0.64%**（y 130→134 µs）。stage 軸は 4 が谷。
+
 - **p=63 `GEMM_FUSED` の GEMM 限定 persist（2026-08-30、`p63_gap_study.md` §39）**:
   flux 前に `SetLimit(0)` しても device **+16.7%**。flux は 128 µs のまま、y が
   130→145 µs。max persist 予算が GEMM の L2 を削る。
