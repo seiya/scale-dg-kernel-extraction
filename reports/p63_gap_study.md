@@ -2322,6 +2322,26 @@ device **+0.66%**、レンジ非重複。バリアの直前に置くと、ロー
 体積ロードは、この次数でも前倒しのままが速い。
 **最速は `FUSED_TC` のまま。**
 
+## 43. CUDA graph 再生（2026-08-30、Main −1.29%）
+
+対象は `CUDAFORTRAN_GEMM_FUSED`。親 `820f892`、job `69925`（c386、12 回交互、
+同一バイナリ `p63gf_eyex64`、`conf_perf_p63_gemm_fused.conf` 対
+`UseCudaGraph=.true.`）。点変化係数、nstep=4 の graph 再生 vs 直接ローンチは
+`dqdt` **ビット一致**。split との max abs は nstep=1 で 3.55e-15。
+
+graph モードは side stream を切り（elembnd を x と重ねない）、device 時間は
+出さない。測るのは `Main per step`。
+
+| | Main 中央値 | レンジ |
+|---|---:|---|
+| 直接ローンチ | 1.95048e-3 | 1.94748e-3..1.95364e-3 |
+| **graph 再生** | **1.92528e-3** | **1.92311e-3..1.92650e-3** |
+
+Main **−1.29%**、レンジ非重複。カーネルの仕事は同じで、ホストのローンチ隙間が
+消える。elembnd 重ねを切ってもなお勝つ。device µs/stage の比較には使わない
+（イベント計時オフ）。既定 conf はプロファイル用に graph off のまま。
+**最速カーネルは `FUSED_TC` のまま。**
+
 ## 41. p=63 `GEMM_FUSED` の契約内ノブ（2026-08-30）
 
 ベースラインは §25 の **570.9 µs/stage**（`Ey*acc+Ex*Dx`、Nq==64）。最速パスは

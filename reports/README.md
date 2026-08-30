@@ -368,6 +368,10 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の CUDA graph（2026-08-30、`p63_gap_study.md` §43）**:
+  Main **−1.29%**（1.950 → 1.925 ms/step）、再生はビット一致。device は非計測。
+  既定 conf は graph off のまま。
+
 - **p=63 `GEMM_FUSED` の z 体積ロード移動（2026-08-30、`p63_gap_study.md` §42）**:
   device **+0.66%**（z 152→155 µs）。lift-behind の隙間に体積ロードを入れると損。
 
