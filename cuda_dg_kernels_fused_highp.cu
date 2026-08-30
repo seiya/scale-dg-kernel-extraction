@@ -10,6 +10,9 @@
 extern cudaStream_t dg_cuda_stream;
 
 #define P31_CC_THREADS 1024
+#define P31_CC_XZ_THREADS 512
+#define P31_CC_Y_THREADS 512
+#define P31_CC_XZ_SMEM (58880)
 #define P63_CC_THREADS 1024
 #define P63_CC_BPE 64
 #define P127_CC_THREADS 1024
@@ -193,10 +196,14 @@ __global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_cc_kernel(
                  sLift[k4 + 64] * sbuf[fa5] + sLift[k4 + 80] * sbuf[fa6]);
 }
 
-__device__ double p31_face_flux_cc(int fidx, const double *q, const double *u,
-                                   const double *v, const double *w,
-                                   const int *VMapM, const int *VMapP,
-                                   const double *normal_fn, const double *Fscale,
+__device__ double p31_face_flux_cc(int fidx, const double *__restrict__ q,
+                                   const double *__restrict__ u,
+                                   const double *__restrict__ v,
+                                   const double *__restrict__ w,
+                                   const int *__restrict__ VMapM,
+                                   const int *__restrict__ VMapP,
+                                   const double *__restrict__ normal_fn,
+                                   const double *__restrict__ Fscale,
                                    int nface)
 {
   const int iM = VMapM[fidx] - 1;
@@ -211,105 +218,180 @@ __device__ double p31_face_flux_cc(int fidx, const double *q, const double *u,
   return 0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
 }
 
-__global__ __launch_bounds__(P31_CC_THREADS, 1) void tendency_fused_p31_xz_cc_kernel(
-    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *v, const double *w, const int *VMapM,
-    const int *VMapP, const double *normal_fn, const double *Fscale,
-    const double *Escale, int Ne)
+__global__ __launch_bounds__(P31_CC_XZ_THREADS, 1) void tendency_fused_p31_xz_cc_kernel(
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ Lift1D, const double *__restrict__ q,
+    const double *__restrict__ u, const double *__restrict__ v,
+    const double *__restrict__ w, const int *__restrict__ VMapM,
+    const int *__restrict__ VMapP, const double *__restrict__ normal_fn,
+    const double *__restrict__ Fscale, const double *__restrict__ Escale,
+    int Ne)
 {
-  __shared__ double sD1D[1024];
-  __shared__ double sLift[192];
-  __shared__ double sQU[1024], sQW[1024];
-  __shared__ double sfz5[1024], sfz6[1024];
+  extern __shared__ __align__(16) double smem[];
+  double *sD1D = smem;
+  double *sLift = sD1D + 1024;
+  double *sQU = sLift + 192;
+  double *sQW = sQU + 2 * 1024;
+  double *sfz5 = sQW + 2 * 1024;
+  double *sfz6 = sfz5 + 1024;
 
-  const int elem = (int)blockIdx.x;
+  const int elem = (int)blockIdx.x >> 1;
   if (elem >= Ne) {
     return;
   }
+  const int j0 = ((int)blockIdx.x & 1) * 16;
 
   const int tid = (int)threadIdx.x;
-  const int i = tid % 32;
-  const int k = tid / 32;
+  const int i0 = 2 * (tid & 15);
+  const int k = tid >> 4;
+  const int ik = i0 + k * 32;
   const int elem_offset = elem * 32768;
   const int face_offset = elem * 6144;
   const int npoint = 32768 * Ne;
   const int nface = 6144 * Ne;
 
-  sD1D[tid] = D1D[tid];
+  *reinterpret_cast<double2 *>(sD1D + 2 * tid) =
+      *reinterpret_cast<const double2 *>(D1D + 2 * tid);
   if (tid < 192) {
     sLift[tid] = Lift1D[tid];
   }
 
-  const double fy1 = p31_face_flux_cc(face_offset + i + k * 32, q, u, v, w,
-                                      VMapM, VMapP, normal_fn, Fscale, nface);
-  const double fy3 = p31_face_flux_cc(face_offset + 2048 + i + k * 32, q, u, v, w,
-                                      VMapM, VMapP, normal_fn, Fscale, nface);
-  const double fx2 = p31_face_flux_cc(face_offset + 1024 + i + k * 32, q, u, v, w,
-                                      VMapM, VMapP, normal_fn, Fscale, nface);
-  const double fx4 = p31_face_flux_cc(face_offset + 3072 + i + k * 32, q, u, v, w,
-                                      VMapM, VMapP, normal_fn, Fscale, nface);
-  sfz5[tid] = p31_face_flux_cc(face_offset + 4096 + i + k * 32, q, u, v, w, VMapM,
-                               VMapP, normal_fn, Fscale, nface);
-  sfz6[tid] = p31_face_flux_cc(face_offset + 5120 + i + k * 32, q, u, v, w, VMapM,
-                               VMapP, normal_fn, Fscale, nface);
+  const double fy1a = p31_face_flux_cc(face_offset + ik, q, u, v, w, VMapM,
+                                        VMapP, normal_fn, Fscale, nface);
+  const double fy1b = p31_face_flux_cc(face_offset + ik + 1, q, u, v, w, VMapM,
+                                        VMapP, normal_fn, Fscale, nface);
+  const double fy3a = p31_face_flux_cc(face_offset + 2048 + ik, q, u, v, w,
+                                        VMapM, VMapP, normal_fn, Fscale, nface);
+  const double fy3b = p31_face_flux_cc(face_offset + 2048 + ik + 1, q, u, v, w,
+                                        VMapM, VMapP, normal_fn, Fscale, nface);
+  const double fx2a = p31_face_flux_cc(face_offset + 1024 + ik, q, u, v, w,
+                                        VMapM, VMapP, normal_fn, Fscale, nface);
+  const double fx2b = p31_face_flux_cc(face_offset + 1024 + ik + 1, q, u, v, w,
+                                        VMapM, VMapP, normal_fn, Fscale, nface);
+  const double fx4a = p31_face_flux_cc(face_offset + 3072 + ik, q, u, v, w,
+                                        VMapM, VMapP, normal_fn, Fscale, nface);
+  const double fx4b = p31_face_flux_cc(face_offset + 3072 + ik + 1, q, u, v, w,
+                                        VMapM, VMapP, normal_fn, Fscale, nface);
+  *reinterpret_cast<double2 *>(sfz5 + ik) = make_double2(
+      p31_face_flux_cc(face_offset + 4096 + ik, q, u, v, w, VMapM, VMapP,
+                       normal_fn, Fscale, nface),
+      p31_face_flux_cc(face_offset + 4096 + ik + 1, q, u, v, w, VMapM, VMapP,
+                       normal_fn, Fscale, nface));
+  *reinterpret_cast<double2 *>(sfz6 + ik) = make_double2(
+      p31_face_flux_cc(face_offset + 5120 + ik, q, u, v, w, VMapM, VMapP,
+                       normal_fn, Fscale, nface),
+      p31_face_flux_cc(face_offset + 5120 + ik + 1, q, u, v, w, VMapM, VMapP,
+                       normal_fn, Fscale, nface));
   __syncthreads();
 
-  for (int j = 0; j < 32; ++j) {
-    const int idx = elem_offset + i + j * 32 + k * 1024;
-    const double qv = q[idx];
-    sQU[tid] = qv * u[idx];
-    sQW[tid] = qv * w[idx];
+  const double lf2a = sLift[i0 + 32];
+  const double lf2b = sLift[i0 + 33];
+  const double lf4a = sLift[i0 + 96];
+  const double lf4b = sLift[i0 + 97];
+  const double lf5 = sLift[k + 128];
+  const double lf6 = sLift[k + 160];
+
+  int idx = elem_offset + i0 + j0 * 32 + k * 1024;
+  double2 qv = *reinterpret_cast<const double2 *>(q + idx);
+  double2 uv = *reinterpret_cast<const double2 *>(u + idx);
+  double2 wv = *reinterpret_cast<const double2 *>(w + idx);
+
+  for (int jl = 0; jl < 16; ++jl) {
+    const int j = j0 + jl;
+    const int buf = (jl & 1) * 1024;
+    *reinterpret_cast<double2 *>(sQU + buf + ik) =
+        make_double2(qv.x * uv.x, qv.y * uv.y);
+    *reinterpret_cast<double2 *>(sQW + buf + ik) =
+        make_double2(qv.x * wv.x, qv.y * wv.y);
+    if (jl + 1 < 16) {
+      const int idxn = idx + 32;
+      qv = *reinterpret_cast<const double2 *>(q + idxn);
+      uv = *reinterpret_cast<const double2 *>(u + idxn);
+      wv = *reinterpret_cast<const double2 *>(w + idxn);
+    }
     __syncthreads();
 
-    double sx = 0.0;
-    double sz = 0.0;
+    double sx0 = 0.0, sx1 = 0.0, sz0 = 0.0, sz1 = 0.0;
     for (int l = 0; l < 32; ++l) {
-      sx += sD1D[i + l * 32] * sQU[l + k * 32];
-      sz += sD1D[k + l * 32] * sQW[i + l * 32];
+      const double qu = sQU[buf + l + k * 32];
+      const double2 dxi = *reinterpret_cast<const double2 *>(sD1D + i0 + l * 32);
+      sx0 += dxi.x * qu;
+      sx1 += dxi.y * qu;
+      const double dk = sD1D[k + l * 32];
+      const double2 qw =
+          *reinterpret_cast<const double2 *>(sQW + buf + i0 + l * 32);
+      sz0 += dk * qw.x;
+      sz1 += dk * qw.y;
     }
 
-    dqdt[idx] = -(Escale[idx] * sx + Escale[idx + 2 * npoint] * sz +
-                  sLift[j] * fy1 + sLift[i + 32] * __shfl_sync(0xffffffff, fx2, j) +
-                  sLift[j + 64] * fy3 +
-                  sLift[i + 96] * __shfl_sync(0xffffffff, fx4, j) +
-                  sLift[k + 128] * sfz5[i + j * 32] +
-                  sLift[k + 160] * sfz6[i + j * 32]);
-    __syncthreads();
+    const int src = (tid & 16) + (j >> 1);
+    const double fx2 = (j & 1) ? __shfl_sync(0xffffffff, fx2b, src)
+                               : __shfl_sync(0xffffffff, fx2a, src);
+    const double fx4 = (j & 1) ? __shfl_sync(0xffffffff, fx4b, src)
+                               : __shfl_sync(0xffffffff, fx4a, src);
+    const double2 ex = *reinterpret_cast<const double2 *>(Escale + idx);
+    const double2 ez =
+        *reinterpret_cast<const double2 *>(Escale + idx + 2 * npoint);
+    const double lf1 = sLift[j];
+    const double lf3 = sLift[j + 64];
+    *reinterpret_cast<double2 *>(dqdt + idx) = make_double2(
+        -(ex.x * sx0 + ez.x * sz0 + lf1 * fy1a + lf2a * fx2 + lf3 * fy3a +
+          lf4a * fx4 + lf5 * sfz5[i0 + j * 32] + lf6 * sfz6[i0 + j * 32]),
+        -(ex.y * sx1 + ez.y * sz1 + lf1 * fy1b + lf2b * fx2 + lf3 * fy3b +
+          lf4b * fx4 + lf5 * sfz5[i0 + 1 + j * 32] +
+          lf6 * sfz6[i0 + 1 + j * 32]));
+    idx += 32;
   }
 }
 
-__global__ __launch_bounds__(P31_CC_THREADS, 1) void tendency_fused_p31_y_cc_kernel(
-    double *dqdt, const double *D1D, const double *q, const double *v,
-    const double *Escale, int Ne)
+__global__ __launch_bounds__(P31_CC_Y_THREADS, 1) void tendency_fused_p31_y_cc_kernel(
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ q, const double *__restrict__ v,
+    const double *__restrict__ Escale, int Ne)
 {
-  __shared__ double sD1D[1024];
-  __shared__ double sQV[1024];
+  __shared__ __align__(16) double sD1D[1024];
+  __shared__ __align__(16) double sQV[2 * 1024];
 
-  const int elem = (int)blockIdx.x;
+  const int elem = (int)blockIdx.x >> 1;
   if (elem >= Ne) {
     return;
   }
+  const int k0 = ((int)blockIdx.x & 1) * 16;
 
   const int tid = (int)threadIdx.x;
-  const int i = tid % 32;
-  const int j = tid / 32;
+  const int i0 = 2 * (tid & 15);
+  const int j = tid >> 4;
+  const int ij = i0 + j * 32;
   const int elem_offset = elem * 32768;
   const int npoint = 32768 * Ne;
 
-  sD1D[tid] = D1D[tid];
+  *reinterpret_cast<double2 *>(sD1D + 2 * tid) =
+      *reinterpret_cast<const double2 *>(D1D + 2 * tid);
   __syncthreads();
 
-  for (int k = 0; k < 32; ++k) {
-    const int idx = elem_offset + i + j * 32 + k * 1024;
-    sQV[tid] = q[idx] * v[idx];
+  for (int kl = 0; kl < 16; ++kl) {
+    const int idx = elem_offset + i0 + j * 32 + (k0 + kl) * 1024;
+    const int buf = (kl & 1) * 1024;
+    const double2 qv = *reinterpret_cast<const double2 *>(q + idx);
+    const double2 vv = *reinterpret_cast<const double2 *>(v + idx);
+    *reinterpret_cast<double2 *>(sQV + buf + ij) =
+        make_double2(qv.x * vv.x, qv.y * vv.y);
     __syncthreads();
 
-    double sy = 0.0;
+    double sy0 = 0.0, sy1 = 0.0;
     for (int l = 0; l < 32; ++l) {
-      sy += sD1D[j + l * 32] * sQV[i + l * 32];
+      const double dj = sD1D[j + l * 32];
+      const double2 fv =
+          *reinterpret_cast<const double2 *>(sQV + buf + i0 + l * 32);
+      sy0 += dj * fv.x;
+      sy1 += dj * fv.y;
     }
-    dqdt[idx] = dqdt[idx] - Escale[idx + npoint] * sy;
-    __syncthreads();
+    const double2 ey =
+        *reinterpret_cast<const double2 *>(Escale + idx + npoint);
+    double2 out = *reinterpret_cast<double2 *>(dqdt + idx);
+    out.x -= ey.x * sy0;
+    out.y -= ey.y * sy1;
+    *reinterpret_cast<double2 *>(dqdt + idx) = out;
   }
 }
 
@@ -1094,10 +1176,18 @@ extern "C" void launch_tendency_fused_p31(
     const int *VMapP, const double *normal_fn, const double *Fscale,
     const double *Escale, int Ne)
 {
-  tendency_fused_p31_xz_cc_kernel<<<Ne, P31_CC_THREADS, 0, dg_cuda_stream>>>(
+  static int xz_smem_set = 0;
+  if (!xz_smem_set) {
+    cudaFuncSetAttribute(tendency_fused_p31_xz_cc_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         P31_CC_XZ_SMEM);
+    xz_smem_set = 1;
+  }
+  tendency_fused_p31_xz_cc_kernel<<<2 * Ne, P31_CC_XZ_THREADS, P31_CC_XZ_SMEM,
+                                   dg_cuda_stream>>>(
       dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
       Ne);
-  tendency_fused_p31_y_cc_kernel<<<Ne, P31_CC_THREADS, 0, dg_cuda_stream>>>(
+  tendency_fused_p31_y_cc_kernel<<<2 * Ne, P31_CC_Y_THREADS, 0, dg_cuda_stream>>>(
       dqdt, D1D, q, v, Escale, Ne);
   check_cuda_cc_hp("tendency_fused_p31_cc_kernels");
 }
