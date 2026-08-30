@@ -368,6 +368,9 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の y side2 最高優先度（2026-08-30、`p63_gap_study.md` §34）**:
+  device **+0.03%**、レンジ重複。y と cuBLAS x の同居は優先度では動かない。
+
 - **p=63 `GEMM_FUSED` の z MaxL1 carveout（2026-08-30、`p63_gap_study.md` §33）**:
   device **+51.8%**（571 → 867 µs/stage）。z assembly が 130–152 → **442 µs**。
   CUTLASS の shared タイルを L1 に奪う。占有 12% はレジスタ律速のまま。

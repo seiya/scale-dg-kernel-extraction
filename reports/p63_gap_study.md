@@ -2177,3 +2177,21 @@ CUTLASS の mainloop は `cp.async` の shared タイルに載っている。Max
 本で決まっており、carveout では 12% は上がらない。L1 を厚くする取り方はこの
 カーネルでは使えない。
 **最速は `FUSED_TC` のまま。**
+
+## 34. y GEMM の side2 最高優先度（2026-08-30、差なし）
+
+対象は `CUDAFORTRAN_GEMM_FUSED`。親 `d9ddabf`、job `69652`（c384、12 回交互、
+対 §25 バイナリ）。点変化係数 vs SPLIT max abs 3.55e-15。
+`dg_side2_stream` だけを `cudaStreamCreateWithPriority(..., greatest)` にした。
+§24.2 の「y を隠す残りは占有率や優先度」のうち優先度。elembnd 側の最低優先度は
+§29 でレンジ重複。コードは戻した。
+
+| | device 中央値 | µs/stage |
+|---|---:|---:|
+| §25 | 3.25427e-2 | 570.9 |
+| **side2 最高優先度** | **3.25526e-2** | **571.1** |
+
+device **+0.03%**、レンジ重複（3.25049e-2..3.25913e-2 対 3.24904e-2..3.25815e-2）。
+nsys: z 152 / y 130 / flux 128 / cuBLAS x 113 µs。y が x を押しのけることも、
+x が y をさらに隠すことも無い。優先度では 91 µs の y は隠れない。
+**最速は `FUSED_TC` のまま。**
