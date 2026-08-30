@@ -368,6 +368,10 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の GEMM 限定 persist（2026-08-30、`p63_gap_study.md` §39）**:
+  flux 前に `SetLimit(0)` しても device **+16.7%**。flux は 128 µs のまま、y が
+  130→145 µs。max persist 予算が GEMM の L2 を削る。
+
 - **p=63 `GEMM_FUSED` の z `launch_bounds`（2026-08-30、`p63_gap_study.md` §38）**:
   8 CTA/SM 強制は device **+90%**（z 152→658 µs）。spill が占有の賞金を上回る。
 
