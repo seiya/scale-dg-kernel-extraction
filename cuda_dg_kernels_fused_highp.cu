@@ -19,11 +19,23 @@ extern cudaStream_t dg_cuda_stream;
 #define P63_CC_BPE 64
 #define P63_CC_NK (4096 / P63_CC_THREADS)
 #define P63_CC_MINBLK (1024 / P63_CC_THREADS)
-#define P127_CC_THREADS 1024
+#ifndef P127_CC_THREADS
+#define P127_CC_THREADS 512
+#endif
 #define P127_CC_BPE 512
+#ifndef P127_CC_BK
+#define P127_CC_BK 64
+#endif
+#define P127_CC_NK (4096 / P127_CC_THREADS)
+#define P127_CC_KSTRIDE (64 / P127_CC_NK)
+#define P127_CC_MINBLK (1024 / P127_CC_THREADS)
+#define P127_CC_STAGE (64 * P127_CC_BK / P127_CC_THREADS)
 #define P255_CC_BPE 65536
 #ifndef P255_CC_ABLATE
 #define P255_CC_ABLATE 0
+#endif
+#ifndef P127_CC_ABLATE
+#define P127_CC_ABLATE 0
 #endif
 // 1=INNER1, 2=all global 1.0, 3=no epilogue, 4=no barrier,
 // 5=D operand 1.0 (Q real), 6=Q/vel 1.0 (D real).
@@ -540,14 +552,17 @@ __global__ __launch_bounds__(P63_CC_THREADS, P63_CC_MINBLK) void tendency_fused_
 }
 
 __global__ __launch_bounds__(P127_CC_THREADS, 1) void tendency_fused_p127_xz_cc_kernel(
-    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *w, const double *flux_bnd,
-    const double *Escale, int Ne)
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ Lift1D, const double *__restrict__ q,
+    const double *__restrict__ u, const double *__restrict__ w,
+    const double *__restrict__ flux_bnd, const double *__restrict__ Escale,
+    int Ne)
 {
-  __shared__ double sDn[64 * 16];
-  __shared__ double sDm[64 * 16];
-  __shared__ double sFU[16 * 64];
-  __shared__ double sFW[64 * 16];
+  extern __shared__ __align__(32) double smem_xz[];
+  double *sDn = smem_xz;
+  double *sDm = smem_xz + 64 * P127_CC_BK;
+  double *sFU = smem_xz + 2 * 64 * P127_CC_BK;
+  double *sFW = smem_xz + 3 * 64 * P127_CC_BK;
 
   const int bidx = (int)blockIdx.x;
   const int ibase = (bidx % 2) * 64;
@@ -566,35 +581,55 @@ __global__ __launch_bounds__(P127_CC_THREADS, 1) void tendency_fused_p127_xz_cc_
   const int face_offset = elem * 98304;
   const int npoint = 2097152 * Ne;
 
-  int kk[4];
-  double sx[4], sz[4];
-  for (int m = 0; m < 4; ++m) {
-    kk[m] = kb + 16 * m;
+  int kk[P127_CC_NK];
+  double sx[P127_CC_NK], sz[P127_CC_NK];
+  const int kpack = P127_CC_NK * kb;
+  for (int m = 0; m < P127_CC_NK; ++m) {
+    kk[m] = kpack + m;
     sx[m] = 0.0;
     sz[m] = 0.0;
   }
 
-  const int sl = tid % 16;
-  const int sk = tid / 16;
-
-  for (int l0 = 0; l0 <= 112; l0 += 16) {
-    sDn[kb * 64 + i] = D1D[ig + (l0 + kb) * 128];
-    sDm[kb * 64 + i] = D1D[kbase + i + (l0 + kb) * 128];
-    int gidx = elem_offset + (l0 + sl) + j * 128 + (kbase + sk) * 16384;
-    sFU[sk * 16 + sl] = q[gidx] * u[gidx];
-    gidx = elem_offset + ig + j * 128 + (l0 + kb) * 16384;
-    sFW[kb * 64 + i] = q[gidx] * w[gidx];
-    __syncthreads();
-
-    for (int lc = 0; lc < 16; ++lc) {
-      const double dxi = sDn[lc * 64 + i];
-      const double fwi = sFW[lc * 64 + i];
-      for (int m = 0; m < 4; ++m) {
-        sx[m] += dxi * sFU[kk[m] * 16 + lc];
-        sz[m] += fwi * sDm[lc * 64 + kk[m]];
-      }
+  for (int l0 = 0; l0 < 128; l0 += P127_CC_BK) {
+    if (l0) {
+      __syncthreads();
+    }
+    for (int p = 0; p < P127_CC_STAGE; ++p) {
+      const int idxp = tid + P127_CC_THREADS * p;
+      const int col = idxp % 64;
+      const int row = idxp / 64;
+      sDn[row * 64 + col] = D1D[(ibase + col) + (l0 + row) * 128];
+      sDm[row * 64 + col] = D1D[(kbase + col) + (l0 + row) * 128];
+      int gidx = elem_offset + (l0 + col) + j * 128 + (kbase + row) * 16384;
+      sFU[row * 64 + col] = q[gidx] * u[gidx];
+      gidx = elem_offset + (ibase + col) + j * 128 + (l0 + row) * 16384;
+      sFW[row * 64 + col] = q[gidx] * w[gidx];
     }
     __syncthreads();
+
+    for (int lc = 0; lc < P127_CC_BK; ++lc) {
+#if P127_CC_ABLATE
+      const double dxi = 1.0;
+      const double fwi = 1.0;
+      for (int m = 0; m < P127_CC_NK; ++m) {
+        sx[m] += dxi * 1.0;
+        sz[m] += fwi * 1.0;
+      }
+#else
+      const double dxi = sDn[lc * 64 + i];
+      const double fwi = sFW[lc * 64 + i];
+      for (int m = 0; m < P127_CC_NK; ++m) {
+        sx[m] += dxi * sFU[kk[m] * P127_CC_BK + lc];
+      }
+#pragma unroll
+      for (int m = 0; m < P127_CC_NK; m += 2) {
+        const double2 dz =
+            *reinterpret_cast<const double2 *>(&sDm[lc * 64 + kpack + m]);
+        sz[m] += fwi * dz.x;
+        sz[m + 1] += fwi * dz.y;
+      }
+#endif
+    }
   }
 
   const double lf1 = Lift1D[j];
@@ -604,7 +639,7 @@ __global__ __launch_bounds__(P127_CC_THREADS, 1) void tendency_fused_p127_xz_cc_
   const double fb5 = flux_bnd[face_offset + 65536 + ig + j * 128];
   const double fb6 = flux_bnd[face_offset + 81920 + ig + j * 128];
 
-  for (int m = 0; m < 4; ++m) {
+  for (int m = 0; m < P127_CC_NK; ++m) {
     const int k = kbase + kk[m];
     const int idx = elem_offset + ig + j * 128 + k * 16384;
     dqdt[idx] = -(Escale[idx] * sx[m] + Escale[idx + 2 * npoint] * sz[m] +
@@ -616,12 +651,14 @@ __global__ __launch_bounds__(P127_CC_THREADS, 1) void tendency_fused_p127_xz_cc_
   }
 }
 
-__global__ __launch_bounds__(P127_CC_THREADS, 1) void tendency_fused_p127_y_cc_kernel(
-    double *dqdt, const double *D1D, const double *q, const double *v,
-    const double *Escale, int Ne)
+__global__ __launch_bounds__(P127_CC_THREADS, P127_CC_MINBLK) void tendency_fused_p127_y_cc_kernel(
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ q, const double *__restrict__ v,
+    const double *__restrict__ Escale, int Ne)
 {
-  __shared__ double sDm[64 * 16];
-  __shared__ double sFV[64 * 16];
+  extern __shared__ __align__(32) double smem_y[];
+  double *sDm = smem_y;
+  double *sFV = smem_y + 64 * P127_CC_BK;
 
   const int bidx = (int)blockIdx.x;
   const int ibase = (bidx % 2) * 64;
@@ -639,29 +676,48 @@ __global__ __launch_bounds__(P127_CC_THREADS, 1) void tendency_fused_p127_y_cc_k
   const int elem_offset = elem * 2097152;
   const int npoint = 2097152 * Ne;
 
-  int jj[4];
-  double sy[4];
-  for (int m = 0; m < 4; ++m) {
-    jj[m] = jb + 16 * m;
+  int jj[P127_CC_NK];
+  double sy[P127_CC_NK];
+  const int jpack = P127_CC_NK * jb;
+  for (int m = 0; m < P127_CC_NK; ++m) {
+    jj[m] = jpack + m;
     sy[m] = 0.0;
   }
 
-  for (int l0 = 0; l0 <= 112; l0 += 16) {
-    sDm[jb * 64 + i] = D1D[jbase + i + (l0 + jb) * 128];
-    const int gidx = elem_offset + ig + (l0 + jb) * 128 + k * 16384;
-    sFV[jb * 64 + i] = q[gidx] * v[gidx];
-    __syncthreads();
-
-    for (int lc = 0; lc < 16; ++lc) {
-      const double fvi = sFV[lc * 64 + i];
-      for (int m = 0; m < 4; ++m) {
-        sy[m] += fvi * sDm[lc * 64 + jj[m]];
-      }
+  for (int l0 = 0; l0 < 128; l0 += P127_CC_BK) {
+    if (l0) {
+      __syncthreads();
+    }
+    for (int p = 0; p < P127_CC_STAGE; ++p) {
+      const int idxp = tid + P127_CC_THREADS * p;
+      const int col = idxp % 64;
+      const int row = idxp / 64;
+      sDm[row * 64 + col] = D1D[(jbase + col) + (l0 + row) * 128];
+      const int gidx = elem_offset + (ibase + col) + (l0 + row) * 128 + k * 16384;
+      sFV[row * 64 + col] = q[gidx] * v[gidx];
     }
     __syncthreads();
+
+    for (int lc = 0; lc < P127_CC_BK; ++lc) {
+#if P127_CC_ABLATE
+      const double fvi = 1.0;
+      for (int m = 0; m < P127_CC_NK; ++m) {
+        sy[m] += fvi * 1.0;
+      }
+#else
+      const double fvi = sFV[lc * 64 + i];
+#pragma unroll
+      for (int m = 0; m < P127_CC_NK; m += 2) {
+        const double2 dy =
+            *reinterpret_cast<const double2 *>(&sDm[lc * 64 + jpack + m]);
+        sy[m] += fvi * dy.x;
+        sy[m + 1] += fvi * dy.y;
+      }
+#endif
+    }
   }
 
-  for (int m = 0; m < 4; ++m) {
+  for (int m = 0; m < P127_CC_NK; ++m) {
     const int j = jbase + jj[m];
     const int idx = elem_offset + ig + j * 128 + k * 16384;
     dqdt[idx] = dqdt[idx] - Escale[idx + npoint] * sy[m];
@@ -1244,9 +1300,15 @@ extern "C" void launch_tendency_fused_p127(
     const double *Escale, int Ne)
 {
   const int nblock = P127_CC_BPE * Ne;
-  tendency_fused_p127_xz_cc_kernel<<<nblock, P127_CC_THREADS, 0, dg_cuda_stream>>>(
+  const size_t smem_xz = 4 * 64 * P127_CC_BK * sizeof(double);
+  const size_t smem_y = 2 * 64 * P127_CC_BK * sizeof(double);
+  cudaFuncSetAttribute(tendency_fused_p127_xz_cc_kernel,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_xz);
+  cudaFuncSetAttribute(tendency_fused_p127_y_cc_kernel,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_y);
+  tendency_fused_p127_xz_cc_kernel<<<nblock, P127_CC_THREADS, smem_xz, dg_cuda_stream>>>(
       dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
-  tendency_fused_p127_y_cc_kernel<<<nblock, P127_CC_THREADS, 0, dg_cuda_stream>>>(
+  tendency_fused_p127_y_cc_kernel<<<nblock, P127_CC_THREADS, smem_y, dg_cuda_stream>>>(
       dqdt, D1D, q, v, Escale, Ne);
   check_cuda_cc_hp("tendency_fused_p127_cc_kernels");
 }
