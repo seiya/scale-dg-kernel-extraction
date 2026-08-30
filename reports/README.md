@@ -368,6 +368,13 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の elembnd を y の下へ（2026-08-30、`p63_gap_study.md` §47）**:
+  device **+2.38%**。x は 113→87 µs に戻るが y が 131→161 µs。同居相手は x が谷。
+
+- **p=63 `GEMM_FUSED` の skip / flux バイト分離（2026-08-30、`p63_gap_study.md` §46）**:
+  elembnd を消す天井は device −7.28%（x の同居伸び 26 µs を含む）。flux の
+  nostore/noload は 4/7・3/7 のバイト比どおり。DRAM 17% 隙に独立位相は無い。
+
 - **p=63 `GEMM_FUSED` の y エピローグロード移動（2026-08-30、`p63_gap_study.md` §45）**:
   device **+0.72%**（y 130→135 µs）。lift が無くてもバリア間へ移すと `acc2smem`
   と争う。§42 と同じ機構。
