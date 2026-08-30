@@ -368,6 +368,9 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の elembnd CTA 128（2026-08-30、`p63_gap_study.md` §49）**:
+  device −0.09%、レンジ重複。x の同居伸びは CTA 幅では動かない。
+
 - **p=63 `GEMM_FUSED` の z `launch_bounds` 5（2026-08-30、`p63_gap_study.md` §48）**:
   device **+49%**（z 152→429 µs）。8 CTA より軽いが spill は残る。占有強制は閉じた。
 
@@ -393,10 +396,10 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 - **p=63 `GEMM_FUSED` の z 体積ロード移動（2026-08-30、`p63_gap_study.md` §42）**:
   device **+0.66%**（z 152→155 µs）。lift-behind の隙間に体積ロードを入れると損。
 
-- **p=63 `GEMM_FUSED` の契約内ノブ（2026-08-30、`p63_gap_study.md` §41）**:
-  flux DRAM 屋根・z 占有・y 隠し・persist 隔離まで測って閉じた。残るのは
-  RK 融合と配列パックで、どちらも範囲外。ベースライン 571 µs/stage。最速は
-  `FUSED_TC`。
+- **p=63 `GEMM_FUSED` の契約内ノブ（2026-08-30、`p63_gap_study.md` §41、§45–§49 で閉じた）**:
+  flux DRAM 屋根・z 占有 5/8 CTA・y 隠し・elembnd 配置/CTA・persist 隔離まで測って
+  閉じた。残るのは RK 融合と配列パックで、どちらも範囲外。ベースライン 571 µs/stage。
+  最速は `FUSED_TC`。
 
 - **p=63 `GEMM_FUSED` の加重 y 5 stage（2026-08-30、`p63_gap_study.md` §40）**:
   device **+0.64%**（y 130→134 µs）。stage 軸は 4 が谷。
