@@ -5,6 +5,11 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 経路×次数の最新時間・アルゴリズム FLOP/s・DRAM スループットは下の
 **「最新結果のまとめ」**。
 
+Namelist は `namelists/`、Slurm ジョブは `jobs/` に移し、名前を揃えた
+（規則は `namelists/README.md` と `jobs/README.md`）。本文が引用する
+`conf_perf_*` / `input_p*_val*` / `job_*.sh` は**当時のファイル名のまま**残す。
+現行名は `namelists/MAPPING.md` と `jobs/MAPPING.md`。
+
 | ファイル | 内容 |
 |---|---|
 | [`overall_summary_report.md`](overall_summary_report.md) | 全実装パスの横断まとめ。時間内訳、ncu 効率分析、理論仕事量に対する達成率、不採用にした最適化とその理由。OpenACC → CUDA Fortran の実装変遷と代表スカラー特殊化の撤回も含む。**最初に読むならこれ。** |

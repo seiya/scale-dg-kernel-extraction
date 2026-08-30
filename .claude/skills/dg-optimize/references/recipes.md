@@ -20,7 +20,7 @@ make clean && make CUDA=1 GPUFLAGS=-gpu=cc100    # GB200 (cc100)、GPU ノード
 ## 計測（login node で直接実行可）
 
 ```bash
-for i in 1 2 3; do ./scale-dg_extraction conf_perf_p63_tc.conf | tail -8; done
+for i in 1 2 3; do ./scale-dg_extraction namelists/perf_p63_fused_tc.conf | tail -8; done
 ```
 
 - 読む値: `Main per step:`（end-to-end）と `Cal_tend:`（device）。両者を混同しない。
@@ -39,9 +39,9 @@ for i in 1 2 3; do ./scale-dg_extraction conf_perf_p63_tc.conf | tail -8; done
 
 ```bash
 SCALE_DG_VARYING_COEFF=1 SCALE_DG_DUMP_DQDT=/tmp/.../ref.txt \
-  ./scale-dg_extraction input_p63_val_ref.conf
+  ./scale-dg_extraction namelists/val_p63_split.conf
 SCALE_DG_VARYING_COEFF=1 SCALE_DG_DUMP_DQDT=/tmp/.../new.txt \
-  ./scale-dg_extraction input_p63_val_tc.conf
+  ./scale-dg_extraction namelists/val_p63_fused_tc.conf
 # ビット一致は不要。cmp の不一致だけで落とさない。max abs / 相対差を見る。
 paste ref.txt new.txt | awk '{d=$1-$2; a=d<0?-d:d; if(a>m){m=a; r=$1}} END{print m, m/(r<0?-r:r)}'
 ```
@@ -66,16 +66,17 @@ module load nvhpc-hpcx
 export DEBUGINFOD_URLS=          # nsys に必須。ncu でも害は無い
 EXE=./scale-dg_extraction.p63tc  # 凍結コピー。並行 make に relink されないように
 OUTDIR=./output; mkdir -p $OUTDIR
+sed 's/nstep = 20/nstep = 4/' namelists/perf_p63_fused_tc.conf > /tmp/perf_p63_fused_tc_ncu.conf
 
 timeout 3600 ncu --set full --csv --kernel-name-base function --rename-kernels 0 \
-  -s 12 -c 6 $EXE conf_perf_p63_tc_ncu.conf \
+  -s 12 -c 6 $EXE /tmp/perf_p63_fused_tc_ncu.conf \
   > $OUTDIR/ncu_p63_tc.csv 2> $OUTDIR/ncu_p63_tc.err
 ```
 
 - 実行ファイルは `cp scale-dg_extraction scale-dg_extraction.<tag>` で凍結してから
   プロファイルする。
 - 各プロファイラ呼び出しを `timeout` で囲む（ハングで割り当てを失わない）。
-- `-s`/`-c` で定常状態の数ローンチだけを採る。ncu 用 conf は `nstep` が短い。
+- `-s`/`-c` で定常状態の数ローンチだけを採る。ncu 用は perf namelist の `nstep` を 4 にする。
 - `--set basic` は Memory Workload Analysis を採らない → **バンクコンフリクトが
   見えない**。`--set full` か明示メトリクス。
 - **`ncu` の時間で採否を決めない**（`SKILL.md` 手順 3）。クロック固定で global の

@@ -5,3 +5,5 @@ advect3d/advect3d
 
 .DS_Store
 .cc_src/
+/jobs/
+/output/

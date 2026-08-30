@@ -203,8 +203,8 @@ login ノード、`nstep=1`、定数速度（`SCALE_DG_VARYING_COEFF` 未設定�
 
 login ノード、`SCALE_DG_VARYING_COEFF=1`、`dt=10⁻⁵`、`nstep=1000`、`WarmupStep=1`
 （測定 999 step）、`s=8`。入力は
-[`input_p7_val_gemm_ozaki1_1000.conf`](../input_p7_val_gemm_ozaki1_1000.conf)
-（比較 native は [`input_p7_val_gemm_1000.conf`](../input_p7_val_gemm_1000.conf)）。
+[`namelists/val_p7_gemm_ozaki1_ne32_n1000.conf`](../namelists/val_p7_gemm_ozaki1_ne32_n1000.conf)
+（比較 native は [`namelists/val_p7_gemm_ne32_n1000.conf`](../namelists/val_p7_gemm_ne32_n1000.conf)）。
 
 | 観測 | OZAKI1 | native `CUDAFORTRAN_GEMM` |
 |---|---|---|
@@ -319,27 +319,27 @@ nvcc -O3 -arch=sm_100 -I.. ../cuda_ozaki1_gemm.cu ../cuda_cublas_gemm.cu \
 ./ozaki1_crt_test
 
 # DG smoke
-./scale-dg_extraction input_p7_val_gemm_ozaki1.conf
-./scale-dg_extraction input_p255_val_gemm_ozaki1.conf
+./scale-dg_extraction namelists/val_p7_gemm_ozaki1_ne32.conf
+./scale-dg_extraction namelists/val_p255_gemm_ozaki1.conf
 
 # 実効スライス統計（warmup 後の step を集約、run 終了時に表示）
 export SCALE_DG_OZAKI1_SLICE_STATS=1
-./scale-dg_extraction input_p7_val_gemm_ozaki1.conf
+./scale-dg_extraction namelists/val_p7_gemm_ozaki1_ne32.conf
 # 1 step ごとの内訳: SCALE_DG_OZAKI1_SLICE_STATS_VERBOSE=1 も併用
 
 # 変動係数・1000 step（dt=10⁻⁵、slice 統計 + 性能）
 export SCALE_DG_VARYING_COEFF=1
 export SCALE_DG_OZAKI1_SLICE_STATS=1
-./scale-dg_extraction input_p7_val_gemm_ozaki1_1000.conf   # OZAKI1 約 61 s
+./scale-dg_extraction namelists/val_p7_gemm_ozaki1_ne32_n1000.conf   # OZAKI1 約 61 s
 # native 比較（同条件・約 5 s）
-./scale-dg_extraction input_p7_val_gemm_1000.conf
+./scale-dg_extraction namelists/val_p7_gemm_ne32_n1000.conf
 
 # dqdt 比較（p=7）
-./scale-dg_extraction input_p7_val_gemm.conf
+./scale-dg_extraction namelists/val_p7_gemm.conf
 export SCALE_DG_DUMP_DQDT=dqdt_ref.txt
-./scale-dg_extraction input_p7_val_gemm.conf
+./scale-dg_extraction namelists/val_p7_gemm.conf
 export SCALE_DG_DUMP_DQDT=dqdt_ozaki1.txt
-./scale-dg_extraction input_p7_val_gemm_ozaki1.conf
+./scale-dg_extraction namelists/val_p7_gemm_ozaki1_ne32.conf
 # paste + awk で max abs diff（約 21）
 ```
 

@@ -27,8 +27,9 @@ description: 指定した多項式次数 p と実装パス (DqdtKernel_Type) の
 - `CUDAFORTRAN_GEMM_CUTE` は `GEMM_FUSED` の GEMM 本体（未融合）の対照である。
   独立に最速化しない。volume GEMM のタイルや `Nq<=64` の x ライブラリ分岐を
   変えるなら `GEMM_FUSED` と同じドライバ経由で変える。
-- 対象 conf を特定する: 計測用 `conf_perf_p<N>[_tag].conf`、ncu 用 `*_ncu.conf`
-  （`nstep` が短い）、検証用 `input_p<N>_val*.conf`。無ければ既存に倣って作る。
+- 対象 conf を特定する: 計測用 `namelists/perf_p<N>_<kernel>.conf`、検証用
+  `namelists/val_p<N>_<kernel>.conf`。ncu は perf の `nstep` を 4 にした一時ファイル。
+  命名は `namelists/README.md`。無ければ既存に倣って作る。
   **`NeX/NeY/NeZ`, `PolyOrder`, `dt`, `nstep` は比較の間ずっと固定**。
 
 ## 1. 既知の棚卸し（実装を触る前に必ず）

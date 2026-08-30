@@ -115,6 +115,10 @@ likewise a defect.
 - `mod_dg_optr_kernel_opt1.F90.erb`: source template for optimized DG kernels.
 - `mod_dg_optr_kernel_opt1.f90`: generated file; update the template when the
   generated kernels must change, then regenerate with `make`.
+- `namelists/`: committed sample and published-mesh Fortran namelists. Names are
+  `{purpose}_p{order}_{kernel}[_{qualifiers}].conf`; see `namelists/README.md`.
+  Do not add `_ncu` copies or one-off `Ne` / `nstep` variants.
+- `jobs/` is local (gitignored). Durable profiler commands go in `reports/`.
 - `reports/`: committed performance and optimization reports. See
   `reports/README.md` for the index and the current fastest path per
   polynomial order.
@@ -272,7 +276,7 @@ profiler output, and Slurm logs are not; see the commit rules below.
 ## Working Tree and Commits
 
 - Preserve unrelated user changes and untracked profiling artifacts.
-- Do not commit Slurm job scripts, `slurm-*.out`, Nsight reports, profiler text
+- Do not commit Slurm job scripts (`jobs/` is gitignored), `slurm-*.out`, Nsight reports, profiler text
   or CSV output, or ad-hoc analysis Markdown unless the user explicitly asks.
   Reports under `reports/` are the exception: they are tracked, and updating
   them is part of the change that invalidates them.

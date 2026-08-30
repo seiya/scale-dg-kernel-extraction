@@ -177,14 +177,14 @@ nvcc -O3 -arch=sm_100 -I.. ../cuda_ozaki2_gemm.cu ../cuda_cublas_gemm.cu \
 ./ozaki2_crt_test
 
 # DG smoke
-./scale-dg_extraction input_p7_val_gemm_ozaki2.conf
-./scale-dg_extraction input_p255_val_gemm_ozaki2.conf
+./scale-dg_extraction namelists/val_p7_gemm_ozaki2_ne32.conf
+./scale-dg_extraction namelists/val_p255_gemm_ozaki2.conf
 
 # native 比較
 export SCALE_DG_DUMP_DQDT=dqdt_ref.txt
-./scale-dg_extraction input_p255_val_gemm.conf
+./scale-dg_extraction namelists/val_p255_gemm.conf
 export SCALE_DG_DUMP_DQDT=dqdt_ozaki2.txt
-./scale-dg_extraction input_p255_val_gemm_ozaki2.conf
+./scale-dg_extraction namelists/val_p255_gemm_ozaki2.conf
 ```
 
 GEMMul8 参照:

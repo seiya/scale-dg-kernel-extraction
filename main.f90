@@ -245,7 +245,7 @@ contains
 
     if (command_argument_count() < 1) then
       write(error_unit,'(A)') 'Error: configuration file argument is required.'
-      write(error_unit,'(A)') 'Usage: scale-dg_extraction input.conf'
+      write(error_unit,'(A)') 'Usage: scale-dg_extraction namelists/<file>.conf'
       flush(error_unit)
       error stop 1
     end if
