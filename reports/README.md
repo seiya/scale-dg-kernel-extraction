@@ -368,6 +368,9 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の z `launch_bounds`（2026-08-30、`p63_gap_study.md` §38）**:
+  8 CTA/SM 強制は device **+90%**（z 152→658 µs）。spill が占有の賞金を上回る。
+
 - **p=63 `GEMM_FUSED` の z MaxShared carveout（2026-08-30、`p63_gap_study.md` §37）**:
   device **+8.0%**（z 152→196 µs）。L1 を削るとエピローグが伸びる。§33 と合わせ
   carveout の両極は既定より遅い。
