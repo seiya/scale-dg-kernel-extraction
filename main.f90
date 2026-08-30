@@ -111,14 +111,13 @@ program main
   !  replay.  A replay does not run the Fortran wrappers, so the per-kernel
   !  CUDA event timing is switched off for the whole run in this mode; only
   !  the wall time is reported.
-  !  The second stream that overlaps the element boundary flux with the volume
-  !  GEMMs is also switched off in graph mode: on a replay the forked structure
-  !  measures as a small loss instead of the gain it is when the kernels are
-  !  launched one by one.
+  !  p=63 GEMM_FUSED (2026-08-30, p63_gap_study.md §44): keeping the side
+  !  stream on a graph replay is Main -0.58% versus turning it off.  The
+  !  earlier note that the fork was a small loss on replay does not hold
+  !  after the y-epilogue fold, where elembnd still fits under cuBLAS x.
   if (UseCudaGraph) then
     MeasureKernelTime = .false.
     call advect3d_eq_set_time_reporting(.false.)
-    call cuda_dg_set_side_stream(.false.)
   end if
   if (.not. MeasureKernelTime) then
     call cuda_dg_set_event_timing(.false.)

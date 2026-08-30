@@ -368,6 +368,10 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の graph + side stream（2026-08-30、`p63_gap_study.md` §44）**:
+  再生でも elembnd を重ねると Main **−0.58%**（graph のみに対し）。直接ローンチ比
+  **−1.97%**。コードに残す。
+
 - **p=63 `GEMM_FUSED` の CUDA graph（2026-08-30、`p63_gap_study.md` §43）**:
   Main **−1.29%**（1.950 → 1.925 ms/step）、再生はビット一致。device は非計測。
   既定 conf は graph off のまま。
