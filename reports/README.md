@@ -218,8 +218,11 @@ device **302.8 µs**）。326.8 µs は CC 復活時の login 測定。`FUSED_DF
 | `CUDAFORTRAN_FUSED_DFMA` | 1.583 | 446.6 | 4.65 | 11.6% | 2.97 | 37.6% | 3.87 | 49.0% |
 | **`CUDAFORTRAN_FUSED_TC`** | **1.068** | **271.8** | **7.65** | **19.1%** | **4.88** | **61.7%** | 6.36 | 80.5% |
 | `CUDAFORTRAN_GEMM` | 2.766 | 847.5 | 2.45 | 6.1% | 1.56 | 19.8% | 4.00 | 50.6% |
+| `CUDAFORTRAN_GEMM_FUSED` | 2.776 | 851.7 | 2.44 | 6.1% | 1.56 | 19.7% | 4.00 | 50.6% |
 
-`GEMM_FUSED` / `GEMM_CUTE` は `Nq*Ne = 65536` でバッチ上限ちょうど外。
+`GEMM_FUSED` は [`p15_gap_study.md`](p15_gap_study.md) §23（job `70990`、
+device **851.7 µs**）。CUTLASS の `batch % 65536` で経路が閉じていたのを開き、
+Nq=16 では x/y/z とも cuBLAS に戻すと融合 z より速い。最速は `FUSED_TC` のまま。
 `CUDAFORTRAN_FUSED` は [`p15_gap_study.md`](p15_gap_study.md) §22 の CC 融合
 （device **340.6 µs**、job `70951`）。§21 の 344.6 µs は 512 スレッド核。論文の主比は
 **TC / FUSED = 271.8 / 340.6 = 1.25×**。§20 は `FUSED_TC` の探索終了。
@@ -376,6 +379,13 @@ p=31 / p=7 / p=15 / p=127 の `FUSED` 行**で、[`p31_gap_study.md`](p31_gap_st
 ベースの µs/stage）は書き換えない。p≥511 は `p511_gap_study.md` ほか §性能。
 
 ## 現時点の結論
+
+- **p=15 `GEMM_FUSED` を開いて探索を閉じた（2026-08-30、
+  `p15_gap_study.md` §23）**: CUTLASS の `batch % 65536` で欠測だった経路を
+  通し、Nq=16 では y/z を cuBLAS に戻すと **1489 → 851.7 µs/stage（−43%）**。
+  融合 z の 64×32 は 503 µs、N=16 に合わせた 64×16 は **637 µs（+44.6%
+  vs 現行、job `71057`）**。最速は `FUSED_TC`（271.8）のまま（**3.13 倍**）。
+  占有 GPU job `70990` で `GEMM` に **+0.73%**。
 
 - **p=15 `FUSED_TC` の残り天井を測って探索を終了した（2026-08-30、
   `p15_gap_study.md` §20）**: 採用ゼロ。§16.7 の z 往復 −6.2% は mma を残した

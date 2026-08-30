@@ -175,6 +175,10 @@ extern "C" int cublas_dgemm_impl(int transa, int transb, int m, int n, int k,
                                  const double *B, int ldb, double beta,
                                  double *C, int ldc)
 {
+  const int cfg = configure_handle();
+  if (cfg != 0) {
+    return cfg;
+  }
   const cublasOperation_t opA = transa ? CUBLAS_OP_T : CUBLAS_OP_N;
   const cublasOperation_t opB = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
   return static_cast<int>(cublasDgemm(g_handle, opA, opB, m, n, k, &alpha, A,
@@ -186,6 +190,10 @@ extern "C" int cublas_dgemm_strided_batched_impl(
     int lda, long long strideA, const double *B, int ldb, long long strideB,
     double beta, double *C, int ldc, long long strideC, int batch)
 {
+  const int cfg = configure_handle();
+  if (cfg != 0) {
+    return cfg;
+  }
   const cublasOperation_t opA = transa ? CUBLAS_OP_T : CUBLAS_OP_N;
   const cublasOperation_t opB = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
   return static_cast<int>(cublasDgemmStridedBatched(

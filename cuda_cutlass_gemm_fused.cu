@@ -187,6 +187,24 @@ int cutlass_error(const char *what, cutlass::Status st)
   return static_cast<int>(st);
 }
 
+// CUDA grid.z max is 65535.  CUTLASS GemmBatchedIdentityThreadblockSwizzle
+// stores batch as `count % 65536`, so Nq*Ne == 65536 (p=15, Ne=16^3)
+// would launch with grid.z = 0 (cutlass status 7).  The batched kernels
+// already walk batch_idx += gridDim.z, so capping z is enough.
+constexpr int kCudaMaxGridZ = 65535;
+
+int batched_grid_z(int batch_count)
+{
+  return batch_count > kCudaMaxGridZ ? kCudaMaxGridZ : batch_count;
+}
+
+cutlass::gemm::GemmCoord cap_batched_grid(cutlass::gemm::GemmCoord tiled,
+                                           int batch_count)
+{
+  return cutlass::gemm::GemmCoord(tiled.m(), tiled.n(),
+                                   batched_grid_z(batch_count));
+}
+
 int bad_mma_shape(int mma_shape)
 {
   std::fprintf(stderr, "cutlass volume gemm: unsupported mma_shape %d\n",
@@ -214,15 +232,32 @@ int run_gemm_batched_nn(int m, int n, int k, double const *A, int lda,
                         long long strideB, double *C, int ldc, long long strideC,
                         int batch)
 {
-  GemmBatched gemm_op;
-  typename GemmBatched::Arguments args({m, n, k}, {A, lda}, strideA, {B, ldb},
-                                       strideB, {C, ldc}, strideC, {C, ldc},
-                                       strideC, {1.0, 0.0}, batch);
-  const cutlass::Status can = gemm_op.can_implement(args);
-  if (can != cutlass::Status::kSuccess) {
-    return cutlass_error("batched can_implement", can);
+  // Chunk so each launch stays inside CUDA's grid.z.  Stock GemmBatched
+  // copies batch into grid_tiled_shape.k() via `% 65536`, so a single
+  // launch at 65536 would still get grid.z = 0 even if we capped later.
+  int offset = 0;
+  while (offset < batch) {
+    int chunk = batch - offset;
+    if (chunk > kCudaMaxGridZ) {
+      chunk = kCudaMaxGridZ;
+    }
+    const long long off = static_cast<long long>(offset);
+    GemmBatched gemm_op;
+    typename GemmBatched::Arguments args(
+        {m, n, k}, {A + strideA * off, lda}, strideA, {B + strideB * off, ldb},
+        strideB, {C + strideC * off, ldc}, strideC, {C + strideC * off, ldc},
+        strideC, {1.0, 0.0}, chunk);
+    const cutlass::Status can = gemm_op.can_implement(args);
+    if (can != cutlass::Status::kSuccess) {
+      return cutlass_error("batched can_implement", can);
+    }
+    const cutlass::Status st = gemm_op(args, nullptr, dg_cuda_stream);
+    if (st != cutlass::Status::kSuccess) {
+      return cutlass_error("batched gemm", st);
+    }
+    offset += chunk;
   }
-  return cutlass_error("batched gemm", gemm_op(args, nullptr, dg_cuda_stream));
+  return 0;
 }
 
 template <class Gemm>
@@ -247,17 +282,29 @@ int run_gemm_batched_nn_scaled(int m, int n, int k, double const *A, int lda,
                                long long strideC, double *D, int ldd,
                                long long strideD, int batch)
 {
-  GemmBatched gemm_op;
-  typename GemmBatched::Arguments args({m, n, k}, {A, lda}, strideA, {B, ldb},
-                                       strideB, {C, ldc}, strideC, {D, ldd},
-                                       strideD,
-                                       typename GemmBatched::EpilogueOutputOp::Params(),
-                                       batch);
-  const cutlass::Status can = gemm_op.can_implement(args);
-  if (can != cutlass::Status::kSuccess) {
-    return cutlass_error("scaled batched can_implement", can);
+  int offset = 0;
+  while (offset < batch) {
+    int chunk = batch - offset;
+    if (chunk > kCudaMaxGridZ) {
+      chunk = kCudaMaxGridZ;
+    }
+    const long long off = static_cast<long long>(offset);
+    GemmBatched gemm_op;
+    typename GemmBatched::Arguments args(
+        {m, n, k}, {A + strideA * off, lda}, strideA, {B + strideB * off, ldb},
+        strideB, {C + strideC * off, ldc}, strideC, {D + strideD * off, ldd},
+        strideD, typename GemmBatched::EpilogueOutputOp::Params(), chunk);
+    const cutlass::Status can = gemm_op.can_implement(args);
+    if (can != cutlass::Status::kSuccess) {
+      return cutlass_error("scaled batched can_implement", can);
+    }
+    const cutlass::Status st = gemm_op(args, nullptr, dg_cuda_stream);
+    if (st != cutlass::Status::kSuccess) {
+      return cutlass_error("scaled batched gemm", st);
+    }
+    offset += chunk;
   }
-  return cutlass_error("scaled batched gemm", gemm_op(args, nullptr, dg_cuda_stream));
+  return 0;
 }
 
 //- y GEMM whose epilogue takes two sources: D = Escale_y * acc + deriv_x.
@@ -292,11 +339,12 @@ int run_volume_gemm_y_scaleadd(double *deriv_xy, const double *flux_y,
 
   auto uargs = GemmY::to_underlying_arguments(gemm_args);
   BatchedSwizzle swizzle;
-  cutlass::gemm::GemmCoord grid_shape = swizzle.get_tiled_shape(
-      uargs.problem_size,
-      {GemmY::ThreadblockShape::kM, GemmY::ThreadblockShape::kN,
-       GemmY::ThreadblockShape::kK},
-      uargs.batch_count);
+  cutlass::gemm::GemmCoord grid_shape = cap_batched_grid(
+      swizzle.get_tiled_shape(uargs.problem_size,
+                              {GemmY::ThreadblockShape::kM, GemmY::ThreadblockShape::kN,
+                               GemmY::ThreadblockShape::kK},
+                              uargs.batch_count),
+      Nq * Ne);
 
   typename Kernel::Params params;
   params.gemm = typename Kernel::BaseKernel::Params(
@@ -438,11 +486,12 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
 
   auto uargs = GemmZ::to_underlying_arguments(gemm_args);
   BatchedSwizzle swizzle;
-  cutlass::gemm::GemmCoord grid_shape = swizzle.get_tiled_shape(
-      uargs.problem_size,
-      {GemmZ::ThreadblockShape::kM, GemmZ::ThreadblockShape::kN,
-       GemmZ::ThreadblockShape::kK},
-      uargs.batch_count);
+  cutlass::gemm::GemmCoord grid_shape = cap_batched_grid(
+      swizzle.get_tiled_shape(uargs.problem_size,
+                              {GemmZ::ThreadblockShape::kM, GemmZ::ThreadblockShape::kN,
+                               GemmZ::ThreadblockShape::kK},
+                              uargs.batch_count),
+      Ne);
 
   typename Kernel::Params params;
   params.gemm = typename Kernel::BaseKernel::Params(

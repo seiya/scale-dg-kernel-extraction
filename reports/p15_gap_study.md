@@ -1372,3 +1372,109 @@ MMA への置換は `FUSED_TC` の役割である。
 
 残る契約内ノブは測った。天井が測定誤差以下か、実装すると内積/占有率で
 負ける。31% / 24% の天井は §21.4 のまま CC では取れない。
+
+## 23. `CUDAFORTRAN_GEMM_FUSED` を p=15 に開く（2026-08-30）
+
+親 `40fff1a`、GB200、`make CUDA=1 GPUFLAGS=-gpu=cc100`。入力
+`namelists/perf_p15_gemm_fused.conf`（`Ne=16³`、`nstep=20`、graph off）。
+検証は `SCALE_DG_VARYING_COEFF=1`、`namelists/val_p15_gemm_fused.conf` 対
+`val_p15_split.conf`（32,768 点）。
+
+p=15 の最速は `FUSED_TC`（271.8 µs）のまま。本節は欠測だった GEMM 融合経路を
+開き、Nq=16 で融合パッケージが何をするかを測る。
+
+### 23.1 なぜ走らなかったか
+
+y GEMM は `Nq*Ne` 平面を batch にし、CUTLASS
+`GemmBatchedIdentityThreadblockSwizzle` が `batch % 65536` を `grid.z` に
+載せる。p=15 `Ne=16³` はちょうど 65536 なので **grid.z = 0**（cutlass
+status 7）。CUDA の上限 65535 を 1 だけ超える、という説明は半分正しく、
+剰余が 0 になることが落ちる理由である。カーネル本体は
+`batch_idx += gridDim.z` で複数 batch を踏める。在庫の `GemmBatched` は
+65535 件ずつ分割し、自前起動（y scaleadd / z assembly）は `grid.z` を
+上限する。Fortran の `Nq*Ne <= 65535` ゲートは外した。
+
+### 23.2 開いた直後の律速（nsys job `70988`、node c387）
+
+login 5-run の device fused **84.87 ms / 57 stage = 1489 µs/stage**。
+同一バイナリの `CUDAFORTRAN_GEMM` は **845 µs**。
+
+1 stage あたり（60 instance、warmup 込み）:
+
+| カーネル | µs | 役割 |
+|---|---:|---|
+| CUTLASS `GemmBatched` ×2 | 571 | y。65535 + 1 の 2 ローンチ。タイル 64×64 対問題 16×16 |
+| `GemmBatchedDqdtAssembly` | 503 | 融合 z。タイル 64×32、N=16 は半分が述語 |
+| `elembnd_flux` | 175 | GEMM と同じ |
+| `volume_flux` | 130 | GEMM と同じ |
+| cuBLAS x (`32x64`) | 107 | `Nq<=64` の既存スイッチ |
+| 1-batch の 32×32 | 3 | y の余り |
+
+1 文: **この経路は浅い K に合わない CUTLASS タイルで y と z が律速している。**
+
+### 23.3 採用
+
+1. **Nq≤16 の y を cuBLAS strided-batched にする**（`GEMM` / `GEMM_CUTE` と
+   同じ呼び出し。`dg_cuda_stream` を毎呼び出し `cublasSetStream`）。
+   login GPU 1 で device **1489 → 1126 µs（−24%）**。対 SPLIT max abs
+   1.78e-15。y の 571 µs が消える。
+2. **Nq≤16 の z を cuBLAS + `separable_lift_assembly` にする**（融合
+   epilogue は K=16 で 503 µs あり、GEMM の z+lift より高い。p=31 と同じ
+   符号）。点変化係数の owned `dqdt` は SPLIT と**ビット一致**。
+3. **Nq≤16 では side stream を切る**（GEMM が Nq<64 で切っているのと同じ。
+   重ねる相手が同じ cuBLAS 3 本だと窓より elembnd が大きい）。login GPU 1
+   で device **49.80 → 48.58 ms（873 → 852 µs、−2.4%）**。
+
+通算 **1489 → 852 µs/stage（−43%）**、Main 4.66 → 2.78 ms/step。
+占有 GPU job `70990`（c178）12 回交互の中央値は device fused **48.545 ms =
+851.7 µs/stage**、`GEMM` **48.196 ms = 845.5 µs**（**+0.73%**、レンジ非重複）。
+差は融合ドライバの event 区間と、side を切ったあとも残る起動の足場で、
+volume カーネルは同じ cuBLAS 3 本 + lift である。
+
+µs/stage 851.7 は 2.44 TFLOP/s（ピーク 6.1%）、unique DRAM 1.56 TB/s
+（19.7%）。`FUSED_TC` 271.8 の **3.13 倍**遅い。最速は動かない。
+
+### 23.4 測って落としたこと / 残さないこと
+
+| 候補 | 結果 | 理由 |
+|---|---|---|
+| CUTLASS y を 1 ローンチに `grid.z` 上限するだけ | 実装せず | タイル 64×64 が残る。cuBLAS 化のほうが天井が大きい |
+| Nq=16 のまま融合 z を残す（タイル 64×32） | nsys 503 µs | GEMM の z+lift より高い。浅い K では融合が負け（p=31 と同じ） |
+| 融合 z のタイルを Nq=16 に合わせる | **+44.6%** | 下表。述語を消すと遅くなる |
+| flux / elembnd の単独最適化 | 範囲外 | GEMM と同じカーネル。制御経路を独立に最速化しない |
+
+TB `64×32` / warp `32×32` を `64×16` / `16×16` にし、未加重 epilogue のまま
+`launch_z_gemm_assembly` に戻した（Fortran の Nq≤16 分岐だけ。CUTE の
+cuBLAS z は触っていない）。点変化係数の owned `dqdt` は SPLIT に対し
+max abs **1.78e-15**。
+
+占有 GPU job `71057`（c178）12 回交互、device fused 中央値:
+
+| 変種 | ms | µs/stage | vs cuBLAS-z |
+|---|---:|---:|---:|
+| cuBLAS z + lift（現行） | 48.545 | 851.7 | — |
+| 融合 z 64×16 | 70.206 | 1231.7 | **+44.6%** |
+
+レンジは重ならない（cuBLAS-z 48.516–48.573、z16 70.178–70.271）。Main
+2.777 vs 3.897 ms/step。
+
+同一 job の nsys（60 instance、warmup 込み）1 stage あたり:
+
+| カーネル | 64×32 融合 z（job `70988`） | 64×16 融合 z | cuBLAS z + lift |
+|---|---:|---:|---:|
+| 融合 assembly | 503 µs | **637 µs** | — |
+| cuBLAS z (`64×32`) | — | — | 89 µs |
+| `separable_lift_assembly` | — | — | 165 µs |
+| z 合計 | 503 | 637 | **255** |
+
+N タイルを問題サイズに合わせると **503 → 637 µs（+27%）** で、半分述語の
+64×32 のほうが速い。ワープが 2 本（`32×32`）から 4 本（`16×16`）に増え、
+epilogue の `RepadEpilogue` パディング 8 が N=16 で相対的に高くつく。
+cuBLAS z + lift の 255 µs にはどちらも届かない。タイル型はソースに残さず、
+Fortran は cuBLAS z に戻した。
+
+`GEMM_CUTE` も Nq≤16 では同じ cuBLAS x/y/z に乗る（タイルと
+`Nq<=64` の x スイッチを分岐させない）。
+
+**契約内で `GEMM_FUSED` が `GEMM` から切り離して取れる残りの天井は尽きた。**
+p=15 `GEMM_FUSED` の探索をここで閉じる。最速は `CUDAFORTRAN_FUSED_TC`。

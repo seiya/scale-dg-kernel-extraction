@@ -210,8 +210,10 @@ mainloop.
 DqdtKernel_Type = "CUDAFORTRAN_GEMM_FUSED"
 ```
 
-Its CUTLASS y GEMM puts `Nq*Ne` batches on `grid.z`, so it requires
-`Nq*Ne <= 65535`. Example inputs are `namelists/val_p255_gemm_fused.conf`,
+Its CUTLASS y GEMM puts `Nq*Ne` planes on `grid.z`. CUDA caps that axis at
+65535, so launches with more batches (p=15 `Ne=16^3` is 65536) cap `grid.z`
+and walk the remainder, or chunk the stock batched operator. Example inputs
+are `namelists/val_p15_gemm_fused.conf`, `namelists/val_p255_gemm_fused.conf`,
 `namelists/val_p511_gemm_fused.conf`, `namelists/val_p575_gemm_fused.conf`,
 `namelists/val_p767_gemm_fused.conf`, and `namelists/val_p1023_gemm_fused.conf`.
 

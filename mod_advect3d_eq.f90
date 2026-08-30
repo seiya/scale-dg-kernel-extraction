@@ -237,10 +237,6 @@ contains
         write(*,*) "CUDAFORTRAN_GEMM_FUSED requires a build with CUDA=1"
         error stop
       end if
-      if (nint(sqrt(real(NfpTot/6)))*Ne > 65535) then
-        write(*,*) "CUDAFORTRAN_GEMM_FUSED needs Nq*Ne <= 65535 (CUTLASS batch on grid.z)"
-        error stop
-      end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED
       dqdt_kernel_name = "CUDAFORTRAN_GEMM_FUSED"
       call cuda_gemm_setup(cublas_emulation_enabled, emulation_mantissa_fixed, &
@@ -249,10 +245,6 @@ contains
     case ("CUDAFORTRAN_GEMM_CUTE")
       if (.not. cuda_dg_kernels_available) then
         write(*,*) "CUDAFORTRAN_GEMM_CUTE requires a build with CUDA=1"
-        error stop
-      end if
-      if (nint(sqrt(real(NfpTot/6)))*Ne > 65535) then
-        write(*,*) "CUDAFORTRAN_GEMM_CUTE needs Nq*Ne <= 65535 (CUTLASS batch on grid.z)"
         error stop
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE

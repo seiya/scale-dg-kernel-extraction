@@ -1915,18 +1915,14 @@ contains
 
     integer :: istat, nface, npoint, nblock, nblock_face
     integer :: nq2, xy_weighted, pair_nq2
+    integer(c_long_long) :: stride_plane, stride_zero, stride_vol
     logical :: use_side, overlap_y
 
-    ! The CUTLASS batched GEMMs put the batch on grid.z, which CUDA caps at
-    ! 65535.  The y GEMM batches over Nq*Ne planes, so this path is available
-    ! at any polynomial order that keeps Nq*Ne within that cap: it covers
-    ! p=63 at Ne=4**3 and p=255 at Ne=1, but not p=7 at Ne=32**3 (262144
-    ! batches) or p=15 at Ne=16**3 (65536).  Those orders keep using
-    ! CUDAFORTRAN_GEMM, whose cuBLAS strided-batched calls have no such cap.
-    if (Nq*Ne > 65535) then
-      write(*,*) "cuda_cal_dqdt_gemm_cutlass: Nq*Ne exceeds the 65535 CUTLASS batch limit:", Nq*Ne
-      error stop
-    end if
+    ! The CUTLASS y GEMM batches Nq*Ne planes on grid.z.  CUDA caps z at
+    ! 65535 and CUTLASS stores batch % 65536, so p=15 Ne=16**3 (65536)
+    ! used to launch with grid.z=0.  The launchers now cap z and, for the
+    ! stock batched operator, chunk the batch.  p=7's 262144 batches are
+    ! the same path.
     if (.not. gemm_inited) then
       call cuda_gemm_setup(.false.)
     end if
@@ -1934,6 +1930,9 @@ contains
     call dg_ev_begin()
 
     nq2 = Nq*Nq
+    stride_plane = int(nq2, c_long_long)
+    stride_zero = 0_c_long_long
+    stride_vol = int(Nq*nq2, c_long_long)
     ! Weighted z + packed faces: Nq>64 (CUTLASS x/y scale) and Nq=64 (cuBLAS x
     ! plus y epilogue Ey*acc + Ex*Dx). Nq<64 stays unweighted; at p=31 the
     ! same fold is +2.3% on login.
@@ -1959,6 +1958,11 @@ contains
     ! time is unchanged.  fuse off matches CUDAFORTRAN_GEMM (Nq >= 64).
     use_side = dg_side_enabled
     if (.not. fuse_epilogue) use_side = use_side .and. (Nq >= 64)
+    ! GEMM itself keeps elembnd off the side stream below Nq=64 (the
+    ! GEMM window is smaller than the flux kernel).  At Nq<=16 the fused
+    ! path now uses the same cuBLAS volume GEMMs, so overlapping here
+    ! only adds contention.
+    if (Nq <= 16) use_side = .false.
     ! y is independent of x only while it does not read deriv_x.  Nq=64 fold
     ! reads it; Nq<64 keeps the unweighted y and can overlap.
     overlap_y = fuse_epilogue .and. use_side .and. (Nq < 64)
@@ -1995,18 +1999,34 @@ contains
         else
           if (overlap_y) then
             call dg_set_cuda_stream(dg_side2_stream)
-            istat = launch_volume_gemm_y( &
-              deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
+            if (Nq <= 16) then
+              ! CUTLASS y tiles are 64x64; at Nq=16 that is 16x predication
+              ! plus a grid.z wrap at 65536 batches.  cuBLAS has no cap.
+              istat = cublas_dgemm_strided_batched_impl(0, 0, Nq, Nq, Nq, &
+                1.0_c_double, flux_y, Nq, stride_plane, D1D_tr, Nq, stride_zero, &
+                0.0_c_double, deriv_y, Nq, stride_plane, Nq*Ne)
+              if (istat /= 0) call cuda_failure("cublasDgemm y-deriv (side2)",istat)
+            else
+              istat = launch_volume_gemm_y( &
+                deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
+              if (istat /= 0) call cuda_failure("launch_volume_gemm_y(side2)",istat)
+            end if
             call dg_set_cuda_stream(dg_stream)
-            if (istat /= 0) call cuda_failure("launch_volume_gemm_y(side2)",istat)
           end if
           istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
             D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
           if (istat /= 0) call cuda_failure("cublasDgemm x-deriv (fused)",istat)
           if (.not. use_side) then
-            istat = launch_volume_gemm_y( &
-              deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
-            if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
+            if (Nq <= 16) then
+              istat = cublas_dgemm_strided_batched_impl(0, 0, Nq, Nq, Nq, &
+                1.0_c_double, flux_y, Nq, stride_plane, D1D_tr, Nq, stride_zero, &
+                0.0_c_double, deriv_y, Nq, stride_plane, Nq*Ne)
+              if (istat /= 0) call cuda_failure("cublasDgemm y-deriv (fused)",istat)
+            else
+              istat = launch_volume_gemm_y( &
+                deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
+              if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
+            end if
           end if
         end if
       else
@@ -2025,12 +2045,26 @@ contains
           deriv_x, flux_x, D1D, Nq, Ne, cutlass_mma_shape_id )
         if (istat /= 0) call cuda_failure("launch_volume_gemm_x",istat)
       end if
-      istat = launch_volume_gemm_y( &
-        deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
-      if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
-      istat = launch_volume_gemm_z( &
-        dqdt, flux_z, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
-      if (istat /= 0) call cuda_failure("launch_volume_gemm_z",istat)
+      if (Nq <= 16) then
+        istat = cublas_dgemm_strided_batched_impl(0, 0, Nq, Nq, Nq, &
+          1.0_c_double, flux_y, Nq, stride_plane, D1D_tr, Nq, stride_zero, &
+          0.0_c_double, deriv_y, Nq, stride_plane, Nq*Ne)
+        if (istat /= 0) call cuda_failure("cublasDgemm y-deriv (cute)",istat)
+      else
+        istat = launch_volume_gemm_y( &
+          deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
+        if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
+      end if
+      if (Nq <= 16) then
+        istat = cublas_dgemm_strided_batched_impl(0, 0, nq2, Nq, Nq, &
+          1.0_c_double, flux_z, nq2, stride_vol, D1D_tr, Nq, stride_zero, &
+          0.0_c_double, dqdt, nq2, stride_vol, Ne)
+        if (istat /= 0) call cuda_failure("cublasDgemm z-deriv (cute)",istat)
+      else
+        istat = launch_volume_gemm_z( &
+          dqdt, flux_z, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
+        if (istat /= 0) call cuda_failure("launch_volume_gemm_z",istat)
+      end if
     end if
     call dg_ev_record(3)
 
@@ -2039,7 +2073,18 @@ contains
     if (fuse_epilogue) call dg_ev_record(4)
 
     if (fuse_epilogue) then
-      if (xy_weighted /= 0) then
+      if (Nq <= 16) then
+        ! Shallow K: even a 64x16 z tile (see p15_gap_study.md §23.4) loses
+        ! to cuBLAS z + separable lift. Keep the fused driver, take library z.
+        istat = cublas_dgemm_strided_batched_impl(0, 0, nq2, Nq, Nq, &
+          1.0_c_double, flux_z, nq2, stride_vol, D1D_tr, Nq, stride_zero, &
+          0.0_c_double, dqdt, nq2, stride_vol, Ne)
+        if (istat /= 0) call cuda_failure("cublasDgemm z-deriv (fused)",istat)
+        call separable_lift_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+          dqdt, Escale(1,1,1), Escale(1,1,2), Escale(1,1,3), &
+          deriv_x, deriv_y, dqdt, flux_bnd, Lift1D, &
+          Nq, Np, npoint )
+      else if (xy_weighted /= 0) then
         istat = launch_z_gemm_assembly( &
           dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, Lift1D, &
           dg_lift_zpair, Escale, Nq, Ne, cutlass_mma_shape_id, xy_weighted )
