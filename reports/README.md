@@ -368,6 +368,10 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の y エピローグロード移動（2026-08-30、`p63_gap_study.md` §45）**:
+  device **+0.72%**（y 130→135 µs）。lift が無くてもバリア間へ移すと `acc2smem`
+  と争う。§42 と同じ機構。
+
 - **p=63 `GEMM_FUSED` の graph + side stream（2026-08-30、`p63_gap_study.md` §44）**:
   再生でも elembnd を重ねると Main **−0.58%**（graph のみに対し）。直接ローンチ比
   **−1.97%**。コードに残す。
