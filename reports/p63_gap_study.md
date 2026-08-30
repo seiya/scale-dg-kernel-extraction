@@ -2154,3 +2154,26 @@ max abs 3.55e-15。コードは戻した。
 `D1D_tr` は既に L2 に載っており、persist 語彙で y/z は速くならない。
 max 容量で L2 を削る persist は §28/§31 で閉じ、小さい容量は賞金ゼロ。
 **最速は `FUSED_TC` のまま。**
+
+## 33. z assembly の MaxL1 carveout（2026-08-30、不採用 +51.8%）
+
+対象は `CUDAFORTRAN_GEMM_FUSED`。親 `07574c7`、job `69648`（c384、12 回交互、
+対 §25 バイナリ `p63gf_eyex64`）。点変化係数 vs SPLIT max abs 3.55e-15。
+`run_z_gemm_assembly` の CUTLASS カーネルに
+`cudaFuncAttributePreferredSharedMemoryCarveout = cudaSharedmemCarveoutMaxL1`
+を付けた。占有 12%・DRAM 28% のレイテンシ律速なので、使っていない shared を
+L1 に回せば待ちが隠れるという仮説。コードは戻した。
+
+| | device 中央値 | µs/stage | nsys z assembly |
+|---|---:|---:|---:|
+| §25 | 3.25433e-2 | 570.9 | ~130–152 µs |
+| **MaxL1 carveout** | **4.94111e-2** | **866.9** | **442 µs** |
+
+device **+51.8%**、レンジ非重複（3.25055e-2..3.26005e-2 対 4.93810e-2..4.94483e-2）。
+y scaleadd は 131 µs、flux は 128 µs のまま。損失は z だけ（+290 µs 級）。
+
+CUTLASS の mainloop は `cp.async` の shared タイルに載っている。MaxL1 は
+その容量を L1 に奪い、オペランド供給が DRAM 待ちに落ちる。占有はレジスタ 254
+本で決まっており、carveout では 12% は上がらない。L1 を厚くする取り方はこの
+カーネルでは使えない。
+**最速は `FUSED_TC` のまま。**

@@ -368,6 +368,10 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の z MaxL1 carveout（2026-08-30、`p63_gap_study.md` §33）**:
+  device **+51.8%**（571 → 867 µs/stage）。z assembly が 130–152 → **442 µs**。
+  CUTLASS の shared タイルを L1 に奪う。占有 12% はレジスタ律速のまま。
+
 - **p=63 `GEMM_FUSED` の 32 KB persist（2026-08-30、`p63_gap_study.md` §32）**:
   容量だけでも窓付きでもレンジ重複。`D1D_tr` は既に L2 に載っている。
 
