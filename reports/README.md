@@ -368,6 +368,9 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の加重 y 3 stage（2026-08-30、`p63_gap_study.md` §35）**:
+  device **+0.53%**（y 130→133 µs）。折り込み後も 4 stage が勝つ。
+
 - **p=63 `GEMM_FUSED` の y side2 最高優先度（2026-08-30、`p63_gap_study.md` §34）**:
   device **+0.03%**、レンジ重複。y と cuBLAS x の同居は優先度では動かない。
 
