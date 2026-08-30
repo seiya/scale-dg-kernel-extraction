@@ -368,6 +368,11 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の flux DRAM 取り方（2026-08-30、`p63_gap_study.md` §27）**:
+  2 点 grid-stride は **+0.38%**、`__ldcs` は **+0.48%**、`__stcs` と L2 prefetch は
+  レンジ重複。加重 z は ncu でも **254 レジスタ / 占有 12%**。コードは戻した。
+  DRAM 83%→100%（~22 µs）は未測の取り方（L2 persist 窓など）を残す。
+
 - **p=63 `GEMM_FUSED` の flux_yz 重ね（2026-08-30、`p63_gap_study.md` §26）**:
   `flux_y/z` を side2 で cuBLAS x と重ねると device **+5.9%**（571 → 605 µs/stage）。
   フルグリッドの DRAM カーネルが SM を占有して GEMM を直列化する。コードは戻した。
