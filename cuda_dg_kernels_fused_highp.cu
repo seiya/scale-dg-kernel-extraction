@@ -70,8 +70,8 @@ __device__ double p15_face_flux_cc(int fidx, const double *__restrict__ q,
   return 0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
 }
 
-// p=15 CC: 512 threads x 8 k-nodes, 2 blocks/SM. Dedicated sFace is filled
-// after the x-panel store so face gathers overlap the three contractions.
+// p=15 CC: 512 threads x 8 k-nodes, 2 blocks/SM. Face gathers issue before
+// the x-panel barrier so they overlap remaining stores.
 __global__ __launch_bounds__(P15_CC_THREADS, 2) void tendency_fused_p15_cc_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
@@ -116,14 +116,13 @@ __global__ __launch_bounds__(P15_CC_THREADS, 2) void tendency_fused_p15_cc_kerne
     qv[m] = q[idx[m]];
     sbuf[nd[m]] = qv[m] * u[idx[m]];
   }
-  __syncthreads();
-
   sFace[tid] = p15_face_flux_cc(face_offset + tid, q, u, v, w, VMapM, VMapP,
                                 normal_fn, Fscale, nface);
   sFace[tid + 512] = p15_face_flux_cc(face_offset + tid + 512, q, u, v, w, VMapM,
                                       VMapP, normal_fn, Fscale, nface);
   sFace[tid + 1024] = p15_face_flux_cc(face_offset + tid + 1024, q, u, v, w,
                                        VMapM, VMapP, normal_fn, Fscale, nface);
+  __syncthreads();
 
   double s[8];
 #pragma unroll
@@ -190,7 +189,6 @@ __global__ __launch_bounds__(P15_CC_THREADS, 2) void tendency_fused_p15_cc_kerne
   for (int m = 0; m < 8; ++m) {
     acc[m] += Escale[idx[m] + 2 * npoint] * s[m];
   }
-  __syncthreads();
 
   const int fa5 = 1024 + i + j * 16;
   const int fa6 = 1280 + i + j * 16;
