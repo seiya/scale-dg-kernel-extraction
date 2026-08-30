@@ -368,6 +368,10 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の flux CTA / TMA / 優先度（2026-08-30、`p63_gap_study.md` §29）**:
+  CTA 128/512 と side 最低優先度はレンジ重複。TMA は `tma_survey.md` §1.4 の
+  「DRAM 飽和で素のロードと 1.8% 以内」がこのカーネルの天井を既に押さえる。
+
 - **p=63 `GEMM_FUSED` の L2 persist 窓（2026-08-30、`p63_gap_study.md` §28）**:
   `q` に persist + streaming miss を掛けると device **+55%**（571 → 886 µs）。
   属性が後続 GEMM まで残り L2 を捨てる。コードは戻した。
@@ -375,7 +379,7 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 - **p=63 `GEMM_FUSED` の flux DRAM 取り方（2026-08-30、`p63_gap_study.md` §27）**:
   2 点 grid-stride は **+0.38%**、`__ldcs` は **+0.48%**、`__stcs` と L2 prefetch は
   レンジ重複。加重 z は ncu でも **254 レジスタ / 占有 12%**。コードは戻した。
-  DRAM 83%→100%（~22 µs）は未測の取り方（L2 persist 窓など）を残す。
+  DRAM 83%→100%（~22 µs）は persistent grid-stride など未測の取り方を残す。
 
 - **p=63 `GEMM_FUSED` の flux_yz 重ね（2026-08-30、`p63_gap_study.md` §26）**:
   `flux_y/z` を side2 で cuBLAS x と重ねると device **+5.9%**（571 → 605 µs/stage）。

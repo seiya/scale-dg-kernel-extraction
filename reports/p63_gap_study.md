@@ -2057,8 +2057,7 @@ cuobjdump が kWeighted Nq=64 で 194 本と出していたのは、実カーネ
 | 次ブロックへの `prefetch.global.L2` | `69605` c384 | 3.25549e-2 → 3.25191e-2（**−0.11%**） | 128.4 µs | レンジ重複（3.25214e-2..3.25981e-2 対 3.25026e-2..3.25317e-2）。差が無い |
 
 DRAM 83%→100% の ~22 µs は、ベクトル化・2/4 点 MLP・C++・ldcs/stcs・L2 prefetch・
-yz 分割重ねでは取れない。L2 persist 窓は §28 で **+55%**。残るのは TMA など、
-まだ測っていない取り方である。
+yz 分割重ねでは取れない。L2 persist 窓は §28 で **+55%**。CTA 幅と TMA は §29。
 z は折り込み後も占有 12% のレイテンシで、タイル再掃引の前提は変わっていない。
 **最速は `FUSED_TC` のまま。**
 
@@ -2082,3 +2081,21 @@ CUTLASS `64x128` Kernel2 が 162 µs で現れ、`volume_flux` は統計に出�
 `cudaCtxResetPersistingL2Cache` 自体は 3 µs で、損失の本体ではない。
 q は 134 MB で L2 に収まらず、persist は DRAM 83% の屋根を上げない。
 **最速は `FUSED_TC` のまま。**
+
+## 29. flux CTA 幅・TMA・side 優先度（2026-08-30、いずれも不採用）
+
+対象は `CUDAFORTRAN_GEMM_FUSED`。親 `1ffd367`、`conf_perf_p63_gemm_fused.conf`、
+対 §25 バイナリ、点変化係数 vs SPLIT max abs 3.55e-15。コードは戻した。
+
+TMA は `tma_survey.md` §1.4 が、DRAM 飽和時に素のロードと **1.8% 以内**と
+既に測っている。`volume_flux` は連続 1D・DRAM 83% なので、その天井は
+83%→100% の ~22 µs より小さい。別カーネルを書いて取り直す根拠は無い。
+
+| 候補 | job / node | device 中央値 | 判定 |
+|---|---|---|---|
+| flux CTA 128 | `69621` c390 | 3.25524e-2 → 3.25644e-2（**+0.04%**） | レンジ重複。nsys flux 128.4 µs |
+| flux CTA 512 | `69625` c384 | 3.25654e-2 → 3.25367e-2（**−0.09%**） | レンジ重複。nsys flux 127.5 µs |
+| side stream 最低優先度 | `69627` c384 | 3.25564e-2 → 3.25476e-2（**−0.03%**） | レンジ重複。elembnd は既に x と同居でき、優先度では x を伸ばせない |
+
+DRAM 屋根までの残りは、まだ測っていない取り方（persistent grid-stride の多反復、
+flux 専用ストリームに閉じた persist）に残る。**最速は `FUSED_TC` のまま。**
