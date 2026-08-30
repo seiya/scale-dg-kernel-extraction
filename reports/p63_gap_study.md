@@ -2117,7 +2117,7 @@ device **+1.35%**、レンジ非重複。CTA を減らすと DRAM パイプの�
 
 ## 31. `D1D_tr` の L2 persist（Normal miss、2026-08-30、不採用 +58%）
 
-対象は `CUDAFORTRAN_GEMM_FUSED`。親 `44e372b`、job `69635`（12 回交互、対 §25）。
+対象は `CUDAFORTRAN_GEMM_FUSED`。親 `44e372b`、job `69635`（c384、12 回交互、対 §25）。
 点変化係数 vs SPLIT max abs 3.55e-15。§28 は `q` に streaming miss を付けて
 後続 GEMM を壊した。今回は **32 KB の `D1D_tr` だけ**を persist し、窓の外は
 `cudaAccessPropertyNormal`、`cudaCtxResetPersistingL2Cache` は呼ばない。
@@ -2136,4 +2136,21 @@ flux の**後**なのに次ステージの flux が伸びる。原因は
 通常 L2 を削ること。§28 の +55% も同じ SetLimit を共有する。32 KB の演算子を
 persist する賞金は、streaming な flux（134 MB × 4）から L2 を奪う損失に負ける。
 max 容量の SetLimit を伴う persist はこの経路では使えない。
+**最速は `FUSED_TC` のまま。**
+
+## 32. 32 KB persist 容量と `D1D_tr` 窓（2026-08-30、いずれも差なし）
+
+対象は `CUDAFORTRAN_GEMM_FUSED`。親 `17b4f0d`、対 §25。点変化係数 vs SPLIT
+max abs 3.55e-15。コードは戻した。
+
+§31 の損失は max 容量の `SetLimit` だったので、容量を `D1D_tr` の 32 KB に
+限って切り分けた。
+
+| 候補 | job / node | device 中央値 | 判定 |
+|---|---|---|---|
+| `SetLimit(32768)` のみ | `69639` c384 | 3.25558e-2 → 3.25511e-2（**−0.01%**） | レンジ重複。flux は 128 µs のまま |
+| 32 KB + `D1D_tr` persist 窓 | `69641` c384 | 3.25232e-2 → 3.25647e-2（**+0.13%**） | レンジ重複。y 152 / z 130 µs は動かない |
+
+`D1D_tr` は既に L2 に載っており、persist 語彙で y/z は速くならない。
+max 容量で L2 を削る persist は §28/§31 で閉じ、小さい容量は賞金ゼロ。
 **最速は `FUSED_TC` のまま。**
