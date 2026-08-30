@@ -2231,3 +2231,19 @@ device **+47.3%**、レンジ非重複。z / flux / x は動かず、y だけ 13
 誤差だったのは当時の y が mainloop 側だったからで、折り込み後はワープ形状を
 触ってはいけない。`<64,32>` も 2 ワープなので取らない。
 **最速は `FUSED_TC` のまま。**
+
+## 37. z assembly の MaxShared carveout（2026-08-30、不採用 +8.0%）
+
+対象は `CUDAFORTRAN_GEMM_FUSED`。親 `bd9cc18`、job `69659`（c384、12 回交互、
+対 §25 バイナリ）。点変化係数 vs SPLIT max abs 3.55e-15。
+§33 の反対側: `cudaSharedmemCarveoutMaxShared`。コードは戻した。
+
+| | device 中央値 | µs/stage | nsys z assembly |
+|---|---:|---:|---:|
+| §25 | 3.25508e-2 | 571.1 | 152 µs |
+| **MaxShared** | **3.51531e-2** | **616.7** | **196 µs** |
+
+device **+8.0%**、レンジ非重複。y / flux / x は動かず z だけ +44 µs。
+MaxL1 は shared タイルを奪って +52%（§33）、MaxShared はエピローグの L1 を
+削って +8%。既定の carveout が両極より速い。carveout 軸は閉じた。
+**最速は `FUSED_TC` のまま。**
