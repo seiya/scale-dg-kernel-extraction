@@ -368,6 +368,9 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の z `launch_bounds` 5（2026-08-30、`p63_gap_study.md` §48）**:
+  device **+49%**（z 152→429 µs）。8 CTA より軽いが spill は残る。占有強制は閉じた。
+
 - **p=63 `GEMM_FUSED` の elembnd を y の下へ（2026-08-30、`p63_gap_study.md` §47）**:
   device **+2.38%**。x は 113→87 µs に戻るが y が 131→161 µs。同居相手は x が谷。
 
