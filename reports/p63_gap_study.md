@@ -2099,3 +2099,18 @@ TMA は `tma_survey.md` §1.4 が、DRAM 飽和時に素のロードと **1.8% �
 
 DRAM 屋根までの残りは、まだ測っていない取り方（persistent grid-stride の多反復、
 flux 専用ストリームに閉じた persist）に残る。**最速は `FUSED_TC` のまま。**
+
+## 30. persistent grid-stride `volume_flux`（2026-08-30、不採用 +1.35%）
+
+対象は `CUDAFORTRAN_GEMM_FUSED`。親 `b2d4ac3`、job `69631`（c386、12 回交互）。
+点変化係数 vs SPLIT max abs 3.55e-15。CTA を 4096 に抑え、各スレッドが
+grid-stride で複数点を処理した。コードは戻した。
+
+| | device 中央値 | µs/stage | nsys flux |
+|---|---:|---:|---:|
+| §25 | 3.25394e-2 | 570.9 | 128 µs |
+| **4096 CTA grid-stride** | **3.29838e-2** | **578.7** | **136 µs** |
+
+device **+1.35%**、レンジ非重複。CTA を減らすと DRAM パイプの同時発行が細り、
+2 点半減グリッド（§27 +0.38%）と同じ方向でより軽い。
+**最速は `FUSED_TC` のまま。**

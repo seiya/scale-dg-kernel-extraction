@@ -368,6 +368,9 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の persistent flux（2026-08-30、`p63_gap_study.md` §30）**:
+  CTA 4096 の grid-stride は device **+1.35%**（flux 128→136 µs）。パイプが細る。
+
 - **p=63 `GEMM_FUSED` の flux CTA / TMA / 優先度（2026-08-30、`p63_gap_study.md` §29）**:
   CTA 128/512 と side 最低優先度はレンジ重複。TMA は `tma_survey.md` §1.4 の
   「DRAM 飽和で素のロードと 1.8% 以内」がこのカーネルの天井を既に押さえる。
