@@ -2057,6 +2057,28 @@ cuobjdump が kWeighted Nq=64 で 194 本と出していたのは、実カーネ
 | 次ブロックへの `prefetch.global.L2` | `69605` c384 | 3.25549e-2 → 3.25191e-2（**−0.11%**） | 128.4 µs | レンジ重複（3.25214e-2..3.25981e-2 対 3.25026e-2..3.25317e-2）。差が無い |
 
 DRAM 83%→100% の ~22 µs は、ベクトル化・2/4 点 MLP・C++・ldcs/stcs・L2 prefetch・
-yz 分割重ねでは取れない。残るのは L2 persist 窓や TMA など、まだ測っていない取り方である。
+yz 分割重ねでは取れない。L2 persist 窓は §28 で **+55%**。残るのは TMA など、
+まだ測っていない取り方である。
 z は折り込み後も占有 12% のレイテンシで、タイル再掃引の前提は変わっていない。
+**最速は `FUSED_TC` のまま。**
+
+## 28. `q` の L2 persist 窓（2026-08-30、不採用 +55%）
+
+対象は `CUDAFORTRAN_GEMM_FUSED`。親 `d5dafb5`、job `69615`（c384、12 回交互、
+対 §25）。点変化係数 vs SPLIT max abs 3.55e-15。
+`volume_flux` の直前に `q` へ `cudaAccessPropertyPersisting` 窓を張り、
+外れを streaming にし、カーネル後に `cudaCtxResetPersistingL2Cache` した。
+
+| | device 中央値 | µs/stage |
+|---|---:|---:|
+| §25 | 3.25648e-2 | 571.3 |
+| **L2 persist 窓** | **5.05118e-2** | **886.2** |
+
+device **+55.1%**、レンジ非重複。コードは戻した。
+
+窓はストリーム属性なので、flux のあとの y/z GEMM まで miss が streaming になる。
+nsys（`conf_perf_p63_ncu.conf`）では z 175 µs・y 147 µs と両方伸び、
+CUTLASS `64x128` Kernel2 が 162 µs で現れ、`volume_flux` は統計に出ない。
+`cudaCtxResetPersistingL2Cache` 自体は 3 µs で、損失の本体ではない。
+q は 134 MB で L2 に収まらず、persist は DRAM 83% の屋根を上げない。
 **最速は `FUSED_TC` のまま。**
