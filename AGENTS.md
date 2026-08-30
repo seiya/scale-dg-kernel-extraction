@@ -172,6 +172,10 @@ Leave the working executable in the build mode relevant to the current task.
   `Escale`, `normal_fn`, and `Fscale`.
 - Compare the complete owned `dqdt(:,1:Ne)` field, not only min/max values or
   elapsed time. Differences should be at floating-point roundoff level.
+  Bit-exact identity is not required: a change in FMA contraction or
+  reduction order is acceptable if the full-field difference stays at
+  roundoff. Do not reject a candidate solely because `cmp` / `filecmp`
+  fails.
 - For p=7, validate `CUDAFORTRAN_FUSED` against a split implementation.
 - For p=255, test both the intended `Ne=1` case and an `Ne>1` smoke case when
   memory permits. The p=255 path currently requires `CUDAFORTRAN_FUSED`,

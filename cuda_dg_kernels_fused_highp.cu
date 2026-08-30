@@ -15,6 +15,11 @@ extern cudaStream_t dg_cuda_stream;
 #define P127_CC_THREADS 1024
 #define P127_CC_BPE 512
 #define P255_CC_BPE 65536
+#ifndef P255_CC_ABLATE
+#define P255_CC_ABLATE 0
+#endif
+// 1=INNER1, 2=all global 1.0, 3=no epilogue, 4=no barrier,
+// 5=D operand 1.0 (Q real), 6=Q/vel 1.0 (D real).
 
 static void check_cuda_cc_hp(const char *what)
 {
@@ -24,6 +29,8 @@ static void check_cuda_cc_hp(const char *what)
   }
 }
 
+// Fortran 2dadc41^ had no launch_bounds; nvcc needs a cap or a 1024-thread
+// block will not launch.  minBlocks=1 matches the previous C++ port.
 __global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_cc_kernel(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
@@ -78,6 +85,7 @@ __global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_cc_kernel(
   __syncthreads();
 
   double s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0;
+#pragma unroll
   for (int l = 0; l < 16; ++l) {
     const int ib = l + j * 16 + k1 * 256;
     const double dm = sD1D[i + l * 16];
@@ -99,6 +107,7 @@ __global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_cc_kernel(
   __syncthreads();
 
   s1 = s2 = s3 = s4 = 0.0;
+#pragma unroll
   for (int l = 0; l < 16; ++l) {
     const int ib = i + l * 16 + k1 * 256;
     const double dm = sD1D[j + l * 16];
@@ -120,6 +129,7 @@ __global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_cc_kernel(
   __syncthreads();
 
   s1 = s2 = s3 = s4 = 0.0;
+#pragma unroll
   for (int l = 0; l < 16; ++l) {
     const int ib = i + j * 16 + l * 256;
     const double bv = sbuf[ib];
@@ -549,140 +559,521 @@ __global__ __launch_bounds__(P127_CC_THREADS, 1) void tendency_fused_p127_y_cc_k
   }
 }
 
-__global__ __launch_bounds__(256, 1) void tendency_x_p255_cc_kernel(
+// One thread writes two outputs so the K-reduction reuses one D/Q operand
+// (ncu 66860: L1/TEX 98%; inner 16→1 is 5058→2188 µs).  128 threads/block.
+__global__ __launch_bounds__(128, 8) void tendency_x_p255_cc_kernel(
     double *dqdt, const double *q, const double *velocity, const double *D1D,
     const double *Lift1D, const double *flux_bnd, const double *Escale, int Ne)
 {
-  __shared__ double sD[16 * 16];
-  __shared__ double sQ[16 * 16];
+  __shared__ double sQ0[33 * 16];
+  __shared__ double sQ1[33 * 16];
 
   const int tx = (int)threadIdx.x;
   const int ty = (int)threadIdx.y;
   const int block0 = (int)blockIdx.x;
-  const int elem = block0 / P255_CC_BPE;
+  const int nblock_pe = P255_CC_BPE / 4;
+  const int elem = block0 / nblock_pe;
   if (elem >= Ne) {
     return;
   }
-  int local_block = block0 % P255_CC_BPE;
-  const int k = local_block / 256;
-  local_block %= 256;
-  const int tile_j = local_block / 16;
-  const int tile_i = local_block % 16;
-  const int i = tile_i * 16 + tx;
-  const int j = tile_j * 16 + ty;
+  int local_block = block0 % nblock_pe;
+  const int k = local_block / 64;
+  local_block %= 64;
+  const int quad_j = local_block / 8;
+  const int pair_i = local_block % 8;
+  const int i0 = pair_i * 32 + tx;
+  const int i1 = i0 + 16;
+  const int j0 = quad_j * 32 + ty;
+  const int j1 = j0 + 8;
+  const int j2 = j0 + 16;
+  const int j3 = j0 + 24;
   const int elem_offset = elem * 16777216;
 
-  double sum = 0.0;
-  for (int ltile = 0; ltile < 16; ++ltile) {
-    int l = ltile * 16 + ty;
-    sD[ty * 16 + tx] = D1D[i + l * 256];
-    l = ltile * 16 + tx;
-    const int idx = elem_offset + l + j * 256 + k * 65536;
-    sQ[ty * 16 + tx] = q[idx] * velocity[idx];
+  double s00 = 0.0, s01 = 0.0, s02 = 0.0, s03 = 0.0;
+  double s10 = 0.0, s11 = 0.0, s12 = 0.0, s13 = 0.0;
+  for (int ltile = 0; ltile < 8; ++ltile) {
+#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 6
+    sQ0[ty * 33 + tx] = 1.0;
+    sQ0[ty * 33 + tx + 16] = 1.0;
+    sQ0[(ty + 8) * 33 + tx] = 1.0;
+    sQ0[(ty + 8) * 33 + tx + 16] = 1.0;
+    sQ1[ty * 33 + tx] = 1.0;
+    sQ1[ty * 33 + tx + 16] = 1.0;
+    sQ1[(ty + 8) * 33 + tx] = 1.0;
+    sQ1[(ty + 8) * 33 + tx + 16] = 1.0;
+#else
+    const int l = ltile * 32 + tx;
+    int gidx = elem_offset + l + j0 * 256 + k * 65536;
+    sQ0[ty * 33 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + (l + 16) + j0 * 256 + k * 65536;
+    sQ0[ty * 33 + tx + 16] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + l + j1 * 256 + k * 65536;
+    sQ0[(ty + 8) * 33 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + (l + 16) + j1 * 256 + k * 65536;
+    sQ0[(ty + 8) * 33 + tx + 16] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + l + j2 * 256 + k * 65536;
+    sQ1[ty * 33 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + (l + 16) + j2 * 256 + k * 65536;
+    sQ1[ty * 33 + tx + 16] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + l + j3 * 256 + k * 65536;
+    sQ1[(ty + 8) * 33 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + (l + 16) + j3 * 256 + k * 65536;
+    sQ1[(ty + 8) * 33 + tx + 16] = q[gidx] * velocity[gidx];
+#endif
+#if P255_CC_ABLATE != 4
     __syncthreads();
-    for (int t = 0; t < 16; ++t) {
-      sum += sD[t * 16 + tx] * sQ[ty * 16 + t];
+#endif
+#pragma unroll
+#if P255_CC_ABLATE == 1
+    for (int t = 0; t < 1; ++t)
+#else
+    for (int t = 0; t < 32; ++t)
+#endif
+    {
+#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 5
+      const double d0 = 1.0;
+      const double d1 = 1.0;
+#else
+      const double d0 = __ldg(D1D + i0 + (ltile * 32 + t) * 256);
+      const double d1 = __ldg(D1D + i1 + (ltile * 32 + t) * 256);
+#endif
+      const double f0 = sQ0[ty * 33 + t];
+      const double f1 = sQ0[(ty + 8) * 33 + t];
+      const double f2 = sQ1[ty * 33 + t];
+      const double f3 = sQ1[(ty + 8) * 33 + t];
+      s00 += d0 * f0;
+      s01 += d0 * f1;
+      s02 += d0 * f2;
+      s03 += d0 * f3;
+      s10 += d1 * f0;
+      s11 += d1 * f1;
+      s12 += d1 * f2;
+      s13 += d1 * f3;
     }
-    __syncthreads();
+#if P255_CC_ABLATE != 4
+    if (ltile + 1 < 8) {
+      __syncthreads();
+    }
+#endif
   }
 
-  const int idx = elem_offset + i + j * 256 + k * 65536;
-  const int fp = j + k * 256;
+  const int fp0 = j0 + k * 256;
+  const int fp1 = j1 + k * 256;
+  const int fp2 = j2 + k * 256;
+  const int fp3 = j3 + k * 256;
   const int elem_face_offset = elem * 6 * 65536;
-  const double lift_value =
-      Lift1D[i + 256] * flux_bnd[elem_face_offset + 65536 + fp] +
-      Lift1D[i + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp];
-  dqdt[idx] = -(Escale[idx] * sum + lift_value);
+#if P255_CC_ABLATE == 3
+  int idx = elem_offset + i0 + j0 * 256 + k * 65536;
+  dqdt[idx] = -s00;
+  idx = elem_offset + i0 + j1 * 256 + k * 65536;
+  dqdt[idx] = -s01;
+  idx = elem_offset + i0 + j2 * 256 + k * 65536;
+  dqdt[idx] = -s02;
+  idx = elem_offset + i0 + j3 * 256 + k * 65536;
+  dqdt[idx] = -s03;
+  idx = elem_offset + i1 + j0 * 256 + k * 65536;
+  dqdt[idx] = -s10;
+  idx = elem_offset + i1 + j1 * 256 + k * 65536;
+  dqdt[idx] = -s11;
+  idx = elem_offset + i1 + j2 * 256 + k * 65536;
+  dqdt[idx] = -s12;
+  idx = elem_offset + i1 + j3 * 256 + k * 65536;
+  dqdt[idx] = -s13;
+#else
+  const double lift00 =
+      Lift1D[i0 + 256] * flux_bnd[elem_face_offset + 65536 + fp0] +
+      Lift1D[i0 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp0];
+  const double lift01 =
+      Lift1D[i0 + 256] * flux_bnd[elem_face_offset + 65536 + fp1] +
+      Lift1D[i0 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp1];
+  const double lift02 =
+      Lift1D[i0 + 256] * flux_bnd[elem_face_offset + 65536 + fp2] +
+      Lift1D[i0 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp2];
+  const double lift03 =
+      Lift1D[i0 + 256] * flux_bnd[elem_face_offset + 65536 + fp3] +
+      Lift1D[i0 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp3];
+  const double lift10 =
+      Lift1D[i1 + 256] * flux_bnd[elem_face_offset + 65536 + fp0] +
+      Lift1D[i1 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp0];
+  const double lift11 =
+      Lift1D[i1 + 256] * flux_bnd[elem_face_offset + 65536 + fp1] +
+      Lift1D[i1 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp1];
+  const double lift12 =
+      Lift1D[i1 + 256] * flux_bnd[elem_face_offset + 65536 + fp2] +
+      Lift1D[i1 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp2];
+  const double lift13 =
+      Lift1D[i1 + 256] * flux_bnd[elem_face_offset + 65536 + fp3] +
+      Lift1D[i1 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp3];
+  int idx = elem_offset + i0 + j0 * 256 + k * 65536;
+  dqdt[idx] = -(__ldg(Escale + idx) * s00 + lift00);
+  idx = elem_offset + i0 + j1 * 256 + k * 65536;
+  dqdt[idx] = -(__ldg(Escale + idx) * s01 + lift01);
+  idx = elem_offset + i0 + j2 * 256 + k * 65536;
+  dqdt[idx] = -(__ldg(Escale + idx) * s02 + lift02);
+  idx = elem_offset + i0 + j3 * 256 + k * 65536;
+  dqdt[idx] = -(__ldg(Escale + idx) * s03 + lift03);
+  idx = elem_offset + i1 + j0 * 256 + k * 65536;
+  dqdt[idx] = -(__ldg(Escale + idx) * s10 + lift10);
+  idx = elem_offset + i1 + j1 * 256 + k * 65536;
+  dqdt[idx] = -(__ldg(Escale + idx) * s11 + lift11);
+  idx = elem_offset + i1 + j2 * 256 + k * 65536;
+  dqdt[idx] = -(__ldg(Escale + idx) * s12 + lift12);
+  idx = elem_offset + i1 + j3 * 256 + k * 65536;
+  dqdt[idx] = -(__ldg(Escale + idx) * s13 + lift13);
+#endif
 }
 
-__global__ __launch_bounds__(256, 1) void tendency_y_p255_cc_kernel(
+__global__ __launch_bounds__(128, 8) void tendency_y_p255_cc_kernel(
     double *dqdt, const double *q, const double *velocity, const double *D1D,
     const double *Lift1D, const double *flux_bnd, const double *Escale, int Ne)
 {
-  __shared__ double sD[16 * 16];
-  __shared__ double sQ[16 * 16];
+  __shared__ double sD[2][16 * 32];
+  __shared__ double sQ0[2][16 * 16];
+  __shared__ double sQ1[2][16 * 16];
 
   const int tx = (int)threadIdx.x;
   const int ty = (int)threadIdx.y;
   const int block0 = (int)blockIdx.x;
-  const int elem = block0 / P255_CC_BPE;
+  const int nblock_pe = P255_CC_BPE / 4;
+  const int elem = block0 / nblock_pe;
   if (elem >= Ne) {
     return;
   }
-  int local_block = block0 % P255_CC_BPE;
-  const int k = local_block / 256;
-  local_block %= 256;
-  const int tile_j = local_block / 16;
-  const int tile_i = local_block % 16;
-  const int i = tile_i * 16 + tx;
-  const int j = tile_j * 16 + ty;
+  int local_block = block0 % nblock_pe;
+  const int k = local_block / 64;
+  local_block %= 64;
+  const int quad_j = local_block / 8;
+  const int pair_i = local_block % 8;
+  const int i0 = pair_i * 32 + tx;
+  const int i1 = i0 + 16;
+  const int j0 = quad_j * 32 + ty;
+  const int j1 = j0 + 8;
+  const int j2 = j0 + 16;
+  const int j3 = j0 + 24;
+  const int jbase = quad_j * 32;
   const int elem_offset = elem * 16777216;
 
-  double sum = 0.0;
+  double s00 = 0.0, s01 = 0.0, s02 = 0.0, s03 = 0.0;
+  double s10 = 0.0, s11 = 0.0, s12 = 0.0, s13 = 0.0;
+  int p = 0;
+  int ft = 0;
+#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 5
+    sD[p][ty * 32 + tx] = 1.0;
+    sD[p][ty * 32 + tx + 16] = 1.0;
+    sD[p][(ty + 8) * 32 + tx] = 1.0;
+    sD[p][(ty + 8) * 32 + tx + 16] = 1.0;
+#else
+    sD[p][ty * 32 + 2 * (tx & 7) + (tx >> 3)] =
+        D1D[jbase + tx + (ft * 16 + ty) * 256];
+    sD[p][ty * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =
+        D1D[jbase + 16 + tx + (ft * 16 + ty) * 256];
+    sD[p][(ty + 8) * 32 + 2 * (tx & 7) + (tx >> 3)] =
+        D1D[jbase + tx + (ft * 16 + ty + 8) * 256];
+    sD[p][(ty + 8) * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =
+        D1D[jbase + 16 + tx + (ft * 16 + ty + 8) * 256];
+#endif
+#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 6
+    sQ0[p][ty * 16 + tx] = 1.0;
+    sQ0[p][(ty + 8) * 16 + tx] = 1.0;
+    sQ1[p][ty * 16 + tx] = 1.0;
+    sQ1[p][(ty + 8) * 16 + tx] = 1.0;
+#else
+    const int l0 = ft * 16 + ty;
+    int gidx = elem_offset + i0 + l0 * 256 + k * 65536;
+    sQ0[p][ty * 16 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + i0 + (l0 + 8) * 256 + k * 65536;
+    sQ0[p][(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + i1 + l0 * 256 + k * 65536;
+    sQ1[p][ty * 16 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + i1 + (l0 + 8) * 256 + k * 65536;
+    sQ1[p][(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
+#endif
+#if P255_CC_ABLATE != 4
+    __syncthreads();
+#endif
   for (int ltile = 0; ltile < 16; ++ltile) {
-    const int l = ltile * 16 + ty;
-    const int idx = elem_offset + i + l * 256 + k * 65536;
-    sQ[ty * 16 + tx] = q[idx] * velocity[idx];
-    sD[ty * 16 + tx] = D1D[tile_j * 16 + tx + l * 256];
-    __syncthreads();
-    for (int t = 0; t < 16; ++t) {
-      sum += sQ[t * 16 + tx] * sD[t * 16 + ty];
+#pragma unroll
+#if P255_CC_ABLATE == 1
+    for (int t = 0; t < 1; ++t)
+#else
+    for (int t = 0; t < 16; ++t)
+#endif
+    {
+      const double2 dj0 =
+          *reinterpret_cast<const double2 *>(&sD[p][t * 32 + 2 * ty]);
+      const double2 dj1 =
+          *reinterpret_cast<const double2 *>(&sD[p][t * 32 + 16 + 2 * ty]);
+      const double f0 = sQ0[p][t * 16 + tx];
+      const double f1 = sQ1[p][t * 16 + tx];
+      s00 += f0 * dj0.x;
+      s01 += f0 * dj0.y;
+      s02 += f0 * dj1.x;
+      s03 += f0 * dj1.y;
+      s10 += f1 * dj0.x;
+      s11 += f1 * dj0.y;
+      s12 += f1 * dj1.x;
+      s13 += f1 * dj1.y;
     }
-    __syncthreads();
+    if (ltile + 1 < 16) {
+      p ^= 1;
+      ft = ltile + 1;
+#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 5
+    sD[p][ty * 32 + tx] = 1.0;
+    sD[p][ty * 32 + tx + 16] = 1.0;
+    sD[p][(ty + 8) * 32 + tx] = 1.0;
+    sD[p][(ty + 8) * 32 + tx + 16] = 1.0;
+#else
+    sD[p][ty * 32 + 2 * (tx & 7) + (tx >> 3)] =
+        D1D[jbase + tx + (ft * 16 + ty) * 256];
+    sD[p][ty * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =
+        D1D[jbase + 16 + tx + (ft * 16 + ty) * 256];
+    sD[p][(ty + 8) * 32 + 2 * (tx & 7) + (tx >> 3)] =
+        D1D[jbase + tx + (ft * 16 + ty + 8) * 256];
+    sD[p][(ty + 8) * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =
+        D1D[jbase + 16 + tx + (ft * 16 + ty + 8) * 256];
+#endif
+#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 6
+    sQ0[p][ty * 16 + tx] = 1.0;
+    sQ0[p][(ty + 8) * 16 + tx] = 1.0;
+    sQ1[p][ty * 16 + tx] = 1.0;
+    sQ1[p][(ty + 8) * 16 + tx] = 1.0;
+#else
+    const int l0 = ft * 16 + ty;
+    int gidx = elem_offset + i0 + l0 * 256 + k * 65536;
+    sQ0[p][ty * 16 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + i0 + (l0 + 8) * 256 + k * 65536;
+    sQ0[p][(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + i1 + l0 * 256 + k * 65536;
+    sQ1[p][ty * 16 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + i1 + (l0 + 8) * 256 + k * 65536;
+    sQ1[p][(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
+#endif
+#if P255_CC_ABLATE != 4
+      __syncthreads();
+#endif
+    }
   }
 
-  const int idx = elem_offset + i + j * 256 + k * 65536;
-  const int fp = i + k * 256;
-  const int elem_face_offset = elem * 6 * 65536;
-  const double lift_value = Lift1D[j] * flux_bnd[elem_face_offset + fp] +
-                            Lift1D[j + 2 * 256] *
-                                flux_bnd[elem_face_offset + 2 * 65536 + fp];
   const int npoint = 16777216 * Ne;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * sum + lift_value);
+  const int fp0 = i0 + k * 256;
+  const int fp1 = i1 + k * 256;
+  const int elem_face_offset = elem * 6 * 65536;
+#if P255_CC_ABLATE == 3
+  int idx = elem_offset + i0 + j0 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - s00;
+  idx = elem_offset + i0 + j1 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - s01;
+  idx = elem_offset + i0 + j2 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - s02;
+  idx = elem_offset + i0 + j3 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - s03;
+  idx = elem_offset + i1 + j0 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - s10;
+  idx = elem_offset + i1 + j1 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - s11;
+  idx = elem_offset + i1 + j2 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - s12;
+  idx = elem_offset + i1 + j3 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - s13;
+#else
+  const double lift00 = Lift1D[j0] * flux_bnd[elem_face_offset + fp0] +
+                        Lift1D[j0 + 2 * 256] *
+                            flux_bnd[elem_face_offset + 2 * 65536 + fp0];
+  const double lift01 = Lift1D[j1] * flux_bnd[elem_face_offset + fp0] +
+                        Lift1D[j1 + 2 * 256] *
+                            flux_bnd[elem_face_offset + 2 * 65536 + fp0];
+  const double lift02 = Lift1D[j2] * flux_bnd[elem_face_offset + fp0] +
+                        Lift1D[j2 + 2 * 256] *
+                            flux_bnd[elem_face_offset + 2 * 65536 + fp0];
+  const double lift03 = Lift1D[j3] * flux_bnd[elem_face_offset + fp0] +
+                        Lift1D[j3 + 2 * 256] *
+                            flux_bnd[elem_face_offset + 2 * 65536 + fp0];
+  const double lift10 = Lift1D[j0] * flux_bnd[elem_face_offset + fp1] +
+                        Lift1D[j0 + 2 * 256] *
+                            flux_bnd[elem_face_offset + 2 * 65536 + fp1];
+  const double lift11 = Lift1D[j1] * flux_bnd[elem_face_offset + fp1] +
+                        Lift1D[j1 + 2 * 256] *
+                            flux_bnd[elem_face_offset + 2 * 65536 + fp1];
+  const double lift12 = Lift1D[j2] * flux_bnd[elem_face_offset + fp1] +
+                        Lift1D[j2 + 2 * 256] *
+                            flux_bnd[elem_face_offset + 2 * 65536 + fp1];
+  const double lift13 = Lift1D[j3] * flux_bnd[elem_face_offset + fp1] +
+                        Lift1D[j3 + 2 * 256] *
+                            flux_bnd[elem_face_offset + 2 * 65536 + fp1];
+  int idx = elem_offset + i0 + j0 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s00 + lift00);
+  idx = elem_offset + i0 + j1 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s01 + lift01);
+  idx = elem_offset + i0 + j2 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s02 + lift02);
+  idx = elem_offset + i0 + j3 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s03 + lift03);
+  idx = elem_offset + i1 + j0 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s10 + lift10);
+  idx = elem_offset + i1 + j1 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s11 + lift11);
+  idx = elem_offset + i1 + j2 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s12 + lift12);
+  idx = elem_offset + i1 + j3 * 256 + k * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s13 + lift13);
+#endif
 }
 
-__global__ __launch_bounds__(256, 1) void tendency_z_p255_cc_kernel(
+__global__ __launch_bounds__(128, 8) void tendency_z_p255_cc_kernel(
     double *dqdt, const double *q, const double *velocity, const double *D1D,
     const double *Lift1D, const double *flux_bnd, const double *Escale, int Ne)
 {
-  __shared__ double sD[16 * 16];
-  __shared__ double sQ[16 * 16];
+  __shared__ double sD[16 * 32];
+  __shared__ double sQ0[16 * 16];
+  __shared__ double sQ1[16 * 16];
 
   const int tx = (int)threadIdx.x;
   const int ty = (int)threadIdx.y;
   const int block0 = (int)blockIdx.x;
-  const int elem = block0 / P255_CC_BPE;
+  const int nblock_pe = P255_CC_BPE / 4;
+  const int elem = block0 / nblock_pe;
   if (elem >= Ne) {
     return;
   }
-  const int local_block = block0 % P255_CC_BPE;
-  const int tile_k = local_block / 4096;
-  const int tile_line = local_block % 4096;
-  const int line = tile_line * 16 + tx;
-  const int k = tile_k * 16 + ty;
+  const int local_block = block0 % nblock_pe;
+  const int quad_k = local_block / 2048;
+  const int pair = local_block % 2048;
+  const int line0 = pair * 32 + tx;
+  const int line1 = line0 + 16;
+  const int k0 = quad_k * 32 + ty;
+  const int k1 = k0 + 8;
+  const int k2 = k0 + 16;
+  const int k3 = k0 + 24;
+  const int kbase = quad_k * 32;
   const int elem_offset = elem * 16777216;
 
-  double sum = 0.0;
+  double s00 = 0.0, s01 = 0.0, s02 = 0.0, s03 = 0.0;
+  double s10 = 0.0, s11 = 0.0, s12 = 0.0, s13 = 0.0;
   for (int ltile = 0; ltile < 16; ++ltile) {
-    const int l = ltile * 16 + ty;
-    const int idx = elem_offset + line + l * 65536;
-    sQ[ty * 16 + tx] = q[idx] * velocity[idx];
-    sD[ty * 16 + tx] = D1D[tile_k * 16 + tx + l * 256];
+#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 5
+    sD[ty * 32 + tx] = 1.0;
+    sD[ty * 32 + tx + 16] = 1.0;
+    sD[(ty + 8) * 32 + tx] = 1.0;
+    sD[(ty + 8) * 32 + tx + 16] = 1.0;
+#else
+    sD[ty * 32 + 2 * (tx & 7) + (tx >> 3)] =
+        D1D[kbase + tx + (ltile * 16 + ty) * 256];
+    sD[ty * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =
+        D1D[kbase + 16 + tx + (ltile * 16 + ty) * 256];
+    sD[(ty + 8) * 32 + 2 * (tx & 7) + (tx >> 3)] =
+        D1D[kbase + tx + (ltile * 16 + ty + 8) * 256];
+    sD[(ty + 8) * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =
+        D1D[kbase + 16 + tx + (ltile * 16 + ty + 8) * 256];
+#endif
+#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 6
+    sQ0[ty * 16 + tx] = 1.0;
+    sQ0[(ty + 8) * 16 + tx] = 1.0;
+    sQ1[ty * 16 + tx] = 1.0;
+    sQ1[(ty + 8) * 16 + tx] = 1.0;
+#else
+    const int l0 = ltile * 16 + ty;
+    int gidx = elem_offset + line0 + l0 * 65536;
+    sQ0[ty * 16 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + line0 + (l0 + 8) * 65536;
+    sQ0[(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + line1 + l0 * 65536;
+    sQ1[ty * 16 + tx] = q[gidx] * velocity[gidx];
+    gidx = elem_offset + line1 + (l0 + 8) * 65536;
+    sQ1[(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
+#endif
+#if P255_CC_ABLATE != 4
     __syncthreads();
-    for (int t = 0; t < 16; ++t) {
-      sum += sQ[t * 16 + tx] * sD[t * 16 + ty];
+#endif
+#pragma unroll
+#if P255_CC_ABLATE == 1
+    for (int t = 0; t < 1; ++t)
+#else
+    for (int t = 0; t < 16; ++t)
+#endif
+    {
+      const double2 dk0 =
+          *reinterpret_cast<const double2 *>(&sD[t * 32 + 2 * ty]);
+      const double2 dk1 =
+          *reinterpret_cast<const double2 *>(&sD[t * 32 + 16 + 2 * ty]);
+      const double f0 = sQ0[t * 16 + tx];
+      const double f1 = sQ1[t * 16 + tx];
+      s00 += f0 * dk0.x;
+      s01 += f0 * dk0.y;
+      s02 += f0 * dk1.x;
+      s03 += f0 * dk1.y;
+      s10 += f1 * dk0.x;
+      s11 += f1 * dk0.y;
+      s12 += f1 * dk1.x;
+      s13 += f1 * dk1.y;
     }
-    __syncthreads();
+#if P255_CC_ABLATE != 4
+    if (ltile + 1 < 16) {
+      __syncthreads();
+    }
+#endif
   }
 
-  const int idx = elem_offset + line + k * 65536;
-  const int fp = line;
-  const int elem_face_offset = elem * 6 * 65536;
-  const double lift_value =
-      Lift1D[k + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + fp] +
-      Lift1D[k + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + fp];
   const int npoint = 16777216 * Ne;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * sum + lift_value);
+  const int elem_face_offset = elem * 6 * 65536;
+#if P255_CC_ABLATE == 3
+  int idx = elem_offset + line0 + k0 * 65536;
+  dqdt[idx] = dqdt[idx] - s00;
+  idx = elem_offset + line0 + k1 * 65536;
+  dqdt[idx] = dqdt[idx] - s01;
+  idx = elem_offset + line0 + k2 * 65536;
+  dqdt[idx] = dqdt[idx] - s02;
+  idx = elem_offset + line0 + k3 * 65536;
+  dqdt[idx] = dqdt[idx] - s03;
+  idx = elem_offset + line1 + k0 * 65536;
+  dqdt[idx] = dqdt[idx] - s10;
+  idx = elem_offset + line1 + k1 * 65536;
+  dqdt[idx] = dqdt[idx] - s11;
+  idx = elem_offset + line1 + k2 * 65536;
+  dqdt[idx] = dqdt[idx] - s12;
+  idx = elem_offset + line1 + k3 * 65536;
+  dqdt[idx] = dqdt[idx] - s13;
+#else
+  const double lift00 =
+      Lift1D[k0 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line0] +
+      Lift1D[k0 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line0];
+  const double lift01 =
+      Lift1D[k1 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line0] +
+      Lift1D[k1 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line0];
+  const double lift02 =
+      Lift1D[k2 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line0] +
+      Lift1D[k2 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line0];
+  const double lift03 =
+      Lift1D[k3 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line0] +
+      Lift1D[k3 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line0];
+  const double lift10 =
+      Lift1D[k0 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line1] +
+      Lift1D[k0 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line1];
+  const double lift11 =
+      Lift1D[k1 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line1] +
+      Lift1D[k1 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line1];
+  const double lift12 =
+      Lift1D[k2 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line1] +
+      Lift1D[k2 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line1];
+  const double lift13 =
+      Lift1D[k3 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line1] +
+      Lift1D[k3 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line1];
+  int idx = elem_offset + line0 + k0 * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s00 + lift00);
+  idx = elem_offset + line0 + k1 * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s01 + lift01);
+  idx = elem_offset + line0 + k2 * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s02 + lift02);
+  idx = elem_offset + line0 + k3 * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s03 + lift03);
+  idx = elem_offset + line1 + k0 * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s10 + lift10);
+  idx = elem_offset + line1 + k1 * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s11 + lift11);
+  idx = elem_offset + line1 + k2 * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s12 + lift12);
+  idx = elem_offset + line1 + k3 * 65536;
+  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s13 + lift13);
+#endif
 }
 
 extern "C" void launch_tendency_fused_p15(
@@ -742,13 +1133,17 @@ extern "C" void launch_tendency_xyz_p255(
     const double *w, const double *D1D, const double *Lift1D,
     const double *flux_bnd, const double *Escale, int Ne)
 {
-  const dim3 threads(16, 16);
-  const int nblock = P255_CC_BPE * Ne;
-  tendency_x_p255_cc_kernel<<<nblock, threads, 0, dg_cuda_stream>>>(
+  const dim3 threads_x(16, 8);
+  const dim3 threads_y(16, 8);
+  const dim3 threads_z(16, 8);
+  const int nblock_x = (P255_CC_BPE / 4) * Ne;
+  const int nblock_y = (P255_CC_BPE / 4) * Ne;
+  const int nblock_z = (P255_CC_BPE / 4) * Ne;
+  tendency_x_p255_cc_kernel<<<nblock_x, threads_x, 0, dg_cuda_stream>>>(
       dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, Ne);
-  tendency_y_p255_cc_kernel<<<nblock, threads, 0, dg_cuda_stream>>>(
+  tendency_y_p255_cc_kernel<<<nblock_y, threads_y, 0, dg_cuda_stream>>>(
       dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, Ne);
-  tendency_z_p255_cc_kernel<<<nblock, threads, 0, dg_cuda_stream>>>(
+  tendency_z_p255_cc_kernel<<<nblock_z, threads_z, 0, dg_cuda_stream>>>(
       dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, Ne);
   check_cuda_cc_hp("tendency_xyz_p255_cc_kernels");
 }
