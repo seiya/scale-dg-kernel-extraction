@@ -52,7 +52,7 @@ p=15 の数値は 4 つの独立実装で一致することを先に確認した
 ## 3. `tendency_fused_p15_kernel`
 
 p=7 の `tendency_fused_p7_kernel` は**一切変更していない**。
-32 レジスタ / 8 ブロック/SM に追い込んだ調整（`execution_times.md` 追記 3）を
+32 レジスタ / 8 ブロック/SM に追い込んだ調整（`tc_paper_survey_2407.09621.md` §8）を
 壊す理由がないため、Nq=16 は別カーネルとして書いた。
 
 ### shared memory 戦略

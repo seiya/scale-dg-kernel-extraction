@@ -6,11 +6,11 @@
 対象GPU: NVIDIA GB200 (RIKYU) 1 GPU
 ビルド: `make CUDA=1 GPUFLAGS=-gpu=cc100`（nvcc は `-arch=sm_100`、NVIDIA HPC SDK `nvhpc-hpcx`）
 
-本レポートは、ソースコード、`README.md` / `AGENTS.md`、既存の
-`execution_times.md` / `gpu_optimization_session_report.md` /
-`p255_gemm_fusion_session_report.md`、および `output/` 配下の
-nsys / ncu 測定結果（Slurm job `43219`、`job_all.sh`）を横断して
-まとめたものである。
+本レポートは、ソースコード、`README.md` / `AGENTS.md`、および `output/`
+配下の nsys / ncu 測定結果（Slurm job `43219`、`job_all.sh`）を横断して
+まとめたものである。OpenACC → CUDA Fortran の実装変遷と代表スカラー特殊化
+の撤回は §2 / §3.1。p=255 の GEMM 融合と TC タイル化の生データは
+[`p255_gap_study.md`](p255_gap_study.md) §0。
 
 ---
 
@@ -47,7 +47,7 @@ nsys / ncu 測定結果（Slurm job `43219`、`job_all.sh`）を横断して
    1.4146 → 1.2072 s になった。
 7. `output/` の測定は `nstep=10` のため、**cuBLAS/CUTLASS 経路のアプリタイマは
    ライブラリ初期化の一回性コストを含む**。定常性能は nsys のカーネル総和、
-   および `nstep=1000` の `execution_times.md` を見ること。
+   および `nstep=1000` の §4 を見ること。
 
 ---
 
@@ -63,7 +63,20 @@ nsys / ncu 測定結果（Slurm job `43219`、`job_all.sh`）を横断して
 - halo は velocity を time-step 前に初期化し、`q` は各 RK stage で更新する。
 
 セッション中、旧 `93a758f` でこの契約を破る「代表スカラー特殊化」が混入し、
-`03551c7` で修正された。**その時期に採取した NCU 値・FLOP/byte 見積りは
+`03551c7` で修正された（`0355529` 時点では配列を参照しており、問題は
+`93a758f` で初めて入った）。p=7 FUSED に
+
+```fortran
+adv_x = Escale(1,1,1) * u(1,1)
+adv_y = Escale(1,1,2) * v(1,1)
+adv_z = Escale(1,1,3) * w(1,1)
+```
+
+を渡し `D(q*u)` を `adv*D(q)` に置き換え、Cartesian 面と速度符号から
+3 つの inflow 面だけを計算していた。benchmark 入力の現在値には一致しても
+配列 API を狭める不正な最適化である。修正後、点変化係数の p=7 で
+`CUDAFORTRAN_FUSED` 対 `CUDAFORTRAN_SPLIT` の owned `dqdt` は
+`max_abs_diff = 0.0`。**その時期に採取した NCU 値・FLOP/byte 見積りは
 現行 array-correct 実装の値として使ってはならない。**
 
 検証は点ごとに `u,v,w,Escale,normal_fn,Fscale` を変えた
@@ -91,9 +104,43 @@ time-stepping 中に host 経由の field copy は行わない。
 p=255 は dense `Lift_mat(256,256,256,6)` を持たず separable な `Lift1D(256,6)` を
 起動時に生成する。
 
+### 3.1 実装の変遷（2026-08-24〜25）
+
+旧 `gpu_optimization_session_report.md` の経緯。表の数値は書かれた時点のまま。
+
+- `03fc9e9`: OpenACC。field / 演算子 / mesh map / geometry を time-stepping 中
+  GPU resident にし、出力時は min/max だけ host へ戻す。`OPENACC_ASIS` は元の
+  `cal_dqdt` 構造。
+- `5142b04`: `OPENACC_SPLIT`。`divlike_dirxyz` や lift の最下層まで全要素の
+  `ke` ループを含む all-element kernel（volume flux / tensor-product derivative /
+  surface lift / dqdt assembly）。velocity halo は GPU data region 内で初期化し、
+  各 RK stage で変化する `q` halo を更新する。
+- `0355529`: `CUDAFORTRAN_SPLIT` と最初の p=7 FUSED。OpenACC resident 配列は
+  `host_data use_device` で渡し、host 経由の field copy はしない。最初の CUDA
+  SPLIT は tensor-product derivative だけ OpenACC より速く、合計では勝てない
+  ケースがあった。`do while (idx <= npoint)` の grid-stride を 1 thread/1 point
+  にしても全体の律速は解消せず、launch 構造と中間配列 traffic の削減が本体。
+- p=7 FUSED: 1 要素 512 点を 1 block、256 thread が各 2 点。`D1D`、3 方向の
+  pointwise volume flux、6 面の数値流束を shared に置き、微分・lift・assembly
+  を 1 kernel 内で行う。lift の shared 配置では FP64 bank conflict が問題になり、
+  read-only/global cache の方が速い場合があった。occupancy 単独では速くならない。
+- p=255 FUSED: 1 要素を 1 block にできないため 16×16 tile。block index に要素
+  番号を含め Ne>1 に対応。dense `Lift_mat` は持たず `Lift1D(256,6)`。LGL /
+  `D1D` / `Lift1D` は起動時生成。各 directional kernel が `D(q*velocity)`、
+  対応する 2 面の lift、pointwise `Escale` を評価する。
+- `03551c7`: 代表スカラー特殊化を撤回（§2）。
+- `69ef5e6`: FP64 Tensor Core `m8n8k4` と cuBLAS GEMM。
+- `299a868`: CUTLASS d884 と z-epilogue assembly fusion。
+- `e22dda1`: p=7 TC の shared レイアウト刷新（バンクコンフリクト除去）。
+
+物理領域は常に `1×1×1`（`dx = 1/NeX`）。`NeX/NeY/NeZ` を増やしても領域は
+広がらず要素が細かくなる。p=7/`Ne=32³` と p=255/`Ne=1` は体積 DOF が同じ
+`256³` でも、行列次数・面点数・要素間並列・launch 数・shared 再利用・GEMM
+への写像が違い、同じ GPU 問題ではない。
+
 ---
 
-## 4. 実行時間の比較（`nstep=1000`, `execution_times.md`, Slurm job 41348）
+## 4. 実行時間の比較（`nstep=1000`, Slurm job 41348）
 
 `DGOptrKernel_OptType=OPT1`、p=7 は Ne=32³/dt=1e-5、p=255 は Ne=1/dt=1e-7。
 `CUDA device` は CUDA Event による device 時間（host launch/sync を含まない）。
@@ -110,7 +157,14 @@ p=255 は dense `Lift_mat(256,256,256,6)` を持たず separable な `Lift1D(256
 | `CUDAFORTRAN_FUSED_TC` | 2.019 | 1.506 | 1.505 | fused 1.473 |
 | `CUDAFORTRAN_GEMM` | 9.271 | 8.743 | 8.742 | GEMM 8.705 |
 
-Main 時間比: FUSED は ASIS の **2.14×**、GEMM は **0.39×**。
+Main 時間比（対 `OPENACC_ASIS`）: SPLIT 1.25–1.27×、FUSED **2.14×**、
+FUSED_TC 1.80×（この表は `299a868`。`e22dda1` 以降は TC が最速）、GEMM 0.39×。
+
+この表は commit `299a868`、job `41348`、host `c162`。`e22dda1` で TC の
+shared レイアウトを直したあとの同一条件は Main **1.614** / device **1.068**
+（job `43618`）。occupancy 100% 化後は device **0.851**（`tc_paper_survey_2407.09621.md`
+§5–§8）。現行の `nstep=20` 横断は [`README.md`](README.md) と
+[`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) §15。
 
 ### 4.2 p=255, Ne=1
 
@@ -122,7 +176,9 @@ Main 時間比: FUSED は ASIS の **2.14×**、GEMM は **0.39×**。
 
 同条件の別セッション実測（device-event, nstep=1000）:
 cuBLAS **3.881 s** / CUTE **3.914 s** / **z-epilogue FUSED 3.603 s**
-（CUTE 比 −8%、cuBLAS 比 −7%）。
+（CUTE 比 −8%、cuBLAS 比 −7%）。Main 時間比（対当時の tiled FUSED）:
+FUSED_TC 1.13×、GEMM **3.50×**。融合 epilogue の詳細は
+[`p255_gap_study.md`](p255_gap_study.md) §0。
 
 ---
 
@@ -476,7 +532,13 @@ tendency 以外になった。** RK 更新は既に 5.06 TB/s（HBM3e 実効と�
 実測の Main 時間は p=7 TC で 1.4146 → 1.3115 s、p=7 CUDA core で
 1.5473 → 1.4520 s、p=255 `GEMM_FUSED` で 4.1889 → 4.0968 s
 （`nstep=1000`, 各 3 回平均、login node）。`Cal_tend` と `CUDA device` は不変。
-全点ビット一致の検証を含む詳細は `execution_times.md` の追記 4 にある。
+
+数値検証: `SCALE_DG_VARYING_COEFF=1`、`Ne=8^3`, `nstep=7`,
+`CUDAFORTRAN_FUSED_TC` で最終 `q(:,1:Ne)` 262,144 点が融合前と**ビット一致**。
+`nstep=1000` の min/max も p=7 の 2 パス、p=255 `GEMM_FUSED`、非 CUDA の
+`OPENACC_ASIS` で一致。式の並びを変えると FMA の contraction が変わり 15 桁目で
+ずれる。最初に `( q0 + dt*dqdt )` と書いた版は 1000 step 後に相対 1e-14。
+**`( q + dt*dqdt )` のまま残すこと**がビット一致の条件である。
 
 p=7 `CUDAFORTRAN_FUSED_TC` での非 tendency 比率は 33% → **27%** に下がった
 （tendency 851 µs / step に対し約 320 µs）。残るのは RK 更新 3 回分で、
@@ -521,7 +583,17 @@ tendency ラッパが device 時間を読むために毎 stage `cudaEventSynchro
 
 device 時間は不変（p=7 TC 0.8523 → 0.8518 s）。残る 50 µs/step は 1 step
 9 回の launch turnaround で、減らすには CUDA Graph 化のように launch 自体を
-減らすしかない。詳細・検証・失敗した最初の方針は `execution_times.md` 追記 5。
+減らすしかない。
+
+数値検証: `SCALE_DG_VARYING_COEFF=1` で p=7 `Ne=8^3`, `nstep=100` の 5 経路と
+p=255 `Ne=1`, `nstep=20` の 4 経路、計 18 比較が参照 `43fe5f2` とビット一致。
+最初は逆向きに `acc_set_cuda_stream(queue, 0)` で OpenACC キューを CUDA 既定
+ストリームへ束ねようとしたが、nvfortran は独自ストリームを使い続け
+（nsys で stream 7 と 14 に分かれ、halo が tendency 終了 9 µs 前に走った）、
+結果が run ごとに揺れた。CUTLASS の device 級 GEMM は `gemm_op(args)` の既定が
+`stream = nullptr` なので、明示するまで p=255 GEMM だけ既定ストリームに残り、
+5 step 後に 1e-11 のずれになった。**同一ストリームに載ったことは nsys の
+stream 列で確認すること。**
 
 **この変更以降、`Cal_tend` と `Volume derivate + surface lift` は tendency の
 wall 時間ではない**（host が同期しなくなったため、キュー済みの device 仕事の
@@ -553,7 +625,20 @@ OpenACC 領域を使う `OPENACC_ASIS` / `OPENACC_SPLIT` / `CUDAFORTRAN_SPLIT` �
 | p=255 `Ne=1` `CUDAFORTRAN_FUSED` | 15.346 | **15.288** | −0.4% | −59 |
 
 削れた絶対量はどのパスでもほぼ同じで、相対利得の差はカーネル時間の差である。
-詳細・数値検証・イベント計測コストの分離は `execution_times.md` 追記 7。
+
+p=7 TC で graph なし・イベント off（`MeasureKernelTime = .false.`）は 1.199 秒、
+graph なし・イベント on の 1.204 秒との差 5 µs/step がイベントの host コスト。
+graph の利得 32 µs/step のうち 27 µs はイベントとは無関係な launch turnaround。
+
+nsys（Slurm job `45686`, `nstep=60`, p=7 `FUSED_TC`、graph 無し）では定常部の
+隙間が **30.6 µs/step** で、end-to-end の 32 µs と一致する。**この環境では
+nsys を graph 再生パスに当てるとハングする**（job `45707`、nsys 2026.1.1、
+180 s で timeout、`.nsys-rep` は `PROCESSED (EMPTY RESULTS)`）。
+`UseCudaGraph = .false.` なら同じバイナリで nsys は採れる。RIKYU では
+`export DEBUGINFOD_URLS=` と `--resolve-symbols=false` の両方が必須。
+
+数値検証: 点変化係数、p=7 `Ne=60` で graph on/off は `q` 全点ビット一致。
+p=255 は `Ne=1` と `Ne=2` で 5 経路とも min/max が一致。
 
 ---
 
@@ -577,7 +662,9 @@ lift(i,j,k) = Lift1D(i,2)*fb2(j,k) + Lift1D(i,4)*fb4(j,k)
 を 1 スレッドでまとめて評価し `lift_out` を 1 回だけ書く
 `separable_lift_kernel` に置き換えた。GEMM 3 本と pack/copy 3 本が消え、
 lift 側の DRAM は 670 → 134 MB になる。加算順は GEMM と同じ `(x+y)+z` に
-そろえたので、**旧実装とビット一致**する（`execution_times.md` 追記 8）。
+そろえたので、**旧実装とビット一致**する。p=7 `CUDAFORTRAN_GEMM` 変更後 vs
+変更前 / vs `SPLIT` もビット一致。p=255 `GEMM_FUSED` vs `FUSED_TC` は
+3.553e-15。
 
 | `DqdtKernel_Type` | 変更前（`514853f`） | 変更後 | |
 |---|---:|---:|---:|
@@ -619,7 +706,8 @@ epilogue に足した整数演算がそのまま効く。
 
 `nstep=1000`、graph off、login node。3000 tendency call なので device は
 1089 → 1027 µs/call。`514853f` からの通算 Main **−12.8%**。
-旧実装と**ビット一致**（`execution_times.md` 追記 9）。
+旧実装と**ビット一致**。p=255 `Ne=2` の `GEMM_FUSED` vs `FUSED_TC` も
+3.553e-15。非 CUDA ビルドも通る。
 
 **§5.1 と §6 の lift 行・z GEMM 行はいずれも変更前の値である。**
 z GEMM のレジスタ 242 本と SM throughput 79.8% は epilogue を厚くした分
@@ -673,7 +761,7 @@ Main は p=255 `GEMM_FUSED` 3.4469 → **3.3702** 秒（−2.2%）、
 `GEMM` 3.9403 → 3.8713、`GEMM_CUTE` 3.9539 → 3.8820、
 p=7 `CUDAFORTRAN_SPLIT` 2.7172 → **2.6440** 秒（−2.7%）。
 `CUDAFORTRAN_FUSED` / `FUSED_TC` はこのカーネルを使わないので変化しない。
-旧実装と**ビット一致**（`execution_times.md` 追記 10）。
+旧実装と**ビット一致**。
 
 **`q` だけをレジスタに退避した版はまったく効かない**（3.080 秒のまま）。
 効いているのは共通部分式の除去ではなく、ストアを挟まないロード窓のほうで
@@ -790,8 +878,7 @@ L1 に当たり、費やしているのは発行スロットだけだからで�
 **tendency に触っていないので全パスが同じだけ得をする。** Main は p=7
 `FUSED_TC` 1.208 → **1.131** 秒（graph on では 1.171 → **1.083**）、
 p=7 `FUSED` 1.345 → 1.250、p=255 `GEMM_FUSED` 3.329 → **3.232**（graph on
-3.289 → **3.192**）、`OPENACC_ASIS` でも 3.50 → 3.41。旧実装と**ビット一致**
-（`execution_times.md` 追記 12）。
+3.289 → **3.192**）、`OPENACC_ASIS` でも 3.50 → 3.41。旧実装と**ビット一致**。
 
 これで §8 の「非 tendency は削り代が小さい」という見立ては更新された。
 `main_87` を 5.06 TB/s と評価して「HBM3e 実効としてはかなり良い」と書いたが、
@@ -1205,11 +1292,9 @@ TMA はコピーエンジンであって MMA とは直交しているので、
 | ファイル | 内容 |
 |---|---|
 | `AGENTS.md` / `CLAUDE.md` | 数値契約、ビルド、検証、プロファイル、コミット方針 |
-| `README.md` | 実装パスの説明と実行方法 |
-| `execution_times.md` | `nstep=1000` の同一条件パス別実行時間（job 41348、`e22dda1` の追記あり） |
-| `gpu_optimization_session_report.md` | GPU 対応・最適化の経緯と失敗の記録 |
-| `p255_gemm_fusion_session_report.md` | p=255 GEMM / epilogue 融合の詳細実験 |
-| `tc_paper_survey_2407.09621.md` | arXiv:2407.09621 の調査と p=7 Tensor Core カーネルの shared レイアウト刷新 |
+| `README.md` | 実装パスの説明と実行方法。経路×次数の最新まとめ表 |
+| [`p255_gap_study.md`](p255_gap_study.md) | p=255 の GEMM 融合（§0）と `FUSED_TC` が CUTLASS を抜く記録 |
+| `tc_paper_survey_2407.09621.md` | arXiv:2407.09621 の調査と p=7 Tensor Core / CC の記録 |
 | `bench_runs/` | 比較用 input・job・ログ（job 41348） |
 | `output/` | nsys / ncu レポートと run log（job 43219） |
 | `job_all.sh` / `gen_ncu_cmds.sh` | 全パス一括 run + nsys + ncu 採取 |
@@ -1336,17 +1421,60 @@ CUDA graph に焼いたポインタが再生時に合わなくなる。
 本レポート本文の時間は 2026-08-25 前後のスナップショットである。表は書き換えない。
 p=7…255 を現行ツリー（commit `2dadc41`）で採り直した結果は
 [`README.md`](README.md) の「最新結果のまとめ」と、各次数レポート
-（p=7 は `execution_times.md` 追記 16、p=15 §18、p=31 §16、p=63 §22、
-p=127 §15、p=255 §12）にある。最速パスの順位は変わっていない。
+（p=7 は [`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) §15、
+p=15 §18、p=31 §16、p=63 §22、p=127 §15、p=255 §12）にある。最速パスの順位は変わっていない。
 この日の namelist `CUDAFORTRAN_FUSED` は iso-schedule DFMA であり、表の経路名は
 `CUDAFORTRAN_FUSED_DFMA` と読む。
+
+p=7 専用の gap study は無いので、現行ツリー（`2dadc41`、login GPU 1、3-run
+中央値、`conf_perf_p7.conf`、`nstep=20`）の横断をここに残す。µs/stage は
+`CUDA device *`。冒頭 §4 の `nstep=1000` 表は当時の値のまま。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `OPENACC_ASIS` | 3.492 | 1065.8 |
+| `OPENACC_SPLIT` | 2.708 | 807.8 |
+| `CUDAFORTRAN_SPLIT` | 2.565 | 764.1 |
+| `CUDAFORTRAN_FUSED_DFMA` | 1.528 | 427.8 |
+| **`CUDAFORTRAN_FUSED_TC`** | **1.073** | **274.9** |
+| `CUDAFORTRAN_GEMM` | 5.088 | 1635.4 |
+
+§4 の GEMM Main 9.271 s（nstep=1000）は RK 最適化前。同一 conf では 5.088 ms/step。
 
 ## 15. CUDA-core 融合の復活（2026-08-29）
 
 `CUDAFORTRAN_FUSED` を次数ごとの自然順 CC カーネルとして C++ に戻した測定は
-[`README.md`](README.md) のまとめ表と、p=7 は `execution_times.md` 追記 18、
+[`README.md`](README.md) のまとめ表と、p=7 は
+[`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) §17、
 p=15 §19、p=31 §17、p=63 §23、p=127 §16、p=255 §13。
 p=15 の CC は DFMA と誤差内（別カーネル: `dqdt` は 1 ulp 差、DFMA と TC は
-ビット一致。独立確認は `execution_times.md` 追記 20）、p=127 は CC の方が
+ビット一致。独立確認は下表と p=15 §19）、p=127 は CC の方が
 DFMA より速く性能 `Ne=2³` で 3 経路がビット一致、p=255 は 16×16 タイル CC が
 fragment 日程の DFMA より遅い（再測でも約 2.6 倍）。最速パスの順位は変わらない。
+
+作業ツリー親 `959ad50`、login GPU 1、各次数の既存 `conf_perf_p*` の type だけ
+`CUDAFORTRAN_FUSED`、3-run 中央値:
+
+| p | conf | Main [ms/step] | µs/stage | TC / FUSED |
+|---:|---|---:|---:|---:|
+| 7 | `conf_perf_p7.conf` | 1.227 | 326.8 | 1.19× |
+| 15 | `conf_perf_p15.conf` | 1.583 | 446.7 | 1.64× |
+| 31 | `conf_perf_p31_fused.conf` | 3.255 | 998.4 | 2.78× |
+| 63 | `conf_perf_p63_fused.conf` | 3.117 | 966.5 | 2.29× |
+| 127 | `conf_perf_p127_fused.conf` | 5.033 | 1593.5 | 2.26× |
+| 255 | `conf_perf_p255_tc.conf` 相当 | 15.755 | 5252.8 | 5.72× |
+
+p=31 はその後 [`p31_gap_study.md`](p31_gap_study.md) §20 で 718.2 µs、
+p=63 は [`p63_gap_study.md`](p63_gap_study.md) §25 で 618.6 µs、
+p=255 は [`p255_gap_study.md`](p255_gap_study.md) §15.92 で 1868.6 µs。
+上表は復活直後の値として残す。
+
+独立確認（login GPU `GPU-d5214545-6d82-2be9-a314-442682ff446b`、点変化係数、
+`SCALE_DG_DUMP_DQDT`、`nstep=1`）:
+
+- **p=15**: `FUSED` と `FUSED_DFMA` は別カーネル。owned 32,768 点のうち 3,078
+  点が差あり（最大絶対差 1.78e-15）。`FUSED_DFMA` と `FUSED_TC` はビット一致。
+- **p=127**: 性能と同じ `Ne=2³` で `FUSED` / `FUSED_DFMA` / `FUSED_TC` が全点
+  ビット一致。`nstep=1` の device は 5.08 / 6.86 / 2.61 ms。
+- **p=255**: `Ne=1` で 3 経路が全点ビット一致。type 差し替え 3-run は FUSED 5251 /
+  DFMA 2015 / TC 913 µs/stage。FUSED は DFMA の約 2.6 倍遅く、CC 経路である。

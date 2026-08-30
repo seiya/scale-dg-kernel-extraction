@@ -117,7 +117,7 @@ multistage mainloop である。**手書き TC の p=255 パスに投資する�
 論文式 (10)。現行レポートは DRAM ルーフラインのみだが、p=7 FUSED は
 DRAM 36% / L1 90% で明らかに shared 律速であり、この指標でないと
 「あとどれだけ余地があるか」が判定できない。
-GB200 の SM 数・クロックを入れて `execution_times.md` 系に一欄追加するのが
+GB200 の SM 数・クロックを入れて `overall_summary_report.md` の効率表に一欄追加するのが
 最も安価な改善。
 
 ### B-1. mma 形状の拡大【論文の先を行く部分】
@@ -130,8 +130,7 @@ GB200 = sm_100 での利用可否の確認が必要。
 **重要な前提差**: 論文の 2.3× のうち 2× 分は「A100 では FP64 Tensor Core peak が
 FP64 CUDA-core peak の 2 倍」という事実に由来する。**GB200（Blackwell）では
 この 2× アドバンテージが撤廃されており、FP64 Tensor Core peak = FP64 CUDA-core
-peak = 40.1 TFLOP/s である**（`overall_summary_report.md` §7、
-`gpu_optimization_session_report.md` §7 に記録）。したがって本リポジトリで
+peak = 40.1 TFLOP/s である**（`overall_summary_report.md` §7 に記録）。したがって本リポジトリで
 Tensor Core 化から期待できるのは、演算ピークの向上ではなく
 **shared memory / L1 パイプの命令数と wavefront の削減**だけである。
 §6 で得た 1.11× はこの範囲の利得であり、論文の 2.3× が再現しないのは想定内。
@@ -337,8 +336,9 @@ ncu の見積りを単純合成すると 1.3〜1.5× 程度で、
 
 - カーネル単体で **1.33×** 高速化。
 - **p=7 で Tensor Core 版が初めて CUDA core 版を上回った**（device 時間で 1.08×）。
-  `execution_times.md` の「p=7 では FUSED が最速」「FUSED_TC は 1.28× 遅い」という
-  記載は、この変更で覆った。同ファイルは commit `299a868` 時点の測定なので未更新。
+  [`overall_summary_report.md`](overall_summary_report.md) §4 の「p=7 では FUSED が最速」
+  「FUSED_TC は 1.28× 遅い」という記載は、この変更で覆った。同節の表は commit
+  `299a868` 時点の測定なので未更新。
 - 数値検証: `SCALE_DG_VARYING_COEFF=1` で `u,v,w,Escale,normal_fn,Fscale` を
   point-varying にし、`CUDAFORTRAN_SPLIT` と `dqdt(:,1:Ne)` 全 4096 点を比較。
   max abs diff `1.776e-15`（`max|dqdt| = 8.18` に対し約 1 ulp）、相対 L2 `8.9e-17`。
@@ -1330,12 +1330,24 @@ p=7 のカーネルは要素まるごとを shared に載せる別構造で、
 
 ## 15. 経路横断の再測定（2026-08-29）
 
-p=7 の現行時間は本調査メモではなく
-[`execution_times.md`](execution_times.md) 追記 16 と
-[`README.md`](README.md) のまとめ表。commit `2dadc41`、login GPU 1、
-3-run 中央値。**最速は `CUDAFORTRAN_FUSED_TC`（Main 1.073 ms/step、device 274.9 µs/stage）のまま。**
-本文 §0 の ncu 時間は当時のカーネルのまま残す。
+p=7 専用の gap study は無いので、現行時間を本調査メモに置く。
+[`README.md`](README.md) のまとめ表と同じ測定。commit `2dadc41`、login GPU 1、
+3-run 中央値。入力は `conf_perf_p7.conf`（`Ne=32³`、`nstep=20`、graph off）の
+`DqdtKernel_Type` だけを差し替え。µs/stage は `CUDA device *`（SPLIT は 4 本 +
+elembnd、OpenACC は volume wall + elembnd）。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `OPENACC_ASIS` | 3.492 | 1065.8 |
+| `OPENACC_SPLIT` | 2.708 | 807.8 |
+| `CUDAFORTRAN_SPLIT` | 2.565 | 764.1 |
+| `CUDAFORTRAN_FUSED_DFMA` | 1.528 | 427.8 |
+| **`CUDAFORTRAN_FUSED_TC`** | **1.073** | **274.9** |
+| `CUDAFORTRAN_GEMM` | 5.088 | 1635.4 |
+
+**最速は `CUDAFORTRAN_FUSED_TC` のまま。** 本文 §0 の ncu 時間は当時のカーネルのまま残す。
 この日の namelist `CUDAFORTRAN_FUSED` は iso-schedule DFMA である。
+旧 Fortran 融合（device 〜324 µs）は CC 最適の旧測であり、DFMA の 427.8 µs とは並べない。
 
 ## 16. p=7 TC: z の shared 往復の天井（2026-08-29、不採用）
 
@@ -1365,3 +1377,20 @@ shared 往復の代金がわずかに見える。
 エピローグのレーンへ合わせるか、z だけ長さ 8 の FMA にする必要があり、
 どちらも 32 レジスタ・8 ブロック/SM を崩す（§14）。そのリスクに対して
 上限 1.3% では見合わない。
+
+## 17. p=7 CUDA-core 融合の C++ 復活（2026-08-29）
+
+`CUDAFORTRAN_FUSED` を Fortran `2dadc41^` の自然順・長さ 8 内積カーネルとして
+C++ に戻した。login GPU 1、`conf_perf_p7.conf` の `DqdtKernel_Type` だけ
+`CUDAFORTRAN_FUSED`、3-run 中央値。
+
+| 経路 | Main [ms/step] | µs/stage |
+|---|---:|---:|
+| `CUDAFORTRAN_FUSED`（CC） | 1.227 | 326.8 |
+| `CUDAFORTRAN_FUSED_DFMA` | 1.517 | 424.1 |
+| `CUDAFORTRAN_FUSED_TC` | 1.074 | 274.9 |
+
+CC 326.8 µs は旧 Fortran 〜324 µs と同水準。論文の主比は **TC / FUSED = 1.19×**、
+メカニズム比 TC / DFMA は 1.54×。点変化係数、`Ne=2³`、`nstep=1` の owned `dqdt`
+は `FUSED` と `FUSED_TC` がビット一致、`CUDAFORTRAN_SPLIT` との最大絶対差
+1.78e-15。

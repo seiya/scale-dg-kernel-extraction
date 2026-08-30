@@ -7,12 +7,9 @@ GPU 実装と最適化の記録。すべて RIKYU の NVIDIA GB200 1 GPU 上で�
 
 | ファイル | 内容 |
 |---|---|
-| [`overall_summary_report.md`](overall_summary_report.md) | 全実装パスの横断まとめ。時間内訳、ncu 効率分析、理論仕事量に対する達成率、不採用にした最適化とその理由。**最初に読むならこれ。** |
-| [`execution_times.md`](execution_times.md) | `nstep=1000` の同一条件でのパス別実行時間。**追記 16（2026-08-29）は p=7 の経路横断再測定**。追記 18 は p=7 CC 復活、追記 19 は p=15…255 の CC 測定、追記 20 は CC/DFMA 取り違えの独立確認、追記 21 以降は p=255 CC、**追記 30 は p=31 CC 融合の −27.6%**、**追記 31–32 は p=63 CC の 966.4 → 618.6 µs/stage** |
-| [`gpu_optimization_session_report.md`](gpu_optimization_session_report.md) | OpenACC → CUDA Fortran → Tensor Core / GEMM に至る実装の変遷と、途中で踏んだ誤り（代表スカラー特殊化）の記録 |
-| [`p255_gap_study.md`](p255_gap_study.md) | p=255 の `CUDAFORTRAN_FUSED_TC` を **1563.9 → 968.8 µs/stage（−38.1%、全段ビット一致）**にした記録。チャンクループの二重バッファ化と 1 ワープ 4×4 mma タイルは**組でしか効かない**、エピローグを b 外 / a 内に組み替えると LDG が 112 → 32 本になる、ストアのペア格納順で 2-way バンクコンフリクトが消える。**これで p=255 の最速は `GEMM_FUSED` から `FUSED_TC` に替わった。**命令数を 17〜34% 減らす変更が 2 度とも遅くなったことの記録も含む。**§10（同日）は逆に `GEMM_FUSED` 側を 1048.8 → 1021.2 µs/stage（−2.6%）にした**: z の assembly epilogue は**命令発行律速**（lift を消すと命令 −13.0% で時間 −12.8%、stall 内訳も占有率も不変）で、`Escale_x/y` を x/y GEMM の標準 epilogue に前送りし、添字クランプをタイル原点へ集約し、lift の 6 本のロードを 3 本の `double2` にした。手書き epilogue で標準 epilogue を置き換えると**それだけで +72 µs** かかる |
-| [`p255_gemm_fusion_session_report.md`](p255_gemm_fusion_session_report.md) | p=255 の volume GEMM と z-epilogue 融合の詳細実験。末尾に **p=255 Tensor Core カーネルのタイル化**（2026-08-27）: 1 warp/block・オペランド全再読み込みで L1/TEX 99% に張り付いていた 3 本を、64×64 タイル・warp 2×4 register blocking の 1 本に統合して **2.86 倍**（4474.3 → 1566 µs/stage、ピーク比 14.6% → 41.6%）。それでも `GEMM_FUSED` には 1.57 倍負けるので **p=255 の最速は `GEMM_FUSED` のまま** |
-| [`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) | arXiv:2407.09621 の取り込み調査と、p=7 Tensor Core カーネルの shared memory レイアウト刷新。§14 は p=31 で効いた「D1D フラグメントのレジスタ常駐化」が p=7 では**効かない**ことの実測（32 レジスタの天井に余白が無く、shared ロード 2 本がスピル 2 本に置き換わるだけ、+0.63%） |
+| [`overall_summary_report.md`](overall_summary_report.md) | 全実装パスの横断まとめ。時間内訳、ncu 効率分析、理論仕事量に対する達成率、不採用にした最適化とその理由。OpenACC → CUDA Fortran の実装変遷と代表スカラー特殊化の撤回も含む。**最初に読むならこれ。** |
+| [`p255_gap_study.md`](p255_gap_study.md) | p=255 の全記録。§0 は volume GEMM と z-epilogue 融合、および TC の 64×64 タイル化（4474 → 1566 µs/stage、当時は `GEMM_FUSED` が最速）。§1 以降は `CUDAFORTRAN_FUSED_TC` を **1563.9 → 968.8 µs/stage（−38.1%、全段ビット一致）**にした記録。チャンクループの二重バッファ化と 1 ワープ 4×4 mma タイルは**組でしか効かない**、エピローグを b 外 / a 内に組み替えると LDG が 112 → 32 本になる、ストアのペア格納順で 2-way バンクコンフリクトが消える。**これで p=255 の最速は `GEMM_FUSED` から `FUSED_TC` に替わった。**命令数を 17〜34% 減らす変更が 2 度とも遅くなったことの記録も含む。**§10（同日）は逆に `GEMM_FUSED` 側を 1048.8 → 1021.2 µs/stage（−2.6%）にした**: z の assembly epilogue は**命令発行律速**（lift を消すと命令 −13.0% で時間 −12.8%、stall 内訳も占有率も不変）で、`Escale_x/y` を x/y GEMM の標準 epilogue に前送りし、添字クランプをタイル原点へ集約し、lift の 6 本のロードを 3 本の `double2` にした。手書き epilogue で標準 epilogue を置き換えると**それだけで +72 µs** かかる |
+| [`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) | arXiv:2407.09621 の取り込み調査と、p=7 Tensor Core カーネルの shared memory レイアウト刷新。p=7 専用の gap study は無いので、経路横断（§15）と CC 復活（§17）もここ。§14 は p=31 で効いた「D1D フラグメントのレジスタ常駐化」が p=7 では**効かない**ことの実測（32 レジスタの天井に余白が無く、shared ロード 2 本がスピル 2 本に置き換わるだけ、+0.63%） |
 | [`h100_report.md`](h100_report.md) | H100（TSUBAME 4）で同じコードを走らせた記録。経路横断の GB200 比、FP64 Tensor Core ピークが 2 倍あることの帰結、H100 では `CutlassMmaShape = "16x8x4"` を選ぶこと |
 | [`sm90_mma_shape_survey.md`](sm90_mma_shape_survey.md) | CUTLASS volume GEMM の MMA 命令形状（8x8x4 / 16x8x4 / 16x8x8 / 16x8x16）を namelist で選べるようにして実測した記録。GB200 では ptxas が SM90 の f64 MMA を `DMMA.8x8x4` に展開するため得るものが無く、H100 では 16x8x4 が最速（cuBLAS が選ぶ 16x8x8 ではない）。kK>4 を CUTLASS 2.x で正しく動かすための warp tile iterator も含む |
 | [`tma_survey.md`](tma_survey.md) | TMA の適用可能性を候補ごとに実測した記録。採用ゼロだが、FP64 での受理条件・帯域・L1 挙動と、2 候補それぞれの構造的な不採用理由 |
@@ -84,7 +81,7 @@ GB200 1 GPU（login node GPU 1）、`make CUDA=1 GPUFLAGS=-gpu=cc100`、
 **p=31 の `FUSED` 行だけは [`p31_gap_study.md`](p31_gap_study.md) §20**（job
 `69623`、12 回交互 A/B、718.2 µs）。p=7 の CC 行は同日の復活測定（326.8 µs）。
 p≥511 は各 gap study の測定のまま（再実行していない）。
-次数別の再測定節: p=7 は [`execution_times.md`](execution_times.md) 追記 16・18、
+次数別の再測定節: p=7 は [`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) §15・§17、
 p=15 §18–19、p=31 §16–20、p=63 §22–23、p=127 §15–16、p=255 §12–15.11。
 
 太字は次数ごとの最速（Main ms/step）。空欄はその次数では経路が無い
@@ -215,7 +212,7 @@ device 326.8 µs）。`FUSED_DFMA` の 427.8 µs は 2026-08-29 の iso-schedule
 `CUDAFORTRAN_FUSED` は CC 復活（login GPU 1、3-run 中央値）。device 446.7 µs は
 iso-schedule DFMA の 446.6 と測定誤差内。これは同一カーネルの二重測定ではない
 （点変化係数の `dqdt` は FUSED と DFMA で 1 ulp、DFMA と TC はビット一致。
-独立再測は [`execution_times.md`](execution_times.md) 追記 20）。この次数では
+独立再測は [`overall_summary_report.md`](overall_summary_report.md) §15）。この次数では
 論文の主比 B とメカニズム比 A が同じ数字になる。
 **TC / FUSED = 271.8 / 446.7 = 1.64×**。
 
@@ -1046,8 +1043,7 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
   1.2038 → 1.1716 秒、p=7 `FUSED` で 1.3441 → 1.3104 秒、p=255 `GEMM_FUSED` で
   3.9730 → 3.8545 秒、p=255 `GEMM_CUTE` で 4.2646 → 4.1328 秒。
   **再生中は Fortran のラッパを通らないので、このモードでは tendency の
-  CUDA event 時間が採れない**（`execution_times.md` 追記 7、
-  `overall_summary_report.md` §8.3）。
+  CUDA event 時間が採れない**（`overall_summary_report.md` §8.3）。
 - **p=7 TC の face gather 前倒し（2026-08-25）**: `tc_paper_survey` §11.6 が
   次の標的に挙げた「`VMapM`/`VMapP` の先行ロードで 2 段依存を volume の
   ロードと重ねる」案は**不採用**（同 §12）。index だけ前倒しした版は
@@ -1066,8 +1062,7 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
   **素直に epilogue へ移すと −0.6% にしかならない**（出力 1 点ごとの
   `p % Nq` / `p / Nq` が SM 律速の z GEMM に効く）ことが重要な知見で、
   column 不変量を `kIterations` ループ外に括り出して初めて −4.7% になる。
-  詳細は `overall_summary_report.md` §8.4 / §8.5 と
-  `execution_times.md` 追記 8 / 9。
+  詳細は   `overall_summary_report.md` §8.4 / §8.5。
 - **`volume_flux_kernel` のロードをまとめた（2026-08-25）**: GEMM 系に残る唯一の
   独立カーネル（150 µs、ncu DRAM 66%）を ncu で測ると、DRAM read は理論値の
   **1.000 倍**でセクタ効率も 100%、つまりトラフィックには一切無駄が無い一方、
@@ -1078,7 +1073,7 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
   7.09 TB/s = ピークの 90%）**。Main は p=255 `GEMM_FUSED` 3.4469 → **3.3702** 秒、
   p=7 `CUDAFORTRAN_SPLIT` 2.7172 → **2.6440** 秒で、旧実装と**ビット一致**。
   `q` だけをレジスタに退避した版は効かない。詳細は
-  `overall_summary_report.md` §8.6 と `execution_times.md` 追記 10。
+  `overall_summary_report.md` §8.6。
 - **現行の最速パスの達成効率（2026-08-25、`78fbbf8`）**: p=7 `FUSED_TC` は
   tendency 277.5 µs で **5.02 TFLOP/s（ピークの 12.5%）/ 5.75 TB/s（72.7%）**、
   p=255 `GEMM_FUSED` は 966.9 µs で **27.01 TFLOP/s（67.3%）/ 2.62 TB/s（33.1%）**。
@@ -1094,8 +1089,7 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
   変わり、321 → 185 µs/step。tendency に触らないので**全パスが得をする**:
   p=7 `FUSED_TC` 1.208 → **1.131** 秒（graph on 1.171 → **1.083**）、
   p=255 `GEMM_FUSED` 3.329 → **3.232**（graph on 3.289 → **3.192**）。
-  ビット一致。詳細は `overall_summary_report.md` §8.8 と
-  `execution_times.md` 追記 12。
+  ビット一致。詳細は   `overall_summary_report.md` §8.8。
 - **境界流束を GEMM の裏に隠した（2026-08-25）**: x/y GEMM は SM 88–89% で
   回りながら DRAM を 6–10% しか使わないので、その裏に帯域律速の
   `elembnd_flux_kernel`（19.6 µs）を 2 本目のストリームで流し込んだ。nsys で
@@ -1104,7 +1098,7 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
   **volume flux を方向で割って隠す案は不採用**で、理由は DRAM ではなく
   レジスタ（x GEMM は SM あたり 11,264 本しか残さない）。**CUDA Graph の
   replay では損になる**ので graph モードでは 1 本に戻している。詳細は
-  `overall_summary_report.md` §8.7 と `execution_times.md` 追記 11。
+  `overall_summary_report.md` §8.7。
 - **p=7 の ±x 面 M 側 gather を shared 経由にした（2026-08-26）**: 全カーネルを
   「何に律速され、上限に対してどこまで出ているか」で棚卸ししたところ
   （`overall_summary_report.md` §13.1）、余地があるのは p=7 の tendency
@@ -1203,13 +1197,12 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
   GPU アイドルを 139 → 50 µs/step にした（2026-08-25）。Main は p=7 `FUSED_TC` で
   1.3099 → 1.207 秒、p=7 `FUSED` で 1.4412 → 1.344 秒、p=255 `GEMM_FUSED` で
   4.0890 → 3.960 秒。device 時間は不変。**この変更以降 `Cal_tend` は
-  tendency の wall 時間ではない**（`execution_times.md` 追記 5、
-  `overall_summary_report.md` §8.2）。
+  tendency の wall 時間ではない**（`overall_summary_report.md` §8.2）。
 - **tendency 以外**: `q0 ← q` を SSP-RK stage 1 の更新カーネルに融合し、
   独立カーネルを削除した（2026-08-25）。非 tendency は約 422 → 320 µs/step、
   Main 時間は p=7 TC で 1.415 → 1.312 秒、p=255 `GEMM_FUSED` で
   4.189 → 4.097 秒。tendency 側の時間は不変。詳細は
-  `execution_times.md` 追記 4 と `overall_summary_report.md` §8.1。
+  `overall_summary_report.md` §8.1。
 
 - **p=31 `FUSED_TC` の残り天井を測って探索を終了した（2026-08-30、
   `p31_gap_study.md` §18–19）**: 採用ゼロ。xz は **`lg_throttle`**（L1/TEX 79%、
