@@ -1038,3 +1038,17 @@ A/B。追記 19 の p=31 行（3.255 ms / 998.4 µs）は改修前のまま残�
 | 改修後 | **2.415** | **718.2** | **2.00×** |
 
 owned `dqdt` は改修前 CC とビット一致。
+
+### 追記 31: p=63 CUDA-core `FUSED`（2026-08-30）
+
+[`p63_gap_study.md`](p63_gap_study.md) §24。Slurm job `69633`、交互 12 回中央値。
+`conf_perf_p63_fused.conf`。device 966.4 → **776.0 µs/stage（−19.7%）**、
+Main 3.134 → **2.574 ms/step**。TC / FUSED = 421.7 / 776.0 = **1.84×**。
+採用は `__restrict__` とチャンクループ除去。最速は `FUSED_TC` のまま。
+
+### 追記 32: p=63 CUDA-core `FUSED` 512 スレッド（2026-08-30）
+
+[`p63_gap_study.md`](p63_gap_study.md) §25。Slurm job `69651`、交互 12 回中央値。
+device 776.0 → **618.6 µs/stage（−20.3%）**、Main 2.574 → **2.110 ms/step**。
+TC / FUSED = 421.7 / 618.6 = **1.47×**。採用は連続 k の D 側 `double2` と
+512 スレッド × 8 蓄積器（2 CTA/SM）。最速は `FUSED_TC` のまま。

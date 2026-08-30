@@ -13,8 +13,12 @@ extern cudaStream_t dg_cuda_stream;
 #define P31_CC_XZ_THREADS 512
 #define P31_CC_Y_THREADS 512
 #define P31_CC_XZ_SMEM (58880)
-#define P63_CC_THREADS 1024
+#ifndef P63_CC_THREADS
+#define P63_CC_THREADS 512
+#endif
 #define P63_CC_BPE 64
+#define P63_CC_NK (4096 / P63_CC_THREADS)
+#define P63_CC_MINBLK (1024 / P63_CC_THREADS)
 #define P127_CC_THREADS 1024
 #define P127_CC_BPE 512
 #define P255_CC_BPE 65536
@@ -395,14 +399,21 @@ __global__ __launch_bounds__(P31_CC_Y_THREADS, 1) void tendency_fused_p31_y_cc_k
   }
 }
 
-__global__ __launch_bounds__(P63_CC_THREADS, 1) void tendency_fused_p63_xz_cc_kernel(
-    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *w, const double *flux_bnd,
-    const double *Escale, int Ne)
+// p=63 CC: one 64x64 plane per block. 512 threads x 8 consecutive k
+// (or j) fit 2 blocks/SM at 64 registers; 1024 threads were occupancy-1
+// and left LDS latency exposed. Natural-order panels (i fastest); not
+// the TC fragment layout.
+__global__ __launch_bounds__(P63_CC_THREADS, P63_CC_MINBLK) void tendency_fused_p63_xz_cc_kernel(
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ Lift1D, const double *__restrict__ q,
+    const double *__restrict__ u, const double *__restrict__ w,
+    const double *__restrict__ flux_bnd, const double *__restrict__ Escale,
+    int Ne)
 {
-  __shared__ double sD[64 * 16];
-  __shared__ double sFU[16 * 64];
-  __shared__ double sFW[64 * 16];
+  extern __shared__ __align__(32) double smem_xz[];
+  double *sD = smem_xz;
+  double *sFU = smem_xz + 64 * 64;
+  double *sFW = smem_xz + 2 * 64 * 64;
 
   const int elem = (int)blockIdx.x / P63_CC_BPE;
   if (elem >= Ne) {
@@ -416,34 +427,41 @@ __global__ __launch_bounds__(P63_CC_THREADS, 1) void tendency_fused_p63_xz_cc_ke
   const int face_offset = elem * 24576;
   const int npoint = 262144 * Ne;
 
-  int kk[4];
-  double sx[4], sz[4];
-  for (int m = 0; m < 4; ++m) {
-    kk[m] = kb + 16 * m;
+  int kk[P63_CC_NK];
+  double sx[P63_CC_NK], sz[P63_CC_NK];
+  const int kbase = P63_CC_NK * kb;
+  for (int m = 0; m < P63_CC_NK; ++m) {
+    kk[m] = kbase + m;
     sx[m] = 0.0;
     sz[m] = 0.0;
   }
 
-  const int sl = tid % 16;
-  const int sk = tid / 16;
+  for (int p = 0; p < P63_CC_NK; ++p) {
+    const int idxp = tid + P63_CC_THREADS * p;
+    const int col = idxp % 64;
+    const int row = idxp / 64;
+    sD[row * 64 + col] = D1D[col + row * 64];
+    const int gidx = elem_offset + col + j * 64 + row * 4096;
+    const double qv = q[gidx];
+    sFU[row * 64 + col] = qv * u[gidx];
+    sFW[row * 64 + col] = qv * w[gidx];
+  }
+  __syncthreads();
 
-  for (int l0 = 0; l0 <= 48; l0 += 16) {
-    sD[kb * 64 + i] = D1D[i + (l0 + kb) * 64];
-    int gidx = elem_offset + (l0 + sl) + j * 64 + sk * 4096;
-    sFU[sk * 16 + sl] = q[gidx] * u[gidx];
-    gidx = elem_offset + i + j * 64 + (l0 + kb) * 4096;
-    sFW[kb * 64 + i] = q[gidx] * w[gidx];
-    __syncthreads();
-
-    for (int lc = 0; lc < 16; ++lc) {
-      const double dxi = sD[lc * 64 + i];
-      const double fwi = sFW[lc * 64 + i];
-      for (int m = 0; m < 4; ++m) {
-        sx[m] += dxi * sFU[kk[m] * 16 + lc];
-        sz[m] += fwi * sD[lc * 64 + kk[m]];
-      }
+  for (int lc = 0; lc < 64; ++lc) {
+    const double dxi = sD[lc * 64 + i];
+    const double fwi = sFW[lc * 64 + i];
+#pragma unroll
+    for (int m = 0; m < P63_CC_NK; ++m) {
+      sx[m] += dxi * sFU[kk[m] * 64 + lc];
     }
-    __syncthreads();
+#pragma unroll
+    for (int m = 0; m < P63_CC_NK; m += 2) {
+      const double2 dz =
+          *reinterpret_cast<const double2 *>(&sD[lc * 64 + kbase + m]);
+      sz[m] += fwi * dz.x;
+      sz[m + 1] += fwi * dz.y;
+    }
   }
 
   const double lf1 = Lift1D[j];
@@ -453,7 +471,7 @@ __global__ __launch_bounds__(P63_CC_THREADS, 1) void tendency_fused_p63_xz_cc_ke
   const double fb5 = flux_bnd[face_offset + 16384 + i + j * 64];
   const double fb6 = flux_bnd[face_offset + 20480 + i + j * 64];
 
-  for (int m = 0; m < 4; ++m) {
+  for (int m = 0; m < P63_CC_NK; ++m) {
     const int k = kk[m];
     const int idx = elem_offset + i + j * 64 + k * 4096;
     dqdt[idx] = -(Escale[idx] * sx[m] + Escale[idx + 2 * npoint] * sz[m] +
@@ -465,12 +483,14 @@ __global__ __launch_bounds__(P63_CC_THREADS, 1) void tendency_fused_p63_xz_cc_ke
   }
 }
 
-__global__ __launch_bounds__(P63_CC_THREADS, 1) void tendency_fused_p63_y_cc_kernel(
-    double *dqdt, const double *D1D, const double *q, const double *v,
-    const double *Escale, int Ne)
+__global__ __launch_bounds__(P63_CC_THREADS, P63_CC_MINBLK) void tendency_fused_p63_y_cc_kernel(
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ q, const double *__restrict__ v,
+    const double *__restrict__ Escale, int Ne)
 {
-  __shared__ double sD[64 * 16];
-  __shared__ double sFV[64 * 16];
+  extern __shared__ __align__(32) double smem_y[];
+  double *sD = smem_y;
+  double *sFV = smem_y + 64 * 64;
 
   const int elem = (int)blockIdx.x / P63_CC_BPE;
   if (elem >= Ne) {
@@ -483,29 +503,36 @@ __global__ __launch_bounds__(P63_CC_THREADS, 1) void tendency_fused_p63_y_cc_ker
   const int elem_offset = elem * 262144;
   const int npoint = 262144 * Ne;
 
-  int jj[4];
-  double sy[4];
-  for (int m = 0; m < 4; ++m) {
-    jj[m] = jb + 16 * m;
+  int jj[P63_CC_NK];
+  double sy[P63_CC_NK];
+  const int jbase = P63_CC_NK * jb;
+  for (int m = 0; m < P63_CC_NK; ++m) {
+    jj[m] = jbase + m;
     sy[m] = 0.0;
   }
 
-  for (int l0 = 0; l0 <= 48; l0 += 16) {
-    sD[jb * 64 + i] = D1D[i + (l0 + jb) * 64];
-    const int gidx = elem_offset + i + (l0 + jb) * 64 + k * 4096;
-    sFV[jb * 64 + i] = q[gidx] * v[gidx];
-    __syncthreads();
+  for (int p = 0; p < P63_CC_NK; ++p) {
+    const int idxp = tid + P63_CC_THREADS * p;
+    const int col = idxp % 64;
+    const int row = idxp / 64;
+    sD[row * 64 + col] = D1D[col + row * 64];
+    const int gidx = elem_offset + col + row * 64 + k * 4096;
+    sFV[row * 64 + col] = q[gidx] * v[gidx];
+  }
+  __syncthreads();
 
-    for (int lc = 0; lc < 16; ++lc) {
-      const double fvi = sFV[lc * 64 + i];
-      for (int m = 0; m < 4; ++m) {
-        sy[m] += fvi * sD[lc * 64 + jj[m]];
-      }
+  for (int lc = 0; lc < 64; ++lc) {
+    const double fvi = sFV[lc * 64 + i];
+#pragma unroll
+    for (int m = 0; m < P63_CC_NK; m += 2) {
+      const double2 dy =
+          *reinterpret_cast<const double2 *>(&sD[lc * 64 + jbase + m]);
+      sy[m] += fvi * dy.x;
+      sy[m + 1] += fvi * dy.y;
     }
-    __syncthreads();
   }
 
-  for (int m = 0; m < 4; ++m) {
+  for (int m = 0; m < P63_CC_NK; ++m) {
     const int j = jj[m];
     const int idx = elem_offset + i + j * 64 + k * 4096;
     dqdt[idx] = dqdt[idx] - Escale[idx + npoint] * sy[m];
@@ -1198,9 +1225,15 @@ extern "C" void launch_tendency_fused_p63(
     const double *Escale, int Ne)
 {
   const int nblock = P63_CC_BPE * Ne;
-  tendency_fused_p63_xz_cc_kernel<<<nblock, P63_CC_THREADS, 0, dg_cuda_stream>>>(
+  const size_t smem_xz = 3 * 64 * 64 * sizeof(double);
+  const size_t smem_y = 2 * 64 * 64 * sizeof(double);
+  cudaFuncSetAttribute(tendency_fused_p63_xz_cc_kernel,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_xz);
+  cudaFuncSetAttribute(tendency_fused_p63_y_cc_kernel,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_y);
+  tendency_fused_p63_xz_cc_kernel<<<nblock, P63_CC_THREADS, smem_xz, dg_cuda_stream>>>(
       dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
-  tendency_fused_p63_y_cc_kernel<<<nblock, P63_CC_THREADS, 0, dg_cuda_stream>>>(
+  tendency_fused_p63_y_cc_kernel<<<nblock, P63_CC_THREADS, smem_y, dg_cuda_stream>>>(
       dqdt, D1D, q, v, Escale, Ne);
   check_cuda_cc_hp("tendency_fused_p63_cc_kernels");
 }
