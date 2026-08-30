@@ -368,6 +368,10 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の `D1D_tr` persist（2026-08-30、`p63_gap_study.md` §31）**:
+  Normal miss でも device **+58%**。`SetLimit` が通常 L2 を削り次の `volume_flux`
+  が 128→318 µs。max 容量の persist はこの経路では使えない。
+
 - **p=63 `GEMM_FUSED` の persistent flux（2026-08-30、`p63_gap_study.md` §30）**:
   CTA 4096 の grid-stride は device **+1.35%**（flux 128→136 µs）。パイプが細る。
 

@@ -2114,3 +2114,26 @@ grid-stride で複数点を処理した。コードは戻した。
 device **+1.35%**、レンジ非重複。CTA を減らすと DRAM パイプの同時発行が細り、
 2 点半減グリッド（§27 +0.38%）と同じ方向でより軽い。
 **最速は `FUSED_TC` のまま。**
+
+## 31. `D1D_tr` の L2 persist（Normal miss、2026-08-30、不採用 +58%）
+
+対象は `CUDAFORTRAN_GEMM_FUSED`。親 `44e372b`、job `69635`（12 回交互、対 §25）。
+点変化係数 vs SPLIT max abs 3.55e-15。§28 は `q` に streaming miss を付けて
+後続 GEMM を壊した。今回は **32 KB の `D1D_tr` だけ**を persist し、窓の外は
+`cudaAccessPropertyNormal`、`cudaCtxResetPersistingL2Cache` は呼ばない。
+y と z の直前から z の直後まで。コードは戻した。
+
+| | device 中央値 | µs/stage |
+|---|---:|---:|
+| §25 | 3.25666e-2 | 571.3 |
+| **`D1D_tr` persist** | **5.15132e-2** | **903.7** |
+
+device **+58.2%**、レンジ非重複。
+
+nsys: `volume_flux` 中央値 **318 µs**（通常 128、min は 126 のまま）。persist 開始は
+flux の**後**なのに次ステージの flux が伸びる。原因は
+`cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, max)` がデバイス全体に残り、
+通常 L2 を削ること。§28 の +55% も同じ SetLimit を共有する。32 KB の演算子を
+persist する賞金は、streaming な flux（134 MB × 4）から L2 を奪う損失に負ける。
+max 容量の SetLimit を伴う persist はこの経路では使えない。
+**最速は `FUSED_TC` のまま。**
