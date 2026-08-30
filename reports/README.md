@@ -368,6 +368,10 @@ p=31 の `FUSED` 行だけ**で、[`p31_gap_study.md`](p31_gap_study.md) §20
 
 ## 現時点の結論
 
+- **p=63 `GEMM_FUSED` の flux_yz 重ね（2026-08-30、`p63_gap_study.md` §26）**:
+  `flux_y/z` を side2 で cuBLAS x と重ねると device **+5.9%**（571 → 605 µs/stage）。
+  フルグリッドの DRAM カーネルが SM を占有して GEMM を直列化する。コードは戻した。
+
 - **p=63 `GEMM_FUSED` の `Ey*acc+Ex*Dx`（2026-08-29、`p63_gap_study.md` §25）**:
   y エピローグで Ex も掛けて加重 z に渡し、scale カーネルと `GemmZWide` は使わない。
   占有 GPU 12 回交互で device **−4.1%**（595.2 → 570.9 µs/stage、max abs 3.55e-15）。
