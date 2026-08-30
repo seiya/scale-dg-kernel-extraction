@@ -17,15 +17,60 @@ static void check_cuda_cc(const char *what)
   }
 }
 
-__global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_cc_kernel(
-    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *v, const double *w, const int *VMapM,
-    const int *VMapP, const double *normal_fn, const double *Fscale,
-    const double *Escale, int Ne)
+#define P7_XFACE_PLANE 72
+__device__ __forceinline__ void p7_stage_mfaces(double *sMx, double *sMyz,
+                                               int node, double qn, double u,
+                                               double v, double w)
+{
+  const int i = node & 7;
+  const int j = (node >> 3) & 7;
+  const int k = node >> 6;
+  if (i == 7 || i == 0) {
+    double *const m = sMx + ((i == 7) ? 0 : P7_XFACE_PLANE) +
+                      ((node >> 3) & 7) + (k << 3);
+    m[0] = qn;
+    m[144] = u;
+    m[288] = v;
+    m[432] = w;
+  }
+  if (j == 0 || j == 7) {
+    const int pt = i + (k << 3);
+    double *const m = sMyz + ((j == 0) ? 0 : 72) + pt;
+    m[0] = qn;
+    m[288] = u;
+    m[576] = v;
+    m[864] = w;
+  }
+  if (k == 0 || k == 7) {
+    const int pt = i + (j << 3);
+    double *const m = sMyz + ((k == 0) ? 144 : 216) + pt;
+    m[0] = qn;
+    m[288] = u;
+    m[576] = v;
+    m[864] = w;
+  }
+}
+
+// 6 blocks/SM: 40 registers, enough to absorb sMface without spill.
+// Occupancy 75%.  8 blocks spill; 4/5/7 lose on occupied GPU A/B.
+__global__ __launch_bounds__(P7_THREADS, 6) void tendency_fused_p7_cc_kernel(
+    double *__restrict__ dqdt, const double *__restrict__ D1D,
+    const double *__restrict__ Lift1D, const double *__restrict__ q,
+    const double *__restrict__ u, const double *__restrict__ v,
+    const double *__restrict__ w, const int *__restrict__ VMapM,
+    const int *__restrict__ VMapP, const double *__restrict__ normal_fn,
+    const double *__restrict__ Fscale, const double *__restrict__ Escale,
+    int Ne)
 {
   __shared__ double sD1D[64];
   __shared__ double sLift[48];
   __shared__ double sflux_bnd[384];
+  // M-side q,u,v,w of the two x-normal faces.  Face points 64-127 / 192-255
+  // gather with stride 8; the same element's volume loads already hold the
+  // values.  Layout matches cuda_dg_kernels_tc.cu (pad 72, field stride 144).
+  __shared__ double sMface[4 * 144];
+  // M-side of faces 1,3 (offset 0/72) and 5,6 (offset 144/216), field stride 288.
+  __shared__ double sMyz[4 * 288];
   __shared__ double sFluxX[512], sFluxY[512], sFluxZ[512];
 
   const int elem = (int)blockIdx.x;
@@ -50,42 +95,54 @@ __global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_cc_kern
   const int idx1 = elem_offset + node1;
   const int idx2 = elem_offset + node2;
   {
-    const double q1 = q[idx1];
-    sFluxX[node1] = q1 * u[idx1];
-    sFluxY[node1] = q1 * v[idx1];
-    sFluxZ[node1] = q1 * w[idx1];
+    const double q1 = q[idx1], u1 = u[idx1], v1 = v[idx1], w1 = w[idx1];
+    sFluxX[node1] = q1 * u1;
+    sFluxY[node1] = q1 * v1;
+    sFluxZ[node1] = q1 * w1;
+    p7_stage_mfaces(sMface, sMyz, node1, q1, u1, v1, w1);
   }
   {
-    const double q2 = q[idx2];
-    sFluxX[node2] = q2 * u[idx2];
-    sFluxY[node2] = q2 * v[idx2];
-    sFluxZ[node2] = q2 * w[idx2];
+    const double q2 = q[idx2], u2 = u[idx2], v2 = v[idx2], w2 = w[idx2];
+    sFluxX[node2] = q2 * u2;
+    sFluxY[node2] = q2 * v2;
+    sFluxZ[node2] = q2 * w2;
+    p7_stage_mfaces(sMface, sMyz, node2, q2, u2, v2, w2);
   }
+  __syncthreads();
 
   int fp = tid;
   int fidx = face_offset + fp;
-  int iM = VMapM[fidx] - 1;
   int iP = VMapP[fidx] - 1;
-  double qM = q[iM];
-  double qP = q[iP];
-  double VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
-                w[iM] * normal_fn[fidx + 2 * nface];
-  double VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
-                w[iP] * normal_fn[fidx + 2 * nface];
+  const double fn1 = normal_fn[fidx];
+  const double fn2 = normal_fn[fidx + nface];
+  const double fn3 = normal_fn[fidx + 2 * nface];
+  double qM, VelM;
+  if ((fp & 64) != 0) {
+    const double *const m =
+        sMface + (((fp & 128) != 0) ? P7_XFACE_PLANE : 0) + (fp & 63);
+    qM = m[0];
+    VelM = m[144] * fn1 + m[288] * fn2 + m[432] * fn3;
+  } else {
+    const double *const m = sMyz + (((fp & 128) != 0) ? 72 : 0) + (fp & 63);
+    qM = m[0];
+    VelM = m[288] * fn1 + m[576] * fn2 + m[864] * fn3;
+  }
+  double qP = __ldg(q + iP);
+  double VelP = __ldg(u + iP) * fn1 + __ldg(v + iP) * fn2 + __ldg(w + iP) * fn3;
   double alpha = 0.5 * fabs(VelP + VelM);
   sflux_bnd[fp] =
       0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
   if (tid < 128) {
     fp = tid + 256;
     fidx = face_offset + fp;
-    iM = VMapM[fidx] - 1;
     iP = VMapP[fidx] - 1;
-    qM = q[iM];
-    qP = q[iP];
-    VelM = u[iM] * normal_fn[fidx] + v[iM] * normal_fn[fidx + nface] +
-           w[iM] * normal_fn[fidx + 2 * nface];
-    VelP = u[iP] * normal_fn[fidx] + v[iP] * normal_fn[fidx + nface] +
-           w[iP] * normal_fn[fidx + 2 * nface];
+    const double *const m = sMyz + ((fp >= 320) ? 216 : 144) + (fp & 63);
+    qM = m[0];
+    VelM = m[288] * normal_fn[fidx] + m[576] * normal_fn[fidx + nface] +
+           m[864] * normal_fn[fidx + 2 * nface];
+    qP = __ldg(q + iP);
+    VelP = __ldg(u + iP) * normal_fn[fidx] + __ldg(v + iP) * normal_fn[fidx + nface] +
+           __ldg(w + iP) * normal_fn[fidx + 2 * nface];
     alpha = 0.5 * fabs(VelP + VelM);
     sflux_bnd[fp] =
         0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));

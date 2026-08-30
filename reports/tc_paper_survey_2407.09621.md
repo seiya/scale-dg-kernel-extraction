@@ -1394,3 +1394,6 @@ CC 326.8 µs は旧 Fortran 〜324 µs と同水準。論文の主比は **TC / 
 メカニズム比 TC / DFMA は 1.54×。点変化係数、`Ne=2³`、`nstep=1` の owned `dqdt`
 は `FUSED` と `FUSED_TC` がビット一致、`CUDAFORTRAN_SPLIT` との最大絶対差
 1.78e-15。
+
+**（追記 2026-08-30）** その後の CC 最適化は [`p7_gap_study.md`](p7_gap_study.md)。
+device 326.3 → **302.8 µs/stage（−7.2%）**、主比 **1.10×**。
