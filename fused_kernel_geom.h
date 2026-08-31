@@ -48,7 +48,11 @@
 #define BKD127 64
 #endif
 #define P127_MT 64
-#define P127_Y_THREADS 1024
+#define P127_Y_THREADS 512
+#define P127_Y_TM 4
+#define P127_Y_TN 2
+#define P127_Y_BPSM 2
+#define BKDY127 32
 #define P127_Y_FSTAGE_ITERS (P127_MT * NQ127 / P127_Y_THREADS)
 #define P127_XZ_THREADS 1024
 

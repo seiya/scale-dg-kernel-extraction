@@ -2338,6 +2338,9 @@ __global__ __launch_bounds__(P127_XZ_THREADS, 1) void tendency_fused_p127_xz_ker
     const int g = eo + (ibase + o) + plane_off + NQ2_127 * ll;
     sFW[swt127(o + P127_MT * ll)] = q[g] * w[g];
   }
+  // Let the y grid start: its mma does not read dqdt.  The wait is in the y
+  // epilogue, after this grid's stores.
+  asm volatile("griddepcontrol.launch_dependents;");
 
   for (int kk = 0; kk < NQ127; kk += BKD127) {
     // The barrier that protects the panels from being overwritten belongs
@@ -2351,18 +2354,18 @@ __global__ __launch_bounds__(P127_XZ_THREADS, 1) void tendency_fused_p127_xz_ker
     }
     // sFU[k][l] = q*u at (kk+l, jp, k), all 128 k.  l is fast in global.
 #pragma unroll
-    for (int p = 0; p < NQ127 * BKD127 / 1024; ++p) {
+    for (int p = 0; p < NQ127 * BKD127 / P127_XZ_THREADS; ++p) {
       const int ll = tid & (BKD127 - 1);
-      const int o = (tid / BKD127) + (1024 / BKD127) * p;
+      const int o = (tid / BKD127) + (P127_XZ_THREADS / BKD127) * p;
       const int g = eo + (kk + ll) + plane_off + NQ2_127 * o;
       sFU[swt128(o + NQ127 * ll)] = q[g] * u[g];
     }
     // sD[r][l] = D1D(r, kk+l), all 128 rows: m runs over the whole range and
     // n sits inside it, so one panel serves both operands as it did at p=63.
 #pragma unroll
-    for (int p = 0; p < NQ127 * BKD127 / 1024; ++p) {
+    for (int p = 0; p < NQ127 * BKD127 / P127_XZ_THREADS; ++p) {
       const int o = tid & (NQ127 - 1);
-      const int ll = (tid / NQ127) + (1024 / NQ127) * p;
+      const int ll = (tid / NQ127) + (P127_XZ_THREADS / NQ127) * p;
       sD[swt128(o + NQ127 * ll)] = D1D[o + NQ127 * (kk + ll)];
     }
     __syncthreads();
@@ -2393,6 +2396,8 @@ __global__ __launch_bounds__(P127_XZ_THREADS, 1) void tendency_fused_p127_xz_ker
       }
     }
   }
+
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 
   const double lf1 = Lift1D[jp];
   const double lf3 = Lift1D[jp + 2 * NQ127];
@@ -2444,14 +2449,14 @@ __global__ __launch_bounds__(P127_XZ_THREADS, 1) void tendency_fused_p127_xz_ker
 // kernel with (i,j) in place of (i,k), so only the A panel of the two is
 // needed and the block holds 64 KB.
 template <bool UseTc>
-__global__ __launch_bounds__(P127_Y_THREADS, 1) void tendency_fused_p127_y_kernel(
+__global__ __launch_bounds__(P127_Y_THREADS, P127_Y_BPSM) void tendency_fused_p127_y_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
 {
   extern __shared__ __align__(16) double smem127[];
   double *const sDm = smem127;
-  double *const sFV = smem127 + NQ127 * BKD127;
+  double *const sFV = smem127 + NQ127 * BKDY127;
 
   const int block = (int)blockIdx.x;
   const int ntile = block & 1;
@@ -2465,8 +2470,11 @@ __global__ __launch_bounds__(P127_Y_THREADS, 1) void tendency_fused_p127_y_kerne
   const int tid = (int)threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  const int wm = warp & 7;
-  const int wn = warp >> 3;
+  // 16 warps in a 4 x 4 grid with 4x2 mma tiles.  512 threads x 64 registers
+  // and 96 KB shared both allow 2 blocks/SM, which the 1024-thread 128 KB
+  // shape could not.  ncu job 70955: Block Limit Registers = Shared Mem = 2.
+  const int wm = warp & 3;
+  const int wn = warp >> 2;
   const int row = lane >> 2;
   const int colk = lane & 3;
 
@@ -2474,25 +2482,24 @@ __global__ __launch_bounds__(P127_Y_THREADS, 1) void tendency_fused_p127_y_kerne
   const int npoint = NP127 * Ne;
   const int plane_off = NQ2_127 * kp;
 
-  double acc[2 * 2 * 2];
+  constexpr int TM = P127_Y_TM;
+  constexpr int TN = P127_Y_TN;
+  double acc[2 * TM * TN];
 #pragma unroll
-  for (int e = 0; e < 2 * 2 * 2; ++e) {
+  for (int e = 0; e < 2 * TM * TN; ++e) {
     acc[e] = 0.0;
   }
 
-  // Same collapse as the xz kernel.  sFV is the l-fast panel, so the field
-  // its swizzle folds is the row index's low three bits, which is row -- also
-  // a per-lane constant -- and the XOR moves onto l instead.
   const int cx = colk << 2;
   const int rx = row << 2;
-  int amx[2], boff[2];
+  int amx[TM], boff[TN];
 #pragma unroll
-  for (int a = 0; a < 2; ++a) {
-    amx[a] = (8 * (2 * wm + a) + row) ^ cx;
+  for (int a = 0; a < TM; ++a) {
+    amx[a] = (8 * (TM * wm + a) + row) ^ cx;
   }
 #pragma unroll
-  for (int bb = 0; bb < 2; ++bb) {
-    boff[bb] = NQ127 * (8 * (2 * wn + bb) + row);
+  for (int bb = 0; bb < TN; ++bb) {
+    boff[bb] = NQ127 * (8 * (TN * wn + bb) + row);
   }
 
   // sFV[i][l] = q*v at (ibase+i, l, kp), staged once at the full depth.
@@ -2504,48 +2511,71 @@ __global__ __launch_bounds__(P127_Y_THREADS, 1) void tendency_fused_p127_y_kerne
     sFV[sw127(ll + NQ127 * o)] = q[g] * v[g];
   }
 
-  for (int kk = 0; kk < NQ127; kk += BKD127) {
-    if (kk) {
-      __syncthreads();
+  // Ping-pong the 32-deep sDm as two 16-deep halves.  D1D is a copy, so
+  // cp.async issues the next half and the mma of the current half covers it
+  // (the register-path version stored the next half before the mma).
+  constexpr int HALF = BKDY127 / 2;
+#define P127_Y_STAGE_D(KK, BUF)                                               \
+  do {                                                                        \
+    const int lbase = (BUF) * HALF;                                           \
+    _Pragma("unroll") for (int p = 0;                                         \
+                           p < HALF * NQ127 / (2 * P127_Y_THREADS); ++p)      \
+    {                                                                         \
+      const int o = (tid & 63) * 2;                                           \
+      const int ll = (tid / 64) + (P127_Y_THREADS / 64) * p;                  \
+      cp_async_16(&sDm[swt128(o + NQ127 * (lbase + ll))],                     \
+                  D1D + o + NQ127 * ((KK) + ll));                             \
+    }                                                                         \
+    asm volatile("cp.async.commit_group;\n" ::);                              \
+  } while (0)
+  P127_Y_STAGE_D(0, 0);
+  asm volatile("cp.async.wait_group 0;\n" ::);
+  __syncthreads();
+  int cur = 0;
+  for (int kk = 0; kk < NQ127; kk += HALF) {
+    const bool more = (kk + HALF) < NQ127;
+    if (more) {
+      P127_Y_STAGE_D(kk + HALF, cur ^ 1);
     }
+    const int lbase = cur * HALF;
 #pragma unroll
-    for (int p = 0; p < BKD127 * NQ127 / P127_Y_THREADS; ++p) {
-      const int o = tid & (NQ127 - 1);
-      const int ll = (tid / NQ127) + (P127_Y_THREADS / NQ127) * p;
-      sDm[swt128(o + NQ127 * ll)] = D1D[o + NQ127 * (kk + ll)];
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (int ks = 0; ks < BKD127 / 4; ++ks) {
+    for (int ks = 0; ks < HALF / 4; ++ks) {
       const int lc = 4 * ks + colk;
       const int lg = kk + lc;
-      double av[2], bv[2];
+      double av[TM], bv[TN];
 #pragma unroll
-      for (int a = 0; a < 2; ++a) {
-        av[a] = sDm[amx[a] + NQ127 * lc];
+      for (int a = 0; a < TM; ++a) {
+        av[a] = sDm[amx[a] + NQ127 * (lbase + lc)];
       }
 #pragma unroll
-      for (int bb = 0; bb < 2; ++bb) {
+      for (int bb = 0; bb < TN; ++bb) {
         bv[bb] = sFV[(lg ^ rx) + boff[bb]];
       }
 #pragma unroll
-      for (int a = 0; a < 2; ++a) {
+      for (int a = 0; a < TM; ++a) {
 #pragma unroll
-        for (int bb = 0; bb < 2; ++bb) {
-          const int e = 2 * (2 * a + bb);
+        for (int bb = 0; bb < TN; ++bb) {
+          const int e = 2 * (TN * a + bb);
           mma_m8n8k4_f64<UseTc>(acc[e], acc[e + 1], av[a], bv[bb], acc[e], acc[e + 1]);
         }
       }
     }
+    if (more) {
+      asm volatile("cp.async.wait_group 0;\n" ::);
+      __syncthreads();
+      cur ^= 1;
+    }
   }
+#undef P127_Y_STAGE_D
+
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 
 #pragma unroll
-  for (int e8 = 0; e8 < 4; ++e8) {
-    const int a = e8 / 2;
-    const int bb = e8 % 2;
-    const int m = 8 * (2 * wm + a) + row;                     // j
-    const int n = ibase + 8 * (2 * wn + bb) + 2 * colk;       // i, and i+1
+  for (int e8 = 0; e8 < TM * TN; ++e8) {
+    const int a = e8 / TN;
+    const int bb = e8 % TN;
+    const int m = 8 * (TM * wm + a) + row;
+    const int n = ibase + 8 * (TN * wn + bb) + 2 * colk;
     const int node = eo + n + NQ127 * m + plane_off;
     const double2 ey =
         *reinterpret_cast<const double2 *>(Escale + node + npoint);
@@ -2556,18 +2586,50 @@ __global__ __launch_bounds__(P127_Y_THREADS, 1) void tendency_fused_p127_y_kerne
   }
 }
 
+// Same numerical flux as elembnd_flux_kernel (pair_nq2 = 0).  Launched from
+// C++ so it can hint PDL; the xz epilogue waits before reading flux_bnd.
+__global__ void p127_elembnd_flux_kernel(
+    double *__restrict__ flux, const double *__restrict__ q,
+    const double *__restrict__ u, const double *__restrict__ v,
+    const double *__restrict__ w, const int *__restrict__ VMapM,
+    const int *__restrict__ VMapP, const double *__restrict__ normal_fn,
+    const double *__restrict__ Fscale, int nface)
+{
+  // Hint the dependent xz grid immediately so its mma can cover this kernel.
+  // Correctness is the wait in the xz epilogue, which still waits for this
+  // grid's stores.  Hinting at the end (previous) only overlapped the tail.
+  asm volatile("griddepcontrol.launch_dependents;");
+  const int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+  if (idx < nface) {
+    const int iM = VMapM[idx] - 1;
+    const int iP = VMapP[idx] - 1;
+    const double qM = q[iM];
+    const double qP = q[iP];
+    const double fn1 = normal_fn[idx];
+    const double fn2 = normal_fn[idx + nface];
+    const double fn3 = normal_fn[idx + 2 * nface];
+    const double VelM = u[iM] * fn1 + v[iM] * fn2 + w[iM] * fn3;
+    const double VelP = u[iP] * fn1 + v[iP] * fn2 + w[iP] * fn3;
+    const double alpha = 0.5 * fabs(VelP + VelM);
+    flux[idx] = 0.5 * Fscale[idx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+  }
+}
+
 template <bool UseTc>
 void launch_tendency_fused_p127_impl(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *v, const double *w, const double *flux_bnd,
-    const double *Escale, int Ne)
+    const double *u, const double *v, const double *w, double *flux_bnd,
+    const double *Escale, const int *VMapM, const int *VMapP,
+    const double *normal_fn, const double *Fscale, int nface, int Ne)
 {
   const int nblock = 2 * NQ127 * Ne;
   const int nblock_y = 2 * NQ127 * Ne;
+  constexpr int FACE_THREADS = 256;
+  const int nblock_face = (nface + FACE_THREADS - 1) / FACE_THREADS;
   const size_t smem_xz =
       (P127_MT * NQ127 + 2 * NQ127 * BKD127) * sizeof(double);
   const size_t smem_y =
-      (NQ127 * BKD127 + P127_MT * NQ127) * sizeof(double);
+      (NQ127 * BKDY127 + P127_MT * NQ127) * sizeof(double);
   static bool opted_in = false;
   if (!opted_in) {
     cudaFuncSetAttribute(tendency_fused_p127_xz_kernel<UseTc>,
@@ -2578,29 +2640,69 @@ void launch_tendency_fused_p127_impl(
                          (int)smem_y);
     opted_in = true;
   }
-  tendency_fused_p127_xz_kernel<UseTc>
-      <<<nblock, P127_XZ_THREADS, smem_xz, dg_cuda_stream>>>(
-          dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
-  tendency_fused_p127_y_kernel<UseTc>
-      <<<nblock_y, P127_Y_THREADS, smem_y, dg_cuda_stream>>>(
-          dqdt, D1D, q, v, Escale, Ne);
+  {
+    cudaLaunchConfig_t fcfg = {};
+    cudaLaunchAttribute fattr[1];
+    fcfg.gridDim = dim3(nblock_face);
+    fcfg.blockDim = dim3(FACE_THREADS);
+    fcfg.dynamicSmemBytes = 0;
+    fcfg.stream = dg_cuda_stream;
+    fattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    fattr[0].val.programmaticStreamSerializationAllowed = 1;
+    fcfg.attrs = fattr;
+    fcfg.numAttrs = 1;
+    cudaLaunchKernelEx(&fcfg, p127_elembnd_flux_kernel, flux_bnd, q, u, v, w,
+                       VMapM, VMapP, normal_fn, Fscale, nface);
+  }
+  {
+    cudaLaunchConfig_t cfg = {};
+    cudaLaunchAttribute attr[1];
+    cfg.gridDim = dim3(nblock);
+    cfg.blockDim = dim3(P127_XZ_THREADS);
+    cfg.dynamicSmemBytes = (unsigned)smem_xz;
+    cfg.stream = dg_cuda_stream;
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, tendency_fused_p127_xz_kernel<UseTc>, dqdt, D1D,
+                       Lift1D, q, u, w, flux_bnd, Escale, Ne);
+  }
+  {
+    cudaLaunchConfig_t ycfg = {};
+    cudaLaunchAttribute yattr[1];
+    ycfg.gridDim = dim3(nblock_y);
+    ycfg.blockDim = dim3(P127_Y_THREADS);
+    ycfg.dynamicSmemBytes = (unsigned)smem_y;
+    ycfg.stream = dg_cuda_stream;
+    yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    yattr[0].val.programmaticStreamSerializationAllowed = 1;
+    ycfg.attrs = yattr;
+    ycfg.numAttrs = 1;
+    cudaLaunchKernelEx(&ycfg, tendency_fused_p127_y_kernel<UseTc>, dqdt, D1D, q,
+                       v, Escale, Ne);
+  }
   check_cuda("tendency_fused_p127 kernels");
 }
 
 extern "C" void launch_tendency_fused_p127_dfma(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *v, const double *w, const double *flux_bnd,
-    const double *Escale, int Ne)
+    const double *u, const double *v, const double *w, double *flux_bnd,
+    const double *Escale, const int *VMapM, const int *VMapP,
+    const double *normal_fn, const double *Fscale, int nface, int Ne)
 {
-  launch_tendency_fused_p127_impl<false>(dqdt, D1D, Lift1D, q, u, v, w, flux_bnd,
-                                         Escale, Ne);
+  launch_tendency_fused_p127_impl<false>(
+      dqdt, D1D, Lift1D, q, u, v, w, flux_bnd, Escale, VMapM, VMapP, normal_fn,
+      Fscale, nface, Ne);
 }
 
 extern "C" void launch_tendency_fused_p127_tc(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *v, const double *w, const double *flux_bnd,
-    const double *Escale, int Ne)
+    const double *u, const double *v, const double *w, double *flux_bnd,
+    const double *Escale, const int *VMapM, const int *VMapP,
+    const double *normal_fn, const double *Fscale, int nface, int Ne)
 {
-  launch_tendency_fused_p127_impl<true>(dqdt, D1D, Lift1D, q, u, v, w, flux_bnd,
-                                        Escale, Ne);
+  launch_tendency_fused_p127_impl<true>(
+      dqdt, D1D, Lift1D, q, u, v, w, flux_bnd, Escale, VMapM, VMapP, normal_fn,
+      Fscale, nface, Ne);
 }

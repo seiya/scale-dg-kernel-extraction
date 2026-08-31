@@ -44,6 +44,8 @@ Qualifiers only when they are not the default: `emu` (`CublasEmulation`), `ne{N}
 | `perf_p63_fused_tc.conf` | published p=63 mesh (`Ne=4`, `nstep=20`) |
 | `perf_p127_gemm_fused.conf` | published p=127 mesh (`Ne=2`, `nstep=100`) |
 | `perf_p127_fused.conf` | same mesh, `CUDAFORTRAN_FUSED` |
+| `perf_p127_fused_tc.conf` | same mesh, `CUDAFORTRAN_FUSED_TC` |
+| `val_p127_fused_tc.conf` / `val_p127_split.conf` | p=127 point-varying `dqdt` check (`Ne=2`, `nstep=1`) |
 | `perf_p255_fused_tc.conf` | published p=255 mesh (`Ne=1`, `nstep=20`) |
 | `perf_p7_gemm_emu_n1.conf` | cuBLAS emulation timing (do not use `nstep=1000`) |
 | `val_p7_*` / `val_p7_split.conf` / `val_p15_fused.conf` / `val_p15_split.conf` / `val_p15_gemm_fused.conf` / `val_p63_split.conf` / `val_p63_fused_tc.conf` / `val_p127_fused.conf` / `val_p127_split.conf` / `val_p255_*` | numerical checks (`SCALE_DG_VARYING_COEFF=1`) |
