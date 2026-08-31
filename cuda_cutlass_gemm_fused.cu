@@ -178,6 +178,27 @@ using MmaSet_1688 = VolumeGemmSet<GS<16, 8, 8>, cutlass::arch::Sm90, 16>;
 using MmaSet_16816 = VolumeGemmSet<GS<16, 8, 16>, cutlass::arch::Sm90, 32>;
 using MmaSet_1684 = VolumeGemmSet<GS<16, 8, 4>, cutlass::arch::Sm90, 16>;
 
+// Nq=8 makes the generic tiles mostly predicated. CUTLASS's FP64 TensorOp
+// multistage iterator needs at least two warps; the measured winners are
+// 32x64 for the 8x8 y batches and 16x32 for the 64x8 z/assembly GEMM.
+struct VolumeGemmSetP7 : VolumeGemmSet<GS<8, 8, 4>, cutlass::arch::Sm80, 16> {
+  using GemmY = cutlass::gemm::device::GemmBatched<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, cutlass::arch::Sm80, GS<32, 64, 16>, GS<32, 32, 16>,
+      GS<8, 8, 4>, EpilogueOp, BatchedSwizzle, 3>;
+  using GemmYScale = cutlass::gemm::device::GemmBatched<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, cutlass::arch::Sm80, GS<32, 64, 16>, GS<32, 32, 16>,
+      GS<8, 8, 4>, PointwiseScaleV<1>, BatchedSwizzle, 3>;
+  using GemmZ = cutlass::gemm::device::GemmBatched<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, cutlass::arch::Sm80, GS<16, 32, 16>, GS<16, 16, 16>,
+      GS<8, 8, 4>, EpilogueOp, BatchedSwizzle, 3>;
+  using GemmZWide = GemmZ;
+};
+
+using P7MmaSet_884 = VolumeGemmSetP7;
+
 int cutlass_error(const char *what, cutlass::Status st)
 {
   if (st == cutlass::Status::kSuccess) {
@@ -561,6 +582,9 @@ extern "C" int launch_volume_gemm_z(double *deriv_z, const double *flux_z,
   if (Nq <= 0 || Ne <= 0) {
     return 1;
   }
+  if (Nq == 8 && mma_shape == 0) {
+    return run_volume_gemm_z<P7MmaSet_884>(deriv_z, flux_z, D1D_tr, Nq, Ne);
+  }
   switch (mma_shape) {
   case 0:
     return run_volume_gemm_z<MmaSet_884>(deriv_z, flux_z, D1D_tr, Nq, Ne);
@@ -638,6 +662,9 @@ extern "C" int launch_volume_gemm_y(double *deriv_y, const double *flux_y,
   if (Nq <= 0 || Ne <= 0) {
     return 1;
   }
+  if (Nq == 8 && mma_shape == 0) {
+    return run_volume_gemm_y<P7MmaSet_884>(deriv_y, flux_y, D1D_tr, Nq, Ne);
+  }
   switch (mma_shape) {
   case 0:
     return run_volume_gemm_y<MmaSet_884>(deriv_y, flux_y, D1D_tr, Nq, Ne);
@@ -688,6 +715,11 @@ extern "C" int launch_z_gemm_assembly(
 {
   if (Nq <= 0 || Ne <= 0) {
     return 1;
+  }
+  if (Nq == 8 && mma_shape == 0 && !xy_weighted) {
+    return run_z_gemm_assembly<P7MmaSet_884, false>(
+        dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d,
+        lift_zpair, escale, Nq, Ne);
   }
   if (!xy_weighted) {
     switch (mma_shape) {

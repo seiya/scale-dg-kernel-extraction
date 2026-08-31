@@ -37,6 +37,7 @@ Qualifiers only when they are not the default: `emu` (`CublasEmulation`), `ne{N}
 | `perf_p7_openacc_split_n1000.conf` | p=7 GPU benchmark (`Ne=32`) |
 | `perf_p7_fused.conf` | published p=7 mesh, CUDA-core fused (`Ne=32`, `nstep=20`) |
 | `perf_p7_fused_tc.conf` | published p=7 mesh (`Ne=32`, `nstep=20`) |
+| `perf_p7_gemm_fused.conf` | published p=7 mesh, `CUDAFORTRAN_GEMM_FUSED` (`Ne=32`, `nstep=20`) |
 | `perf_p15_fused_tc.conf` | published p=15 mesh (`Ne=16`, `nstep=20`) |
 | `perf_p15_fused.conf` | p=15 CUDA-core fused (`CUDAFORTRAN_FUSED`) |
 | `perf_p15_gemm_fused.conf` | published p=15 mesh, `CUDAFORTRAN_GEMM_FUSED` |

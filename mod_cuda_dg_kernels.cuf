@@ -1501,6 +1501,32 @@ contains
     cutlass_mma_shape_id = int(shape_id, c_int)
   end subroutine cuda_cutlass_set_mma_shape
 
+  ! Shared y mainloop for GEMM_CUTE and GEMM_FUSED.  Keeping this call in one
+  ! place prevents the two comparison paths from silently diverging.
+  subroutine launch_volume_gemm_y_common(deriv_y, flux_y, D1D_tr, Nq, Ne, &
+    istat)
+    implicit none
+    integer, intent(in) :: Nq, Ne
+    real(RP), device, intent(out) :: deriv_y(*)
+    real(RP), device, intent(in) :: flux_y(*), D1D_tr(*)
+    integer, intent(out) :: istat
+    istat = launch_volume_gemm_y(deriv_y, flux_y, D1D_tr, Nq, Ne, &
+      cutlass_mma_shape_id)
+  end subroutine launch_volume_gemm_y_common
+
+  ! Shared cuBLAS x mainloop for GEMM_CUTE and GEMM_FUSED.
+  subroutine launch_volume_gemm_x_common(deriv_x, flux_x, D1D, Nq, Np, Ne, &
+    istat)
+    implicit none
+    integer, intent(in) :: Nq, Np, Ne
+    real(RP), device, intent(out) :: deriv_x(*)
+    real(RP), device, intent(in) :: flux_x(*), D1D(*)
+    integer, intent(out) :: istat
+
+    istat = cublas_dgemm_impl(0, 0, Nq, (Np/Nq)*Ne, Nq, 1.0_c_double, &
+      D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
+  end subroutine launch_volume_gemm_x_common
+
   subroutine cuda_gemm_setup(emulate, mantissa_fixed, mantissa_bits)
     implicit none
     logical, intent(in) :: emulate
@@ -1913,14 +1939,11 @@ contains
 
     integer :: istat, nface, npoint, nblock, nblock_face
     integer :: nq2, xy_weighted, pair_nq2
-    integer(c_long_long) :: stride_plane, stride_zero, stride_vol
     logical :: use_side, overlap_y
 
-    ! The CUTLASS y GEMM batches Nq*Ne planes on grid.z.  CUDA caps z at
-    ! 65535 and CUTLASS stores batch % 65536, so p=15 Ne=16**3 (65536)
-    ! used to launch with grid.z=0.  The launchers now cap z and, for the
-    ! stock batched operator, chunk the batch.  p=7's 262144 batches are
-    ! the same path.
+    ! y GEMM batches over Nq*Ne planes and CUTLASS puts the batch on grid.z
+    ! (CUDA cap 65535).  cuda_cutlass_gemm_fused.cu splits that launch so
+    ! p=7 Ne=32**3 and p=15 Ne=16**3 are valid; the tile types are unchanged.
     if (.not. gemm_inited) then
       call cuda_gemm_setup(.false.)
     end if
@@ -1928,9 +1951,6 @@ contains
     call dg_ev_begin()
 
     nq2 = Nq*Nq
-    stride_plane = int(nq2, c_long_long)
-    stride_zero = 0_c_long_long
-    stride_vol = int(Nq*nq2, c_long_long)
     ! Weighted z + packed faces: Nq>64 (CUTLASS x/y scale) and Nq=64 (cuBLAS x
     ! plus y epilogue Ey*acc + Ex*Dx). Nq<64 stays unweighted; at p=31 the
     ! same fold is +2.3% on login.
@@ -1952,18 +1972,12 @@ contains
     nblock = (npoint+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
     nblock_face = (nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
 
-    ! fuse on keeps the historical side-stream predicate so GEMM_FUSED device
-    ! time is unchanged.  fuse off matches CUDAFORTRAN_GEMM (Nq >= 64).
-    use_side = dg_side_enabled
-    if (.not. fuse_epilogue) use_side = use_side .and. (Nq >= 64)
-    ! GEMM itself keeps elembnd off the side stream below Nq=64 (the
-    ! GEMM window is smaller than the flux kernel).  At Nq<=16 the fused
-    ! path now uses the same cuBLAS volume GEMMs, so overlapping here
-    ! only adds contention.
-    if (Nq <= 16) use_side = .false.
-    ! y is independent of x only while it does not read deriv_x.  Nq=64 fold
-    ! reads it; Nq<64 keeps the unweighted y and can overlap.
-    overlap_y = fuse_epilogue .and. use_side .and. (Nq < 64)
+    ! Overlapping elembnd with the volume GEMMs still loses at Nq<64
+    ! (+3.2% after cuBLAS y, same as the historical GEMM +3.1%): both
+    ! kernels are DRAM-bound and they serialize each other.  y beside x
+    ! is a different overlap and is kept.
+    use_side = dg_side_enabled .and. (Nq >= 64)
+    overlap_y = fuse_epilogue .and. dg_side_enabled .and. (Nq < 64)
 
     call dg_ev_record(1)
 
@@ -1977,18 +1991,20 @@ contains
 
     call dg_ev_record(2)
 
-    if (use_side) then
+    if (use_side .or. overlap_y) then
       call dg_side_fork(overlap_y)
-      call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
+      if (use_side) then
+        call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
+          flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
+      end if
     end if
 
     if (fuse_epilogue) then
       if (Nq <= 64) then
         if (Nq == 64) then
           ! y reads unweighted deriv_x, so it cannot run beside cuBLAS x.
-          istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
-            D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
+          call launch_volume_gemm_x_common( &
+            deriv_x, flux_x, D1D, Nq, Np, Ne, istat )
           if (istat /= 0) call cuda_failure("cublasDgemm x-deriv (fused)",istat)
           istat = launch_volume_gemm_y_scaleadd( &
             deriv_y, flux_y, D1D_tr, Escale(1,1,2), deriv_x, Escale(1,1,1), &
@@ -1997,34 +2013,18 @@ contains
         else
           if (overlap_y) then
             call dg_set_cuda_stream(dg_side2_stream)
-            if (Nq <= 16) then
-              ! CUTLASS y tiles are 64x64; at Nq=16 that is 16x predication
-              ! plus a grid.z wrap at 65536 batches.  cuBLAS has no cap.
-              istat = cublas_dgemm_strided_batched_impl(0, 0, Nq, Nq, Nq, &
-                1.0_c_double, flux_y, Nq, stride_plane, D1D_tr, Nq, stride_zero, &
-                0.0_c_double, deriv_y, Nq, stride_plane, Nq*Ne)
-              if (istat /= 0) call cuda_failure("cublasDgemm y-deriv (side2)",istat)
-            else
-              istat = launch_volume_gemm_y( &
-                deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
-              if (istat /= 0) call cuda_failure("launch_volume_gemm_y(side2)",istat)
-            end if
+            call launch_volume_gemm_y_common( &
+              deriv_y, flux_y, D1D_tr, Nq, Ne, istat )
             call dg_set_cuda_stream(dg_stream)
+            if (istat /= 0) call cuda_failure("launch_volume_gemm_y(side2)",istat)
           end if
-          istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
-            D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
+          call launch_volume_gemm_x_common( &
+            deriv_x, flux_x, D1D, Nq, Np, Ne, istat )
           if (istat /= 0) call cuda_failure("cublasDgemm x-deriv (fused)",istat)
-          if (.not. use_side) then
-            if (Nq <= 16) then
-              istat = cublas_dgemm_strided_batched_impl(0, 0, Nq, Nq, Nq, &
-                1.0_c_double, flux_y, Nq, stride_plane, D1D_tr, Nq, stride_zero, &
-                0.0_c_double, deriv_y, Nq, stride_plane, Nq*Ne)
-              if (istat /= 0) call cuda_failure("cublasDgemm y-deriv (fused)",istat)
-            else
-              istat = launch_volume_gemm_y( &
-                deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
-              if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
-            end if
+          if (.not. overlap_y) then
+            call launch_volume_gemm_y_common( &
+              deriv_y, flux_y, D1D_tr, Nq, Ne, istat )
+            if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
           end if
         end if
       else
@@ -2035,63 +2035,39 @@ contains
       end if
     else
       if (Nq <= 64) then
-        istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
-          D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
+        call launch_volume_gemm_x_common( &
+          deriv_x, flux_x, D1D, Nq, Np, Ne, istat )
         if (istat /= 0) call cuda_failure("cublasDgemm x-deriv (cute)",istat)
       else
         istat = launch_volume_gemm_x( &
           deriv_x, flux_x, D1D, Nq, Ne, cutlass_mma_shape_id )
         if (istat /= 0) call cuda_failure("launch_volume_gemm_x",istat)
       end if
-      if (Nq <= 16) then
-        istat = cublas_dgemm_strided_batched_impl(0, 0, Nq, Nq, Nq, &
-          1.0_c_double, flux_y, Nq, stride_plane, D1D_tr, Nq, stride_zero, &
-          0.0_c_double, deriv_y, Nq, stride_plane, Nq*Ne)
-        if (istat /= 0) call cuda_failure("cublasDgemm y-deriv (cute)",istat)
-      else
-        istat = launch_volume_gemm_y( &
-          deriv_y, flux_y, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
-        if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
-      end if
-      if (Nq <= 16) then
-        istat = cublas_dgemm_strided_batched_impl(0, 0, nq2, Nq, Nq, &
-          1.0_c_double, flux_z, nq2, stride_vol, D1D_tr, Nq, stride_zero, &
-          0.0_c_double, dqdt, nq2, stride_vol, Ne)
-        if (istat /= 0) call cuda_failure("cublasDgemm z-deriv (cute)",istat)
-      else
-        istat = launch_volume_gemm_z( &
-          dqdt, flux_z, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
-        if (istat /= 0) call cuda_failure("launch_volume_gemm_z",istat)
-      end if
+      call launch_volume_gemm_y_common( &
+        deriv_y, flux_y, D1D_tr, Nq, Ne, istat )
+      if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
+      istat = launch_volume_gemm_z( &
+        dqdt, flux_z, D1D_tr, Nq, Ne, cutlass_mma_shape_id )
+      if (istat /= 0) call cuda_failure("launch_volume_gemm_z",istat)
     end if
     call dg_ev_record(3)
 
-    if (use_side) call dg_side_join(overlap_y)
+    if (use_side .or. overlap_y) call dg_side_join(overlap_y)
 
     if (fuse_epilogue) call dg_ev_record(4)
 
     if (fuse_epilogue) then
-      if (Nq <= 16) then
-        ! Shallow K: even a 64x16 z tile (see p15_gap_study.md §23.4) loses
-        ! to cuBLAS z + separable lift. Keep the fused driver, take library z.
-        istat = cublas_dgemm_strided_batched_impl(0, 0, nq2, Nq, Nq, &
-          1.0_c_double, flux_z, nq2, stride_vol, D1D_tr, Nq, stride_zero, &
-          0.0_c_double, dqdt, nq2, stride_vol, Ne)
-        if (istat /= 0) call cuda_failure("cublasDgemm z-deriv (fused)",istat)
-        call separable_lift_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-          dqdt, Escale(1,1,1), Escale(1,1,2), Escale(1,1,3), &
-          deriv_x, deriv_y, dqdt, flux_bnd, Lift1D, &
-          Nq, Np, npoint )
-      else if (xy_weighted /= 0) then
+      if (xy_weighted /= 0) then
         istat = launch_z_gemm_assembly( &
           dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, Lift1D, &
           dg_lift_zpair, Escale, Nq, Ne, cutlass_mma_shape_id, xy_weighted )
+        if (istat /= 0) call cuda_failure("launch_z_gemm_assembly",istat)
       else
         istat = launch_z_gemm_assembly( &
           dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, Lift1D, &
           Lift1D, Escale, Nq, Ne, cutlass_mma_shape_id, xy_weighted )
+        if (istat /= 0) call cuda_failure("launch_z_gemm_assembly",istat)
       end if
-      if (istat /= 0) call cuda_failure("launch_z_gemm_assembly",istat)
     else
       call separable_lift_assembly_kernel<<<nblock,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
         dqdt, Escale(1,1,1), Escale(1,1,2), Escale(1,1,3), &

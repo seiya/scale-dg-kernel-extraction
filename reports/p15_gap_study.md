@@ -1380,6 +1380,12 @@ MMA への置換は `FUSED_TC` の役割である。
 検証は `SCALE_DG_VARYING_COEFF=1`、`namelists/val_p15_gemm_fused.conf` 対
 `val_p15_split.conf`（32,768 点）。
 
+> **2026-08-31 訂正:** §23.3--23.4 の cuBLAS y/z 採用は、現在の経路役割
+> （`GEMM_CUTE` と `GEMM_FUSED` は同じ CUTLASS volume-GEMM tile を使い、
+> `GEMM_FUSED` の z は fused epilogue とする）に反する。測定値は negative / out-of-scope
+> evidence として残すが、現行実装・公開値ではない。役割準拠版への復帰、再検証、
+> 再計測は §24。
+
 p=15 の最速は `FUSED_TC`（271.8 µs）のまま。本節は欠測だった GEMM 融合経路を
 開き、Nq=16 で融合パッケージが何をするかを測る。
 
@@ -1412,7 +1418,7 @@ login 5-run の device fused **84.87 ms / 57 stage = 1489 µs/stage**。
 
 1 文: **この経路は浅い K に合わない CUTLASS タイルで y と z が律速している。**
 
-### 23.3 採用
+### 23.3 当時の採用（現在は範囲外）
 
 1. **Nq≤16 の y を cuBLAS strided-batched にする**（`GEMM` / `GEMM_CUTE` と
    同じ呼び出し。`dg_cuda_stream` を毎呼び出し `cublasSetStream`）。
@@ -1452,7 +1458,7 @@ max abs **1.78e-15**。
 
 | 変種 | ms | µs/stage | vs cuBLAS-z |
 |---|---:|---:|---:|
-| cuBLAS z + lift（現行） | 48.545 | 851.7 | — |
+| cuBLAS z + lift（当時採用、現在は範囲外） | 48.545 | 851.7 | — |
 | 融合 z 64×16 | 70.206 | 1231.7 | **+44.6%** |
 
 レンジは重ならない（cuBLAS-z 48.516–48.573、z16 70.178–70.271）。Main
@@ -1473,8 +1479,70 @@ epilogue の `RepadEpilogue` パディング 8 が N=16 で相対的に高くつ
 cuBLAS z + lift の 255 µs にはどちらも届かない。タイル型はソースに残さず、
 Fortran は cuBLAS z に戻した。
 
-`GEMM_CUTE` も Nq≤16 では同じ cuBLAS x/y/z に乗る（タイルと
-`Nq<=64` の x スイッチを分岐させない）。
+当時は `GEMM_CUTE` も Nq≤16 で同じ cuBLAS x/y/z に乗せた。この変更は
+両経路を一致させてはいるが、共有すべき主ループを CUTLASS から cuBLAS に置換して
+しまうため、現在の経路役割には適合しない。
 
-**契約内で `GEMM_FUSED` が `GEMM` から切り離して取れる残りの天井は尽きた。**
-p=15 `GEMM_FUSED` の探索をここで閉じる。最速は `CUDAFORTRAN_FUSED_TC`。
+851.7 µs/stage は浅い K で cuBLAS が有利という有効な性能データだが、
+`GEMM_FUSED` の production 値には使わない。訂正後も最速は
+`CUDAFORTRAN_FUSED_TC`。
+
+## 24. p=15 の経路役割訂正（2026-08-31）
+
+親 `e220c85aa33a378f964f2449602d577a827554df`、GB200、
+`make CUDA=1 GPUFLAGS=-gpu=cc100`。§23.3 の `Nq<=16` cuBLAS y と、cuBLAS z +
+separate lift の特例を除去した。p=15 (`Nq=16`) は p=7 と同様に、x だけが共通の
+`Nq<=64` cuBLAS switch、y は `launch_volume_gemm_y_common`、z は
+`GEMM_CUTE` が CUTLASS z、`GEMM_FUSED` が同じ tile 型を使う fused-z assembly
+へ到達する。これで両経路の差は fusion package に戻った。
+
+### 24.1 数値検証
+
+Slurm job `73219`（c188）、凍結バイナリ
+`scale-dg_extraction.p15gf_role_compliant`。`SCALE_DG_VARYING_COEFF=1` とし、
+`namelists/val_p15_split.conf` と `val_p15_gemm_fused.conf`（`Ne=2³`、owned
+32,768 点）の全 `dqdt` を比較した。最大絶対差 **1.77636e-15**、対応点相対差
+**3.76300e-16**。点ごとに変化する `u,v,w,Escale,normal_fn,Fscale` を含む契約を保つ。
+同じ凍結バイナリの `GEMM_CUTE` も job `73242` で SPLIT と比較し、全点
+**bit exact** だった。
+
+### 24.2 性能と機構
+
+同じ job `73219`、`namelists/perf_p15_gemm_fused.conf`（`Ne=16³`、`nstep=20`、
+graph off）で `GEMM_FUSED` / `GEMM_CUTE` を 12 回交互に実行した中央値:
+
+| 経路 | Main [ms/step] | device [ms/57 stage] | µs/stage |
+|---|---:|---:|---:|
+| `GEMM_CUTE` | 4.10998 | 74.33045 | 1304.0 |
+| `GEMM_FUSED`（役割準拠） | **4.55839** | **83.03550** | **1456.8** |
+| cuBLAS y/z hybrid（§23.3、範囲外） | 2.776 | 48.545 | 851.7 |
+
+準拠版 `GEMM_FUSED` の device レンジは 82.9791--83.0746 ms で、旧 hybrid は
+**1.71 倍高速**だった。しかしその差は fusion package の改善ではなく、y/z mainloop
+を cuBLAS に交換した効果なので production 比較には採用しない。準拠版は
+1.43 TFLOP/s（FP64 peak の 3.6%）、unique 0.91 TB/s（11.5%）、path 2.14 TB/s
+（27.1%）。`FUSED_TC` 271.8 µs/stage に対して 5.36 倍遅く、最速経路は変わらない。
+
+nsys job `73220`（c188、graph off、60 instance）の 1 stage あたり:
+
+| カーネル | µs/stage | 説明 |
+|---|---:|---|
+| CUTLASS y（2 launch） | 570.3 | 64×64 tile 対 16×16、65535 + 1 batch |
+| fused CUTLASS z assembly | 504.3 | 64×32 tile、N=16 の半分を述語化 |
+| `elembnd_flux` | 138.4 | 直列実行 |
+| `volume_flux` | 125.9 | pointwise flux |
+| cuBLAS x | 96.8 | 許可された共通 `Nq<=64` switch |
+| y の 1-batch remainder | 3.2 | 32×32 kernel |
+
+y と z だけで約 1.075 ms/stage あり、§23.2 と同じ「浅い K に対して tile が大きい」
+機構が再現した。したがって 851.7 µs は捨てる測定ではなく、cuBLAS 置換の天井を示す
+範囲外 ablation として保持する。
+
+プロファイラは凍結バイナリに対し次で取得した:
+
+```bash
+export DEBUGINFOD_URLS=
+timeout 180 nsys profile --stats=true --resolve-symbols=false \
+  -o output/nsys_p15gf_role \
+  ./scale-dg_extraction.p15gf_role_compliant namelists/perf_p15_gemm_fused.conf
+```
