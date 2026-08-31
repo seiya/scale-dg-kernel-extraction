@@ -428,8 +428,9 @@ __device__ __forceinline__ int sw255(int idx)
 template <int DIR, int BM, int BN, int TM, int TN>
 __device__ __forceinline__ void p255_epilogue(
     double *dqdt, const double *Lift1D, const double *flux_bnd,
-    const double *Escale, const double *acc, int m0, int n0, int wm, int wn,
-    int row, int colk, int eo, int efo, int npoint, int plane_off, int kplane)
+    const double *Escale, const double *acc, const double *face24,
+    const double *es_pre, int m0, int n0, int wm, int wn, int row, int colk,
+    int eo, int efo, int npoint, int plane_off, int kplane)
 {
   const int NQ = NQ255;
   const int NQ2 = NQ * NQ;
@@ -441,15 +442,32 @@ __device__ __forceinline__ void p255_epilogue(
   for (int a = 0; a < TM; ++a) {
     const int m = m0 + 8 * (TM * wm + a) + row;
     if (DIR == 0) {
-      const int fp = m + NQ * kplane;
-      ra[a] = flux_bnd[efo + NQ2 + fp];
-      rb2[a] = flux_bnd[efo + 3 * NQ2 + fp];
+      ra[a] = face24[m - m0];
+      rb2[a] = face24[64 + (m - m0)];
     } else if (DIR == 1) {
       ra[a] = Lift1D[m];
       rb2[a] = Lift1D[m + 2 * NQ];
     } else {
       ra[a] = Lift1D[m + 4 * NQ];
       rb2[a] = Lift1D[m + 5 * NQ];
+    }
+  }
+
+  double2 dout[TM * TN];
+  double2 esy[TM * TN];
+  if (DIR != 0) {
+#pragma unroll
+    for (int bb = 0; bb < TN; ++bb) {
+      const int n = n0 + 8 * (TN * wn + bb) + 2 * colk;
+#pragma unroll
+      for (int a = 0; a < TM; ++a) {
+        const int m = m0 + 8 * (TM * wm + a) + row;
+        const int node =
+            (DIR == 2) ? (eo + n + NQ2 * m) : (eo + n + NQ * m + plane_off);
+        dout[TN * a + bb] = *reinterpret_cast<const double2 *>(dqdt + node);
+        esy[TN * a + bb] = *reinterpret_cast<const double2 *>(
+            Escale + node + (DIR == 1 ? npoint : 2 * npoint));
+      }
     }
   }
 
@@ -481,7 +499,7 @@ __device__ __forceinline__ void p255_epilogue(
       if (DIR == 0) {
         // Faces 2 and 4 vary in (j,k), so the node pair shares the flux value
         // and differs only through the Lift1D coefficient, which varies in i.
-        const double2 es = *reinterpret_cast<const double2 *>(Escale + node);
+        const double2 es = make_double2(es_pre[2 * e8], es_pre[2 * e8 + 1]);
         const double l0 = c0n.x * ra[a] + c1n.x * rb2[a];
         const double l1 = c0n.y * ra[a] + c1n.y * rb2[a];
         *reinterpret_cast<double2 *>(dqdt + node) =
@@ -490,9 +508,8 @@ __device__ __forceinline__ void p255_epilogue(
         // Faces 1 and 3 vary in (i,k) and faces 5 and 6 in the linear (i,j)
         // point: here the pair shares the coefficient and the two flux values
         // are one aligned double2.
-        const double2 es = *reinterpret_cast<const double2 *>(
-            Escale + node + (DIR == 1 ? npoint : 2 * npoint));
-        double2 out = *reinterpret_cast<const double2 *>(dqdt + node);
+        const double2 es = esy[e8];
+        double2 out = dout[e8];
         out.x -= es.x * c0 + ra[a] * c0n.x + rb2[a] * c1n.x;
         out.y -= es.y * c1 + ra[a] * c0n.y + rb2[a] * c1n.y;
         *reinterpret_cast<double2 *>(dqdt + node) = out;
@@ -524,12 +541,15 @@ __device__ __forceinline__ void p255_epilogue(
 //   - bigger tiles (64x128, 128x64, 128x128) in every thread-count and
 //     launch-bound combination that fits: 10-35% slower, all of them through
 //     registers and occupancy, never through the operand traffic they save.
-template <int DIR, bool UseTc>
+template <int DIR, bool UseTc, bool FuseFace24>
 __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
     double *__restrict__ dqdt, const double *__restrict__ q,
     const double *__restrict__ velocity, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ flux_bnd,
-    const double *__restrict__ Escale, int Ne)
+    const double *__restrict__ Escale, const double *__restrict__ vel_v,
+    const double *__restrict__ vel_w, const int *__restrict__ VMapM,
+    const int *__restrict__ VMapP, const double *__restrict__ normal_fn,
+    const double *__restrict__ Fscale, int Ne)
 {
   constexpr int BM = BM255;
   constexpr int BN = BN255;
@@ -757,9 +777,51 @@ __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
 #undef P255_ISSUE
 #undef P255_STORE
 
-  p255_epilogue<DIR, BM, BN, TM, TN>(dqdt, Lift1D, flux_bnd, Escale, acc, m0,
-                                     n0, wm, wn, row, colk, eo, efo, npoint,
-                                     plane_off, kplane);
+  double esx[2 * TM * TN];
+  const double *face24 = nullptr;
+  if (DIR == 0) {
+    const int j = m0 + (tid & 63);
+    const int fp = j + NQ * kplane;
+#pragma unroll
+    for (int bb = 0; bb < TN; ++bb) {
+      const int n = n0 + 8 * (TN * wn + bb) + 2 * colk;
+#pragma unroll
+      for (int a = 0; a < TM; ++a) {
+        const int e8 = TN * a + bb;
+        const int m = m0 + 8 * (TM * wm + a) + row;
+        const int node = eo + n + NQ * m + plane_off;
+        const double2 es = *reinterpret_cast<const double2 *>(Escale + node);
+        esx[2 * e8] = es.x;
+        esx[2 * e8 + 1] = es.y;
+      }
+    }
+    const int fidx = efo + ((tid < 64) ? NQ2 : 3 * NQ2) + fp;
+    if constexpr (FuseFace24) {
+      const int nface = 6 * NQ2 * Ne;
+      const int iP = VMapP[fidx] - 1;
+      const double fn1 = normal_fn[fidx];
+      const double fn2 = normal_fn[fidx + nface];
+      const double fn3 = normal_fn[fidx + 2 * nface];
+      const double qP = q[iP];
+      const double VelP =
+          velocity[iP] * fn1 + vel_v[iP] * fn2 + vel_w[iP] * fn3;
+      const int iM = eo + ((tid < 64) ? (NQ - 1) : 0) + NQ * j + plane_off;
+      const double qM = q[iM];
+      const double VelM =
+          velocity[iM] * fn1 + vel_v[iM] * fn2 + vel_w[iM] * fn3;
+      const double alpha = 0.5 * fabs(VelP + VelM);
+      sA[0][tid] =
+          0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+    } else {
+      sA[0][tid] = flux_bnd[fidx];
+    }
+    face24 = sA[0];
+    __syncthreads();
+  }
+
+  p255_epilogue<DIR, BM, BN, TM, TN>(dqdt, Lift1D, flux_bnd, Escale, acc, face24,
+                                     esx, m0, n0, wm, wn, row, colk, eo, efo,
+                                     npoint, plane_off, kplane);
 }
 
 static void check_cuda(const char *what)
@@ -821,12 +883,15 @@ void launch_tendency_xyz_p255_impl(
     const double *flux_bnd, const double *Escale, int Ne)
 {
   const int nblock = (NQ255 * NQ255 * NQ255 / (BM255 * BN255)) * Ne;
-  tendency_p255_kernel<0, UseTc><<<nblock, TH255, 0, dg_cuda_stream>>>(
-      dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, Ne);
-  tendency_p255_kernel<1, UseTc><<<nblock, TH255, 0, dg_cuda_stream>>>(
-      dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, Ne);
-  tendency_p255_kernel<2, UseTc><<<nblock, TH255, 0, dg_cuda_stream>>>(
-      dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, Ne);
+  tendency_p255_kernel<0, UseTc, false><<<nblock, TH255, 0, dg_cuda_stream>>>(
+      dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, v, w, nullptr, nullptr, nullptr,
+      nullptr, Ne);
+  tendency_p255_kernel<1, UseTc, false><<<nblock, TH255, 0, dg_cuda_stream>>>(
+      dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, nullptr, nullptr, nullptr,
+      nullptr, nullptr, nullptr, Ne);
+  tendency_p255_kernel<2, UseTc, false><<<nblock, TH255, 0, dg_cuda_stream>>>(
+      dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, nullptr, nullptr, nullptr,
+      nullptr, nullptr, nullptr, Ne);
   check_cuda("p255 fused tendency kernels");
 }
 
@@ -846,6 +911,52 @@ extern "C" void launch_tendency_xyz_p255_tc(
 {
   launch_tendency_xyz_p255_impl<true>(dqdt, q, u, v, w, D1D, Lift1D, flux_bnd,
                                       Escale, Ne);
+}
+
+template <bool UseTc>
+void launch_tendency_dir_p255_impl(
+    int dir, double *dqdt, const double *q, const double *u, const double *v,
+    const double *w, const double *D1D, const double *Lift1D,
+    const double *flux_bnd, const double *Escale, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale, int Ne)
+{
+  const int nblock = (NQ255 * NQ255 * NQ255 / (BM255 * BN255)) * Ne;
+  if (dir == 0) {
+    tendency_p255_kernel<0, UseTc, true><<<nblock, TH255, 0, dg_cuda_stream>>>(
+        dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, v, w, VMapM, VMapP, normal_fn,
+        Fscale, Ne);
+  } else if (dir == 1) {
+    tendency_p255_kernel<1, UseTc, false><<<nblock, TH255, 0, dg_cuda_stream>>>(
+        dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, v, w, VMapM, VMapP, normal_fn,
+        Fscale, Ne);
+  } else {
+    tendency_p255_kernel<2, UseTc, false><<<nblock, TH255, 0, dg_cuda_stream>>>(
+        dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, v, w, VMapM, VMapP, normal_fn,
+        Fscale, Ne);
+  }
+  check_cuda("p255 fused tendency dir kernel");
+}
+
+extern "C" void launch_tendency_dir_p255_dfma(
+    int dir, double *dqdt, const double *q, const double *u, const double *v,
+    const double *w, const double *D1D, const double *Lift1D,
+    const double *flux_bnd, const double *Escale, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale, int Ne)
+{
+  launch_tendency_dir_p255_impl<false>(dir, dqdt, q, u, v, w, D1D, Lift1D,
+                                       flux_bnd, Escale, VMapM, VMapP, normal_fn,
+                                       Fscale, Ne);
+}
+
+extern "C" void launch_tendency_dir_p255_tc(
+    int dir, double *dqdt, const double *q, const double *u, const double *v,
+    const double *w, const double *D1D, const double *Lift1D,
+    const double *flux_bnd, const double *Escale, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale, int Ne)
+{
+  launch_tendency_dir_p255_impl<true>(dir, dqdt, q, u, v, w, D1D, Lift1D,
+                                      flux_bnd, Escale, VMapM, VMapP, normal_fn,
+                                      Fscale, Ne);
 }
 
 //============================================================================

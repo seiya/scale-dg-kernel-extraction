@@ -13,7 +13,7 @@ Namelist は `namelists/`、Slurm ジョブは `jobs/` に移し、名前を揃�
 | ファイル | 内容 |
 |---|---|
 | [`overall_summary_report.md`](overall_summary_report.md) | 全実装パスの横断まとめ。時間内訳、ncu 効率分析、理論仕事量に対する達成率、不採用にした最適化とその理由。OpenACC → CUDA Fortran の実装変遷と代表スカラー特殊化の撤回も含む。**最初に読むならこれ。** |
-| [`p255_gap_study.md`](p255_gap_study.md) | p=255 の全記録。§0 は volume GEMM と z-epilogue 融合、および TC の 64×64 タイル化（4474 → 1566 µs/stage、当時は `GEMM_FUSED` が最速）。§1 以降は `CUDAFORTRAN_FUSED_TC` を **1563.9 → 968.8 µs/stage（−38.1%、全段ビット一致）**にした記録。チャンクループの二重バッファ化と 1 ワープ 4×4 mma タイルは**組でしか効かない**、エピローグを b 外 / a 内に組み替えると LDG が 112 → 32 本になる、ストアのペア格納順で 2-way バンクコンフリクトが消える。**これで p=255 の最速は `GEMM_FUSED` から `FUSED_TC` に替わった。**命令数を 17〜34% 減らす変更が 2 度とも遅くなったことの記録も含む。**§10（同日）は逆に `GEMM_FUSED` 側を 1048.8 → 1021.2 µs/stage（−2.6%）にした**: z の assembly epilogue は**命令発行律速**（lift を消すと命令 −13.0% で時間 −12.8%、stall 内訳も占有率も不変）で、`Escale_x/y` を x/y GEMM の標準 epilogue に前送りし、添字クランプをタイル原点へ集約し、lift の 6 本のロードを 3 本の `double2` にした。手書き epilogue で標準 epilogue を置き換えると**それだけで +72 µs** かかる |
+| [`p255_gap_study.md`](p255_gap_study.md) | p=255 の全記録。§0 は volume GEMM と z-epilogue 融合、および TC の 64×64 タイル化（4474 → 1566 µs/stage、当時は `GEMM_FUSED` が最速）。§1 以降は `CUDAFORTRAN_FUSED_TC` を **1563.9 → 968.8 µs/stage（−38.1%、全段ビット一致）**にした記録。チャンクループの二重バッファ化と 1 ワープ 4×4 mma タイルは**組でしか効かない**、エピローグを b 外 / a 内に組み替えると LDG が 112 → 32 本になる、ストアのペア格納順で 2-way バンクコンフリクトが消える。**これで p=255 の最速は `GEMM_FUSED` から `FUSED_TC` に替わった。**命令数を 17〜34% 減らす変更が 2 度とも遅くなったことの記録も含む。**§10（同日）は逆に `GEMM_FUSED` 側を 1048.8 → 1021.2 µs/stage（−2.6%）にした**。**§16（2026-08-30）は大タイル/`BK=32`/range 重ねを不採用（912.6 µs）。§17–20 は compact 重ね・faces 2,4・M 側直アドレス・エピローグ先読みを採用し、最終占有 GPU 測定は 883.8 µs/stage。§21 の P 側先行は占有 GPU で差なし、§22 の `cp.async` / 最終 ISSUE / `__ldg` ほかも採用ゼロ** |
 | [`p7_gap_study.md`](p7_gap_study.md) | p=7 `CUDAFORTRAN_FUSED`（CUDA-core）を 326.3 → **302.8 µs/stage（−7.2%、ビット一致）**。6 面の M 側 shared ステージ、`launch_bounds(256,6)` で spill 除去、P 側 `__ldg`。最速は `FUSED_TC` のまま。主比 1.19× → **1.10×** |
 | [`p7_gemm_fused.md`](p7_gemm_fused.md) | p=7 `CUDAFORTRAN_GEMM_FUSED` の役割準拠 CUTLASS tile を調整し **2532.9 → 1960.3 µs/stage（−22.6%）**。y 32x64 s3、z 16x32 s3。旧 380 µs の要素 CTA は `FUSED` 相当なので範囲外として訂正 |
 | [`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) | arXiv:2407.09621 の取り込み調査と、p=7 Tensor Core カーネルの shared memory レイアウト刷新。経路横断（§15）と CC 復活（§17）。CC のその後は [`p7_gap_study.md`](p7_gap_study.md)。§14 は p=31 で効いた「D1D フラグメントのレジスタ常駐化」が p=7 では**効かない**ことの実測 |
@@ -419,7 +419,14 @@ p=31 / p=7 / p=15 / p=127 の `FUSED` 行**で、[`p31_gap_study.md`](p31_gap_st
   役割準拠の CUTLASS mainloop を **2532.9 → 1960.3 µs/stage（−22.6%）**。
   z は命令 −65%、shared −62.5%、占有率 12.25 → 24.06%。旧 380 µs の
   要素 CTA は `FUSED` 相当で範囲外。最速は `FUSED_TC` のまま。
-
+- **p=255 `FUSED_TC` を 912.6 → 883.8 µs/stage にした（2026-09-01、
+  `p255_gap_study.md` §17–22）**: 面重ね、faces 2,4 の x 内評価、M 側直
+  アドレス、x/y/z エピローグ先読み。P 側 gather の先行は login で −0.12%
+  だったが、占有 GPU 12 組では +0.001% で差なしとして戻した。最速は
+  `CUDAFORTRAN_FUSED_TC` のまま。横断表の 918.9 µs は
+  2026-08-29 のまま。**§22（2026-08-31）は P 側 `cp.async`（+1.06%）、
+  最終 mma ISSUE（+0.35%）、P `__ldg`（+0.87%）ほか採用ゼロ。** ptxas 168
+  レジスタで `MINB=3` が屋根。
 - **p=15 `FUSED_TC` の残り天井を測って探索を終了した（2026-08-30、
   `p15_gap_study.md` §20）**: 採用ゼロ。§16.7 の z 往復 −6.2% は mma を残した
   不正アブレーションで、契約内の 2 形は p=31 型 `(i,k)` + j ループが **+77%**、

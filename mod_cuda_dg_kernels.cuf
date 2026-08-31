@@ -346,6 +346,30 @@ module mod_cuda_dg_kernels
       real(c_double), device :: D1D(*), Lift1D(*), flux_bnd(*), Escale(*)
     end subroutine launch_tendency_xyz_p255_dfma
 
+    subroutine launch_tendency_dir_p255_tc( &
+      dir, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
+      VMapM, VMapP, normal_fn, Fscale, Ne) &
+      bind(C, name="launch_tendency_dir_p255_tc")
+      import
+      integer(c_int), value :: dir, Ne
+      real(c_double), device :: dqdt(*), q(*), u(*), v(*), w(*)
+      real(c_double), device :: D1D(*), Lift1D(*), flux_bnd(*), Escale(*)
+      integer(c_int), device :: VMapM(*), VMapP(*)
+      real(c_double), device :: normal_fn(*), Fscale(*)
+    end subroutine launch_tendency_dir_p255_tc
+
+    subroutine launch_tendency_dir_p255_dfma( &
+      dir, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
+      VMapM, VMapP, normal_fn, Fscale, Ne) &
+      bind(C, name="launch_tendency_dir_p255_dfma")
+      import
+      integer(c_int), value :: dir, Ne
+      real(c_double), device :: dqdt(*), q(*), u(*), v(*), w(*)
+      real(c_double), device :: D1D(*), Lift1D(*), flux_bnd(*), Escale(*)
+      integer(c_int), device :: VMapM(*), VMapP(*)
+      real(c_double), device :: normal_fn(*), Fscale(*)
+    end subroutine launch_tendency_dir_p255_dfma
+
     function cublas_gemm_init(emulate, mantissa_fixed, mantissa_bits) &
       bind(C, name="cublas_gemm_init")
       import
@@ -1265,7 +1289,9 @@ contains
     real(RP), device, intent(out) :: flux_bnd(NfpTot,Ne)
     real(RP), intent(out) :: kernel_time(2)
 
-    integer :: istat, nface, nblock_face
+    integer :: istat, nface, nq2, nblock_rest
+    integer(kind=cuda_stream_kind) :: s_rest
+    logical :: use_side
 
     if (Nq /= CUDA_P255_NQ .or. Np /= CUDA_P255_NQ**3) then
       error stop "cuda_cal_dqdt_fused_p255_dfma requires PolyOrder=255"
@@ -1273,13 +1299,29 @@ contains
     call dg_ev_begin()
 
     nface = NfpTot*Ne
-    nblock_face = (nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    nq2 = Nq*Nq
+    nblock_rest = (4*nq2*Ne+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    use_side = dg_side_enabled
 
     call dg_ev_record(1)
-    call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
-    call launch_tendency_xyz_p255_dfma( &
-      dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, int(Ne,c_int) )
+    if (use_side) then
+      call dg_side_fork(.false.)
+      s_rest = dg_side_stream
+    else
+      s_rest = dg_stream
+    end if
+    call launch_tendency_dir_p255_dfma( &
+      0, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
+      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int) )
+    call elembnd_flux_group_kernel<<<nblock_rest,CUDA_BLOCK_SIZE,0,s_rest>>>( &
+      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, nq2, 1 )
+    if (use_side) call dg_side_join(.false.)
+    call launch_tendency_dir_p255_dfma( &
+      1, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
+      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int) )
+    call launch_tendency_dir_p255_dfma( &
+      2, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
+      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int) )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("p=255 DFMA tendency kernels",istat)
     call dg_ev_record(2)
@@ -1460,7 +1502,9 @@ contains
     real(RP), device, intent(out) :: flux_bnd(NfpTot,Ne)
     real(RP), intent(out) :: kernel_time(2)
 
-    integer :: istat, nface, nblock_face
+    integer :: istat, nface, nq2, nblock_rest
+    integer(kind=cuda_stream_kind) :: s_rest
+    logical :: use_side
 
     if (Nq /= CUDA_P255_NQ .or. Np /= CUDA_P255_NQ**3) then
       error stop "cuda_cal_dqdt_fused_p255_tc requires PolyOrder=255"
@@ -1468,13 +1512,29 @@ contains
     call dg_ev_begin()
 
     nface = NfpTot*Ne
-    nblock_face = (nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    nq2 = Nq*Nq
+    nblock_rest = (4*nq2*Ne+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    use_side = dg_side_enabled
 
     call dg_ev_record(1)
-    call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
-    call launch_tendency_xyz_p255_tc( &
-      dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, int(Ne,c_int) )
+    if (use_side) then
+      call dg_side_fork(.false.)
+      s_rest = dg_side_stream
+    else
+      s_rest = dg_stream
+    end if
+    call launch_tendency_dir_p255_tc( &
+      0, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
+      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int) )
+    call elembnd_flux_group_kernel<<<nblock_rest,CUDA_BLOCK_SIZE,0,s_rest>>>( &
+      flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, nq2, 1 )
+    if (use_side) call dg_side_join(.false.)
+    call launch_tendency_dir_p255_tc( &
+      1, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
+      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int) )
+    call launch_tendency_dir_p255_tc( &
+      2, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
+      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int) )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("p=255 TC tendency kernels",istat)
     call dg_ev_record(2)
@@ -2841,6 +2901,57 @@ contains
         qP*VelP-qM*VelM-alpha*(qP-qM) )
     end if
   end subroutine elembnd_flux_kernel
+
+  ! group=0: faces 2 and 4 (2*Nq^2 compact threads / element).
+  ! group=1: faces 1,3,5,6 (4*Nq^2 compact threads / element).
+  attributes(global) subroutine elembnd_flux_group_kernel( &
+    flux, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, nq2, group )
+    implicit none
+    integer, value :: nface, nq2, group
+    real(RP), device :: flux(*), q(*), u(*), v(*), w(*)
+    integer, device :: VMapM(*), VMapP(*)
+    real(RP), device :: normal_fn(*), Fscale(*)
+
+    integer :: tid, nwork_e, ie, local, base, idx, iM, iP
+    real(RP) :: qM, qP, VelM, VelP, alpha
+
+    tid = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    nwork_e = merge(2*nq2, 4*nq2, group == 0)
+    ie = (tid-1) / nwork_e
+    local = mod(tid-1, nwork_e)
+    base = ie * 6 * nq2
+    idx = base + local + 1
+    if (group == 0) then
+      if (local < nq2) then
+        idx = base + nq2 + local + 1
+      else
+        idx = base + 3*nq2 + (local-nq2) + 1
+      end if
+    else
+      if (local < nq2) then
+        idx = base + local + 1
+      else if (local < 2*nq2) then
+        idx = base + 2*nq2 + (local-nq2) + 1
+      else
+        idx = base + 4*nq2 + (local-2*nq2) + 1
+      end if
+    end if
+    if (idx <= nface) then
+      iM = VMapM(idx)
+      iP = VMapP(idx)
+      qM = q(iM)
+      qP = q(iP)
+      VelM = u(iM)*normal_fn(idx) &
+           + v(iM)*normal_fn(idx+nface) &
+           + w(iM)*normal_fn(idx+2*nface)
+      VelP = u(iP)*normal_fn(idx) &
+           + v(iP)*normal_fn(idx+nface) &
+           + w(iP)*normal_fn(idx+2*nface)
+      alpha = 0.5_RP*abs(VelP+VelM)
+      flux(idx) = 0.5_RP*Fscale(idx)*( &
+        qP*VelP-qM*VelM-alpha*(qP-qM) )
+    end if
+  end subroutine elembnd_flux_group_kernel
 
   subroutine cuda_cal_volume_flux( &
     flux_x, flux_y, flux_z, q, u, v, w, Np, Ne, NeA )
