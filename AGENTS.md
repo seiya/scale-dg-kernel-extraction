@@ -63,10 +63,12 @@ it would explain or how fast it would be; record it as out of scope and why.
 
 ## Implementation Path Roles
 
-The fastest production paths are `CUDAFORTRAN_GEMM_FUSED` and
-`CUDAFORTRAN_FUSED_TC` (which one wins depends on polynomial order). The
-other CUDA paths exist to isolate one axis at a time. Do not independently
-speed-optimize a control path.
+Across the polynomial orders measured so far the fastest path is either
+`CUDAFORTRAN_GEMM_FUSED` or `CUDAFORTRAN_FUSED_TC`; see `reports/README.md`
+for the current table. That is a measurement, not a role assignment.
+`CUDAFORTRAN_FUSED` is a production path as well and is optimized as such.
+The remaining CUDA paths are controls that exist to isolate one axis at a
+time; do not independently speed-optimize a control path.
 
 Numerical correctness and path identity are two independent requirements.
 A candidate is eligible for production only if it satisfies both:
@@ -83,33 +85,69 @@ implementation is fastest.
 
 - `CUDAFORTRAN_GEMM`: unfused volume GEMM with cuBLAS. Surrounding kernels
   (volume flux, face flux, `separable_lift_assembly`, z written into `dqdt`)
-  are the reference layout for library comparisons.
+  are shared with `GEMM_CUTE`, the Ozaki paths and `GEMM_FUSED`, which is what
+  makes those three comparisons one-axis ones (mainloop, GEMM internals,
+  epilogue fusion). Shared does not mean unoptimized: the GEMM family is the
+  paper's library baseline and a weak baseline overstates the fused paths'
+  win, so optimize these kernels -- but land the change on all of them at
+  once. The one fusion `GEMM` must not have is the epilogue itself, which is
+  the axis `GEMM_FUSED` measures and which cuBLAS cannot express anyway.
+  This sharing is structural, not a convention: `GEMM`, `OZAKI1` and `OZAKI2`
+  are thin wrappers over one `cuda_cal_dqdt_gemm_unfused(backend, ...)` driver,
+  and `GEMM_CUTE` / `GEMM_FUSED` over one
+  `cuda_cal_dqdt_gemm_cutlass(fuse_epilogue, ...)` driver. Keep it that way:
+  optimize a surrounding kernel through its shared launch helper (e.g.
+  `launch_volume_flux`) so every GEMM path gets it at once.
 - `CUDAFORTRAN_GEMM_OZAKI1` / `CUDAFORTRAN_GEMM_OZAKI2`: the same unfused
   driver as `CUDAFORTRAN_GEMM`. Only the three volume GEMMs are replaced.
   Compare them to native cuBLAS and to `CublasEmulation` on that same
   driver. Do not put Ozaki on the CUTLASS fused paths.
 - `CUDAFORTRAN_GEMM_CUTE`: the unfused control for the CUTLASS GEMM path.
   It must use the same volume-GEMM mainloops, tile shapes, MMA shapes, stage
-  counts, swizzles, order specializations, and batch chunking as
-  `CUDAFORTRAN_GEMM_FUSED`. The only library exception is the shared
-  `Nq<=64` cuBLAS **x** switch. Its y and z volume GEMMs remain CUTLASS. Its
-  epilogues are unweighted, z is materialized in `dqdt`, and a separate
+  counts, swizzles, order specializations, batch chunking, and per-GEMM
+  library assignment as `CUDAFORTRAN_GEMM_FUSED`. Its epilogues are
+  unweighted, z is materialized in `dqdt`, and a separate
   `separable_lift_assembly` kernel performs the final weighting and surface
   lift. `GEMM` vs `GEMM_CUTE` measures the library/mainloop difference. Do
   not retune CUTE on its own.
 - `CUDAFORTRAN_GEMM_FUSED`: the fused-epilogue production CUTLASS GEMM path.
-  It has the same volume-GEMM mainloops and the same `Nq<=64` cuBLAS-x switch
-  as `GEMM_CUTE`. Its z CUTLASS operation must fuse the final volume weighting
-  and surface lift/assembly into the z epilogue; it must not materialize z and
-  then call `separable_lift_assembly`. At `Nq>64` the fusion package also
-  includes Escale forwarding and folding `deriv_x` into y. CUTLASS tile types
-  live in `VolumeGemmSet` (or an explicitly shared order-specialized set) in
-  `cuda_cutlass_gemm_fused.cu`.
+  It has the same volume-GEMM mainloops and the same per-GEMM library
+  assignment as `GEMM_CUTE`. The last of its three volume GEMMs must fuse the
+  final volume weighting and surface lift/assembly into its epilogue; it must
+  not materialize all three derivatives and then call
+  `separable_lift_assembly`. Which GEMM carries that epilogue is a
+  measurement, not part of the
+  definition: the epilogue reads the other two derivatives elementwise at the
+  same node index, so x, y or z can each carry it by running last, and each
+  offers a different face-point pair for tile-level reuse and a different
+  register budget. z is the current carrier and the only one measured. The
+  carrier cannot be cuBLAS, which has no epilogue. That is the only fixed
+  point of the library assignment: which library runs each of the other two
+  volume GEMMs is a measurement, and the assignment must be identical in
+  `GEMM_CUTE` and `GEMM_FUSED`. There is no threshold in this document to
+  honour: the assignment in the tree is whatever last measured fastest, and
+  the gap studies record it. Beyond that required fusion, forwarding Escale
+  factors into the other two volume GEMMs and folding one derivative into
+  another belong to the fusion package as well: they are consequences of
+  fusing, not mainloop differences, so `GEMM_FUSED`
+  may carry them where `GEMM_CUTE` cannot, and which of them to carry at a
+  given order is a measurement, not a rule stated here. With z as the carrier
+  they are gated by `xy_weighted` (Escale into x/y, `deriv_x` into y); the
+  orders where that measured faster are in the gap studies.
+  CUTLASS tile types live in `VolumeGemmSet` (or an explicitly shared
+  order-specialized set) in `cuda_cutlass_gemm_fused.cu`.
 - `CUDAFORTRAN_FUSED`: CUDA-core fused kernels in `cuda_dg_kernels_fused.cu`
   (natural-order shared panels, length-`Nq` inner products). This is the
-  paper's "CC fused" column. Do not retune it as a race against
-  `FUSED_TC`. Selecting `FUSED` must launch these kernels. Never dispatch
-  `FUSED_DFMA` or `FUSED_TC` in its place.
+  paper's "CC fused" column, and it is a full optimization target: make it as
+  fast as CUDA cores allow within that implementation style. What it must not
+  do is adopt the TC path's implementation: that variant already exists and is
+  measured as `FUSED_DFMA`, and merging the two would cost the iso-schedule
+  ablation -- the only thing that separates the mma instruction from the
+  schedule built around it. The paper's CC column is the fastest CC path, not
+  a property of this one: `FUSED` currently holds it at every order measured,
+  and if the TC schedule ever won, the answer is to report `FUSED_DFMA` as the
+  fastest CC, not to rewrite `FUSED`. Selecting `FUSED` must launch these
+  kernels. Never dispatch `FUSED_DFMA` or `FUSED_TC` in its place.
 - `CUDAFORTRAN_FUSED_TC`: Tensor Core fused kernels in
   `cuda_dg_kernels_tc.cu` with `UseTc=true` (`mma.sync.m8n8k4`).
 - `CUDAFORTRAN_FUSED_DFMA`: the same source as `FUSED_TC` with
@@ -124,14 +162,12 @@ roundtrip into `FUSED`.
 For `GEMM_CUTE` / `GEMM_FUSED`, the following are defects even when they are
 numerically correct and faster:
 
-- replacing y or z with cuBLAS for one or both paths;
-- implementing `GEMM_FUSED` as cuBLAS/CUTLASS z followed by a separate
-  lift/assembly kernel;
+- giving the epilogue carrier to cuBLAS, which has no epilogue;
+- implementing `GEMM_FUSED` as a cuBLAS/CUTLASS volume GEMM followed by a
+  separate lift/assembly kernel;
 - giving `GEMM_CUTE` and `GEMM_FUSED` different volume mainloop tiles,
-  stage counts, swizzles, batch partitioning, or order-specialized launch
-  geometry;
-- adding a library switch other than the explicitly shared `Nq<=64` cuBLAS-x
-  switch.
+  stage counts, swizzles, batch partitioning, order-specialized launch
+  geometry, or per-GEMM library assignment.
 
 Polynomial-order specialization is allowed, but it may specialize only the
 shared CUTLASS mainloop/launch configuration and the path-appropriate
