@@ -57,8 +57,14 @@
 //- six face loads as three 16-byte loads (kPaired) -- can be measured one
 //- at a time at a low order.  kPaired requires the interleaved face layout
 //- (pair_nq2 in elembnd_flux_kernel) and the packed lift_zpair table.
+//- kXWeighted is the partial form the p=7 fused path needs: the x GEMM runs
+//- on CUTLASS and folds Escale_x into its own epilogue, but y is cuBLAS and
+//- cannot receive Escale_y.  deriv_x therefore arrives pre-weighted while
+//- deriv_y does not, so this epilogue reads four volume tensors (Dx, Dy,
+//- Escale_y, Escale_z) instead of five.  It is meaningful only when kWeighted
+//- is false; kWeighted already covers the all-forwarded case.
 template <typename Epilogue, bool kWeighted, bool kAffine = kWeighted,
-          bool kPaired = kWeighted>
+          bool kPaired = kWeighted, bool kXWeighted = false>
 class EpilogueDqdtAssembly : public Epilogue {
 public:
   using OutputTileIterator = typename Epilogue::OutputTileIterator;
@@ -215,6 +221,16 @@ public:
         it_ez.load(frag_ez);
         ++it_dx;
         ++it_ez;
+      } else if (kXWeighted) {
+        //- Escale_x is already in deriv_x; Escale_y is not in deriv_y.
+        it_dx.load(frag_dx);
+        it_dy.load(frag_dy);
+        it_ey.load(frag_ey);
+        it_ez.load(frag_ez);
+        ++it_dx;
+        ++it_dy;
+        ++it_ey;
+        ++it_ez;
       } else {
         it_dx.load(frag_dx);
         it_dy.load(frag_dy);
@@ -339,6 +355,12 @@ public:
           //- dx already holds deriv_x + deriv_y; see cutlass_y_gemm_scaleadd.h.
           out[i] = -(dx[i] + ez[i] * dz[i] + lf[i]);
         }
+      } else if (kXWeighted) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < OutputTileIterator::Fragment::kElements; ++i) {
+          //- dx already holds Escale_x * deriv_x; deriv_y is still raw.
+          out[i] = -(dx[i] + ey[i] * dy[i] + ez[i] * dz[i] + lf[i]);
+        }
       } else {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < OutputTileIterator::Fragment::kElements; ++i) {
@@ -379,13 +401,15 @@ using RepadEpilogue = cutlass::epilogue::threadblock::Epilogue<
     Epilogue_::kFragmentsPerIteration>;
 
 template <typename Mma_, typename Epilogue_, typename ThreadblockSwizzle_, bool kWeighted,
-          bool kAffine = kWeighted, bool kPaired = kWeighted>
+          bool kAffine = kWeighted, bool kPaired = kWeighted,
+          bool kXWeighted = false>
 struct GemmBatchedDqdtAssembly {
   using Mma = Mma_;
   using Epilogue = Epilogue_;
   using ThreadblockSwizzle = ThreadblockSwizzle_;
   using BaseKernel = cutlass::gemm::kernel::GemmBatched<Mma, Epilogue, ThreadblockSwizzle>;
-  using AssemblyEpilogue = EpilogueDqdtAssembly<Epilogue, kWeighted, kAffine, kPaired>;
+  using AssemblyEpilogue =
+      EpilogueDqdtAssembly<Epilogue, kWeighted, kAffine, kPaired, kXWeighted>;
   using WarpCount = typename Mma::WarpCount;
   static int const kThreadCount = 32 * WarpCount::kCount;
 

@@ -412,6 +412,12 @@ path **2.25 TB/s**（28.5%）。数値は `val_p7_split.conf` 比で max abs
 
 ## 13. `Nq>64` に閉じていた z epilogue の 4 つを p=7 で測る（2026-09-01、3 つ採用、−4.07%）
 
+> **2026-09-02 追記:** 本節の 1739.9 µs/stage はその後 **1505.1 µs/stage** になった
+> （x を次数専用タイルの CUTLASS に、y を cuBLAS に。[`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §1–2）。
+> §13.2 が `Escale` 前送りの +39.4% を「`Nq<=64` では x が cuBLAS で epilogue を
+> 持てず、受け皿が y だけになる」と説明したのは**正しかった**。x を CUTLASS に
+> して受け皿を作ると +39.4% は **+0.53%** まで縮む。それでも負ける（同 §4）。
+
 出所は [`p255_gap_study.md`](p255_gap_study.md) §10 と
 [`p127_gap_study.md`](p127_gap_study.md) §12--13。あちらで
 `GEMM_FUSED` の z assembly epilogue に入れた 4 つは、どれも

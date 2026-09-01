@@ -282,6 +282,14 @@ p=7 では 40 対 148 = 3.7 倍あった。
 
 ## 10. 次数依存ノブの掃引 —— 採用ゼロ
 
+> **2026-09-02 訂正:** 「x GEMM を CUTLASS にすると +10.6%、閾値 `Nq<=64` は
+> 4 次数で裏が取れた」は **機構ごと反証された**（[`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §1）。
+> 原因は K 深度ではなく、C が column-major で `device::Gemm` が転置問題を解くため
+> threadblock の N が Nq に当たり、汎用 64×128 タイルが N の `(128−Nq)/128` を
+> 述語で捨てていたことである。次数専用タイル（Nq=32 は 32×32 / warp 16×16 / 3 stage）
+> では **−1.64%（CUTE）/ −0.81%（FUSED）** で CUTLASS が勝つ。K は逆向きに効き、
+> `TileK=32` は +0.42%。下の表は当時の測定として残す。
+
 | ノブ | 変更 | 結果 | 判定 |
 |---|---|---|---|
 | 側ストリーム（`mod_cuda_dg_kernels.cuf:829`） | `Nq >= 64` → `Nq >= 32` | 2.45242 対 2.43915（**+0.5%**） | 閾値そのままが正しい |
@@ -1040,6 +1048,12 @@ CC と**ビット一致**、`CUDAFORTRAN_SPLIT` に対する最大絶対差は 2
 
 ## 21. `CUDAFORTRAN_GEMM_FUSED`（2026-08-30）
 
+> **2026-09-02 追記:** ここで採った cuBLAS-z + separate-lift の 599.9 µs を
+> 範囲外としたのは、当時の `AGENTS.md` が融合エピローグの担い手を z に
+> 固定していたためで、その判断は当時の定義では正しい。`AGENTS.md` `cbc6cea`
+> で担い手は測定事項になり、**担い手を y にすれば cuBLAS z は合法な割り当てになる**。
+> 役割準拠のまま **609.2 µs/stage** が出た（[`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §3）。
+
 > **2026-08-31 訂正:** §21 の cuBLAS y/z + separate lift 採用は、現在の
 > 経路役割（y/z は CUTLASS mainloop、`GEMM_FUSED` の z は fused epilogue）に
 > 反する hybrid だった。数値と性能は範囲外 ablation の証拠として残すが、
@@ -1218,6 +1232,13 @@ mainloop を優先し、上の特例を `Nq==32` だけに狭めた。job `73791
 `GEMM_FUSED` は最大絶対差 **1.78e-15**。
 
 ## 23. p=31 の経路役割訂正と準拠 y tile（2026-09-01）
+
+> **2026-09-02 訂正:** 「準拠 `GEMM_FUSED` の限界は 709.2 µs/stage」は
+> 担い手が z に固定されていた前提での結論である。担い手を y に移し、
+> `Escale_x` を x epilogue に前送りし、z を cuBLAS にし、z を x と並走させると
+> **609.2 µs/stage**、`GEMM_CUTE` も **606.0 µs/stage**（[`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §3）。
+> 4 つは組でしか効かず、y 担い手だけなら +5.0% の負けである。
+> 本節の x の `Nq<=64` cuBLAS switch 据え置きも、同 §1 で覆った。
 
 親 `feature/cuda` `755538e`、GB200、`make CUDA=1 GPUFLAGS=-gpu=cc100`。
 §21--22 の `Nq==32` cuBLAS-z + `separable_lift_assembly` 分岐を production
@@ -1669,6 +1690,11 @@ ncu duration 342 → 175 µs。global セクタは同一（17,039,360）。占�
 だったことが示すように、このはしごでは 1 バイトも動いていない。
 
 ## 28. `Nq>64` の z epilogue 4 つを p=31 で測る（2026-09-01、採用ゼロ）
+
+> **2026-09-02 追記:** 本節の棄却理由である「レジスタ 254 で 16.3 M スピル」は
+> **p=31 という次数の性質ではなく、z タイル 64×32 の性質**だった。
+> 担い手を y に移すと同じ次数で 128 レジスタ / スピル 0 になる
+> （[`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §3）。この 4 つは y 担い手の上で再測定する価値がある（未測定）。
 
 [`p7_gemm_fused.md`](p7_gemm_fused.md) §13 の横展開。`GEMM_FUSED` の z
 assembly epilogue にあって `Nq >= 64` の枝に閉じていた 4 つ —— 添字クランプの

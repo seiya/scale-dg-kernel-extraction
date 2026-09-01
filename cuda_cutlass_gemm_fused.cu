@@ -15,6 +15,7 @@
 
 #include "cutlass_z_gemm_assembly.h"
 #include "cutlass_y_gemm_scaleadd.h"
+#include "cutlass_y_gemm_assembly.h"
 
 // Volume GEMM tiles match the cuBLAS nsys kernels:
 //   cutlass_80_tensorop_d884gemm_64x128_16x3_nn_align1
@@ -229,6 +230,97 @@ struct VolumeGemmSetP7 : VolumeGemmSet<GS<8, 8, 4>, cutlass::arch::Sm80, 16> {
 };
 
 using P7MmaSet_884 = VolumeGemmSetP7;
+
+//- Order-specialized x volume GEMM tiles.  The x GEMM is Nq x (nq2*Ne) x Nq
+//- with a column-major C, so device::Gemm runs the transposed problem: the
+//- threadblock's M dimension covers the long nq2*Ne axis and its N dimension
+//- covers Nq.  The generic GemmX tile is 64x128, so at Nq = 8 120 of its 128
+//- N columns are predicated away, at Nq = 16 112 of them, at Nq = 32 96 and
+//- at Nq = 64 still half -- which is why cuBLAS held this GEMM at every order
+//- up to 64.  These candidates keep the M extent and shrink N to Nq (16 is
+//- the floor, see below).  Whichever one measures fastest is used by
+//- GEMM_CUTE and GEMM_FUSED alike; only the Escale-weighted variant is
+//- fused-only, and it differs from the plain one in the epilogue output op
+//- alone.
+template <int TbM, int TbN, int WM, int WN, int TileK = 16, int Stages = 3>
+struct XTile {
+  using GemmX = cutlass::gemm::device::Gemm<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, cutlass::arch::Sm80, GS<TbM, TbN, TileK>, GS<WM, WN, TileK>,
+      GS<8, 8, 4>, EpilogueOp, Swizzle, Stages>;
+  using GemmXScale = cutlass::gemm::device::Gemm<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, cutlass::arch::Sm80, GS<TbM, TbN, TileK>, GS<WM, WN, TileK>,
+      GS<8, 8, 4>, PointwiseScaleV<1>, Swizzle, Stages>;
+};
+
+//- N = 8 does not build: the FP64 multistage B iterator's thread map
+//- degenerates to zero contiguous iterations for a 16x8 tile with 128
+//- threads, so 16 is the narrowest usable N and half of it is predicated at
+//- Nq = 8.  Same reason the p=7 y and z tiles are two warps wide.
+using P7XTile0 = XTile<64, 16, 32, 16>;
+using P7XTile1 = XTile<128, 16, 64, 16>;
+using P7XTile2 = XTile<32, 16, 16, 16>;
+using P7XTile3 = XTile<256, 16, 64, 16>;
+using P7XTile4 = XTile<128, 16, 32, 16>;
+using P7XTile5 = XTile<64, 32, 32, 32>;
+using P7XTile6 = XTile<64, 16, 32, 16, 16, 4>;
+using P7XTile7 = XTile<64, 16, 32, 16, 16, 5>;
+using P7XTile8 = XTile<64, 16, 32, 16, 32, 3>;
+using P7XTile9 = XTile<64, 16, 16, 16, 16, 3>;
+using P7XTile12 = XTile<32, 16, 16, 16, 16, 3>;
+using P7XTile13 = XTile<128, 16, 16, 16, 16, 3>;
+using P7XTile14 = XTile<64, 16, 16, 16, 16, 4>;
+using P7XTile15 = XTile<256, 16, 32, 16, 16, 3>;
+//- Indices 10 and 11 are absent on purpose: a one-warp threadblock (32x16
+//- with a 32x16 warp) and TileK = 8 both fail the CUTLASS static assertions
+//- for this iterator, so they are not options at Nq = 8.  SCALE_DG_XTILE=10
+//- or 11 therefore reports a bad tile rather than silently running something
+//- else.
+
+//- The same sweep at Nq = 16, 32 and 64.  N is Nq exactly, so nothing is
+//- predicated in the N direction any more and K is covered in Nq/TileK
+//- iterations.  The candidates vary the long-axis extent TbM, the warp
+//- partition, TileK and the pipeline depth; the shared tile that measures
+//- fastest is the one both GEMM paths use at that order.
+using P15XTile0 = XTile<64, 16, 32, 16, 16, 3>;
+using P15XTile1 = XTile<128, 16, 64, 16, 16, 3>;
+using P15XTile2 = XTile<32, 16, 16, 16, 16, 3>;
+using P15XTile3 = XTile<256, 16, 64, 16, 16, 3>;
+using P15XTile4 = XTile<128, 16, 32, 16, 16, 3>;
+using P15XTile5 = XTile<64, 16, 16, 16, 16, 3>;
+using P15XTile6 = XTile<64, 16, 32, 16, 16, 4>;
+using P15XTile7 = XTile<64, 16, 16, 16, 16, 4>;
+using P15XTile8 = XTile<128, 16, 16, 16, 16, 3>;
+using P15XTile9 = XTile<256, 16, 32, 16, 16, 3>;
+using P15XTile10 = XTile<64, 32, 32, 32, 16, 3>;
+using P15XTile11 = XTile<64, 16, 32, 16, 32, 3>;
+
+using P31XTile0 = XTile<64, 32, 32, 32, 16, 3>;
+using P31XTile1 = XTile<64, 32, 16, 32, 16, 3>;
+using P31XTile2 = XTile<64, 32, 32, 16, 16, 3>;
+using P31XTile3 = XTile<128, 32, 64, 32, 16, 3>;
+using P31XTile4 = XTile<128, 32, 32, 32, 16, 3>;
+using P31XTile5 = XTile<256, 32, 64, 32, 16, 3>;
+using P31XTile6 = XTile<32, 32, 16, 32, 16, 3>;
+using P31XTile7 = XTile<32, 32, 16, 16, 16, 3>;
+using P31XTile8 = XTile<64, 32, 32, 32, 16, 4>;
+using P31XTile9 = XTile<64, 32, 32, 32, 32, 3>;
+using P31XTile10 = XTile<64, 32, 32, 32, 16, 5>;
+using P31XTile11 = XTile<128, 32, 32, 32, 16, 4>;
+
+using P63XTile0 = XTile<64, 64, 32, 32, 16, 3>;
+using P63XTile1 = XTile<64, 64, 32, 64, 16, 3>;
+using P63XTile2 = XTile<64, 64, 64, 32, 16, 3>;
+using P63XTile3 = XTile<128, 64, 64, 32, 16, 3>;
+using P63XTile4 = XTile<128, 64, 32, 32, 16, 3>;
+using P63XTile5 = XTile<32, 64, 32, 32, 16, 3>;
+using P63XTile6 = XTile<32, 64, 16, 32, 16, 3>;
+using P63XTile7 = XTile<64, 64, 32, 32, 16, 4>;
+using P63XTile8 = XTile<64, 64, 32, 32, 32, 3>;
+using P63XTile9 = XTile<256, 64, 64, 32, 16, 3>;
+using P63XTile10 = XTile<64, 64, 16, 32, 16, 3>;
+using P63XTile11 = XTile<64, 32, 32, 32, 16, 3>;
 
 //- Nq=16 leaves the generic tiles as predicated as Nq=8 does: the y GEMM is
 //- 16x16x16 per batch against a 64x64 tile, and the z / z-assembly GEMM is
@@ -673,6 +765,26 @@ int run_volume_gemm_x(double *deriv_x, const double *flux_x, const double *D1D,
                                           Nq, deriv_x, Nq);
 }
 
+//- The x volume GEMM on an order-specialized CUTLASS tile.  escale = nullptr is the unweighted
+//- form both GEMM paths share; a non-null escale folds Escale_x into the
+//- epilogue and belongs to GEMM_FUSED's fusion package.  Both go through the
+//- repadded epilogue, so the two differ only in the output op.
+template <class Tile>
+int run_volume_gemm_x_tiled(double *deriv_x, const double *flux_x,
+                         const double *D1D, const double *escale, int Nq,
+                         int Ne)
+{
+  const int n = Nq * Nq * Ne;
+  if (escale == nullptr) {
+    //- LinearCombination with beta = 0 never reads C, so passing deriv_x as
+    //- the source is inert; it keeps one launch helper for both forms.
+    return run_gemm_nn_scaled_repad<typename Tile::GemmX>(
+        Nq, n, Nq, D1D, Nq, flux_x, Nq, deriv_x, Nq, deriv_x, Nq);
+  }
+  return run_gemm_nn_scaled_repad<typename Tile::GemmXScale>(
+      Nq, n, Nq, D1D, Nq, flux_x, Nq, escale, Nq, deriv_x, Nq);
+}
+
 template <class Set>
 int run_volume_gemm_z(double *deriv_z, const double *flux_z,
                       const double *D1D_tr, int Nq, int Ne)
@@ -702,7 +814,8 @@ int run_volume_gemms(double *deriv_x, double *deriv_y, double *deriv_z,
 }
 
 template <class Set, bool kWeighted, bool kWide = kWeighted,
-          bool kAffine = kWeighted, bool kPaired = kWeighted>
+          bool kAffine = kWeighted, bool kPaired = kWeighted,
+          bool kXWeighted = false>
 int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr,
                         const double *deriv_x, const double *deriv_y,
                         const double *flux_bnd, const double *lift1d,
@@ -727,7 +840,7 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
   using ZEpilogue = RepadEpilogue<typename GemmZ::GemmKernel::Epilogue, 8>;
   using Kernel = GemmBatchedDqdtAssembly<typename GemmZ::GemmKernel::Mma,
                                          ZEpilogue, BatchedSwizzle, kWeighted,
-                                         kAffine, kPaired>;
+                                         kAffine, kPaired, kXWeighted>;
 
   cutlass::TensorRef<double const, ColumnMajor> ref_A(flux_z, m);
   cutlass::TensorRef<double const, ColumnMajor> ref_B(D1D_tr, k);
@@ -788,6 +901,83 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
   return err == cudaSuccess ? 0 : 1;
 }
 
+//- The same fusion package on the y GEMM instead of the z GEMM.  x and z run
+//- first as plain unweighted GEMMs into deriv_x and a scratch deriv_z, and this
+//- kernel -- whose mainloop is the one GEMM_CUTE runs for y -- applies
+//- Escale_x/y/z, adds the six-face lift and writes dqdt.  See
+//- cutlass_y_gemm_assembly.h for the geometry.
+template <class GemmYT, bool kXWeighted>
+int run_y_gemm_assembly(double *dqdt, const double *flux_y, const double *D1D_tr,
+                        const double *deriv_x, const double *deriv_z,
+                        const double *flux_bnd, const double *lift1d,
+                        const double *escale, int Nq, int Ne)
+{
+  const int nq2 = Nq * Nq;
+  const int Np = nq2 * Nq;
+  const std::int64_t npoint = std::int64_t{Np} * Ne;
+  const long long stride_plane = nq2;
+  const int m = Nq;
+  const int n = Nq;
+  const int k = Nq;
+  const int batch = Nq * Ne;
+
+  using YEpilogue = RepadEpilogue<typename GemmYT::GemmKernel::Epilogue, 8>;
+  using Kernel = GemmBatchedDqdtAssemblyY<typename GemmYT::GemmKernel::Mma,
+                                          YEpilogue, BatchedSwizzle, kXWeighted>;
+
+  cutlass::TensorRef<double const, ColumnMajor> ref_A(flux_y, m);
+  cutlass::TensorRef<double const, ColumnMajor> ref_B(D1D_tr, k);
+  cutlass::TensorRef<double, ColumnMajor> ref_D(dqdt, m);
+
+  typename GemmYT::Arguments gemm_args({m, n, k}, ref_A, stride_plane, ref_B, 0,
+                                       ref_D, stride_plane, ref_D, stride_plane,
+                                       {1.0, 0.0}, batch);
+  cutlass::Status can = GemmYT::can_implement(gemm_args);
+  if (can != cutlass::Status::kSuccess) {
+    return cutlass_error("y-assembly can_implement", can);
+  }
+
+  auto uargs = GemmYT::to_underlying_arguments(gemm_args);
+  BatchedSwizzle swizzle;
+  cutlass::gemm::GemmCoord grid_shape = cap_batched_grid(
+      swizzle.get_tiled_shape(uargs.problem_size,
+                              {GemmYT::ThreadblockShape::kM, GemmYT::ThreadblockShape::kN,
+                               GemmYT::ThreadblockShape::kK},
+                              uargs.batch_count),
+      batch);
+
+  typename Kernel::Params params;
+  params.gemm = typename Kernel::BaseKernel::Params(
+      uargs.problem_size, grid_shape, uargs.ref_A.non_const_ref(), uargs.stride_A,
+      uargs.ref_B.non_const_ref(), uargs.stride_B, uargs.ref_C.non_const_ref(),
+      uargs.stride_C, uargs.ref_D, uargs.stride_D, uargs.epilogue, batch);
+  params.ptr_dx = deriv_x;
+  params.ptr_dz = deriv_z;
+  params.ptr_flux_bnd = flux_bnd;
+  params.ptr_lift1d = lift1d;
+  params.Nq = Nq;
+  params.ptr_ex = escale;
+  params.ptr_ey = escale + npoint;
+  params.ptr_ez = escale + 2 * npoint;
+
+  dim3 grid = swizzle.get_grid_shape(grid_shape);
+  dim3 block(Kernel::kThreadCount, 1, 1);
+  int smem_size = int(sizeof(typename Kernel::SharedStorage));
+  if (smem_size >= (48 << 10)) {
+    cudaError_t attr = cudaFuncSetAttribute(
+        cutlass::Kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size);
+    if (attr != cudaSuccess) {
+      return 1;
+    }
+  }
+
+  cutlass::arch::synclog_setup();
+  cutlass::Kernel<Kernel><<<grid, block, smem_size, dg_cuda_stream>>>(params);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? 0 : 1;
+}
+
 } // namespace
 
 extern "C" int launch_volume_gemm_x(double *deriv_x, const double *flux_x,
@@ -810,6 +1000,113 @@ extern "C" int launch_volume_gemm_x(double *deriv_x, const double *flux_x,
     return bad_mma_shape(mma_shape);
   }
 }
+
+#define DG_X_TILE_CASE(idx, TileType)                                          \
+  case idx:                                                                    \
+    return run_volume_gemm_x_tiled<TileType>(deriv_x, flux_x, D1D, escale, Nq, \
+                                             Ne);
+
+//- Shared, order-specialized x volume GEMM.  One issue point for GEMM_CUTE
+//- and GEMM_FUSED so the two cannot get different tiles; `weighted` is the
+//- only fused-only degree of freedom and it changes the epilogue output op,
+//- not the mainloop.
+extern "C" int launch_volume_gemm_x_tiled(double *deriv_x, const double *flux_x,
+                                          const double *D1D,
+                                          const double *escale, int weighted,
+                                          int Nq, int Ne, int tile)
+{
+  if (Ne <= 0) {
+    return 1;
+  }
+  if (!weighted) {
+    escale = nullptr;
+  }
+  switch (Nq) {
+  case 8:
+    switch (tile) {
+      DG_X_TILE_CASE(0, P7XTile0)
+      DG_X_TILE_CASE(1, P7XTile1)
+      DG_X_TILE_CASE(2, P7XTile2)
+      DG_X_TILE_CASE(3, P7XTile3)
+      DG_X_TILE_CASE(4, P7XTile4)
+      DG_X_TILE_CASE(5, P7XTile5)
+      DG_X_TILE_CASE(6, P7XTile6)
+      DG_X_TILE_CASE(7, P7XTile7)
+      DG_X_TILE_CASE(8, P7XTile8)
+      DG_X_TILE_CASE(9, P7XTile9)
+      DG_X_TILE_CASE(12, P7XTile12)
+      DG_X_TILE_CASE(13, P7XTile13)
+      DG_X_TILE_CASE(14, P7XTile14)
+      DG_X_TILE_CASE(15, P7XTile15)
+    default:
+      break;
+    }
+    break;
+  case 16:
+    switch (tile) {
+      DG_X_TILE_CASE(0, P15XTile0)
+      DG_X_TILE_CASE(1, P15XTile1)
+      DG_X_TILE_CASE(2, P15XTile2)
+      DG_X_TILE_CASE(3, P15XTile3)
+      DG_X_TILE_CASE(4, P15XTile4)
+      DG_X_TILE_CASE(5, P15XTile5)
+      DG_X_TILE_CASE(6, P15XTile6)
+      DG_X_TILE_CASE(7, P15XTile7)
+      DG_X_TILE_CASE(8, P15XTile8)
+      DG_X_TILE_CASE(9, P15XTile9)
+      DG_X_TILE_CASE(10, P15XTile10)
+      DG_X_TILE_CASE(11, P15XTile11)
+    default:
+      break;
+    }
+    break;
+  case 32:
+    switch (tile) {
+      DG_X_TILE_CASE(0, P31XTile0)
+      DG_X_TILE_CASE(1, P31XTile1)
+      DG_X_TILE_CASE(2, P31XTile2)
+      DG_X_TILE_CASE(3, P31XTile3)
+      DG_X_TILE_CASE(4, P31XTile4)
+      DG_X_TILE_CASE(5, P31XTile5)
+      DG_X_TILE_CASE(6, P31XTile6)
+      DG_X_TILE_CASE(7, P31XTile7)
+      DG_X_TILE_CASE(8, P31XTile8)
+      DG_X_TILE_CASE(9, P31XTile9)
+      DG_X_TILE_CASE(10, P31XTile10)
+      DG_X_TILE_CASE(11, P31XTile11)
+    default:
+      break;
+    }
+    break;
+  case 64:
+    switch (tile) {
+      DG_X_TILE_CASE(0, P63XTile0)
+      DG_X_TILE_CASE(1, P63XTile1)
+      DG_X_TILE_CASE(2, P63XTile2)
+      DG_X_TILE_CASE(3, P63XTile3)
+      DG_X_TILE_CASE(4, P63XTile4)
+      DG_X_TILE_CASE(5, P63XTile5)
+      DG_X_TILE_CASE(6, P63XTile6)
+      DG_X_TILE_CASE(7, P63XTile7)
+      DG_X_TILE_CASE(8, P63XTile8)
+      DG_X_TILE_CASE(9, P63XTile9)
+      DG_X_TILE_CASE(10, P63XTile10)
+      DG_X_TILE_CASE(11, P63XTile11)
+    default:
+      break;
+    }
+    break;
+  default:
+    std::fprintf(stderr, "launch_volume_gemm_x_tiled: no tile set for Nq %d\n",
+                 Nq);
+    return 1;
+  }
+  std::fprintf(stderr, "launch_volume_gemm_x_tiled: bad tile %d at Nq %d\n",
+               tile, Nq);
+  return 1;
+}
+
+#undef DG_X_TILE_CASE
 
 extern "C" int launch_volume_gemm_z(double *deriv_z, const double *flux_z,
                                     const double *D1D_tr, int Nq, int Ne,
@@ -979,10 +1276,38 @@ extern "C" int launch_z_gemm_assembly(
   //- epilogue and the paired loads win on their own too, while the clamp hoist
   //- only wins on top of them.  At Nq = 16, 32 and 64 every one of the three
   //- loses.  reports/p7_gemm_fused.md section 13.
-  if (Nq == 8 && mma_shape == 0 && !xy_weighted) {
+  if (Nq == 8 && mma_shape == 0 && xy_weighted != 1) {
+    //- xy_weighted == 2 is the partial form: CUTLASS x already applied
+    //- Escale_x, cuBLAS y could not apply Escale_y, so this epilogue reads
+    //- four volume tensors instead of five.  Same mainloop and same other
+    //- three ingredients either way.
+    if (xy_weighted == 2) {
+      return run_z_gemm_assembly<P7MmaSet_884, false, true, true, true, true>(
+          dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d,
+          lift_zpair, escale, Nq, Ne);
+    }
     return run_z_gemm_assembly<P7MmaSet_884, false, true, true, true>(
         dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d,
         lift_zpair, escale, Nq, Ne);
+  }
+  //- Same partial form at the two other orders whose x GEMM can carry
+  //- Escale_x while y cannot.  Nq = 64 does not need it: there the y GEMM
+  //- already applies Escale_x through GemmYScale.
+  if (xy_weighted == 2 && mma_shape == 0 && Nq == 16) {
+    return run_z_gemm_assembly<P15MmaSet_884, false, false, false, false, true>(
+        dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d, lift_zpair,
+        escale, Nq, Ne);
+  }
+  if (xy_weighted == 2 && mma_shape == 0 && Nq == 32) {
+    return run_z_gemm_assembly<MmaSet_884, false, false, false, false, true>(
+        dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d, lift_zpair,
+        escale, Nq, Ne);
+  }
+  if (xy_weighted == 2) {
+    std::fprintf(stderr,
+                 "launch_z_gemm_assembly: no partial-weighting epilogue for "
+                 "Nq %d / mma %d\n", Nq, mma_shape);
+    return 1;
   }
   if (Nq == 16 && mma_shape == 0 && !xy_weighted) {
     return run_z_gemm_assembly<P15MmaSet_884, false>(
@@ -1053,4 +1378,42 @@ extern "C" int launch_z_gemm_assembly(
   default:
     return bad_mma_shape(mma_shape);
   }
+}
+
+
+//- GEMM_FUSED with the assembly epilogue moved from z onto y.  The mainloop is
+//- Set::GemmY (Nq = 16) / Set::GemmY32 (Nq = 32), i.e. exactly the y mainloop
+//- GEMM_CUTE uses, so the two paths keep the same tiles and the same library
+//- assignment; only the epilogue differs, which AGENTS.md does not share.
+//- x_weighted == 2 means the x GEMM already folded Escale_x into deriv_x.
+extern "C" int launch_y_gemm_assembly(
+    double *dqdt, const double *flux_y, const double *D1D_tr,
+    const double *deriv_x, const double *deriv_z, const double *flux_bnd,
+    const double *lift1d, const double *escale, int Nq, int Ne, int mma_shape,
+    int x_weighted)
+{
+  if (Nq <= 0 || Ne <= 0) {
+    return 1;
+  }
+  if (mma_shape != 0) {
+    return bad_mma_shape(mma_shape);
+  }
+  if (Nq == 16) {
+    if (x_weighted == 2) {
+      return run_y_gemm_assembly<P15MmaSet_884::GemmY, true>(
+          dqdt, flux_y, D1D_tr, deriv_x, deriv_z, flux_bnd, lift1d, escale, Nq, Ne);
+    }
+    return run_y_gemm_assembly<P15MmaSet_884::GemmY, false>(
+        dqdt, flux_y, D1D_tr, deriv_x, deriv_z, flux_bnd, lift1d, escale, Nq, Ne);
+  }
+  if (Nq == 32) {
+    if (x_weighted == 2) {
+      return run_y_gemm_assembly<MmaSet_884::GemmY32, true>(
+          dqdt, flux_y, D1D_tr, deriv_x, deriv_z, flux_bnd, lift1d, escale, Nq, Ne);
+    }
+    return run_y_gemm_assembly<MmaSet_884::GemmY32, false>(
+        dqdt, flux_y, D1D_tr, deriv_x, deriv_z, flux_bnd, lift1d, escale, Nq, Ne);
+  }
+  std::fprintf(stderr, "launch_y_gemm_assembly: unsupported Nq %d\n", Nq);
+  return 1;
 }
