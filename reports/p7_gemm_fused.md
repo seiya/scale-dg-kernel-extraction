@@ -385,3 +385,27 @@ unique **0.832 TB/s**（10.5%）、path **2.16 TB/s**（27.3%）。
 数値は `SCALE_DG_VARYING_COEFF=1`、`val_p7_split.conf` 対
 `val_p7_gemm_fused.conf` で max abs **1.77636e-15**、相対 **2.86031e-16**
 （§10.3 と同じ）。最速は `FUSED_TC` のまま。
+
+## 12. y epilogue の repad（2026-09-01、採用、−4.1%）
+
+[`p15_gap_study.md`](p15_gap_study.md) §26.2 の横展開。batched volume GEMM の
+エピローグは accumulator の置き場を shared に取るが、在庫の設定では
+半ワープの 16 レーンが同じバンク組に落ちる。z assembly が使っている
+`RepadEpilogue<..., 8>` を batched launcher（`run_gemm_batched_nn_capped`）
+にも入れ、行ストライドに 8 doubles 足した。mainloop・tile・stage は不変で、
+`GEMM_CUTE` と `GEMM_FUSED` の両方に同じものが入る。
+
+job `74636`（c178、12 回交互 A/B）:
+
+| 構成 | Main [ms/step] | device [ms/57 stage] | µs/stage | 対 §11 |
+|---|---:|---:|---:|---:|
+| §11（単一 launch） | 5.85431 | 108.078 | 1896.1 | — |
+| **repad 8** | **5.62624** | **103.634** | **1818.1** | **−4.11%** |
+
+レンジは 108.036--108.239 対 103.452--103.841 で重ならない。p=15 では
+同じ変更が −0.63%、p=63（y batch 4096）では差が無い。p=7 で効きが大きいのは
+y の batch が 262,144 で、この kernel がステージに占める割合が高いためである。
+
+最終形は **0.773 TFLOP/s**（40.1 の 1.9%）、unique **0.867 TB/s**（11.0%）、
+path **2.25 TB/s**（28.5%）。数値は `val_p7_split.conf` 比で max abs
+**1.77636e-15**、相対 **2.86031e-16**（§10.3 と同じ）。最速は `FUSED_TC` のまま。

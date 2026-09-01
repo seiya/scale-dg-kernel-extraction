@@ -284,7 +284,15 @@ int run_gemm_batched_nn_capped(int m, int n, int k, double const *A, int lda,
                                long long strideB, double *C, int ldc,
                                long long strideC, int batch)
 {
-  using Kernel = typename GemmBatched::GemmKernel;
+  //- Same mainloop, with the epilogue's accumulator staging tile padded by 8
+  //- the way the z assembly pads it (RepadEpilogue, cutlass_z_gemm_assembly.h).
+  //- Without it the y GEMM takes 2.18 M shared-store bank conflicts (ncu job
+  //- 74635); pad 4 and 16 are neutral, 8 is worth -0.6% at p=15 and -4.1% at
+  //- p=7 and does not move p=63.
+  using Kernel = cutlass::gemm::kernel::GemmBatched<
+      typename GemmBatched::GemmKernel::Mma,
+      RepadEpilogue<typename GemmBatched::GemmKernel::Epilogue, 8>,
+      BatchedSwizzle>;
 
   typename GemmBatched::Arguments args({m, n, k}, {A, lda}, strideA, {B, ldb},
                                        strideB, {C, ldc}, strideC, {C, ldc},
@@ -331,37 +339,9 @@ int run_gemm_batched_nn(int m, int n, int k, double const *A, int lda,
                         long long strideB, double *C, int ldc, long long strideC,
                         int batch)
 {
-  if (batch > kCudaMaxGridZ) {
-    return run_gemm_batched_nn_capped<GemmBatched>(m, n, k, A, lda, strideA, B,
-                                                   ldb, strideB, C, ldc,
-                                                   strideC, batch);
-  }
-  // Chunk so each launch stays inside CUDA's grid.z.  Stock GemmBatched
-  // copies batch into grid_tiled_shape.k() via `% 65536`, so a single
-  // launch at 65536 would still get grid.z = 0 even if we capped later.
-  int offset = 0;
-  while (offset < batch) {
-    int chunk = batch - offset;
-    if (chunk > kCudaMaxGridZ) {
-      chunk = kCudaMaxGridZ;
-    }
-    const long long off = static_cast<long long>(offset);
-    GemmBatched gemm_op;
-    typename GemmBatched::Arguments args(
-        {m, n, k}, {A + strideA * off, lda}, strideA, {B + strideB * off, ldb},
-        strideB, {C + strideC * off, ldc}, strideC, {C + strideC * off, ldc},
-        strideC, {1.0, 0.0}, chunk);
-    const cutlass::Status can = gemm_op.can_implement(args);
-    if (can != cutlass::Status::kSuccess) {
-      return cutlass_error("batched can_implement", can);
-    }
-    const cutlass::Status st = gemm_op(args, nullptr, dg_cuda_stream);
-    if (st != cutlass::Status::kSuccess) {
-      return cutlass_error("batched gemm", st);
-    }
-    offset += chunk;
-  }
-  return 0;
+  return run_gemm_batched_nn_capped<GemmBatched>(m, n, k, A, lda, strideA, B,
+                                                 ldb, strideB, C, ldc, strideC,
+                                                 batch);
 }
 
 template <class Gemm>
