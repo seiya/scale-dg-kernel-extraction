@@ -26,10 +26,10 @@ Namelist は `namelists/`、Slurm ジョブは `jobs/` に移し、名前を揃�
 | [`ozaki1_implementation_report.md`](ozaki1_implementation_report.md) | 同 worktree の `CUDAFORTRAN_GEMM_OZAKI1`（Ozaki Scheme I）。A/B 両スライス・最大 s² 本 INT8 GEMM・CRT なし FP64 加算。`scale_a` の z 方向バッファ修正を含む。p=7 で native 比 max abs ≈21（OZAKI2 と同オーダー）、device 時間は OZAKI2 より遅い典型 |
 | [`p15_gap_study.md`](p15_gap_study.md) | p=7 と p=255 の間を同一 DOF で埋める最初の点 p=15 (Nq=16)。CUDA core 版と Tensor Core 版の融合カーネル、shared 戦略、Nq=16 では融合したまま占有率 50% を超えられないという構造的な壁。**§14（2026-08-27）は p=15 が同一 DOF の曲線から外れている**（p=31 が 1.83 倍の演算を 1.07 倍の時間でこなす）ことを追い、律速を測り直した: 命令数でも shared でも占有率でもなく **global ロード**（`long scoreboard` 48%、sector/request 13.46）。z の shared 往復を消しても **0%**、面 gather をタダにしても **−17.5% が上限**。p=63 で効いた「面 flux の別カーネル化」は面点率 37.5% の p=15 では 3 倍の赤字。**§15 で採用に至った**: 面フラックスに専用の shared バッファ 12 KB を与えて x パネル格納の直後に前倒しすると、**gather を 1 つも減らさないまま `long scoreboard` が 47.1% → 24.5% に半減し −5.3%**（345.1 → 326.8 µs/stage、ビット一致）。占有率はレジスタで決まっているので 12 KB は事実上タダ。**§16（2026-08-28）は「shared を節約する」という前提そのものを捨てて 332.0 → 272.0 µs/stage（−18.1%、ビット一致）**: カーブアウトの代金を先に測って **+64 KB まではタダ・+128 KB で崖**を確かめ、3 パネル同時 shared 化（バリア 8 → 3 本、−7.0%）、面フェーズの 2 面点/スレッド化（−3.0%）、`__restrict__`（−2.2%、**p=63 では −11.6%** と次数をまたぐ。p=7 だけは spill で +3.6% と逆効果）、**M 側 i 境界 2 面の shared 常駐**（§14.6 が残した唯一の筋、−6.1%）、z 往復のバリアを `__syncwarp` に（−0.8%）。床は 281.3 → 223.0 µs。**§20（2026-08-30）は z 往復の契約内 2 形を測って `FUSED_TC` 探索終了**：p=31 型 `(i,k)` + j ループ **+77%**、x/y 写像の FMA **+27%**。**§21–22 は CUDA-core `FUSED` を 445.7 → 340.6 µs/stage（−23.6%）**。**§23–24 は `GEMM_FUSED` を p=15 に開き、経路役割を訂正（1456.8 µs/stage）**。**§25（2026-09-01）は Nq=16 用 CUTLASS tile（y `16x32 s3`、z `16x64 s3`）と capped launch で `GEMM_FUSED` を 1459.6 → 661.6 µs/stage（−54.7%）、`GEMM_CUTE` も 1306.1 → 705.9 にし、p=15 で初めて融合が CUTE に勝った**。**§26 は y epilogue の repad（−0.63%、657.3 µs/stage）と、3 本の volume パスを純ストリーミングに置換した床 536.7 µs/stage の測定で探索終了** |
 | [`p63_gap_study.md`](p63_gap_study.md) | 同一 DOF の 4 点目 p=63 (Nq=64)。任意次数の LGL 演算子生成、CUTLASS GEMM 経路の次数開放とその batch 上限、5 本のカーネルが 3 種類の理由で別々に詰まる様子、融合カーネルを書かない判断の根拠。§8 のその判断は 2026-08-27 に訂正され、**§13 で実際に両方書いて測った**: `FUSED` 970.7 µs / `FUSED_TC` 662.3 µs に対し `GEMM_FUSED` 598.6 µs で、**p=63 の最速は `GEMM_FUSED` のまま**。§8 の訂正注記が外挿した 365 µs は 1.8 倍外れており、理由は TC 版が帯域律速でも発行律速でもなく**レイテンシ律速**（DRAM 18%、占有率 24.6%）であること。**§16 でこれは覆った**: チャンクループを消し（`BK63` 16→64、動的 shared 96 KB）、shared レイアウトを直して **539.0 µs/stage、`GEMM_FUSED` の 587.3 に 1.090 倍**。**p=63 の最速は `CUDAFORTRAN_FUSED_TC` に交代**し、融合が勝つ上限は p=63 に上がった。§16.4 は「8 B の shared アクセスの条件は 32 レーンの `d mod 32` ではなく半ワープ 16 レーンの `d mod 16`」を SASS と実測で確定させている 。**§20（2026-08-28）で残り 3 ブロックの天井を測って探索終了**（面フラックスカーネルが実は 13.45% あり、その 79% は i 平面に連続方向が無いことによるギャザー増幅。契約内では直らない）。**§19（2026-08-28）で 487.8 µs/stage**（y カーネルを 2 ブロック/SM に、y エピローグの `dqdt` を `cp.async` で先読み、`sFU` のストアをコンフリクトフリーに。§17.1 の「構造的」は成立しなかった）。**§18（2026-08-28）で 477.2 µs/stage**: チャンクループ本体の末尾に置いていたバリアを先頭へ `if (kk)` 付きで移すと、`BK63 = NQ63` で 1 回しか回らないこのループでは末尾の 1 本がまるごと消える（ビット一致、−7.7%）。`GEMM_FUSED` との差は 1.101 倍から 1.20 倍に広がった。**§24（2026-08-30）は CUDA-core `FUSED` を 966.4 → 776.0 µs/stage（−19.7%）**: `__restrict__` とチャンクループ除去。計算 LDS を消すと −58% の天井があるが、`double4` / shuffle / `cp.async` は全部負け。主比 TC/FUSED は 2.29× → 1.84×。**`GEMM_FUSED` の x/y 重ねは −0.28%**。屋根には当たっていない |
-| [`p127_gap_study.md`](p127_gap_study.md) | p=127 (Nq=128) の全記録。§11–16 は FUSED_TC / GEMM_FUSED の初期最適化と経路交代。§17 は CUDA-core `FUSED` を 1587.6 → 1149.9 µs/stage（−27.6%）。§18–20 は `FUSED_TC` を y 2 CTA、D1D `cp.async`、面 / y PDL で **621.5 µs/stage**まで短縮し、`GEMM_FUSED` 674.0 を抜いて最速。最終 nsys と負結果を含め契約内候補の探索を終了。 |
+| [`p127_gap_study.md`](p127_gap_study.md) | p=127 (Nq=128) の全記録。§11–16 は FUSED_TC / GEMM_FUSED の初期最適化と経路交代。§17 は CUDA-core `FUSED` を 1587.6 → 1149.9 µs/stage（−27.6%）。§18–20 は `FUSED_TC` を y 2 CTA、D1D `cp.async`、面 / y PDL で **621.5 µs/stage**まで短縮し、`GEMM_FUSED` 674.0 を抜いて最速。最終 nsys と負結果を含め契約内候補の探索を終了。 **§21（2026-09-01）は p=767 由来の横展開で `GEMM_FUSED` の x/y epilogue を repad し 728.3 → 724.7 µs/stage（−0.487%、レンジ非重複）**。 |
 | [`p511_gap_study.md`](p511_gap_study.md) | p=511 (Nq=512, Ne=1) の `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_FUSED` 対応。packed halo allocation で主場6配列を host/device 各42→12 GiBへ削減。点変化係数を含む全134,217,728点の `dqdt` を最大絶対差3.55e-15で検証。§5 の当時値は `GEMM_FUSED` 13.159対 `GEMM` 13.528 ms/stage。**§11（2026-09-01）は現行 tree の `GEMM_FUSED` を 12.48 ms/stage として再測し、タイル・stage・flux 重ね・cuBLAS x を全部不採用**。**§12（同日）で融合 y GEMM を 4 段→3 段にして 12.414 ms/stage（−0.213%）**。占有率は動かず**命令数 −0.80%** で、これらの GEMM が発行律速であることの証拠。利得は `Nq/16` 回のループにプロローグを薄める形なので次数とともに減り（p=127 −0.76%、p=255 −0.60%、p=511 −0.21%、p=767 −0.10%、p=1023 −0.06%）、**Nq=64 だけ融合側で +0.45% と反転する**ので Nq>64 に限った。未融合の `GemmY` は Nq=64 でも勝つ（p=63 CUTE −0.78%）。§12.6 の不採用は z の N 最内ラスタライズ（ncu で DRAM 3.3 倍・時間 +0.09% ＝ z は演算律速）、タイル掃引 7 形、flux ベクトル化、`__ldcs`/`__stcs` を使った flux 重ね |
 | [`p575_gap_study.md`](p575_gap_study.md) | p=575 (Nq=576, Ne=1) の `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_FUSED` 対応。点変化係数を含む全191,102,976点の `dqdt` を最大絶対差3.55e-15で検証。login 3-run では `GEMM_FUSED` が20.453対20.912 ms/stage。**§11（2026-09-01）で 20.043 → 19.347 µs/stage（−3.47%）**: Nq≥512 の x を 64×64 batched に（§11.2）、x/y を 3 段パイプラインに（§11.13、他の Nq≥512 次数にも −0.18〜−0.47%）。§11.8 の ncu で 3 本の GEMM は**いずれも FP64 パイプ 92〜96% 律速**（DRAM 5〜7%）と確定。不採用は flux 重ね（全 grid §11.1 / grid 上限 §11.7）、`double2` §11.5、CUDA graph §11.6、z タイル 4 点 §11.3/§11.9/§11.10、x のオペランド入替 §11.11（天井 0）、`Escale_x` を y へ §11.12、`TileK=32` §11.14、warp `64x32` §11.15 |
-| [`p767_gap_study.md`](p767_gap_study.md) | p=767 (Nq=768, Ne=1) の `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_FUSED` 対応。点変化係数を含む全452,984,832点の `dqdt` を最大絶対差3.55e-15で検証。GB200の3-run中央値では `GEMM_FUSED` が60.362対62.817 ms/stageで3.91%速い |
+| [`p767_gap_study.md`](p767_gap_study.md) | p=767 (Nq=768, Ne=1) の `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_FUSED` 対応。点変化係数を含む全452,984,832点の `dqdt` を最大絶対差3.55e-15で検証。GB200の3-run中央値では `GEMM_FUSED` が60.362対62.817 ms/stageで3.91%速い。**§11（2026-09-01）は `GEMM_FUSED` の残り天井を測って探索終了**（採用ゼロ。y は SM 96.8%、flux は DRAM 91.6%、lift 天井 −0.80%）。**§12（2026-09-01）は §11.4 を訂正**: 融合経路の x/y epilogue を repad して 59.744 → 59.669 ms/stage（−0.127%、p=127 へ横展開で −0.487%）、タイル掃引 5 形は +0.40〜+1.20% で全滅、`GEMM_CUTE` を p≥511 で開いて融合の値段（GEMM +0.426 ms / GEMM 外 −3.83 ms、差引 −5.4%）と純 GEMM の床 55.323 ms/stage（mma 屋根の 94.1%）を分離 |
 | [`p1023_gap_study.md`](p1023_gap_study.md) | p=1023 (Nq=1024, Ne=1) の `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_GEMM_FUSED` 対応。Escale方向offsetだけを64-bit安全化し、未使用surfaceとz中間配列を除いた。正確な配列payloadは144.320 GiBだが、OpenACC allocator込みの実測peak増分はGEMM 176.416 GiB / FUSED 176.358 GiB。p=511/575/767/1023実測を覆う事前見積もりを`payload*1.25+2 GiB`とした。点変化係数を含む全1,073,741,824点を最大絶対差3.55e-15で検証。GB200では `GEMM_FUSED` が187.617対194.058 ms/stageで3.32%速い |
 | [`index64_boundary_validation.md`](index64_boundary_validation.md) | 高次数の host-side extent / pointer offset を64-bit安全化。p=7/15/511 の全 owned `dqdt` は変更前後でビット一致、device SASSも一致。性能差は −0.19%〜+0.02%で既存経路への影響なし |
 | [`p31_gap_study.md`](p31_gap_study.md) | 同一 DOF の 6 点目にして最後の点 p=31 (Nq=32)。**最速は `CUDAFORTRAN_FUSED_TC`**（§14、374.8 µs/stage；§16 device 359.7）。**§18–19（2026-08-30）は残り天井を測って探索終了**：xz は `lg_throttle`、y は `mio_throttle`。面 2,4 の天井 −17.8% に対し実装 4 形は +25.6% / +25.6% / ±0 / +31.5%。占有率 50% はスピルまたは `lg_throttle` 増で +25〜29%。採用ゼロ。Nq=32 の Tensor Core 融合カーネル 2 本で CUDA core 融合版の **2.66 倍**、`GEMM` の 1.67 倍。x と z が同じ出力写像を共有するので z の shared 往復が無く、転置形にすると D1D がレジスタに載る。**「p=31 は曲線の極大点」「融合が勝つ上限は p=15」という当初の結論はこれで否定された**（§14.2、§14.1 に訂正注記）。Nq=32 の CUDA core 融合カーネル 2 本、CUTLASS 経路は p=31 で使えるという訂正、**lift と assembly の融合で `GEMM` / `GEMM_CUTE` 経路を全次数 1 割速く**した（p=31 −11.7%、p=63 −12.0%、p=127 −10.2%、ビット一致）。**§20（2026-08-30）は CC 融合 `FUSED` を 992.5 → 718.2 µs/stage（−27.6%、ビット一致）**。**§21–22 の 599.9 µs は cuBLAS-z + separate-lift hybrid で範囲外。§23 は役割を訂正し、共有Nq=32 y tileとface schedulingで準拠 `GEMM_FUSED`を 865.5 → 709.2 µs/stage（−18.1%）**。最速はTCのまま |
@@ -424,6 +424,26 @@ p=31 / p=7 / p=15 / p=127 の `FUSED` 行**で、[`p31_gap_study.md`](p31_gap_st
 ベースの µs/stage）は書き換えない。p≥511 は `p511_gap_study.md` ほか §性能。
 
 ## 現時点の結論
+
+- **p=767 `GEMM_FUSED` の融合 epilogue を repad し、`GEMM_CUTE` を p≥511 で
+  開いた（2026-09-01、`p767_gap_study.md` §12）**: `09cb3b3` の
+  `RepadEpilogue<...,8>` はバッチ launcher にしか入っておらず、融合経路の x
+  （`run_gemm_nn_scaled`）と y（`run_volume_gemm_y_scaleadd`）が素の epilogue の
+  ままだった。両方に入れて占有 GPU job `74820`（c182、12 回交互）で
+  **59.744 → 59.669 ms/stage（−0.127%、レンジ非重複）**。ncu は
+  **命令数が 1 命令も動かないまま** shared store conflict が x 32.57 → 4.26 M、
+  y 33.59 → 4.15 M（−87%）。横展開は **p=127 が −0.487%**（job `74821`）、
+  p=7/15/31 はレンジ重複で差なし（`Nq≤64` でも回帰しないので次数ゲート不要）。
+  効果が p=7 の −4.11% より小さいのは epilogue が **1/K** で希釈されるため。
+  同節でゲートを開いた**未融合対照 `GEMM_CUTE` を p=767 で初測定**し、
+  **融合は GEMM 側に +0.426 ms 払って GEMM 外を 7.826 → 3.994 ms に減らす
+  （差引 −5.4%、63.149 対 59.743 ms/stage）**ことを分離した。純 GEMM の床は
+  55.323 ms/stage = mma 屋根の 94.1%（`GEMM_CUTE` は `GEMM` と全 452,984,832 点で
+  ビット一致、`GEMM_FUSED` は 1.77636e-15）。タイル掃引 5 形（x 128×128 / 64×256、
+  y 128×64 / 64×128 / s5）は **+0.40〜+1.20% で全滅**し、`p255_gap_study.md`
+  §10.4 の結果が K 3 倍でも成立することを確かめた。**§11.4 の「探索終了」は
+  §12 で訂正。** 最速は `CUDAFORTRAN_GEMM_FUSED` のまま（上表の 60.362 は
+  §5 当時値）。
 
 - **p=15 `GEMM_FUSED` を 1459.6 → 661.6 µs/stage にした（2026-09-01、
   `p15_gap_study.md` §25）**: Nq=16 用の CUTLASS tile set（y `16x32/16x16 s3`、
@@ -1014,6 +1034,8 @@ p=31 / p=7 / p=15 / p=127 の `FUSED` 行**で、[`p31_gap_study.md`](p31_gap_st
   `CUDAFORTRAN_GEMM_FUSED` が最速。3-run中央値の warm-up 後 device tendency は
   **60.362 ms/stage**、`CUDAFORTRAN_GEMM` の 62.817 ms/stage より **3.91%**短い。
   点変化係数を含む全452,984,832点の `dqdt` を最大絶対差3.55e-15で検証した。
+  **（追記 2026-09-01、§11）** 同一 conf の再測は 59.471 ms/stage。カーネル側の
+  探索は採用ゼロで終了。上の 60.362 は当時の表のまま。
 - **p=1023, `Ne=1`（2026-08-28、`p1023_gap_study.md`）**:
   `CUDAFORTRAN_GEMM_FUSED`が最速。3-run中央値のwarm-up後device tendencyは
   **187.617 ms/stage**、`CUDAFORTRAN_GEMM`の194.058 ms/stageより**3.32%**短い。

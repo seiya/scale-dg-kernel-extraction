@@ -208,6 +208,210 @@ p=7…255 は同一実行ファイルで再測定したが、**p=767 は再実�
 [`README.md`](README.md) まとめ表の p=767 行は本レポートの
 `GEMM` 62.817 / `GEMM_FUSED` 60.362 ms/stage のまま。
 
+## 11. `GEMM_FUSED` の残り天井を測って探索終了（2026-09-01）
+
+コミット: `f7788bb`（コード変更なし。候補は測って全部戻した）。
+GPU: RIKYU GB200 1 枚。入力は `namelists/perf_p767_gemm_fused.conf`
+（`Ne=1`、`PolyOrder=767`、`nstep=30`、`WarmupStep=5`、graph off）。
+nsys job `71131`、ncu job `71132`（c178、`--set full`、nstep=4）。
+採否の A/B は job `73625`（flux_yz 重ね、c179）と job `74704`（flux CTA 128、c399）。
+
+p=767 の最速は `CUDAFORTRAN_GEMM_FUSED` のまま。採用ゼロ。
+
+### 11.1 ベースライン
+
+login GPU 0、同一 conf を 4 回。device fused は 4.46030 / 4.46076 / 4.60724 /
+4.45768 s（75 stage）。外れ値 4.607 を除く中央値 **4.46030 s = 59.471 ms/stage**、
+Main **182.31 ms/step**。§5 の 60.362 ms/stage より 1.5% 短いが、当時の表は
+書き換えない。理論 volume GEMM は `6*Nq^4 / 40.1e12 = 52.05 ms`。device 全体の
+アルゴリズム FLOP 2.097e12 を 59.471 ms で割ると **35.26 TFLOP/s（ピークの 87.9%）**。
+
+### 11.2 律速
+
+nsys（12 launch 中央値、µs）:
+
+| カーネル | µs | 1 方向 mma 下限 17350 µs に対する比 |
+|---|---:|---:|
+| z assembly | 18927 | 91.7%（epilogue 込み） |
+| x scale | 18227 | 95.0% |
+| y scaleadd | 18027 | 96.2% |
+| `volume_flux` | 3504 | — |
+| `elembnd`（side） | 183 | x/y の裏に隠れている |
+
+ncu（クロック固定。時間は採否に使わない）:
+
+- **y**: SM 96.77%、DRAM 5.39%、占有率 18.4%（レジスタ 168、3 CTA）。stall の 47% は math pipe。**演算パイプが律速。**
+- **z**: SM 93.90%、DRAM 5.33%、L2 hit 84%、占有率 12.5%（レジスタ 254、4 CTA）。y より 0.90 ms 長い差の半分は lift（§11.4）。**これも演算パイプ。flux_z の 24 回読みは L2 が捕まえている。**
+- **`volume_flux`**: DRAM 91.64%（7.27 TB/s）、long scoreboard が stall の 81%。**帯域律速。** 100% までの天井は 0.29 ms（stage の 0.49%）。
+- x は ncu の `-c 6` から外れた。nsys では y と 1% 以内。
+
+1 文: **3 本の GEMM は FP64/Tensor パイプ、flux は DRAM、elembnd は隠れている。**
+
+### 11.3 候補と結果
+
+| 候補 | 天井 | 結果 | 機構 |
+|---|---|---|---|
+| C++ `double4` の volume_flux | DRAM 屋根まで 0.29 ms | login 3/3 で device **+0.08%**（4.464 vs 4.460）。戻した | バイトは減らない。p=7 TC のベクトル化が DRAM 飽和で負けたのと同じ |
+| flux CTA 256→128 | 同上 0.29 ms | job `74704` の A 4.44897–4.44938、B 4.44943–4.44980。**レンジ重複、差が無い**。戻した | 占有率理論値はどちらも 100%。DRAM 91% では CTA 幅が動かない |
+| `flux_y/z` を x GEMM の side2 に重ねる | yz を消すと最大 ~2 ms | job `73625` で A 4.456、B 4.540（**+1.89%**、3 対ともレンジ非重複）。戻した | x は SM 97%。フルグリッドの DRAM カーネルが GEMM を直列化する。`p63_gap_study.md` §26 の +5.9% と同じ向きで、ここでは x が 18 ms あっても負けが消えない |
+| z タイル 64×32→64×64（warp 32×64、`Nq>=512`） | z を y の 96.8% SM に寄せる 0.6 ms | login 3/3 で device **+20%**（5.36 vs 4.46）。戻した | ncu の L2 84% が正しく、N を広げても DRAM は減らない。shared 増とワープ形状で mainloop が壊れる。p=255 §10.4 の 64×64 負けが、A が L2 に載らない次数でも成り立つ |
+| lift を消すアブレーション（不正） | — | login 中央値 4.424 vs 4.460、**−0.80%（0.48 ms/stage）** | z−y の 0.90 ms のうち半分。契約内で lift を消す手は残っていない（p=255 §10.8） |
+
+範囲外（実装せず）: RK 更新の z epilogue 融合（p=255 で +5.5%）、速度の代表スカラー化、`volume_flux` を書かないこと。
+
+### 11.4 終了条件
+
+残る契約内の天井は (1) GEMM をピークの 100% まで寄せる約 1.7 ms（y は既に 96.8% で、CUTLASS 2.x のタイルは p=255 と本節で掃引済み）、(2) flux の DRAM 屋根 0.29 ms で、測った 2 形はゼロか負け、(3) lift 0.48 ms で取り方が無い。
+
+**p=767 `CUDAFORTRAN_GEMM_FUSED` の探索を終了する。** 最速経路は変わらない。
+
+## 12. 融合エピローグの accumulator repad と `GEMM_CUTE` の開通（2026-09-01）
+
+コミット: 本節を追加したコミット（親は `acdbd8a`）。GPU は RIKYU GB200 1 枚、
+`make CUDA=1 GPUFLAGS=-gpu=cc100`。入力は `namelists/perf_p767_gemm_fused.conf`
+（`Ne=1`、`PolyOrder=767`、`nstep=30`、`WarmupStep=5`、graph off）。
+採否の A/B は占有 GPU job `74732` / `74820`（ともに c182、12 回交互）、
+横展開は job `74821`（c185、10 回交互）。ncu も同一ジョブ内で採った。
+
+§11 で探索を終了したが、`feature/cuda` の `09cb3b3` が**バッチ launcher にだけ**
+`RepadEpilogue` を入れていたため、融合経路の x と y が素の epilogue のまま
+取り残されていた。本節はそれを塞ぎ、ついでに p≥511 で塞がっていた未融合対照
+`GEMM_CUTE` を開いた。**§11.4 の「探索終了」は本節で訂正する。**
+
+### 12.1 rebase の影響はゼロ
+
+`f7788bb` 凍結バイナリと `acdbd8a` ビルドを login で 3 対交互: 4.48551–4.49332 対
+4.48849–4.49206 s。**レンジ重複＝差なし**。§11.1 の 4.46030 s との差は login GPU の
+日差であり、`acdbd8a` までの共有コード変更は p=767 を動かしていない。本節の分母は
+job `74820` の base 中央値 **4.48084 s = 59.744 ms/stage** である。
+
+### 12.2 採用: x と y の epilogue を 8 パディングする（−0.127%）
+
+z の assembly epilogue は `RepadEpilogue<...,8>` を最初から使い、`09cb3b3` で
+バッチ launcher にも入った。だが融合経路の x は `run_gemm_nn_scaled`（device 版
+`Gemm`）、y は `run_volume_gemm_y_scaleadd` を通るのでどちらも素のままだった。
+y は `Kernel` の epilogue 型を差し替えるだけ、x は device 版 operator が
+epilogue を差し替えられないので `run_gemm_nn_scaled_repad` で Params を手組みした
+（列優先 C の device `Gemm` は転置問題を回すので、`to_underlying_arguments` から
+組む）。
+
+job `74820`（c182、12 回交互、`Cal_tend` [s/75 stage]）:
+
+| variant | 中央値 | range | base 比 |
+|---|---:|---:|---:|
+| base | 4.48084 | 4.48058–4.48109 | — |
+| y のみ repad | 4.47949 | 4.47921–4.47969 | **−0.030%** |
+| x + y repad | **4.47515** | 4.47490–4.47539 | **−0.127%** |
+
+3 群は互いにレンジ非重複。`Main` と `CUDA device GEMM fused` も同符号・同幅。
+**59.744 → 59.669 ms/stage。**
+
+機構は同一ジョブの ncu（job `74732` が base と y のみ、`74820` が x+y。
+shared store bank conflict の総数）:
+
+| kernel | base | x+y repad | 命令数 |
+|---|---:|---:|---|
+| x (`kernel::Gemm`, `GemmXScale`) | 32.57 M | **4.26 M（−86.9%）** | 4,695,515,136（不変） |
+| y (`GemmBatchedScaleAdd`) | 33.59 M | **4.15 M（−87.6%）** | 5,659,213,824（不変） |
+| z (`GemmBatchedDqdtAssembly`、元から repad 済み) | 5.03 M | 5.00 M | 7,041,171,456（不変） |
+
+**命令数が 1 命令も動かず conflict だけが消える。** ncu duration も x 33.923 →
+33.782 ms、y 33.921 → 33.833 ms と同符号である。`p127_gap_study.md` §20.2 は
+shared-store conflict を −72.6% にしても壁時間が動かなかった例だが、あれは
+同時に命令が **+11.2%** 増えていた。ここは命令が完全に不変なので、ncu の既知
+バイアス（`SKILL.md` 手順 3）に乗らずに占有 GPU の A/B が同符号で出る。
+
+効果が p=7 の −4.11%（`09cb3b3`）に対して p=767 で −0.127% なのは、epilogue が
+mainloop の **1/K** で希釈されるからである。K=768 は p=7 の 96 倍あり、比は桁で合う。
+
+### 12.3 横展開（job `74821`、c185、10 回交互、`Cal_tend` 中央値）
+
+| 次数 | base | x+y repad | 判定 |
+|---|---:|---:|---|
+| p=7 (`Ne=32³`) | 0.10424 | 0.10421 | レンジ重複 = **差なし** |
+| p=15 (`Ne=16³`) | 0.04061 | 0.04060 | レンジ重複 = **差なし** |
+| p=31 (`Ne=8³`) | 0.46974 | 0.46989 | レンジ重複 = **差なし** |
+| p=127 (`Ne=2³`) | 0.21631 | **0.21525** | レンジ非重複、**−0.487%**（728.3 → 724.7 µs/stage、`Cal_tend`/297 stage） |
+
+x の repad は `Nq>64` の枝にしか無く（`Nq<=64` は x が cuBLAS）、y の repad は
+全次数に入る。`p255_gap_study.md` §10.4 の「(2)(3) を `Nq<=64` の枝に持ち込むと
+ptxas のコード生成が悪化して p=63 が +2.7%」という前例があるので Nq ゲートを
+警戒したが、**Nq≤64 の 3 次数とも回帰しない**ので次数で分けない。p=127 の取り分が
+p=767 の 3.8 倍なのは K=128 で希釈が 6 分の 1 だからで、これも 1/K と整合する。
+
+### 12.4 タイル掃引はすべて負け（login 3 回、中央値）
+
+`p255_gap_study.md` §10.4 のタイル掃引は Nq=256 のものなので、K が 3 倍の
+p=767 で測り直した。天井は x が mma 屋根に対して 0.88 ms（1.5%）、y が 0.68 ms
+（1.1%）。融合経路が使う `GemmXScale` / `GemmYScale` だけを差し替えている
+（`GEMM_CUTE` の `GemmX` / `GemmY` は触っていない）。
+
+| variant | `Cal_tend` [s] | base 比 |
+|---|---:|---:|
+| base（x 64×128 s3 / y 64×64 s4） | 4.48481 | — |
+| y 128×64 s3（warp 64×32） | 4.50288 | +0.40% |
+| y 64×128 s3（warp 32×64） | 4.50948 | +0.55% |
+| y 64×64 s5 | 4.52302 | +0.85% |
+| x 128×128 s3 | 4.53190 | +1.05% |
+| x 64×256 s3 | 4.53882 | +1.20% |
+
+5 形とも base のレンジ 4.48379–4.48554 と非重複の負け。**p=255 の掃引結果は
+K が 3 倍でもそのまま成立し、x と y の残り天井はタイルでは取れない。**
+5 形とも p=127 の全点比較は max abs 1.77636e-15 で通っている。
+
+### 12.5 `GEMM_CUTE` を p≥511 で開いた —— 融合の値段が初めて測れる
+
+`mod_advect3d_eq.f90` の次数ゲートが p=511/575/767/1023 で `GEMM_CUTE` を
+弾いていた。`GEMM_CUTE` は `GEMM_FUSED` の**未融合対照**（`AGENTS.md`）で
+volume GEMM タイルを共有するので、ここが塞がっていると融合エピローグの値段が
+測れない。ゲートに 1 行足すだけで p=767 は初回から完走した。
+
+login 3 回の中央値（`Cal_tend` と、両経路が出す volume GEMM 区間）:
+
+| 経路 | volume GEMM [ms/stage] | 残り [ms/stage] | `Cal_tend` [ms/stage] |
+|---|---:|---:|---:|
+| `CUDAFORTRAN_GEMM_CUTE`（未融合、**初測定**） | 55.323 | 7.826 | 63.149 |
+| `CUDAFORTRAN_GEMM_FUSED`（本節） | 55.749 | 3.994 | **59.743** |
+
+**融合は GEMM 側に +0.426 ms/stage（+0.77%）払って、GEMM 外を
+7.826 → 3.994 ms/stage（−3.83 ms）に減らしている。** 差引 −3.41 ms/stage
+（**−5.4%**）。§5 の cuBLAS `GEMM` 62.82 との比較では「CUTLASS 化の分」と
+「融合の分」が混ざっていたが、これで分離できた。
+
+同時に **p=767 の純 GEMM の床**も出た: 55.323 ms/stage は 1 方向 mma 下限
+17.35 ms の 3 倍 = 52.05 ms に対して **94.1%** で、融合版の 55.749 は 93.4%。
+`GEMM_FUSED` の GEMM 外に残る 3.994 ms は `volume_flux` 3.504 ms（§11.2、
+DRAM 91.6%）とその他 0.49 ms であり、収支が閉じる。
+
+### 12.6 数値検証
+
+- p=127（`Ne=2³`、`SCALE_DG_VARYING_COEFF=1`）で `CUDAFORTRAN_SPLIT` と全
+  16,777,216 点比較: base / y repad / x+y repad / タイル 5 形すべて
+  **max abs 1.77636e-15、max rel 2.22029e-16**（base と同値）。
+- p=767 実寸（`Ne=1`、`SCALE_DG_VARYING_COEFF=1`）で、独立実装の
+  `CUDAFORTRAN_GEMM`（cuBLAS）を参照に全 **452,984,832 点**を比較した
+  （`namelists/val_p767_gemm.conf` / `val_p767_gemm_fused.conf`、ダンプは 1 本
+  11.3 GB）:
+
+  | 経路 | max abs | max rel |
+  |---|---:|---:|
+  | `CUDAFORTRAN_GEMM_FUSED`（x+y repad） | **1.77636e-15** | 2.22017e-16 |
+  | `CUDAFORTRAN_GEMM_CUTE`（本節で開通） | **0（ビット一致）** | 0 |
+
+  §4 の 3.55e-15 と同オーダーで、GEMM 縮約順の丸め差と整合する。3 経路とも
+  最終 min/max は `-9.999676920720005E-01` / `9.999676926585226E-01` で一致。
+  通常の benchmark 係数でも `val_p767_gemm_fused.conf` の min/max は §4 の
+  公表値 `-9.999676850160175E-01` / `9.999676855992745E-01` のまま。
+
+### 12.7 残っているもの
+
+§11.4 の 3 項のうち (1) は本節で 0.075 ms 取り、タイルでは取れないことを
+測って確定した。残りは §11 と同じで、(2) flux の DRAM 屋根 0.29 ms、
+(3) lift 0.48 ms、(1) の残り約 3.1 ms（GEMM を屋根まで寄せる分。§11.2 の nsys で
+x 95.0% / y 96.2% / z 91.7%、§12.5 の純 GEMM 合計で 94.1%）。範囲外は
+§11.3 のとおり。**最速は
+`CUDAFORTRAN_GEMM_FUSED` のまま。**
+
 ## 追記（2026-09-01）: p=575 側から入った `Nq >= 512` の分岐
 
 [`p575_gap_study.md`](p575_gap_study.md) §11 が volume GEMM に `Nq >= 512` の

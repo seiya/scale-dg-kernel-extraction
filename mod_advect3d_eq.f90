@@ -322,15 +322,20 @@ contains
         "CUDAFORTRAN_GEMM_OZAKI2, or CUDAFORTRAN_GEMM_OZAKI1"
     end if
 
+    ! GEMM_CUTE is the unfused control for GEMM_FUSED and shares its volume
+    ! GEMM tiles, so it has to be reachable wherever GEMM_FUSED is: without it
+    ! the fused epilogue has no price tag at these degrees.
     if ((Np == 512**3 .or. Np == 576**3 .or. Np == 768**3 .or. &
          Np == 1024**3) .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_FUSED .and. &
+        dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2 .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI1) then
       error stop "PolyOrder=511, 575, 767, or 1023 requires " // &
         "CUDAFORTRAN_GEMM, CUDAFORTRAN_GEMM_FUSED, " // &
-        "CUDAFORTRAN_GEMM_OZAKI2, or CUDAFORTRAN_GEMM_OZAKI1"
+        "CUDAFORTRAN_GEMM_CUTE, CUDAFORTRAN_GEMM_OZAKI2, or " // &
+        "CUDAFORTRAN_GEMM_OZAKI1"
     end if
 
     if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &

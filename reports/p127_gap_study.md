@@ -1600,6 +1600,34 @@ misaligned address（job `72042`）で範囲外。整列を保つ 2-way 下限�
 shared conflict、CTA 幅、占有率、命令、同期、面 overlap の契約内候補を測り切り、
 **p=127 FUSED_TC の探索を 621.5 µs/stage で終了する。**
 
+## 21. `GEMM_FUSED` の x / y epilogue を repad（2026-09-01、採用、−0.487%）
+
+p=767 由来の横展開。詳細と機構は [`p767_gap_study.md`](p767_gap_study.md) §12。
+コミットは本節を追加したもの、GPU は RIKYU GB200、占有 GPU job `74821`（c185、
+base と候補を 10 回交互）、入力は `namelists/perf_p127_gemm_fused.conf`
+（`Ne=2³`、`nstep=100`、graph off）。
+
+融合経路の x（`run_gemm_nn_scaled`）と y（`run_volume_gemm_y_scaleadd`）だけが
+CUTLASS 標準 epilogue のままで、accumulator staging タイルが無パディングだった。
+z の assembly と、`09cb3b3` 以降のバッチ launcher が使っているのと同じ
+`RepadEpilogue<...,8>` を両方に入れる。p=127 は `Nq=128 > 64` なので x と y の
+両方が対象。
+
+| variant | `Cal_tend` 中央値 [s/99 step] | range | µs/stage |
+|---|---:|---:|---:|
+| base | 0.21631 | 0.21572–0.21662 | 728.3 |
+| x + y repad | **0.21525** | 0.21467–0.21554 | **724.7** |
+
+レンジ非重複、**−0.487%**。`SCALE_DG_VARYING_COEFF=1` で `CUDAFORTRAN_SPLIT` と
+全 16,777,216 点比較して **max abs 1.77636e-15**（base と同値）。
+
+§20.2 は shared-store conflict を −72.6% にしても壁時間が動かなかった例だが、
+あれは同時に命令が **+11.2%** 増えていた。今回は ncu（p=767、job `74820`）で
+**命令数が 1 命令も動かず** conflict だけが x 32.57 → 4.26 M、y 33.59 → 4.15 M と
+消えるので、ncu の既知バイアスに乗らずに占有 GPU の A/B が同符号で出る。
+
+最速は `FUSED_TC`（621.5 µs/stage、§20）のまま。
+
 ## 追記（2026-09-01）: volume GEMM の y を 3 段にした
 
 `p511_gap_study.md` §12 で `VolumeGemmSet` の y GEMM のパイプライン段数を

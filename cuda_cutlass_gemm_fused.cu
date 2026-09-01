@@ -384,6 +384,64 @@ int run_gemm_nn_scaled(int m, int n, int k, double const *A, int lda,
   return cutlass_error("scaled gemm", gemm_op(args, nullptr, dg_cuda_stream));
 }
 
+//- Same GEMM as run_gemm_nn_scaled with the epilogue's accumulator staging
+//- tile padded by 8 (RepadEpilogue, cutlass_z_gemm_assembly.h).  The x volume
+//- GEMM is the last one still on the stock epilogue, and ncu job 74732 counts
+//- 32.6 M shared-store bank conflicts in it -- the same 2-way conflict the
+//- batched launcher and the z assembly already pad away.  The device-level
+//- operator cannot take a different epilogue, so Params is built here.
+template <class Gemm>
+int run_gemm_nn_scaled_repad(int m, int n, int k, double const *A, int lda,
+                             double const *B, int ldb, double const *C, int ldc,
+                             double *D, int ldd)
+{
+  using Kernel = cutlass::gemm::kernel::Gemm<
+      typename Gemm::GemmKernel::Mma,
+      RepadEpilogue<typename Gemm::GemmKernel::Epilogue, 8>, Swizzle, false>;
+
+  typename Gemm::Arguments args({m, n, k}, {A, lda}, {B, ldb}, {C, ldc},
+                                {D, ldd},
+                                typename Gemm::EpilogueOutputOp::Params());
+  const cutlass::Status can = Gemm::can_implement(args);
+  if (can != cutlass::Status::kSuccess) {
+    return cutlass_error("scaled repad can_implement", can);
+  }
+
+  //- The column-major-C device operator runs the transposed problem, so build
+  //- Params from its underlying arguments rather than from ours.
+  auto uargs = Gemm::to_underlying_arguments(args);
+  Swizzle swizzle;
+  cutlass::gemm::GemmCoord grid_shape = swizzle.get_tiled_shape(
+      uargs.problem_size,
+      {Gemm::ThreadblockShape::kM, Gemm::ThreadblockShape::kN,
+       Gemm::ThreadblockShape::kK},
+      1);
+
+  typename Kernel::Params params{uargs.problem_size,
+                                 grid_shape,
+                                 uargs.ref_A.non_const_ref(),
+                                 uargs.ref_B.non_const_ref(),
+                                 uargs.ref_C.non_const_ref(),
+                                 uargs.ref_D,
+                                 uargs.epilogue,
+                                 nullptr};
+
+  dim3 grid = swizzle.get_grid_shape(grid_shape);
+  dim3 block(Kernel::kThreadCount, 1, 1);
+  int smem_size = int(sizeof(typename Kernel::SharedStorage));
+  if (smem_size >= (48 << 10)) {
+    cudaError_t attr = cudaFuncSetAttribute(
+        cutlass::Kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size);
+    if (attr != cudaSuccess) {
+      return 1;
+    }
+  }
+  cutlass::arch::synclog_setup();
+  cutlass::Kernel<Kernel><<<grid, block, smem_size, dg_cuda_stream>>>(params);
+  return cudaGetLastError() == cudaSuccess ? 0 : 1;
+}
+
 template <class GemmBatched>
 int run_gemm_batched_nn_scaled(int m, int n, int k, double const *A, int lda,
                                long long strideA, double const *B, int ldb,
@@ -433,9 +491,13 @@ int run_volume_gemm_y_scaleadd(double *deriv_xy, const double *flux_y,
   using GemmY = typename cutlass::platform::conditional<
       kShallowPipe, typename Set::GemmYScaleShallow,
       typename Set::GemmYScale>::type;
+  //- Same accumulator repad the z assembly and the plain batched launcher use
+  //- (RepadEpilogue, cutlass_z_gemm_assembly.h).  The stock epilogue stages the
+  //- accumulators unpadded and takes a 2-way shared-store conflict on every
+  //- phase.
   using Kernel = GemmBatchedScaleAdd<typename GemmY::GemmKernel::Mma,
-                                     typename GemmY::GemmKernel::Epilogue, BatchedSwizzle,
-                                     kMulAddend>;
+                                     RepadEpilogue<typename GemmY::GemmKernel::Epilogue, 8>,
+                                     BatchedSwizzle, kMulAddend>;
 
   cutlass::TensorRef<double const, ColumnMajor> ref_A(flux_y, Nq);
   cutlass::TensorRef<double const, ColumnMajor> ref_B(D1D_tr, Nq);
@@ -500,7 +562,7 @@ int run_volume_gemm_x_scale(double *deriv_x, const double *flux_x,
         Nq, Nq, Nq, D1D, Nq, 0, flux_x, Nq, stride, escale, Nq, stride, deriv_x,
         Nq, stride, Nq * Ne);
   }
-  return run_gemm_nn_scaled<typename Set::GemmXScale>(
+  return run_gemm_nn_scaled_repad<typename Set::GemmXScale>(
       Nq, nq2 * Ne, Nq, D1D, Nq, flux_x, Nq, escale, Nq, deriv_x, Nq);
 }
 
