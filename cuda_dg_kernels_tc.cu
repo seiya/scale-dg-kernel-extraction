@@ -2047,10 +2047,11 @@ __global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_k
   // limit and at BK63=64 they are twice it.  Occupancy is capped by registers
   // (512 threads times 124) long before shared memory matters, so the extra
   // shared costs nothing; see section 16 of p63_gap_study.md.
+  constexpr int P63_PANEL = NQ63 * BK63;
   extern __shared__ __align__(16) double smem63[];
   double *const sFU = smem63;
-  double *const sD = smem63 + NQ63 * BK63;
-  double *const sFW = smem63 + 2 * NQ63 * BK63;
+  double *const sD = smem63 + P63_XZ_NBUF * P63_PANEL;
+  double *const sFW = smem63 + 2 * P63_XZ_NBUF * P63_PANEL;
 
   const int elem = (int)blockIdx.x / NQ63;
   if (elem >= Ne) {
@@ -2087,6 +2088,68 @@ __global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_k
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 
+  // sFU[k][l] = q*u at (l, jp, k).  l is fast in global, so sixteen lanes
+  // walk l and cover one 128-byte run.  sD[r][l] = D1D(r, l), r fast in the
+  // Fortran column-major operator.  sFW[i][l] = q*w at (i, jp, l), i fast in
+  // global.
+#define P63_XZ_FU_IDX(P) \
+  const int ll = tid & (BK63 - 1);                                            \
+  const int o = (tid / BK63) + (P63_THREADS / BK63) * (P)
+#define P63_XZ_DW_IDX(P) \
+  const int o = tid & 63;                                                     \
+  const int ll = (tid >> 6) + (P63_THREADS / 64) * (P)
+
+#if P63_XZ_DB
+  // Double buffered, the form section 4.1 of p255_gap_study.md measured:
+  // issue(k+1) -> mma(buf) -> store(buf^1) -> barrier.  One barrier per chunk
+  // instead of two, and the next chunk's global loads are in flight across
+  // the whole mma loop.  The values stay raw in registers and the q*u and q*w
+  // products happen at the store.
+  double pq[P63_STAGE_ITERS], pu[P63_STAGE_ITERS];
+  double pd[P63_STAGE_ITERS], pqw[P63_STAGE_ITERS], pw[P63_STAGE_ITERS];
+#define P63_XZ_ISSUE(KK)                                                      \
+  do {                                                                        \
+    _Pragma("unroll") for (int p = 0; p < P63_STAGE_ITERS; ++p)               \
+    {                                                                         \
+      P63_XZ_FU_IDX(p);                                                       \
+      const int g = eo + ((KK) + ll) + plane_off + NQ2_63 * o;                \
+      pq[p] = q[g];                                                           \
+      pu[p] = u[g];                                                           \
+    }                                                                         \
+    _Pragma("unroll") for (int p = 0; p < P63_STAGE_ITERS; ++p)               \
+    {                                                                         \
+      P63_XZ_DW_IDX(p);                                                       \
+      pd[p] = D1D[o + NQ63 * ((KK) + ll)];                                    \
+      const int g = eo + o + plane_off + NQ2_63 * ((KK) + ll);                \
+      pqw[p] = q[g];                                                          \
+      pw[p] = w[g];                                                           \
+    }                                                                         \
+  } while (0)
+#define P63_XZ_STORE(BUF)                                                     \
+  do {                                                                        \
+    _Pragma("unroll") for (int p = 0; p < P63_STAGE_ITERS; ++p)               \
+    {                                                                         \
+      P63_XZ_FU_IDX(p);                                                       \
+      sFU[(BUF) * P63_PANEL + swu63(o + BK63 * ll)] = pq[p] * pu[p];          \
+    }                                                                         \
+    _Pragma("unroll") for (int p = 0; p < P63_STAGE_ITERS; ++p)               \
+    {                                                                         \
+      P63_XZ_DW_IDX(p);                                                       \
+      sD[(BUF) * P63_PANEL + swt63(o + BK63 * ll)] = pd[p];                   \
+      sFW[(BUF) * P63_PANEL + swt63(o + BK63 * ll)] = pqw[p] * pw[p];         \
+    }                                                                         \
+  } while (0)
+  P63_XZ_ISSUE(0);
+  P63_XZ_STORE(0);
+  __syncthreads();
+  int buf = 0;
+  for (int kk = 0; kk < NQ63; kk += BK63) {
+    const bool more = (kk + BK63) < NQ63;
+    if (more) {
+      P63_XZ_ISSUE(kk + BK63);
+    }
+#else
+  int buf = 0;
   for (int kk = 0; kk < NQ63; kk += BK63) {
     // The barrier that protects the panels from being overwritten belongs at
     // the head of the body, not at its end: written at the end it also runs
@@ -2095,26 +2158,21 @@ __global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_k
     if (kk) {
       __syncthreads();
     }
-    // sFU[k][l] = q*u at (l, jp, k).  l is fast in global, so sixteen lanes
-    // walk l and cover one 128-byte run.
 #pragma unroll
     for (int p = 0; p < P63_STAGE_ITERS; ++p) {
-      const int ll = tid & (BK63 - 1);
-      const int o = (tid / BK63) + (P63_THREADS / BK63) * p;
+      P63_XZ_FU_IDX(p);
       const int g = eo + (kk + ll) + plane_off + NQ2_63 * o;
       sFU[swu63(o + BK63 * ll)] = q[g] * u[g];
     }
-    // sD[r][l] = D1D(r, l), r fast in the Fortran column-major operator.
-    // sFW[i][l] = q*w at (i, jp, l), i fast in global.
 #pragma unroll
     for (int p = 0; p < P63_STAGE_ITERS; ++p) {
-      const int o = tid & 63;
-      const int ll = (tid >> 6) + (P63_THREADS / 64) * p;
+      P63_XZ_DW_IDX(p);
       sD[swt63(o + BK63 * ll)] = D1D[o + NQ63 * (kk + ll)];
       const int g = eo + o + plane_off + NQ2_63 * (kk + ll);
       sFW[swt63(o + BK63 * ll)] = q[g] * w[g];
     }
     __syncthreads();
+#endif
 
 #pragma unroll
     for (int ks = 0; ks < BK63 / 4; ++ks) {
@@ -2123,14 +2181,14 @@ __global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_k
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
         const int m = 8 * (2 * wm + a) + row;
-        av[a] = sFU[swu63(m + BK63 * l)];
-        avz[a] = sD[swt63(m + BK63 * l)];
+        av[a] = sFU[buf * P63_PANEL + swu63(m + BK63 * l)];
+        avz[a] = sD[buf * P63_PANEL + swt63(m + BK63 * l)];
       }
 #pragma unroll
       for (int bb = 0; bb < P63_TN; ++bb) {
         const int n = 8 * (P63_TN * wn + bb) + row;
-        bv[bb] = sD[swt63(n + BK63 * l)];
-        bvz[bb] = sFW[swt63(n + BK63 * l)];
+        bv[bb] = sD[buf * P63_PANEL + swt63(n + BK63 * l)];
+        bvz[bb] = sFW[buf * P63_PANEL + swt63(n + BK63 * l)];
       }
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
@@ -2142,7 +2200,20 @@ __global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_k
         }
       }
     }
+#if P63_XZ_DB
+    if (more) {
+      P63_XZ_STORE(buf ^ 1);
+      __syncthreads();
+      buf ^= 1;
+    }
+#endif
   }
+#undef P63_XZ_FU_IDX
+#undef P63_XZ_DW_IDX
+#if P63_XZ_DB
+#undef P63_XZ_ISSUE
+#undef P63_XZ_STORE
+#endif
 
 #if P63_PDL_STAGE >= 1
   // The epilogue below is the first thing that reads flux_bnd, so this is the
@@ -2328,7 +2399,8 @@ void launch_tendency_fused_p63_impl(
   const int nblock = NQ63 * Ne;
   constexpr int FACE_THREADS = 256;
   const int nblock_face = (nface + FACE_THREADS - 1) / FACE_THREADS;
-  const size_t smem_xz = 3 * NQ63 * BK63 * sizeof(double);
+  const size_t smem_xz =
+      3 * P63_XZ_NBUF * NQ63 * BK63 * sizeof(double);
   const size_t smem_y = (2 * NQ63 * BK63 + NQ2_63) * sizeof(double);
   static bool opted_in = false;
   if (!opted_in) {
@@ -2431,8 +2503,11 @@ extern "C" void launch_tendency_fused_p63_tc(
 // fluxes once, then an xz kernel writes dqdt and a y kernel accumulates onto
 // it.  A 128x128 output plane cannot be one block, so both volume kernels
 // tile it 128x64 -- the whole contraction index m, half the output index n --
-// and run two blocks per plane, 1024 threads in an 8 by 4 warp grid with 2x2
-// mma tiles per warp.
+// and run two blocks per plane.  The xz kernel is 512 threads in an 8 by 2
+// warp grid with 2x4 mma tiles per warp and a double-buffered chunk loop; the
+// y kernel is 512 threads in a 4 by 4 grid with 4x2 tiles and a cp.async
+// ping-pong.  The xz kernel was 1024 threads with 2x2 tiles and a single
+// buffered loop until section 23; the two changes only pay together.
 //
 //   x: C[m=k][n=i] = sum_l FU[k][l] * D[i][l]      A = sFU, B = sD
 //   z: C[m=k][n=i] = sum_l D[k][l]  * FW[i][l]     A = sD,  B = sFW
@@ -2471,27 +2546,24 @@ extern "C" void launch_tendency_fused_p63_tc(
 // together, the p=63 arrangement, and deeper was monotonically better (999.0
 // / 934.7 / 866.2 us/stage at 16 / 32 / 64 on the 64x64 tile) for the reason
 // p=63 section 16 gives: with no prefetch the loads of chunk k+1 are not
-// issued until the mma of chunk k has consumed chunk k.  With the resident
-// flux panel that pressure is off the DRAM path, and what is left is an L2
-// round trip per chunk:
+// issued until the mma of chunk k has consumed chunk k.  While the loop was
+// single buffered that made deep chunks the right answer (794.9 at 32 against
+// 757.2 at 64, and 128 does not fit in the 227 KB a Blackwell block holds).
+// With the double-buffered loop the sign flips, because the loads of chunk
+// k+1 are issued before the mma of chunk k and a shallow chunk buys register
+// budget and shared memory instead: 16 is 4.3% faster than 64 was.  See
+// section 23 of p127_gap_study.md for the sweep and for the three-point
+// measurement that shows the warp shape and the pipelining only pay together.
 //
-//   BKD127   xz shared   us/stage
-//     32       128 KB      794.9
-//     64       192 KB      757.2   <- kept
-//
-// 128 would remove the chunk loop but needs 320 KB against the 227 KB a
-// Blackwell block can hold.  The y kernel holds one chunked panel instead of
-// two, so 128 does fit there, and it loses anyway (765.6 against 756.1).
-//
-// The register-blocking ratio is where this design stops.  Going from 2x2 to
-// 4x2 mma tiles per warp would cut the operand loads per tile from 1.0 to
-// 0.75, and it is reachable only for the y kernel -- the xz kernel carries
-// two accumulator sets, so 4x2 is 32 doubles a lane and 1024 threads have 64
-// registers.  It was written for the y kernel, one block per whole 128x128
-// plane, 192 KB, no spills, and it changes nothing: 759.3 against 757.2.
-// Together with the ablation that removes the mma itself for no gain, that
-// says the mma loop is bound by neither the mma nor the count of shared
-// loads, and nothing further is diagnosable without ncu.
+// The register budget is what ties the two together.  Going from 2x2 to 2x4
+// mma tiles per warp cuts the operand loads per unit of mma from 1.0 to 0.75
+// (ncu: shared load instructions 16.78 M -> 12.58 M), and it needs half the
+// warps, so a lane holds 32 accumulator doubles instead of 16.  At 1024
+// threads that is impossible -- 1024 x 64 registers is the whole register
+// file, and the 2x2 shape already spilled 32 bytes -- so the wider tile is
+// only reachable at 512 threads, where the budget is 128 registers a thread
+// and the prefetch registers of the double-buffered loop fit alongside the
+// accumulators with nothing spilled.
 
 // The panels are 64 outer in the tile index, exactly the p=63 shape, so the
 // swizzles carry over unchanged.  swt127 is for outer-fast panels (idx =
@@ -2517,10 +2589,7 @@ __device__ __forceinline__ int sw127(int idx)
   return idx ^ (((idx / NQ127) & 7) << 2);
 }
 
-// Both volume kernels run 1024 threads, 32 warps in an 8 by 4 grid with 2x2
-// mma tiles per warp, which covers the 128x64 tile of either kernel.
-//
-// The xz warp shape was swept twice.  With the first arrangement -- every
+// The xz warp shape was swept three times.  With the first arrangement -- every
 // panel chunked together, a 64x64 tile, four blocks per plane -- occupancy
 // decided it (Ne=2**3, nstep=400):
 //
@@ -2535,19 +2604,55 @@ __device__ __forceinline__ int sw127(int idx)
 // the 128x64 tile buys: 2x2 tiles per warp costs 2+2 operand loads per k-step
 // for four mma tiles against the 2+1 for two of a 2x1 shape, so a third fewer
 // shared loads per unit of mma, at the same 50% occupancy.
+//
+// The third sweep (section 23) went the other way, giving up occupancy for a
+// wider warp tile once the chunk loop was pipelined.  Interleaved on an
+// occupied GPU, twelve rounds each:
+//
+//   TM x TN  threads  BKD  buffers  regs  spill  us/stage
+//     2x2       1024   64        1    64    32 B    708.0  <- was kept
+//     2x4        512   64        1   128     8 B    704.1
+//     2x2       1024   16        2    64    40 B    705.8
+//     2x2       1024   32        2    64   104 B    736.4
+//     4x2        512   16        2   128     0      693.0
+//     2x4        512    8        2   128     0      683.3
+//     2x4        512   16        2   128     0      677.9  <- kept
+//
+// Neither change alone is worth more than half a percent and one form of the
+// pipelining alone is 4% slower; together they are 4.25%.
 
+// The warp shape, the chunk depth and whether the chunk loop is double
+// buffered are the three knobs P127_XZ_TM / P127_XZ_TN / BKD127 / P127_XZ_DB
+// in fused_kernel_geom.h.  The block tile stays 128x64 in every setting, so
+// the warp grid and the thread count follow from TM and TN:
+//
+//   TM  TN  warps      threads  acc doubles  regs/thread available
+//    2   2  8 x 4         1024           16                     64
+//    4   2  4 x 4          512           32                    128
+//    4   4  4 x 2          256           64                    255
+//
+// The accumulator count is twice what a one-direction kernel would carry,
+// because this kernel holds x and z at once.  See section 23 of
+// p127_gap_study.md for the sweep.
 template <bool UseTc>
-__global__ __launch_bounds__(P127_XZ_THREADS, 1) void tendency_fused_p127_xz_kernel(
+__global__ __launch_bounds__(P127_XZ_THREADS, P127_XZ_MINB) void tendency_fused_p127_xz_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ w,
     const double *__restrict__ flux_bnd, const double *__restrict__ Escale,
     int Ne)
 {
+  constexpr int TM = P127_XZ_TM;
+  constexpr int TN = P127_XZ_TN;
+  constexpr int THREADS = P127_XZ_THREADS;
+  constexpr int NBUF = P127_XZ_NBUF;
+  constexpr int PANEL = NQ127 * BKD127;
+  constexpr int NSTAGE = PANEL / THREADS;
+
   extern __shared__ __align__(16) double smem127[];
   double *const sFW = smem127;                       //  64 x NQ, full depth
-  double *const sFU = smem127 + P127_MT * NQ127;     // 128 x BKD
-  double *const sD = smem127 + P127_MT * NQ127 + NQ127 * BKD127;  // 128 x BKD
+  double *const sFU = smem127 + P127_MT * NQ127;     // NBUF x 128 x BKD
+  double *const sD = sFU + NBUF * PANEL;             // NBUF x 128 x BKD
 
   const int block = (int)blockIdx.x;
   const int ntile = block & 1;
@@ -2561,8 +2666,8 @@ __global__ __launch_bounds__(P127_XZ_THREADS, 1) void tendency_fused_p127_xz_ker
   const int tid = (int)threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  const int wm = warp & 7;
-  const int wn = warp >> 3;
+  const int wm = warp % P127_XZ_WM;
+  const int wn = warp / P127_XZ_WM;
   const int row = lane >> 2;
   const int colk = lane & 3;
 
@@ -2571,9 +2676,9 @@ __global__ __launch_bounds__(P127_XZ_THREADS, 1) void tendency_fused_p127_xz_ker
   const int npoint = NP127 * Ne;
   const int plane_off = NQ127 * jp;
 
-  double ax[2 * 2 * 2], az[2 * 2 * 2];
+  double ax[2 * TM * TN], az[2 * TM * TN];
 #pragma unroll
-  for (int e = 0; e < 2 * 2 * 2; ++e) {
+  for (int e = 0; e < 2 * TM * TN; ++e) {
     ax[e] = 0.0;
     az[e] = 0.0;
   }
@@ -2589,22 +2694,22 @@ __global__ __launch_bounds__(P127_XZ_THREADS, 1) void tendency_fused_p127_xz_ker
   // 16.8 M mma, 66% of them address arithmetic, with the DMMA pipe starved at
   // 53.1%.  See section 11.10 of p127_gap_study.md.
   const int cx = colk << 2;
-  int amx[2], bnx[2];
+  int amx[TM], bnx[TN];
 #pragma unroll
-  for (int a = 0; a < 2; ++a) {
-    amx[a] = (8 * (2 * wm + a) + row) ^ cx;
+  for (int a = 0; a < TM; ++a) {
+    amx[a] = (8 * (TM * wm + a) + row) ^ cx;
   }
 #pragma unroll
-  for (int bb = 0; bb < 2; ++bb) {
-    bnx[bb] = (8 * (2 * wn + bb) + row) ^ cx;
+  for (int bb = 0; bb < TN; ++bb) {
+    bnx[bb] = (8 * (TN * wn + bb) + row) ^ cx;
   }
 
   // sFW[i][l] = q*w at (ibase+i, jp, l), the panel this tile reads exactly
   // once per plane, so it is the one staged at full depth.
 #pragma unroll
-  for (int p = 0; p < P127_MT * NQ127 / 1024; ++p) {
+  for (int p = 0; p < P127_MT * NQ127 / THREADS; ++p) {
     const int o = tid & (P127_MT - 1);
-    const int ll = (tid / P127_MT) + (1024 / P127_MT) * p;
+    const int ll = (tid / P127_MT) + (THREADS / P127_MT) * p;
     const int g = eo + (ibase + o) + plane_off + NQ2_127 * ll;
     sFW[swt127(o + P127_MT * ll)] = q[g] * w[g];
   }
@@ -2612,6 +2717,64 @@ __global__ __launch_bounds__(P127_XZ_THREADS, 1) void tendency_fused_p127_xz_ker
   // epilogue, after this grid's stores.
   asm volatile("griddepcontrol.launch_dependents;");
 
+  // sFU[k][l] = q*u at (kk+l, jp, k), all 128 k.  l is fast in global.
+  // sD[r][l] = D1D(r, kk+l), all 128 rows: m runs over the whole range and
+  // n sits inside it, so one panel serves both operands as it did at p=63.
+#define P127_XZ_FU_IDX(P) \
+  const int ll = tid & (BKD127 - 1);                                          \
+  const int o = (tid / BKD127) + (THREADS / BKD127) * (P)
+#define P127_XZ_D_IDX(P) \
+  const int o = tid & (NQ127 - 1);                                            \
+  const int ll = (tid / NQ127) + (THREADS / NQ127) * (P)
+
+#if P127_XZ_DB
+  // Double buffered: issue(k+1) -> mma(buf) -> store(buf^1) -> barrier.  One
+  // barrier per chunk instead of two, and the next chunk's global loads are
+  // in flight across the whole mma loop.  The loaded values stay raw in
+  // registers and the q*u multiply happens at the store, because multiplying
+  // at issue time would make the pipeline wait on the loads exactly where it
+  // is trying not to.  Same shape as tendency_p255_kernel.
+  double pq[NSTAGE], pu[NSTAGE], pd[NSTAGE];
+#define P127_XZ_ISSUE(KK)                                                     \
+  do {                                                                        \
+    _Pragma("unroll") for (int p = 0; p < NSTAGE; ++p)                        \
+    {                                                                         \
+      P127_XZ_FU_IDX(p);                                                      \
+      const int g = eo + ((KK) + ll) + plane_off + NQ2_127 * o;               \
+      pq[p] = q[g];                                                           \
+      pu[p] = u[g];                                                           \
+    }                                                                         \
+    _Pragma("unroll") for (int p = 0; p < NSTAGE; ++p)                        \
+    {                                                                         \
+      P127_XZ_D_IDX(p);                                                       \
+      pd[p] = D1D[o + NQ127 * ((KK) + ll)];                                   \
+    }                                                                         \
+  } while (0)
+#define P127_XZ_STORE(BUF)                                                    \
+  do {                                                                        \
+    _Pragma("unroll") for (int p = 0; p < NSTAGE; ++p)                        \
+    {                                                                         \
+      P127_XZ_FU_IDX(p);                                                      \
+      sFU[(BUF) * PANEL + swt128(o + NQ127 * ll)] = pq[p] * pu[p];            \
+    }                                                                         \
+    _Pragma("unroll") for (int p = 0; p < NSTAGE; ++p)                        \
+    {                                                                         \
+      P127_XZ_D_IDX(p);                                                       \
+      sD[(BUF) * PANEL + swt128(o + NQ127 * ll)] = pd[p];                     \
+    }                                                                         \
+  } while (0)
+
+  P127_XZ_ISSUE(0);
+  P127_XZ_STORE(0);
+  __syncthreads();
+  int buf = 0;
+  for (int kk = 0; kk < NQ127; kk += BKD127) {
+    const bool more = (kk + BKD127) < NQ127;
+    if (more) {
+      P127_XZ_ISSUE(kk + BKD127);
+    }
+#else
+  int buf = 0;
   for (int kk = 0; kk < NQ127; kk += BKD127) {
     // The barrier that protects the panels from being overwritten belongs
     // here, not at the end of the body: written at the end it also runs after
@@ -2622,62 +2785,79 @@ __global__ __launch_bounds__(P127_XZ_THREADS, 1) void tendency_fused_p127_xz_ker
     if (kk) {
       __syncthreads();
     }
-    // sFU[k][l] = q*u at (kk+l, jp, k), all 128 k.  l is fast in global.
 #pragma unroll
-    for (int p = 0; p < NQ127 * BKD127 / P127_XZ_THREADS; ++p) {
-      const int ll = tid & (BKD127 - 1);
-      const int o = (tid / BKD127) + (P127_XZ_THREADS / BKD127) * p;
+    for (int p = 0; p < NSTAGE; ++p) {
+      P127_XZ_FU_IDX(p);
       const int g = eo + (kk + ll) + plane_off + NQ2_127 * o;
       sFU[swt128(o + NQ127 * ll)] = q[g] * u[g];
     }
-    // sD[r][l] = D1D(r, kk+l), all 128 rows: m runs over the whole range and
-    // n sits inside it, so one panel serves both operands as it did at p=63.
 #pragma unroll
-    for (int p = 0; p < NQ127 * BKD127 / P127_XZ_THREADS; ++p) {
-      const int o = tid & (NQ127 - 1);
-      const int ll = (tid / NQ127) + (P127_XZ_THREADS / NQ127) * p;
+    for (int p = 0; p < NSTAGE; ++p) {
+      P127_XZ_D_IDX(p);
       sD[swt128(o + NQ127 * ll)] = D1D[o + NQ127 * (kk + ll)];
     }
     __syncthreads();
+#endif
 
 #pragma unroll
     for (int ks = 0; ks < BKD127 / 4; ++ks) {
       const int lc = 4 * ks + colk;
       const int lg = kk + lc;
-      double av[2], bv[2], avz[2], bvz[2];
+      double av[TM], bv[TN], avz[TM], bvz[TN];
 #pragma unroll
-      for (int a = 0; a < 2; ++a) {
-        av[a] = sFU[amx[a] + NQ127 * lc];
-        avz[a] = sD[amx[a] + NQ127 * lc];
+      for (int a = 0; a < TM; ++a) {
+        av[a] = sFU[buf * PANEL + amx[a] + NQ127 * lc];
+        avz[a] = sD[buf * PANEL + amx[a] + NQ127 * lc];
       }
 #pragma unroll
-      for (int bb = 0; bb < 2; ++bb) {
-        bv[bb] = sD[ibase + bnx[bb] + NQ127 * lc];
+      for (int bb = 0; bb < TN; ++bb) {
+        bv[bb] = sD[buf * PANEL + ibase + bnx[bb] + NQ127 * lc];
         bvz[bb] = sFW[bnx[bb] + P127_MT * lg];
       }
 #pragma unroll
-      for (int a = 0; a < 2; ++a) {
+      for (int a = 0; a < TM; ++a) {
 #pragma unroll
-        for (int bb = 0; bb < 2; ++bb) {
-          const int e = 2 * (2 * a + bb);
+        for (int bb = 0; bb < TN; ++bb) {
+          const int e = 2 * (TN * a + bb);
           mma_m8n8k4_f64<UseTc>(ax[e], ax[e + 1], av[a], bv[bb], ax[e], ax[e + 1]);
           mma_m8n8k4_f64<UseTc>(az[e], az[e + 1], avz[a], bvz[bb], az[e], az[e + 1]);
         }
       }
     }
+#if P127_XZ_DB
+    if (more) {
+      P127_XZ_STORE(buf ^ 1);
+      __syncthreads();
+      buf ^= 1;
+    }
+#endif
   }
+#undef P127_XZ_FU_IDX
+#undef P127_XZ_D_IDX
+#if P127_XZ_DB
+#undef P127_XZ_ISSUE
+#undef P127_XZ_STORE
+#endif
 
   asm volatile("griddepcontrol.wait;" ::: "memory");
 
+  // The epilogue is nested b-outer / a-inner in the sense of section 4.4 of
+  // p255_gap_study.md: half of what it reads depends on one tile index only.
+  // Faces 2 and 4 and their lift coefficients are indexed by m, faces 5 and 6
+  // and the faces 2/4 coefficients by n, and faces 1 and 3 by both.  Written
+  // flat as below, ptxas already emits exactly the hoisted count -- 20 LDG.128
+  // and 18 LDG.64 per warp against the 56 loads a reload-per-tile schedule
+  // would need -- because with TM*TN <= 8 tiles the values stay live.  See
+  // section 23.1.
   const double lf1 = Lift1D[jp];
   const double lf3 = Lift1D[jp + 2 * NQ127];
 
 #pragma unroll
-  for (int e8 = 0; e8 < 4; ++e8) {
-    const int a = e8 / 2;
-    const int bb = e8 % 2;
-    const int m = 8 * (2 * wm + a) + row;                 // k
-    const int n = ibase + 8 * (2 * wn + bb) + 2 * colk;   // i, and i+1
+  for (int e8 = 0; e8 < TM * TN; ++e8) {
+    const int a = e8 / TN;
+    const int bb = e8 % TN;
+    const int m = 8 * (TM * wm + a) + row;                 // k
+    const int n = ibase + 8 * (TN * wn + bb) + 2 * colk;   // i, and i+1
     const int node = eo + n + plane_off + NQ2_127 * m;
 
     const double2 ex = *reinterpret_cast<const double2 *>(Escale + node);
@@ -2696,6 +2876,11 @@ __global__ __launch_bounds__(P127_XZ_THREADS, 1) void tendency_fused_p127_xz_ker
         *reinterpret_cast<const double2 *>(flux_bnd + efo + 4 * NQ2_127 + fp56);
     const double2 fb6 =
         *reinterpret_cast<const double2 *>(flux_bnd + efo + 5 * NQ2_127 + fp56);
+    // n is even, so the faces 2 and 4 coefficient pairs could be read as one
+    // aligned double2 each, the way p255_epilogue reads them.  Measured: it
+    // takes the four LDG.64 to two LDG.128 and is worth -0.76% on the 1024
+    // thread 2x2 shape but +0.58% on the shape below, whose ranges do not
+    // overlap.  Section 23.4.
     const double lf2a = Lift1D[n + NQ127];
     const double lf2b = Lift1D[n + 1 + NQ127];
     const double lf4a = Lift1D[n + 3 * NQ127];
@@ -2743,8 +2928,8 @@ __global__ __launch_bounds__(P127_Y_THREADS, P127_Y_BPSM) void tendency_fused_p1
   // 16 warps in a 4 x 4 grid with 4x2 mma tiles.  512 threads x 64 registers
   // and 96 KB shared both allow 2 blocks/SM, which the 1024-thread 128 KB
   // shape could not.  ncu job 70955: Block Limit Registers = Shared Mem = 2.
-  const int wm = warp & 3;
-  const int wn = warp >> 2;
+  const int wm = warp % P127_Y_WM;
+  const int wn = warp / P127_Y_WM;
   const int row = lane >> 2;
   const int colk = lane & 3;
 
@@ -2868,7 +3053,7 @@ void launch_tendency_fused_p127_impl(
   constexpr int FACE_THREADS = 256;
   const int nblock_face = (nface + FACE_THREADS - 1) / FACE_THREADS;
   const size_t smem_xz =
-      (P127_MT * NQ127 + 2 * NQ127 * BKD127) * sizeof(double);
+      (P127_MT * NQ127 + 2 * P127_XZ_NBUF * NQ127 * BKD127) * sizeof(double);
   const size_t smem_y =
       (NQ127 * BKDY127 + P127_MT * NQ127) * sizeof(double);
   static bool opted_in = false;
