@@ -2010,14 +2010,18 @@ contains
 
     nq2 = Nq*Nq
     p31_early_face = fuse_epilogue .and. (Nq == 32)
-    ! Weighted z + packed faces: Nq>64 (CUTLASS x/y scale) and Nq=64 (cuBLAS x
-    ! plus y epilogue Ey*acc + Ex*Dx). Nq<64 stays unweighted; at p=31 the
-    ! same fold is +2.3% on login.
+    ! Weighted z: Nq>64 (CUTLASS x/y scale) and Nq=64 (cuBLAS x plus y
+    ! epilogue Ey*acc + Ex*Dx). Nq<64 stays unweighted; the fold is +2.3% at
+    ! p=31 and +39% at p=7, where y is the dominant kernel and pays for the
+    ! three extra volume tensors that z saves.
     xy_weighted = 0
     pair_nq2 = 0
-    if (fuse_epilogue .and. Nq >= 64) then
-      xy_weighted = 1
-      pair_nq2 = nq2
+    if (fuse_epilogue .and. Nq >= 64) xy_weighted = 1
+    ! Nq = 8 keeps the five-tensor z epilogue but does take the paired face
+    ! layout: the three 16-byte lift loads are -2.4% there (p7_gemm_fused.md
+    ! section 13).  Nq = 16, 32 and 64 lose from it.
+    if (fuse_epilogue .and. (Nq >= 64 .or. Nq == 8)) pair_nq2 = nq2
+    if (pair_nq2 /= 0) then
       if (dg_lift_zpair_nq /= Nq) then
         if (allocated(dg_lift_zpair)) deallocate(dg_lift_zpair)
         allocate(dg_lift_zpair(2*Nq))
@@ -2120,7 +2124,7 @@ contains
     if (fuse_epilogue) call dg_ev_record(4)
 
     if (fuse_epilogue) then
-      if (xy_weighted /= 0) then
+      if (pair_nq2 /= 0) then
         istat = launch_z_gemm_assembly( &
           dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, Lift1D, &
           dg_lift_zpair, Escale, Nq, Ne, cutlass_mma_shape_id, xy_weighted )

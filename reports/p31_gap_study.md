@@ -1667,3 +1667,57 @@ ncu duration 342 → 175 µs。global セクタは同一（17,039,360）。占�
 細くする手は残っていないので、次に賞金があるのは内積の外側（面 gather と
 `dqdt` / `Escale` のストリーム）だが、そちらは global セクタが 4 形とも同一
 だったことが示すように、このはしごでは 1 バイトも動いていない。
+
+## 28. `Nq>64` の z epilogue 4 つを p=31 で測る（2026-09-01、採用ゼロ）
+
+[`p7_gemm_fused.md`](p7_gemm_fused.md) §13 の横展開。`GEMM_FUSED` の z
+assembly epilogue にあって `Nq >= 64` の枝に閉じていた 4 つ —— 添字クランプの
+タイル原点集約（bit 0）、lift の 6 ロードを 3 本の 16 B ロードに（bit 1）、
+16 B epilogue アクセス `GemmZWide`（bit 2）、`Escale` と `deriv_x` の y への
+前送り（bit 3）—— を p=31 (Nq=32) の z（`MmaSet_884` の 64×32 タイル）に
+当てた。bit 3 は y に `GemmY32` の重み付き双子が必要で `GEMM_CUTE` と
+mainloop を共有しなくなるため実装せず、§23 の +2.3% を引き継ぐ。
+
+入力は `namelists/perf_p31_gemm_fused.conf`、µs/stage は
+`CUDA device GEMM fused` ÷ 57。
+
+| bits | µs/stage | 対 base | 測定 |
+|---:|---:|---:|---|
+| 0（base） | 7400.1 | — | job `75869`、c182、12 回交互（0.421081--0.422108 s/57） |
+| 2 (16 B lift) | 7469.4 | **+0.94%** | 同上（0.425043--0.426369、レンジ非重複） |
+| 1 (クランプ) | 7617 | +2.8% | login 3-run |
+| 4 (16 B epilogue) | 8438 | +13.9% | login 3-run |
+| 3 (1+2) | 13,950 | +88.4% | login 3-run |
+| 6 (2+4) | 12,528 | +69.2% | login 3-run |
+| 7 (全部) | 12,520 | +69.1% | login 3-run |
+
+**採用ゼロ。** 機構は ncu job `75870`（c187、`--set full`、p=7 の 2 変種と
+同一ジョブ）で確定した。z assembly の先頭ローンチ:
+
+| | base | bits 7 |
+|---|---:|---:|
+| duration | 507.5 µs | 1100.3 µs（+116.8%） |
+| `smsp__inst_executed.sum` | 138.0 M | 129.9 M（**−5.9%**） |
+| register / thread | 254 | 255 |
+| local memory spilling requests | 0 | **16.3 M（overhead 100%）** |
+| warp cycles / issued inst | 4.68 | **10.89** |
+| Compute (SM) throughput | 41.3% | 17.8% |
+
+**命令数は減っているのに時間は 2.17 倍**である。p=31 の z タイルは
+64×32・shared 49 KB・レジスタ **254** で既に上限に張り付いており、bit 1 が
+要求する `lift_a` / `lift_b`（アキュムレータの shared 往復をまたいで生かす
+`double2` 配列）を置く場所が無い。ptxas はローカルメモリへ落とし、1 命令
+あたりの待ちが 4.68 → 10.89 サイクルになる。これに対し p=7 の z タイルは
+16×32・shared 18 KB・レジスタ 128 で、同じ 3 つを入れてもレジスタは 164 に
+増えるだけでスピルは 0、時間は命令数どおり −19.4% になる（`p7_gemm_fused.md`
+§13.2）。**「この epilogue は命令発行律速だから命令を減らせば速くなる」という
+p=255 §10.2 の関係は、レジスタ予算に余裕がある次数でだけ成り立つ。**
+
+これで `Nq = 8 / 16 / 32 / 64 / >=128` の全点が測り終わり、
+**3 つを受け取れるのは Nq = 8 だけ**である（Nq=16 は
+[`p15_gap_study.md`](p15_gap_study.md) §25.8 の +2.3%、Nq=64 は
+[`p255_gap_study.md`](p255_gap_study.md) §10.4 の +2.7% / +0.8%）。
+
+数値は `SCALE_DG_VARYING_COEFF=1`、`namelists/val_p31_split.conf` 参照で
+bits 0--7 と採用形（= base）のすべてが最大絶対差 **1.77636e-15**、相対
+**4.19244e-16**。p=31 の production は本節の前後で同一である。

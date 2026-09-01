@@ -219,7 +219,13 @@ struct VolumeGemmSetP7 : VolumeGemmSet<GS<8, 8, 4>, cutlass::arch::Sm80, 16> {
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
       TensorOp, cutlass::arch::Sm80, GS<16, 32, 16>, GS<16, 16, 16>,
       GS<8, 8, 4>, EpilogueOp, BatchedSwizzle, 3>;
-  using GemmZWide = GemmZ;
+  //- Same tile with 16-byte epilogue accesses.  Only the low-order study of
+  //- reports/p7_gemm_fused.md section 13 instantiates it; the mainloop is the
+  //- one GemmZ has, so GEMM_CUTE and GEMM_FUSED still share it.
+  using GemmZWide = cutlass::gemm::device::GemmBatched<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, cutlass::arch::Sm80, GS<16, 32, 16>, GS<16, 16, 16>,
+      GS<8, 8, 4>, EpilogueOp2, BatchedSwizzle, 3>;
 };
 
 using P7MmaSet_884 = VolumeGemmSetP7;
@@ -695,7 +701,8 @@ int run_volume_gemms(double *deriv_x, double *deriv_y, double *deriv_z,
   return run_volume_gemm_z<Set>(deriv_z, flux_z, D1D_tr, Nq, Ne);
 }
 
-template <class Set, bool kWeighted, bool kWide = kWeighted>
+template <class Set, bool kWeighted, bool kWide = kWeighted,
+          bool kAffine = kWeighted, bool kPaired = kWeighted>
 int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr,
                         const double *deriv_x, const double *deriv_y,
                         const double *flux_bnd, const double *lift1d,
@@ -719,7 +726,8 @@ int run_z_gemm_assembly(double *dqdt, const double *flux_z, const double *D1D_tr
   //- bank-conflict free. See RepadEpilogue in cutlass_z_gemm_assembly.h.
   using ZEpilogue = RepadEpilogue<typename GemmZ::GemmKernel::Epilogue, 8>;
   using Kernel = GemmBatchedDqdtAssembly<typename GemmZ::GemmKernel::Mma,
-                                         ZEpilogue, BatchedSwizzle, kWeighted>;
+                                         ZEpilogue, BatchedSwizzle, kWeighted,
+                                         kAffine, kPaired>;
 
   cutlass::TensorRef<double const, ColumnMajor> ref_A(flux_z, m);
   cutlass::TensorRef<double const, ColumnMajor> ref_B(D1D_tr, k);
@@ -964,8 +972,15 @@ extern "C" int launch_z_gemm_assembly(
   if (Nq <= 0 || Ne <= 0) {
     return 1;
   }
+  //- Nq = 8 keeps the five-tensor (unweighted) epilogue -- forwarding Escale
+  //- into y costs far more there than z gains -- but takes the other three
+  //- ingredients of the Nq > 64 package: hoisted clamps, paired 16-byte face
+  //- loads and 16-byte epilogue accesses.  Together they are -3.9%; the wide
+  //- epilogue and the paired loads win on their own too, while the clamp hoist
+  //- only wins on top of them.  At Nq = 16, 32 and 64 every one of the three
+  //- loses.  reports/p7_gemm_fused.md section 13.
   if (Nq == 8 && mma_shape == 0 && !xy_weighted) {
-    return run_z_gemm_assembly<P7MmaSet_884, false>(
+    return run_z_gemm_assembly<P7MmaSet_884, false, true, true, true>(
         dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d,
         lift_zpair, escale, Nq, Ne);
   }

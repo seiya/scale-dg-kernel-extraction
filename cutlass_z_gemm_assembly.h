@@ -50,7 +50,15 @@
 // lets the lift be reconstructed here without a volume-sized intermediate:
 // the six face planes total 6*Nq*Nq doubles, against Nq^3 for lift_out.
 
-template <typename Epilogue, bool kWeighted>
+//- kAffine and kPaired default to kWeighted, which is how every order
+//- above Nq = 64 uses them.  They are separate template parameters so the
+//- three ingredients of the package -- reading two volume tensors instead
+//- of five (kWeighted), hoisting the index clamps (kAffine) and issuing the
+//- six face loads as three 16-byte loads (kPaired) -- can be measured one
+//- at a time at a low order.  kPaired requires the interleaved face layout
+//- (pair_nq2 in elembnd_flux_kernel) and the packed lift_zpair table.
+template <typename Epilogue, bool kWeighted, bool kAffine = kWeighted,
+          bool kPaired = kWeighted>
 class EpilogueDqdtAssembly : public Epilogue {
 public:
   using OutputTileIterator = typename Epilogue::OutputTileIterator;
@@ -126,10 +134,12 @@ public:
     //- address, just not the one it would have, and the value is never stored
     //- because the output iterator predicates the store -- and it leaves the
     //- four face gathers affine in the row offset, so they strength-reduce.
-    //- Worth 8.9 us per stage. Only on the kWeighted branch: the same change
-    //- makes ptxas produce a 2.7% slower kernel on the other one, for a
-    //- bit-identical result.
-    static bool const kAffineIndex = kWeighted;
+    //- Worth 8.9 us per stage above Nq = 64. It is not free code: on its own
+    //- it makes ptxas produce a 2.7% slower kernel at Nq = 64 and a 2.8%
+    //- slower one at Nq = 8, for a bit-identical result. At Nq = 8 it is
+    //- nonetheless adopted, because on top of the paired face loads and the
+    //- 16-byte epilogue it turns -2.9% into -3.9%.
+    static bool const kAffineIndex = kAffine;
 
     const int nq2 = Nq * Nq;
     double const *fb0 = flux_bnd;
@@ -180,7 +190,7 @@ public:
           const int j = p / Nq;
           col_i[cc] = i;
           col_j[cc] = j;
-          if (kWeighted) {
+          if (kPaired) {
             const double2 z = pC[p];
             col_zx[cc] = z.x;
             col_zy[cc] = z.y;
@@ -239,15 +249,15 @@ public:
                                    cluster * ThreadMap::Delta::kCluster;
             const int k = kAffineIndex ? (start_row + row_offset)
                                        : min(start_row + row_offset, Nq - 1);
-            const double2 lzp = kWeighted ? pz[k] : make_double2(0.0, 0.0);
-            const double lz1 = kWeighted ? lzp.x : lift1d[4 * Nq + k];
-            const double lz2 = kWeighted ? lzp.y : lift1d[5 * Nq + k];
+            const double2 lzp = kPaired ? pz[k] : make_double2(0.0, 0.0);
+            const double lz1 = kPaired ? lzp.x : lift1d[4 * Nq + k];
+            const double lz2 = kPaired ? lzp.y : lift1d[5 * Nq + k];
             const int kNq = k * Nq;
 
             CUTLASS_PRAGMA_UNROLL
             for (int cc = 0; cc < kCols; ++cc) {
               const int idx = frag_row_idx * kCols + cc;
-              if (kWeighted) {
+              if (kPaired) {
                 //- Load phase only: keep the two face pairs in registers and
                 //- let the accumulator's shared round trip below cover their
                 //- latency.  The arithmetic runs after sli.load().
@@ -290,7 +300,7 @@ public:
       //- shared round trip so that the two face loads above are in flight
       //- across the two barriers instead of being waited on immediately.
       //- Worth 5 us per stage at p=127 for a bit-identical result.
-      if (kWeighted) {
+      if (kPaired) {
         CUTLASS_PRAGMA_UNROLL
         for (int cluster = 0; cluster < ThreadMap::Iterations::kCluster; ++cluster) {
           CUTLASS_PRAGMA_UNROLL
@@ -368,13 +378,14 @@ using RepadEpilogue = cutlass::epilogue::threadblock::Epilogue<
     cutlass::MatrixShape<0, PaddingColumn>,
     Epilogue_::kFragmentsPerIteration>;
 
-template <typename Mma_, typename Epilogue_, typename ThreadblockSwizzle_, bool kWeighted>
+template <typename Mma_, typename Epilogue_, typename ThreadblockSwizzle_, bool kWeighted,
+          bool kAffine = kWeighted, bool kPaired = kWeighted>
 struct GemmBatchedDqdtAssembly {
   using Mma = Mma_;
   using Epilogue = Epilogue_;
   using ThreadblockSwizzle = ThreadblockSwizzle_;
   using BaseKernel = cutlass::gemm::kernel::GemmBatched<Mma, Epilogue, ThreadblockSwizzle>;
-  using AssemblyEpilogue = EpilogueDqdtAssembly<Epilogue, kWeighted>;
+  using AssemblyEpilogue = EpilogueDqdtAssembly<Epilogue, kWeighted, kAffine, kPaired>;
   using WarpCount = typename Mma::WarpCount;
   static int const kThreadCount = 32 * WarpCount::kCount;
 
