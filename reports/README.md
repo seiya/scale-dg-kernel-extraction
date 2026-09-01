@@ -111,6 +111,16 @@ p=7…255 は同一体積 DOF（`NeX*Nq = 256`、16,777,216 点）。p≥511 は
 数 %〜十数 % 遅めに出ていた。FLOP/s と TB/s はすべてこの µs/stage で割る。
 Main ms/step は `Main per step:`（RK 更新と halo を含む）。
 
+**`Step loop`（2026-09-01 追加）**: `Cal_tend` は非同期 launch のホスト側を
+挟んでいるだけで、最後の stage の drain を取りこぼし（`p767_gap_study.md` §15、
+33 stage で −3.0%）、区間外で enqueue された RK 更新も抱え、graph 再生では
+何も出なかった。`Step loop:` / `Step loop per step:` / `Step loop per stage:`
+は計時対象ステップの実時間を device 同期から device 同期まで測り、ループ内の
+ホスト側診断を区間外にする。stage の欠落が無いので `Step loop per stage` は
+そのまま ÷(3*steps) でよく、graph 再生でも出る。ただし 1 ステップ全体
+（halo + tendency + RK 更新）であり、tendency 単体は `CUDA device *`。
+`Cal_tend` は過去のレポートとの継続性のために残してある。
+
 ### カウントの定義（全経路共通の FLOP、2 種類の DRAM）
 
 FLOP と unique DRAM は実装に依らない。パス列の DRAM だけ経路で変わる。

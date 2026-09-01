@@ -95,6 +95,12 @@ contains
 
     integer(IP) :: count_now
     !------------------------------------------------------------------------------
+    !- count_rate is set by the first Timer_start, so a timer that was never
+    !  started has no scale to report against.
+    if (this%count_rate == 0_int64) then
+      time_sec = 0.0_RP
+      return
+    end if
     time_sec = real(this%count_accum, RP) &
             / real(this%count_rate, RP)    
     return

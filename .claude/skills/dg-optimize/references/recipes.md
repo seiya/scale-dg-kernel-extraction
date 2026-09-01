@@ -20,11 +20,20 @@ make clean && make CUDA=1 GPUFLAGS=-gpu=cc100    # GB200 (cc100)、GPU ノード
 ## 計測（login node で直接実行可）
 
 ```bash
-for i in 1 2 3; do ./scale-dg_extraction namelists/perf_p63_fused_tc.conf | tail -8; done
+for i in 1 2 3; do ./scale-dg_extraction namelists/perf_p63_fused_tc.conf | tail -12; done
 ```
 
-- 読む値: `Main per step:`（end-to-end）と `Cal_tend:`（device）。両者を混同しない。
-- `UseCudaGraph = .true.` では `Cal_tend:` は "not measured (graph)" になる。
+- 読む値: `Main per step:`（end-to-end）、`Step loop per stage:`（計時対象ステップの
+  同期済み実時間）、`Cal_tend:`（旧タイマ、下記の偏りあり）。混同しない。
+- **`Step loop` が現行の正しい実時間タイマ**（2026-09-01 追加、`main.f90`）。
+  計時対象ステップの前後を `!$acc wait` で挟むので stage の取りこぼしが無く、
+  ループ内のホスト側診断（q の min/max リダクションとその出力、device memory
+  レポート）は区間外。ラッパ呼び出しではなくステップを数えるので
+  `UseCudaGraph = .true.` でも出る。1 ステップ全体（halo 更新 + tendency +
+  RK 更新の 3 stage）であって tendency 単体ではない。tendency 単体の device 時間は
+  `CUDA device *` の行。
+- `UseCudaGraph = .true.` では `Cal_tend:` は "not measured (graph)" になる
+  （`Step loop` は出る）。
 - `WarmupStep`（既定 1、graph 経路では 2 以上に自動昇格）で先頭ステップは計時外。
   `nstep` は変えない。
 - 3〜5 回の中央値。レンジが重なる差は「差が無い」と書く。
@@ -36,7 +45,8 @@ for i in 1 2 3; do ./scale-dg_extraction namelists/perf_p63_fused_tc.conf | tail
   振った増分の傾きを使う。`Cal_tend` の傾きは `Main`/3 と一致し、RK 更新など
   タイマ区間の外で enqueue された仕事も含む。
 - 偏りは 5 つのタイマすべて**ちょうど整数 stage**なので、割る数を直せばコードを
-  触らずに正しい値になる: `Main` は ÷(3*steps)、`Cal_tend` と
+  触らずに正しい値になる（`Step loop per stage` は既に ÷(3*steps) で偏り無し）:
+  `Main` は ÷(3*steps)、`Cal_tend` と
   `Volume derivate + surface lift` は **÷(3*steps−1)**、`CUDA device GEMM fused` と
   `... volume GEMM only` は **÷(3*steps+1)**（イベント系は 1 stage 余分に数える）。
   **タイマ本体は直さない**（過去の全レポートと基準がずれるため）。

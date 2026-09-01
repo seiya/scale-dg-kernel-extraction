@@ -74,6 +74,29 @@ program main
   type(Timer) :: timer_main
   type(Timer) :: timer_cal_tend
 
+  !> Wall time of the measured steps themselves.
+  !!
+  !! Cal_tend is kept for continuity with the earlier reports, but what it
+  !! measures is not the tendency: it brackets the host side of an
+  !! asynchronous launch sequence, so it holds the enqueue time plus whatever
+  !! backpressure the queue happens to apply, it never sees the stage that is
+  !! still draining after the last Timer_stop (a bias of one stage, -3.0% at
+  !! 33 stages; reports/p767_gap_study.md section 15), it silently carries the
+  !! Runge-Kutta update that is enqueued outside its own brackets, and a CUDA
+  !! graph replay does not run the wrapper at all so it reports nothing.
+  !!
+  !! timer_step_loop measures one well-defined thing instead: the wall time of
+  !! the nstep-nwarmup measured steps, from a device synchronization to a
+  !! device synchronization.  Both ends are synchronized, so no stage is
+  !! missing and none is double counted; the host-side diagnostics inside the
+  !! loop (the q extrema reduction and its print, the device memory report)
+  !! are bracketed out; and because it counts steps rather than wrapper calls
+  !! it is valid on a CUDA graph replay as well.  It is a whole step -- three
+  !! stages of halo update, tendency and Runge-Kutta update -- and is reported
+  !! as such; the tendency alone is what the "CUDA device ..." device-event
+  !! lines of the breakdown measure.
+  type(Timer) :: timer_step_loop
+
   !- Main program ----------------------------------------------------------
 
   report_memory_env = ''
@@ -143,8 +166,10 @@ program main
       !  before the clock starts.
       !$acc wait(ACC_QUEUE)
       call Timer_reset(timer_cal_tend)
+      call Timer_reset(timer_step_loop)
       call advect3d_eq_reset_timers()
       call Timer_start(timer_main)
+      call Timer_start(timer_step_loop)
     end if
 
     if (UseCudaGraph .and. istep >= 2) then
@@ -160,7 +185,9 @@ program main
 
     if (ReportDeviceMemory .and. istep == 1) then
       !$acc wait(ACC_QUEUE)
+      if (istep > nwarmup) call Timer_stop(timer_step_loop)
       call cuda_dg_report_memory('after_first_step')
+      if (istep > nwarmup) call Timer_start(timer_step_loop)
     end if
 
     if (mod(istep,output_interval) == 0) then
@@ -169,6 +196,9 @@ program main
       !- The reduction result is read on the host, so the queued device work
       !  has to be complete first.
       !$acc wait(ACC_QUEUE)
+      !- The steps queued so far are complete here, so this is a clean point
+      !  to leave the diagnostic out of the step-loop time.
+      if (istep > nwarmup) call Timer_stop(timer_step_loop)
       !$acc parallel loop gang vector collapse(2) present(q) &
       !$acc& reduction(min:q_min) reduction(max:q_max)
       do kelem=1, Ne
@@ -178,8 +208,13 @@ program main
         end do
       end do
       write(*,'(I8,2ES24.15)') istep, q_min, q_max
+      if (istep > nwarmup) call Timer_start(timer_step_loop)
     end if
   end do
+
+  !- The last step is still draining, and it belongs to the measured window.
+  !$acc wait(ACC_QUEUE)
+  if (nstep > nwarmup) call Timer_stop(timer_step_loop)
 
   call dump_q_if_requested()
 
@@ -334,6 +369,12 @@ contains
     write(*,'(A30,I24)')    "Skipped warm-up steps:", nwarmup
     write(*,'(A30,ES24.5)') "Main per step:", &
       Timer_elapsed(timer_main) / real(max(nstep-nwarmup,1),RP)
+    write(*,'(A30,ES24.5)') "Step loop:", Timer_elapsed(timer_step_loop)
+    write(*,'(A30,ES24.5)') "Step loop per step:", &
+      Timer_elapsed(timer_step_loop) / real(max(nstep-nwarmup,1),RP)
+    write(*,'(A30,ES24.5)') "Step loop per stage:", &
+      Timer_elapsed(timer_step_loop) &
+      / real(max(nstep-nwarmup,1)*RK_nstage,RP)
     if (UseCudaGraph) then
       write(*,'(A30,A24)') "CUDA graph replay:", "on"
       write(*,'(A30,A24)') "Cal_tend:", "not measured (graph)"
