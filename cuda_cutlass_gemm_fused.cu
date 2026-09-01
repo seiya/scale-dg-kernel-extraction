@@ -149,6 +149,14 @@ struct VolumeGemmSet {
       TensorOp, ArchTag, GS<64, 64, TileK>, GS<32, 32, TileK>, InstShape,
       EpilogueOp, BatchedSwizzle, 4>;
 
+  //- Nq=32 tile: four 16x16 warps own the whole matrix. Three stages are
+  //- enough for the two TileK=16 iterations and raise occupancy over the
+  //- five-stage cuBLAS kernel selected for this shape.
+  using GemmY32 = cutlass::gemm::device::GemmBatched<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, ArchTag, GS<32, 32, TileK>, GS<16, 16, TileK>, InstShape,
+      EpilogueOp, BatchedSwizzle, 3>;
+
   //- The x and y GEMMs of the fused path, with Escale folded into the stock
   //- epilogue through PointwiseScale.  Same tiles as GemmX / GemmY.
   using GemmXScale = cutlass::gemm::device::Gemm<
@@ -494,6 +502,16 @@ int run_volume_gemm_y(double *deriv_y, const double *flux_y,
 }
 
 template <class Set>
+int run_volume_gemm_y32(double *deriv_y, const double *flux_y,
+                        const double *D1D_tr, int Nq, int Ne)
+{
+  const long long stride_plane = Nq * Nq;
+  return run_gemm_batched_nn<typename Set::GemmY32>(
+      Nq, Nq, Nq, flux_y, Nq, stride_plane, D1D_tr, Nq, 0, deriv_y, Nq,
+      stride_plane, Nq * Ne);
+}
+
+template <class Set>
 int run_volume_gemm_x(double *deriv_x, const double *flux_x, const double *D1D,
                       int Nq, int Ne)
 {
@@ -733,6 +751,20 @@ extern "C" int launch_volume_gemm_y(double *deriv_y, const double *flux_y,
   }
   if (Nq == 16 && mma_shape == 0) {
     return run_volume_gemm_y<P15MmaSet_884>(deriv_y, flux_y, D1D_tr, Nq, Ne);
+  }
+  if (Nq == 32) {
+    switch (mma_shape) {
+    case 0:
+      return run_volume_gemm_y32<MmaSet_884>(deriv_y, flux_y, D1D_tr, Nq, Ne);
+    case 1:
+      return run_volume_gemm_y32<MmaSet_1684>(deriv_y, flux_y, D1D_tr, Nq, Ne);
+    case 2:
+      return run_volume_gemm_y32<MmaSet_1688>(deriv_y, flux_y, D1D_tr, Nq, Ne);
+    case 3:
+      return run_volume_gemm_y32<MmaSet_16816>(deriv_y, flux_y, D1D_tr, Nq, Ne);
+    default:
+      return bad_mma_shape(mma_shape);
+  }
   }
   switch (mma_shape) {
   case 0:

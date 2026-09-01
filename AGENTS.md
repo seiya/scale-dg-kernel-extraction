@@ -68,6 +68,19 @@ The fastest production paths are `CUDAFORTRAN_GEMM_FUSED` and
 other CUDA paths exist to isolate one axis at a time. Do not independently
 speed-optimize a control path.
 
+Numerical correctness and path identity are two independent requirements.
+A candidate is eligible for production only if it satisfies both:
+
+1. It preserves the Numerical Contract above.
+2. It still implements the path selected by `DqdtKernel_Type` as defined in
+   this section.
+
+Full-field agreement, including bit-exact agreement, proves only the first
+requirement. It does not make a library substitution, a split epilogue, or a
+different algorithm valid for a named path. Path names are part of the
+benchmark contract, not descriptive labels that may be reassigned to whichever
+implementation is fastest.
+
 - `CUDAFORTRAN_GEMM`: unfused volume GEMM with cuBLAS. Surrounding kernels
   (volume flux, face flux, `separable_lift_assembly`, z written into `dqdt`)
   are the reference layout for library comparisons.
@@ -75,14 +88,23 @@ speed-optimize a control path.
   driver as `CUDAFORTRAN_GEMM`. Only the three volume GEMMs are replaced.
   Compare them to native cuBLAS and to `CublasEmulation` on that same
   driver. Do not put Ozaki on the CUTLASS fused paths.
-- `CUDAFORTRAN_GEMM_CUTE`: same CUTLASS volume-GEMM tiles and
-  `Nq<=64` cuBLAS-x switch as `CUDAFORTRAN_GEMM_FUSED`, but unweighted
-  epilogues and a separate lift/assembly kernel. `GEMM` vs `GEMM_CUTE` is
-  the library/mainloop difference. `GEMM_CUTE` vs `GEMM_FUSED` is the
-  fusion package (at `Nq>64` that package includes Escale forwarding and
-  folding `deriv_x` into y). Do not retune CUTE on its own.
-- `CUDAFORTRAN_GEMM_FUSED`: the fused-epilogue production GEMM path.
-  CUTLASS tile types live in `VolumeGemmSet` in `cuda_cutlass_gemm_fused.cu`.
+- `CUDAFORTRAN_GEMM_CUTE`: the unfused control for the CUTLASS GEMM path.
+  It must use the same volume-GEMM mainloops, tile shapes, MMA shapes, stage
+  counts, swizzles, order specializations, and batch chunking as
+  `CUDAFORTRAN_GEMM_FUSED`. The only library exception is the shared
+  `Nq<=64` cuBLAS **x** switch. Its y and z volume GEMMs remain CUTLASS. Its
+  epilogues are unweighted, z is materialized in `dqdt`, and a separate
+  `separable_lift_assembly` kernel performs the final weighting and surface
+  lift. `GEMM` vs `GEMM_CUTE` measures the library/mainloop difference. Do
+  not retune CUTE on its own.
+- `CUDAFORTRAN_GEMM_FUSED`: the fused-epilogue production CUTLASS GEMM path.
+  It has the same volume-GEMM mainloops and the same `Nq<=64` cuBLAS-x switch
+  as `GEMM_CUTE`. Its z CUTLASS operation must fuse the final volume weighting
+  and surface lift/assembly into the z epilogue; it must not materialize z and
+  then call `separable_lift_assembly`. At `Nq>64` the fusion package also
+  includes Escale forwarding and folding `deriv_x` into y. CUTLASS tile types
+  live in `VolumeGemmSet` (or an explicitly shared order-specialized set) in
+  `cuda_cutlass_gemm_fused.cu`.
 - `CUDAFORTRAN_FUSED`: CUDA-core fused kernels in `cuda_dg_kernels_fused.cu`
   (natural-order shared panels, length-`Nq` inner products). This is the
   paper's "CC fused" column. Do not retune it as a race against
@@ -96,10 +118,33 @@ speed-optimize a control path.
   instantiation; never treat it as `FUSED`.
 
 A change that would make `FUSED_DFMA` and `FUSED_TC` diverge (except the
-inner product) is a defect. Do not copy the TC fragment layout or z
-shared roundtrip into `FUSED`. A change that would make GEMM_CUTE's GEMM launches
-diverge from GEMM_FUSED's mainloop tiles or `Nq<=64` x-library switch is
-likewise a defect.
+inner product) is a defect. Do not copy the TC fragment layout or z shared
+roundtrip into `FUSED`.
+
+For `GEMM_CUTE` / `GEMM_FUSED`, the following are defects even when they are
+numerically correct and faster:
+
+- replacing y or z with cuBLAS for one or both paths;
+- implementing `GEMM_FUSED` as cuBLAS/CUTLASS z followed by a separate
+  lift/assembly kernel;
+- giving `GEMM_CUTE` and `GEMM_FUSED` different volume mainloop tiles,
+  stage counts, swizzles, batch partitioning, or order-specialized launch
+  geometry;
+- adding a library switch other than the explicitly shared `Nq<=64` cuBLAS-x
+  switch.
+
+Polynomial-order specialization is allowed, but it may specialize only the
+shared CUTLASS mainloop/launch configuration and the path-appropriate
+epilogue. For example, an `Nq==32` y tile is valid only when both `GEMM_CUTE`
+and `GEMM_FUSED` use that tile; an `Nq==32` cuBLAS-z plus separate-lift branch
+is not a valid `GEMM_FUSED` implementation.
+
+Out-of-role variants may be built as temporary ablations to measure a ceiling.
+Label them explicitly as out of scope, record their performance and mechanism,
+and remove them from production dispatch. Do not publish their timing as the
+named path's production result or use it to update the fastest-path table.
+Changing a path definition requires an explicit edit to this section; a local
+performance win must never be treated as implicit permission to redefine it.
 
 ## Important Files
 

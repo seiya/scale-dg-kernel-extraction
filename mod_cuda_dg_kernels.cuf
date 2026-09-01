@@ -1999,7 +1999,7 @@ contains
 
     integer :: istat, nface, npoint, nblock, nblock_face
     integer :: nq2, xy_weighted, pair_nq2
-    logical :: use_side, overlap_y
+    logical :: use_side, overlap_y, p31_early_face
 
     ! y GEMM batches over Nq*Ne planes and CUTLASS puts the batch on grid.z
     ! (CUDA cap 65535).  cuda_cutlass_gemm_fused.cu splits that launch so
@@ -2011,6 +2011,7 @@ contains
     call dg_ev_begin()
 
     nq2 = Nq*Nq
+    p31_early_face = fuse_epilogue .and. (Nq == 32)
     ! Weighted z + packed faces: Nq>64 (CUTLASS x/y scale) and Nq=64 (cuBLAS x
     ! plus y epilogue Ey*acc + Ex*Dx). Nq<64 stays unweighted; at p=31 the
     ! same fold is +2.3% on login.
@@ -2032,17 +2033,21 @@ contains
     nblock = (npoint+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
     nblock_face = (nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
 
-    ! Overlapping elembnd with the volume GEMMs still loses at Nq<64
-    ! (+3.2% after cuBLAS y, same as the historical GEMM +3.1%): both
-    ! kernels are DRAM-bound and they serialize each other.  y beside x
-    ! is a different overlap and is kept.
-    use_side = dg_side_enabled .and. (Nq >= 64)
+    ! Overlapping elembnd with the volume GEMMs loses at Nq<64 except for
+    ! Nq=32 GEMM_FUSED, where starting it before volume_flux gives it an
+    ! earlier finish and keeps the fused z behind the join (p31 section 23).
+    use_side = dg_side_enabled .and. &
+      ((Nq >= 64) .or. p31_early_face)
     overlap_y = fuse_epilogue .and. dg_side_enabled .and. (Nq < 64)
 
     call dg_ev_record(1)
 
     if (.not. use_side) then
       call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
+    else if (p31_early_face) then
+      call dg_side_fork(overlap_y)
+      call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
         flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
     end if
 
@@ -2051,7 +2056,7 @@ contains
 
     call dg_ev_record(2)
 
-    if (use_side .or. overlap_y) then
+    if ((use_side .or. overlap_y) .and. .not. p31_early_face) then
       call dg_side_fork(overlap_y)
       if (use_side) then
         call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &

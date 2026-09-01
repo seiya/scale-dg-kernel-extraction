@@ -787,6 +787,8 @@ elembnd 込み）。§14 の 374.8 µs は当時の計測で、表は残す。
 4% 短い（その後入った `__restrict__` と `dqdt` 先読みを含む現行バイナリ）。
 この次数だけ `GEMM_FUSED` が素の `GEMM` より遅い（`K=32` で z epilogue 融合の
 方が高い）という §6 / §14 の結論は変わらない。
+> **（訂正 2026-08-30、§21）** 融合 z を捨てて cuBLAS y/z + lift に戻すと
+> device 611.2 µs になり、`GEMM`（625.7）より短い。上表の 940.6 は当時の値。
 FLOP/s と DRAM は README のまとめ表。
 この節の `CUDAFORTRAN_FUSED` は iso-schedule DFMA の測定である（経路名は
 `CUDAFORTRAN_FUSED_DFMA`）。
@@ -1035,3 +1037,338 @@ CC と**ビット一致**、`CUDAFORTRAN_SPLIT` に対する最大絶対差は 2
 役割であり、fragment 日程を `FUSED` に持ち込まない。
 
 **契約内で実装できる候補の天井は測った。探索を終了する。**
+
+## 21. `CUDAFORTRAN_GEMM_FUSED`（2026-08-30）
+
+> **2026-08-31 訂正:** §21 の cuBLAS y/z + separate lift 採用は、現在の
+> 経路役割（y/z は CUTLASS mainloop、`GEMM_FUSED` の z は fused epilogue）に
+> 反する hybrid だった。数値と性能は範囲外 ablation の証拠として残すが、
+> production 値ではない。役割準拠版への復帰と再計測は §23。
+
+p=31 の最速は `FUSED_TC`（359.7 µs）のまま。本節は同一 DOF で唯一
+`GEMM_FUSED` が素の `GEMM` より遅かった次数を、浅い K の融合パッケージとして
+測って閉じる。親 `f7788bb`、`make CUDA=1 GPUFLAGS=-gpu=cc100`、入力
+`namelists/perf_p31_gemm_fused.conf`（`Ne=8³`、`nstep=200`、graph off、
+199 measured steps × 3 RK = 597 stage）。検証は
+`SCALE_DG_VARYING_COEFF=1`、`namelists/val_p31_gemm_fused.conf` 対
+`val_p31_split.conf`（262,144 点）。
+
+### 21.1 改修前の律速
+
+login GPU 1、5-run 中央値の device fused **0.51698 s = 866 µs/stage**
+（README §16 の 940.6 は別セッション。表は残す）。占有 GPU job `71076`
+（c178）12 回交互の基準は **0.516332 s = 864.9 µs/stage**、Main 2.857 ms/step。
+
+nsys job `71075`（c178、`nstep=4`、12 instance 中央値、1 文）:
+**この経路は浅い K に合わない CUTLASS y（64×64）と融合 z エピローグで律速している。**
+
+| カーネル | µs |
+|---:|---|
+| 融合 z `GemmBatchedDqdtAssembly` | 335 |
+| CUTLASS y `GemmBatched` | 205 |
+| `volume_flux` | 128 |
+| `elembnd_flux` | 127 |
+| cuBLAS x (`32×64`) | 97 |
+
+同一次数の `CUDAFORTRAN_GEMM` は volume GEMM 3 本とも cuBLAS で、device
+は README の 625.7 µs。差のほぼ全部が y+z にある。
+
+### 21.2 採用
+
+1. **`Nq<=32` の y/z を cuBLAS strided-batched にし、z のあとに
+   `separable_lift_assembly` を使う**（`GEMM` と同じ volume 経路。
+   `GEMM_CUTE` の y/z も同じスイッチに乗せる）。CUTLASS y の 64×64 タイルは
+   Nq=32 でも半分が述語で、融合 z は K=2 反復の mainloop に重いエピローグを
+   足す。job `71076` 12 回交互、device **864.9 → 627.0 µs/stage（−27.5%）**、
+   Main 2.857 → 2.146 ms/step。レンジ非重複、12/12。点変化係数の owned
+   `dqdt` は SPLIT と**ビット一致**。
+
+   nsys job `71077`（同じ c178）: y は `32×32` 75 µs、z は `64×32` 65 µs、
+   lift 158 µs。消えたのは 335+205、入ったのは 75+65+158。差し引きは
+   device の −238 µs と一致する。
+
+2. **融合 z を side join の前へ**（z は `flux_bnd` を読まない）。elembnd を
+   x+z の裏に伸ばす。job `71122`（c178）12 回交互、device **627.1 → 622.2
+   µs（−0.79%）**、11/12 が勝ち。点変化係数はビット一致。
+
+3. **`Nq<=32` だけ elembnd を `volume_flux` の前に fork する**（Nq>32 の
+   歴史的な配置は変えない）。両方 DRAM なので flux の 128 µs で elembnd を
+   ほぼ隠し、cuBLAS 3 本が SM を奪われない。job `71129`（c178）12 回交互、
+   対 (2) **622.5 → 611.2 µs/stage（−1.81%）**、Main 2.132 → **2.101 ms/step**。
+   レンジ非重複、12/12。ビット一致。
+
+通算 **864.9 → 611.2 µs/stage（−29.3%）**。µs/stage 611.2 は 5.93 TFLOP/s
+（ピーク 14.8%）、unique DRAM 1.96 TB/s（24.8%）。volume 経路は GEMM と同じ
+20V になったので path は 4.97 TB/s（62.9%）。同一 job ではないが、login の
+`GEMM` は 623 µs で、融合ドライバのほうが elembnd を flux の裏に隠す分だけ
+短い。最速は `FUSED_TC`（359.7）のまま（**1.70 倍**）。
+
+nsys job `71134`（最終形、c178）1 stage 中央値:
+
+| カーネル | µs |
+|---:|---|
+| `separable_lift_assembly` | 158 |
+| `volume_flux` | 139 |
+| `elembnd_flux` | 114 |
+| cuBLAS y (`32×32`) | 75 |
+| cuBLAS x (`32×64`) | 72 |
+| cuBLAS z (`64×32`) | 66 |
+
+### 21.3 測って落としたこと / 残さないこと
+
+| 候補 | 結果 | 理由 |
+|---|---|---|
+| Nq=32 で side を切る（p=15 の Nq≤16 と同じ） | job `71123` **+0.88%** | レンジ非重複、0/12。GEMM 窓は elembnd を隠せる。コードは Nq≤16 のまま |
+| Nq=32 のまま融合 z を残す | nsys 335 µs | GEMM の z+lift（65+158）より高い。p=15 §23.4 と同符号 |
+| `Ey*acc+Ex*Dx` 折り込み | 既知 **+2.3%**（login） | `Nq==64` だけ。本節では触らない |
+| flux / elembnd / lift の単独最適化 | 範囲外 | `GEMM` と同じカーネル。制御経路を独立に最速化しない |
+| RK 融合・速度の事前計算 | 範囲外 | 抽出インタフェースを特殊化する |
+
+`Nq<=16` では `use_side` が既に切ってあるので、elembnd の前倒しは
+`lib_yz .and. use_side` の Nq=32 にだけ効く。p=15 の `GEMM_FUSED` は
+バイト一致のまま。
+
+当時はここで探索を閉じたが、y の 32×32 専用タイルという未測定形が残って
+いた。§22 で訂正し、さらに 2.47% を取った。残る lift / flux を独立に
+retune しないという経路役割の結論は変わらない。
+
+## 22. `GEMM_FUSED` y の Nq=32 専用タイル（2026-08-31）
+
+> **訂正:** この節の y 専用 CUTLASS tile 自体は `GEMM_CUTE` と共有されるため
+> 役割準拠だが、§21 の cuBLAS-z + separate-lift driver 上で採った 599.9 µs は
+> production `GEMM_FUSED` 値ではない。fused-z driver 上の採用値は §23。
+
+§21 の「残りの天井は尽きた」は早かった。cuBLAS y は 32×32 を選んでいたが、
+同じ出力を CTA 32×32・warp 16×16 でちょうど覆う CUTLASS 形は未測定だった。
+親 `f7788bb`、GB200、`make CUDA=1 GPUFLAGS=-gpu=cc100`、入力は §21 と同じ
+`namelists/perf_p31_gemm_fused.conf`。採否は Slurm job `73630`（node c179）の
+12 回交互 A/B。基準は §21 最終形の凍結バイナリ、候補は y だけを専用
+`GemmBatched` に替えた凍結バイナリである。
+
+### 22.1 採用結果
+
+| | Main [ms/step] | device [s / 597 stage] | µs/stage |
+|---|---:|---:|---:|
+| §21 最終（cuBLAS y） | 2.1125 | 0.367225 | **615.12** |
+| 32×32 / warp 16×16 / K=16 / 3 stage | **2.0651** | **0.358146** | **599.91** |
+
+device **−2.47%**、Main **−2.24%**。12/12 で候補が勝ち、両レンジは非重複。
+§21 の最初からは **864.9 → 599.9 µs/stage（−30.6%）**。理論 3.6228
+GFLOP/stage から **6.04 TFLOP/s（40.1 TFLOP/s の 15.1%）**、unique 1.198
+GB/stage から **2.00 TB/s（7.9 TB/s の 25.3%）**、経路 3.038 GB/stage
+から **5.06 TB/s（64.1%）**。最速 `FUSED_TC` 359.7 µs に対しては 1.67 倍。
+
+Nq=32 の y は `VolumeGemmSet` に置き、`GEMM_FUSED` と `GEMM_CUTE` が同じ
+mainloop と mma-shape switch を使う。x の Nq≤64 cuBLAS switch と z の
+cuBLAS + separate lift はそのまま。点ごとの係数、全 6 面、halo の契約は
+変えていない。
+
+### 22.2 なぜ速いか
+
+nsys job `73631`（c179、同一 job 内）で y の中央値は cuBLAS
+`32x32_16x5` **75.024 → 63.680 µs（−15.1%、−11.344 µs/stage）**。
+stage 全体の −15.2 µs と一致し、ほかのカーネルを速くした結果ではない。
+
+ncu job `73633`（c179、同一 job 内、機構の比較だけに使用）:
+
+| y の指標 | cuBLAS | 専用 CUTLASS | 変化 |
+|---|---:|---:|---:|
+| ncu kernel time [µs] | 124.8 | 109.5 | −12.2% |
+| L1/TEX throughput | 86.3% | 86.4% | 不変 |
+| SM throughput | 54.3% | 60.5% | +6.2 pt |
+| active warps | 29.7% | 41.6% | +11.9 pt |
+| shared wavefront | 15.79 M | 13.83 M | −12.4% |
+| instructions | 44.56 M | 43.71 M | −1.9% |
+| shared load conflicts | 0.363 M | 0.402 M | 増加 |
+
+**律速は L1/TEX 86% のまま。** 効いたのは bank conflict 除去でも命令削減でも
+なく、K=16 の 2 反復を 3 stage で回して shared pipeline の仕事を 12% 減らし、
+active warp を増やしたこと。ncu の clock lock 下でも機構はこの向きで、採否は
+上の占有 GPU wall/device A/B による。
+
+### 22.3 測って落とした形
+
+| y / z 候補 | 結果 | 機構・制約 |
+|---|---:|---|
+| y 32×32、warp 16×32、4 stage（2 warp） | cuBLAS 比 **+0.18%** | warp を減らした占有の賞金が無い |
+| y 32×32、warp 16×16、4 stage | cuBLAS 比 **−0.56%** | 4 warp はよいが stage が深い |
+| y 32×32、warp 16×32 / 32×16、3 stage | 採用形比 **各 +1.4%** | 2 warp では latency hiding が減る |
+| y K=32、warp 16×16、3 stage | job `73636` **+3.44%** | 1 K 反復にしても K staging footprint が 2 倍になる代金が勝つ |
+| y K=8 | ビルド不可 | 128-thread thread-map の K divisibility を満たさない |
+| y 2 stage | ビルド不可 | SM80/SM90 multistage specialization の制約 |
+| y 1 warp、warp 8×32 / 32×8 | ビルド不可 | FP64 multistage の最小 warp 数 / iterator divisibility |
+| z 64×32、K=16、4 / 3 stage | cuBLAS z 比で全体 **+8.9% / +7.6%** | 浅い K と lift 分離には cuBLAS が勝つ |
+| z 128×32、3 stage | **+24.2%** | 過大な M tile |
+
+これで y は warp 数 2/4、warp 形、stage 3/4、K=16/32 とコンパイル可能な
+近傍を閉じた。K=8 / stage 2 / 1 warp は実装制約で閉じ、z の近傍も負けた。
+残る最大カーネルは shared の lift 158 µs と DRAM の flux 139 µs だが、これは
+`GEMM` と共通の制御経路であり独立 retune の対象ではない。融合 z は既に
+335 µs 対 z+lift 223 µs と棄却済み。
+
+最終版は job `73712`、`SCALE_DG_VARYING_COEFF=1` の full owned `dqdt` で p=31
+`GEMM_FUSED`、p=31 `GEMM_CUTE`、p=15 `GEMM_FUSED` が各 SPLIT と
+**バイト一致**。この未測定形まで含め、p=31 `GEMM_FUSED` の契約内探索を閉じる。
+
+`feature/cuda` `755538e` への rebase 後は p=7/p=15 の共通 CUTLASS
+mainloop を優先し、上の特例を `Nq==32` だけに狭めた。job `73791`
+の rebase 前後 6 回交互 A/B は device 中央値 **0.357046 → 0.356939 s
+(−0.03%)** で同等。job `73789` の点変化係数で p=31 `GEMM_FUSED` /
+`GEMM_CUTE` は SPLIT とバイト一致、役割準拠に戻った p=15
+`GEMM_FUSED` は最大絶対差 **1.78e-15**。
+
+## 23. p=31 の経路役割訂正と準拠 y tile（2026-09-01）
+
+親 `feature/cuda` `755538e`、GB200、`make CUDA=1 GPUFLAGS=-gpu=cc100`。
+§21--22 の `Nq==32` cuBLAS-z + `separable_lift_assembly` 分岐を production
+dispatch から除去した。現行経路は次の役割を満たす。
+
+- x は `GEMM_CUTE` / `GEMM_FUSED` 共通の `Nq<=64` cuBLAS switch。
+- y は両経路共通の CUTLASS 32×32 / warp 16×16 / K=16 / 3-stage tile。
+- z は CUTE が CUTLASS unweighted epilogue + separate assembly、FUSED が同じ
+  mainloop tile の fused weighting/lift/assembly epilogue。
+
+面 flux の Nq=32 前倒しは mainloop や fusion package を置換せず、全 6 面を同じ
+カーネルで評価する scheduling 変更なので残した。
+
+### 23.1 数値検証
+
+Slurm jobs `74503`, `74652`（最終sm_100 rebuild）、`SCALE_DG_VARYING_COEFF=1`、`Ne=2³`、
+full owned `dqdt`:
+
+| 経路 | SPLIT との差（max abs） |
+|---|---:|
+| p=31 `GEMM_FUSED` | **1.77636e-15** |
+| p=31 `GEMM_CUTE` | **0（bit exact）** |
+| p=15 `GEMM_FUSED` 回帰 | **1.77636e-15** |
+
+### 23.2 役割準拠 A/B
+
+入力 `namelists/perf_p31_gemm_fused.conf`（`Ne=8³`、`nstep=200`、graph off）。
+Slurm job `73793`（node c178）、旧役割準拠版（64×64 y、fused z）と現行版を
+12 回交互 A/B:
+
+| | Main [ms/step] | device [s / 597 stage] | µs/stage |
+|---|---:|---:|---:|
+| 旧準拠版 | 2.8604 | 0.516708 | **865.51** |
+| Nq=32共有 y tile + face scheduling | **2.3898** | **0.423375** | **709.17** |
+
+device **−18.06%**、Main **−16.45%**。device は12/12で勝ち、レンジは非重複。
+§22 の範囲外 hybrid 599.9 µs は現行準拠版より18.2%速いが、fusion packageを
+外した天井としてのみ保持する。
+
+理論 3.6228 GFLOP/stage から **5.11 TFLOP/s（40.1 TFLOP/s の12.7%）**、
+unique 1.198 GB/stage から **1.69 TB/s（7.9 TB/s の21.4%）**、融合経路
+165 B/nodeから **3.90 TB/s（49.4%）**。最速 `FUSED_TC` 359.7 µs に対して
+GEMM_FUSED は1.97倍。
+
+### 23.3 カーネル機構
+
+nsys job `73794`（c178、各12 instance中央値）:
+
+| カーネル | 旧準拠版 [µs] | 現行 [µs] | 変化 |
+|---|---:|---:|---:|
+| fused CUTLASS z assembly | 336.99 | 336.83 | 不変 |
+| CUTLASS y | 207.25 | 64.19 | **−69.0%** |
+| cuBLAS x | 97.33 | 73.36 | −24.6% |
+| `elembnd_flux` | 127.65 | 114.80 | −10.1% |
+| `volume_flux` | 128.13 | 136.00 | +6.1% |
+
+fused z が同じ約337 µsで残っていることを確認した。主減少は、64×64 tile の
+75%を述語化していた y を32×32でちょうど覆った143 µs。面前倒しはfluxを
+約8 µs遅くする代わりに、elembndとxの競合を減らす。device全体の−156 µsと
+内訳が一致する。
+
+ncu job `73796`（c178、同一job内、clock lock下なので機構だけに使用）の
+y中央値:
+
+| y の指標 | 64×64 / 4-stage | 32×32 / 3-stage | 変化 |
+|---|---:|---:|---:|
+| ncu kernel time [µs] | 363.87 | 110.53 | −69.6% |
+| L1/TEX throughput | 60.3% | 86.7% | +26.4 pt |
+| SM throughput | 57.9% | 60.7% | +2.8 pt |
+| active warps | 18.3% | 42.0% | +23.7 pt |
+| shared wavefront | 34.37 M | 13.83 M | −59.8% |
+| instructions | 85.00 M | 43.71 M | −48.6% |
+| shared store conflicts | 4.20 M | 1.11 M | −73.6% |
+
+64×64 tileは出力の75%を捨てるだけでなく、shared wavefrontを2.49倍、命令を
+1.94倍払い、active warpも18%に留まる。32×32化で無駄を除いた結果、律速は
+L1/TEX 60%から87%へ移った。ncu時間の−69.6%はnsys yの−69.0%と一致する。
+
+§21--22 の z候補表は「cuBLAS-z hybridに対する比較」であり、準拠productionの
+zを別カーネルへ置換する根拠にはしない。次のz最適化はfused epilogueを保った
+専用tile／epilogueとして行う。
+
+## 24. 役割準拠 fused z の局所探索（2026-09-01）
+
+§23 の現行版を基準に、`GEMM_CUTE` と `GEMM_FUSED` の z mainloopを同じ
+CUTLASS tileに保ち、FUSED側では weighting/lift/assembly epilogueを外さず探索した。
+入力は `namelists/perf_p31_gemm_fused.conf`、GB200、12回交互A/B。各実行は
+597 stageで、表はdevice-event中央値である。
+
+| 候補 | Slurm job / node | 基準 [µs/stage] | 候補 [µs/stage] | 変化 | 勝ち数 |
+|---|---|---:|---:|---:|---:|
+| z 64×32, warp 32×32, **3-stage** | `74509` / c358 | 708.752 | 707.966 | −0.111% | 9/12 |
+| z **32×32**, warp 16×16, 3-stage | `74526` / c384 | 707.842 | 708.379 | +0.076% | 5/12 |
+| fused epilogueの `Nq=32` 定数化 | `74529` / c049 | 707.663 | 708.417 | +0.107% | 4/12 |
+| fused epilogue 8→16 byte access | `74531` / c049 | 707.758 | 707.956 | +0.028% | 7/12 |
+| 64×32, warp **32×16**, 4-stage | `74534` / c049 | 707.592 | 707.755 | +0.023% | 5/12 |
+| 64×32, warp **16×32**, 4-stage | `74536` / c384 | 707.867 | 708.277 | +0.058% | 4/12 |
+| warp 32×16 + **3-stage** | `74647` / c178 | 708.988 | 709.016 | +0.004% | 5/12 |
+
+3-stage単独だけは全体deviceで小さく勝ったように見えるが、nsys job `74510`
+（c384）の z 自体は **336.592→337.184 µs（+0.18%）**。他カーネルの揺らぎであり
+採用しない。16-byte版もjob `74532`（c384）で **336.432→336.832 µs**、
+warp 32×16版もjob `74535`（c384）で **336.288→337.088 µs** とz単体が遅い。
+全候補は点変化係数のfull owned `dqdt`で検証し、GFは最大絶対差
+**1.77636e-15**、mainloopを共有するCUTEはbit exactだった（jobs `74508`,
+`74528`, `74530`, `74533`, `74537`, `74648`）。
+
+### 24.1 z の律速とoccupancy交差項
+
+現行zをncu job `74527`（c384、clock lock下）で直接測った。
+
+| 指標 | 現行 fused z |
+|---|---:|
+| ncu kernel time | 508.768 µs |
+| SM / DRAM / L1-TEX throughput | 40.77% / 23.70% / 48.10% |
+| active warps | **12.17%** |
+| instructions | **138.019 M** |
+| long-scoreboard / issue | 0.89 |
+| shared wavefront | 20.152 M |
+| shared load / store bank conflicts | 0.064 M / 0.156 M |
+
+現行2-warp epilogueは254 registers/thread。4-warp化すると156へ下がるが、
+job `74538`（c384）ではactive warpsが **12.20→12.21%**、instructionsも
+**138.019→138.019 M**で不変だった。4-stage mainloopのshared memoryが次の制約に
+なり、register削減だけではresident warpが増えない。したがってwall/nsysも改善しない。
+
+そこで4-warpと3-stageを組み合わせ、registerとsharedの両方を下げた。しかしncu
+job `74649`（c178）でもactive warpsは **12.21→12.20%**。3-stageでも3 CTA分の
+shared memoryが収まらず、nsys job `74650`（c182）のzは
+**336.528→337.328 µs（+0.24%）**だった。ncu時間は508.448→505.504 µsと逆符号だが、
+clock lock下の機構値なので採否はinterleaved wall/nsysに従う。
+
+4-warp・2-stageならshared制約を越えられる見込みだが、CUTLASS 2.xでは
+`DefaultMmaCore<..., Stages=2>` のSM70/SM80 partial specializationが同時matchし、
+コンパイル不能だった。したがって現行CUTLASS 2.xのmainloop/epilogue近傍では、
+stage 3/4、CTA 32/64、warp 16×16 / 16×32 / 32×16 / 32×32、8/16-byte access、
+Nq定数化、およびregister/shared交差項まで閉じ、**採用は§23の構成のまま**とする。
+次の余地はcustom 2-stage FP64 mainloopまたはSM100専用mainloopであり、既存tileの
+retuneではない。
+
+### 24.2 `feature/cuda` `09cb3b3` rebase回帰
+
+親を `755538e` から `09cb3b3` へrebaseした後、Slurm job `74664`（c386）で
+rebase前後の凍結バイナリを12回交互A/Bした。入力はp=31が
+`namelists/perf_p31_gemm_fused.conf`、p=15が
+`namelists/perf_p15_gemm_fused.conf`。p=31のdevice中央値は
+**707.511 → 706.655 µs/stage（−0.12%、12/12）**、Mainは
+2.3861 → 2.3842 ms/step（−0.08%）で、性能は維持された。
+
+親側のNq=16専用tileとbatched epilogue repadが効くp=15は、device中央値が
+**1457.354 → 656.531 µs/stage（−54.95%、12/12）**、Mainは
+4.5606 → 2.1999 ms/step（−51.76%）。job `74662` の点変化係数full owned
+`dqdt`検証はp=31 `GEMM_FUSED`とp=15 `GEMM_FUSED`がSPLIT比最大絶対差
+**1.77636e-15**、p=31 `GEMM_CUTE`がbit exactだった。
