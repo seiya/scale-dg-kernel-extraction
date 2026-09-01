@@ -439,10 +439,24 @@ SM 2062 MHz 固定、900 W / 上限 1200 W、56 °C、throttle 0x0）。
   1〜3% 過大に出るだけで、採否も符号もレンジ判定も動かない。
 - **次数や conf をまたぐ絶対値の比較は無効**。下のまとめ表と各 gap study の
   per-stage 値は、`Cal_tend` 基準ならこの分だけ低く出ている。
-- **絶対値は `Main per step` か、`nstep` を 2 点以上振った増分の傾きで出す。**
-  `Cal_tend` の per-stage を載せるときは stage 数を併記する。
+- **偏りは 5 つのタイマすべてで「ちょうど整数 stage」**（`p767_gap_study.md` §15.5）。
+  ホスト時計系は最後の 1 stage を取りこぼし、CUDA イベント系（`dg_ev_*`、二重
+  バッファで 1 stage 遅れて harvest）は 1 stage 余分に数える。**割る数を直すだけで
+  コードを触らずに正しい値が出る**:
+
+  | 出力 | 正しい割り方 |
+  |---|---|
+  | `Main` | ÷ (3·steps) |
+  | `Cal_tend` / `Volume derivate + surface lift` | ÷ **(3·steps − 1)** |
+  | `CUDA device GEMM fused` / `FUSED volume GEMM only` | ÷ **(3·steps + 1)** |
+
+- **タイマ本体は直さない**（2026-09-01 の判断）。直すと過去の全次数・全レポートの
+  per-stage と基準が 1 stage 分ずれ、並行して走っている測定ともぶつかる。
 - `Cal_tend` の傾きは `Main`/3 と一致する。つまり **RK 更新などタイマ区間の外で
   enqueue された仕事も含んでおり**、「テンダンシーだけの device 時間」ではない。
+  テンダンシーだけが要るなら `CUDA device GEMM fused` ÷ (3·steps + 1) を使う。
+- 偏りを除いた p=767 `GEMM_FUSED`: **テンダンシー 58.592 ms/stage**、
+  volume GEMM のみ 55.080、1 step 全体 182.0 ms/step。
 
 ## 現時点の結論
 

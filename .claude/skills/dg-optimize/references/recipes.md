@@ -35,6 +35,11 @@ for i in 1 2 3; do ./scale-dg_extraction namelists/perf_p63_fused_tc.conf | tail
   だが、次数や conf をまたぐ絶対値には `Main per step` か、`nstep` を 2 点以上
   振った増分の傾きを使う。`Cal_tend` の傾きは `Main`/3 と一致し、RK 更新など
   タイマ区間の外で enqueue された仕事も含む。
+- 偏りは 5 つのタイマすべて**ちょうど整数 stage**なので、割る数を直せばコードを
+  触らずに正しい値になる: `Main` は ÷(3*steps)、`Cal_tend` と
+  `Volume derivate + surface lift` は **÷(3*steps−1)**、`CUDA device GEMM fused` と
+  `... volume GEMM only` は **÷(3*steps+1)**（イベント系は 1 stage 余分に数える）。
+  **タイマ本体は直さない**（過去の全レポートと基準がずれるため）。
 - **採否を決める計測は sbatch で占有した GPU 上で**、変種を交互に 10〜12 回。
   ログインノードは他人と共有で、同じ実行ファイルでも 0.5% ほどぶれる。
   1 % 未満の差はこれをやらないと判定できない。
