@@ -515,3 +515,22 @@ flux は DRAM 90% で、ベクトル化でも重ねでも縮まない。**契約
 
 **最速は `CUDAFORTRAN_GEMM_FUSED` のまま。公開値は 12.414 ms/stage /
 Main 38.475 ms/step**（job `74863`、c179、10 交互中央値）。
+
+## 追記（2026-09-01）: p=575 側から入った `Nq >= 512` の分岐
+
+[`p575_gap_study.md`](p575_gap_study.md) §11 が volume GEMM に `Nq >= 512` の
+分岐を 2 つ足したので、本次数にもそのまま載る。
+本レポート §12 の公開値 12.414 ms/stage は **batched x が入る前**の値である
+（§12 が 4 段→3 段にしたのは融合 y だけ）。
+
+- **§11.2**: 融合 x を `64x128` の 1 本から、y と同じ `64x64` batched へ。
+- **§11.13**: その x も `GemmYScaleShallow` を共有して 3 段パイプラインにする
+  （`GEMM_CUTE` の x / y も同じ mainloop）。
+
+両方入った実行ファイルと、batched x だけ入れて x/y は 4 段のままの実行ファイルを
+占有 GPU 上で 8 回交互に測った（`p575_gap_study.md` §11.16、job `74975`、
+`namelists/perf_p511_gemm_fused.conf` を `nstep`/`WarmupStep` だけ変えたもの）:
+**12412.9 → 12355.0 µs/stage（−0.466%）**。この A/B が測っているのは
+**batched x の上で x/y を 4 段から 3 段にする効果**であって、
+`p511_gap_study.md` §12 が融合 y 単独で測った値とは分母も対象も違う。
+数値は p=575 で 191,102,976 点ビット一致（§11.13）。

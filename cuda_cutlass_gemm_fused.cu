@@ -177,7 +177,10 @@ struct VolumeGemmSet {
   //- 0.80% more instructions and buys nothing.  The freed 16 KB of shared does
   //- not raise occupancy (three CTAs either way, registers cap it), so the win
   //- is the shorter pipeline alone.  Nq = 64 is the exception and keeps four
-  //- (reports/p511_gap_study.md section 12).
+  //- (reports/p511_gap_study.md section 12).  At Nq >= 512 the x GEMM shares
+  //- this tile and takes the same pipeline; five stages there is +1.3% and
+  //- TileK = 32 is +1.6%, both because the extra shared memory drops the SM
+  //- to two CTAs (reports/p575_gap_study.md sections 11.13 and 11.14).
   using GemmYScaleShallow = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
       TensorOp, ArchTag, GS<64, 64, TileK>, GS<32, 32, TileK>, InstShape,
@@ -483,6 +486,25 @@ int run_volume_gemm_y_scaleadd(double *deriv_xy, const double *flux_y,
 }
 
 template <class Set>
+int run_volume_gemm_x_scale(double *deriv_x, const double *flux_x,
+                            const double *D1D, const double *escale, int Nq,
+                            int Ne)
+{
+  const int nq2 = Nq * Nq;
+  //- p=255 tried batched x and lost 0.7% (p255_gap_study.md §10.4).  At
+  //- Nq>=512 the single 64x128 GEMM is 84% of peak while the same-FLOP y
+  //- GEMM (64x64 batched) is 95%.  Use y's tile for both CUTE and fused x.
+  if (Nq >= 512) {
+    const long long stride = nq2;
+    return run_gemm_batched_nn_scaled<typename Set::GemmYScaleShallow>(
+        Nq, Nq, Nq, D1D, Nq, 0, flux_x, Nq, stride, escale, Nq, stride, deriv_x,
+        Nq, stride, Nq * Ne);
+  }
+  return run_gemm_nn_scaled<typename Set::GemmXScale>(
+      Nq, nq2 * Ne, Nq, D1D, Nq, flux_x, Nq, escale, Nq, deriv_x, Nq);
+}
+
+template <class Set>
 int run_volume_gemms_xy(double *deriv_x, double *deriv_y, const double *flux_x,
                         const double *flux_y, const double *D1D,
                         const double *D1D_tr, const double *escale, int Nq,
@@ -491,8 +513,7 @@ int run_volume_gemms_xy(double *deriv_x, double *deriv_y, const double *flux_x,
   const int nq2 = Nq * Nq;
   const int npoint = nq2 * Nq * Ne;
 
-  int st = run_gemm_nn_scaled<typename Set::GemmXScale>(
-      Nq, nq2 * Ne, Nq, D1D, Nq, flux_x, Nq, escale, Nq, deriv_x, Nq);
+  int st = run_volume_gemm_x_scale<Set>(deriv_x, flux_x, D1D, escale, Nq, Ne);
   if (st != 0) {
     return st;
   }
@@ -535,6 +556,12 @@ int run_volume_gemm_x(double *deriv_x, const double *flux_x, const double *D1D,
                       int Nq, int Ne)
 {
   const int nq2 = Nq * Nq;
+  if (Nq >= 512) {
+    const long long stride = nq2;
+    return run_gemm_batched_nn<typename Set::GemmY>(
+        Nq, Nq, Nq, D1D, Nq, 0, flux_x, Nq, stride, deriv_x, Nq, stride,
+        Nq * Ne);
+  }
   return run_gemm_nn<typename Set::GemmX>(Nq, nq2 * Ne, Nq, D1D, Nq, flux_x,
                                           Nq, deriv_x, Nq);
 }
