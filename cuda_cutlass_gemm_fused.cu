@@ -442,6 +442,65 @@ int run_gemm_nn_scaled_repad(int m, int n, int k, double const *A, int lda,
   return cudaGetLastError() == cudaSuccess ? 0 : 1;
 }
 
+//- Same launch as run_gemm_batched_nn_capped, for the two-tensor epilogue that
+//- run_gemm_batched_nn_scaled drives: full batch_count with a capped grid.z,
+//- and the accumulator staging tile padded by 8 so the epilogue's shared
+//- stores are conflict free (RepadEpilogue, cutlass_z_gemm_assembly.h).  The
+//- Nq >= 512 x GEMM is the only caller that needs the pad; without it that
+//- kernel takes the same 2-way store conflict the y GEMM used to.
+template <class GemmBatched>
+int run_gemm_batched_nn_scaled_capped(int m, int n, int k, double const *A,
+                                      int lda, long long strideA,
+                                      double const *B, int ldb,
+                                      long long strideB, double const *C,
+                                      int ldc, long long strideC, double *D,
+                                      int ldd, long long strideD, int batch)
+{
+  using Kernel = cutlass::gemm::kernel::GemmBatched<
+      typename GemmBatched::GemmKernel::Mma,
+      RepadEpilogue<typename GemmBatched::GemmKernel::Epilogue, 8>,
+      BatchedSwizzle>;
+
+  typename GemmBatched::Arguments args(
+      {m, n, k}, {A, lda}, strideA, {B, ldb}, strideB, {C, ldc}, strideC,
+      {D, ldd}, strideD, typename GemmBatched::EpilogueOutputOp::Params(),
+      batch);
+  const cutlass::Status can = GemmBatched::can_implement(args);
+  if (can != cutlass::Status::kSuccess) {
+    return cutlass_error("scaled batched capped can_implement", can);
+  }
+
+  auto uargs = GemmBatched::to_underlying_arguments(args);
+  BatchedSwizzle swizzle;
+  cutlass::gemm::GemmCoord grid_shape = cap_batched_grid(
+      swizzle.get_tiled_shape(uargs.problem_size,
+                              {GemmBatched::ThreadblockShape::kM,
+                               GemmBatched::ThreadblockShape::kN,
+                               GemmBatched::ThreadblockShape::kK},
+                              uargs.batch_count),
+      batch);
+
+  typename Kernel::Params params(
+      uargs.problem_size, grid_shape, uargs.ref_A.non_const_ref(), uargs.stride_A,
+      uargs.ref_B.non_const_ref(), uargs.stride_B, uargs.ref_C.non_const_ref(),
+      uargs.stride_C, uargs.ref_D, uargs.stride_D, uargs.epilogue, batch);
+
+  dim3 grid = swizzle.get_grid_shape(grid_shape);
+  dim3 block(Kernel::kThreadCount, 1, 1);
+  int smem_size = int(sizeof(typename Kernel::SharedStorage));
+  if (smem_size >= (48 << 10)) {
+    cudaError_t attr = cudaFuncSetAttribute(
+        cutlass::Kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size);
+    if (attr != cudaSuccess) {
+      return 1;
+    }
+  }
+  cutlass::arch::synclog_setup();
+  cutlass::Kernel<Kernel><<<grid, block, smem_size, dg_cuda_stream>>>(params);
+  return cudaGetLastError() == cudaSuccess ? 0 : 1;
+}
+
 template <class GemmBatched>
 int run_gemm_batched_nn_scaled(int m, int n, int k, double const *A, int lda,
                                long long strideA, double const *B, int ldb,
@@ -449,29 +508,9 @@ int run_gemm_batched_nn_scaled(int m, int n, int k, double const *A, int lda,
                                long long strideC, double *D, int ldd,
                                long long strideD, int batch)
 {
-  int offset = 0;
-  while (offset < batch) {
-    int chunk = batch - offset;
-    if (chunk > kCudaMaxGridZ) {
-      chunk = kCudaMaxGridZ;
-    }
-    const long long off = static_cast<long long>(offset);
-    GemmBatched gemm_op;
-    typename GemmBatched::Arguments args(
-        {m, n, k}, {A + strideA * off, lda}, strideA, {B + strideB * off, ldb},
-        strideB, {C + strideC * off, ldc}, strideC, {D + strideD * off, ldd},
-        strideD, typename GemmBatched::EpilogueOutputOp::Params(), chunk);
-    const cutlass::Status can = gemm_op.can_implement(args);
-    if (can != cutlass::Status::kSuccess) {
-      return cutlass_error("scaled batched can_implement", can);
-    }
-    const cutlass::Status st = gemm_op(args, nullptr, dg_cuda_stream);
-    if (st != cutlass::Status::kSuccess) {
-      return cutlass_error("scaled batched gemm", st);
-    }
-    offset += chunk;
-  }
-  return 0;
+  return run_gemm_batched_nn_scaled_capped<GemmBatched>(
+      m, n, k, A, lda, strideA, B, ldb, strideB, C, ldc, strideC, D, ldd,
+      strideD, batch);
 }
 
 //- y GEMM whose epilogue takes two sources: D = Escale_y * acc + deriv_x.
