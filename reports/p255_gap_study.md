@@ -2749,3 +2749,72 @@ p=255 CC はその律速ではない。§15.21 の結論はカーネルを作り
 張り付いていて、かつロード律速ではない」である。
 
 p=255 CC の本番コードは §15.92 のまま、1869.9 µs/stage（占有 GPU 中央値）。
+
+## 24. x volume GEMM の `64x64` batched 化を Nq=256 で測る（2026-09-01、不採用 +0.22%）
+
+対象は `CUDAFORTRAN_GEMM_FUSED`（と共有ゲートで `CUDAFORTRAN_GEMM_CUTE`）。
+親 `c386c85`、GPU は RIKYU GB200 1 枚、Slurm job `75947`（占有ノード c398）。
+入力は `namelists/perf_p255_fused.conf` の `DqdtKernel_Type` だけを
+`CUDAFORTRAN_GEMM_FUSED` に差し替えたもの（`Ne=1`, `PolyOrder=255`,
+`nstep=20`, `UseCudaGraph=.false.`）。12 回交互 A/B。
+
+### 24.1 §10.4 の batched x と何が違うか
+
+`p575_gap_study.md` §11.2 は `Nq>=512` の x を **y と同じ `64x64` batched**
+（`GemmYScaleShallow`、3 段、`run_gemm_batched_nn_scaled` の capped grid.z、
+epilogue padding 8、バッチ全体を 1 ローンチ）にして p=575 で **−2.94%** を得た。
+本節はそのゲート `Nq >= 512` を `Nq >= 256` に下げ、Nq=256 でだけ符号を見る。
+
+§10.4 の「x GEMM を y と同じ batched 形（A=D1D stride 0）に → +0.7%」は
+**4 段の `GemmYScale` を使った別の形**で、capped grid.z も 1 ローンチ化も
+入っていない。つまり本節は「同じ結論の再測」ではなく、`Nq>=512` で勝った
+現行の形を Nq=256 に下ろす初めての測定である。
+（`p767_gap_study.md` 側の記録どおり、Nq が上がるほど効き目は薄くなる方向で、
+p=767 / 1023 では §11.16 の差も 0.25% / 0.18% まで縮んでいる。）
+
+実装は `cuda_cutlass_gemm_fused.cu` の 2 つのゲート（融合 x の
+`run_volume_gemm_x_scale` と `GEMM_CUTE` の `run_volume_gemm_x`）を
+1 つの定数で同時に動かした。**片方だけ動かすと経路役割違反になる**ので、
+両方が同じ mainloop を取ることを保った。
+
+### 24.2 結果
+
+| | Main/step | `Step loop`/stage | `CUDA device GEMM fused` | `FUSED volume GEMM only` |
+|---|---:|---:|---:|---:|
+| A ゲート `Nq>=512`（現行） | 3.05205e-3 | **1.01680e-3** | 5.38338e-2 | 4.59755e-2 |
+| B ゲート `Nq>=256` | 3.05879e-3 | **1.01901e-3** | 5.39731e-2 | 4.61281e-2 |
+| B − A | +0.221% | **+0.217%** | +0.259% | **+0.332%** |
+
+レンジ（`Step loop`/stage、12 回）は A 1.01418e-3..1.01882e-3、
+B 1.01632e-3..1.02149e-3 で**重なる**。ただし**4 つの指標すべてで符号が同じ**で、
+x だけを含む `FUSED volume GEMM only` で差が最も大きい（+0.332%）。
+判定は**不採用**。ゲートは `Nq >= 512` のまま。
+
+### 24.3 機構
+
+`FUSED volume GEMM only` の +0.33% は x 単独の劣化としては +1% 前後にあたり、
+§10.4 の +0.7% と同じ向き・同じ桁である。x は Nq=256 では
+`m=Nq=256, n=nq2*Ne=65536, k=256` の 1 本の GEMM で、`64x128` タイルは
+n 方向に 512 タイル取れて既に SM を埋めている。`64x64` batched に割ると
+同じ FLOP を 2 倍の CTA 数で回すので、CTA あたりの K ループが同じまま
+プロローグ／エピローグの回数だけが増える。`Nq>=512` で勝ったのは
+そこでの x が `64x128` で **SM 84.5%** しか出ていなかったからで
+（`p575_gap_study.md` §11.2）、Nq=256 の x は §10.5 の ncu で既に **84%**
+台の mainloop にいて、y（86%）との差が p=575 ほど開いていない。
+**タイルを y に寄せる余地そのものが Nq=256 には無い**というのが結論である。
+
+### 24.4 数値
+
+`SCALE_DG_VARYING_COEFF=1`、`dqdt(:,1:Ne)` 全点。
+
+| 比較 | 点数 | max abs |
+|---|---:|---:|
+| B `GEMM_FUSED` vs A `GEMM_FUSED`（`Ne=1`） | 16,777,216 | **ビット一致** |
+| B `GEMM_FUSED` vs `CUDAFORTRAN_GEMM` | 16,777,216 | 1.776e-15（相対 2.219e-16） |
+| B `GEMM_CUTE` vs A `GEMM_CUTE` | 16,777,216 | **ビット一致** |
+| B `GEMM_CUTE` vs `CUDAFORTRAN_GEMM` | 16,777,216 | 0 |
+| B `GEMM_FUSED` vs A `GEMM_FUSED`（`Ne=2`） | 33,554,432 | **ビット一致** |
+| B `GEMM_FUSED` vs `CUDAFORTRAN_GEMM`（`Ne=2`） | 33,554,432 | 1.776e-15 |
+
+Nq=256 では A も B も同じ和の順序なので、ビット一致は期待どおりである。
+コードは戻した（作業ツリーに残らない）。

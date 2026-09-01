@@ -496,6 +496,29 @@ SM 2062 MHz 固定、900 W / 上限 1200 W、56 °C、throttle 0x0）。
 
 ## 現時点の結論
 
+- **`GEMM_FUSED` の横展開 3 件（2026-09-01、job `75947`、親 `c386c85`）**:
+  最速パスは**どの次数でも変わらない**。
+  (1) **`Nq>64` の融合パッケージ（`Escale` 前送り・`deriv_x` の y 畳み込み・
+  面ペア 16 B ロード・z エピローグ 16 B、`p127_gap_study.md` §13）は
+  p=511 / 767 / 1023 で既に有効**だった（ゲートは `Nq >= 64` / `Nq > 64` のみ）。
+  §13 の「4 本目のストリーム」は CUDA ストリームではなく z が読むデータの本数の
+  ことで、横展開すべき差分は無い。文字どおりの「z を 4 本の CUDA ストリームに」は
+  天井がゼロ（隙間は stage 周期の 0.02%、z は SM 91.5% で 65536 CTA / 148 SM）。
+  [`p511_gap_study.md`](p511_gap_study.md) §13。
+  (2) **`Nq>=512` の `64x64` batched x を Nq=256 に下ろすのは不採用**
+  （`Step loop`/stage +0.217%、`FUSED volume GEMM only` +0.332%、
+  4 指標すべて同符号、`Ne=1`/`Ne=2` ともビット一致）。§10.4 の別形 +0.7% と
+  同じ向きで、Nq=256 の x は既に `64x128` で SM を埋めている。
+  [`p255_gap_study.md`](p255_gap_study.md) §24。
+  (3) **CUDA graph 再生は p=7 / 15 / 31 の `GEMM_FUSED` で `Step loop`/stage
+  −1.44% / −3.16% / −2.82%**（12 回交互、レンジ非重複、直接ローンチと
+  ビット一致）。得は 22〜26 µs/stage とほぼ一定で、率は 1 ステージの長さで
+  決まる。**既定 conf は graph off のまま**（graph 再生では `Cal_tend` /
+  `CUDA device *` が出ず、`nsys` も当てられない。`p63_gap_study.md` §43 と
+  同じ判断）。[`p31_gap_study.md`](p31_gap_study.md) §29、
+  [`p15_gap_study.md`](p15_gap_study.md) §28、
+  [`p7_gemm_fused.md`](p7_gemm_fused.md) §14。
+
 - **p=31 / p=15 CUDA-core 融合への「出力タイル × レジスタ予算」の横展開
   （2026-09-01、`p31_gap_study.md` §27 / `p15_gap_study.md` §27）**: 出所は
   p=255 CC の 2 系列（1 スレッド複数出力によるオペランド共有と、その前提に
