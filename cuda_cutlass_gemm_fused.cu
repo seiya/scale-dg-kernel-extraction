@@ -144,10 +144,12 @@ struct VolumeGemmSet {
       TensorOp, ArchTag, GS<64, 128, TileK>, GS<32, 64, TileK>, InstShape,
       EpilogueOp, Swizzle, 3>;
 
+  //- Three stages, not four: see GemmYScaleShallow below.  This epilogue has
+  //- no second source, so unlike the fused y GEMM it wins at Nq = 64 too.
   using GemmY = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
       TensorOp, ArchTag, GS<64, 64, TileK>, GS<32, 32, TileK>, InstShape,
-      EpilogueOp, BatchedSwizzle, 4>;
+      EpilogueOp, BatchedSwizzle, 3>;
 
   //- Nq=32 tile: four 16x16 warps own the whole matrix. Three stages are
   //- enough for the two TileK=16 iterations and raise occupancy over the
@@ -168,6 +170,18 @@ struct VolumeGemmSet {
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
       TensorOp, ArchTag, GS<64, 64, TileK>, GS<32, 32, TileK>, InstShape,
       PointwiseScaleV<2>, BatchedSwizzle, 4>;
+
+  //- Same y GEMM with a three-deep pipeline instead of four.  These GEMMs run
+  //- at 95% of the SM throughput roof, so they are issue bound and not latency
+  //- bound, and the fourth stage only pays for a longer prologue: it costs
+  //- 0.80% more instructions and buys nothing.  The freed 16 KB of shared does
+  //- not raise occupancy (three CTAs either way, registers cap it), so the win
+  //- is the shorter pipeline alone.  Nq = 64 is the exception and keeps four
+  //- (reports/p511_gap_study.md section 12).
+  using GemmYScaleShallow = cutlass::gemm::device::GemmBatched<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, ArchTag, GS<64, 64, TileK>, GS<32, 32, TileK>, InstShape,
+      PointwiseScaleV<2>, BatchedSwizzle, 3>;
 
   using GemmZ = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
@@ -401,9 +415,10 @@ int run_gemm_batched_nn_scaled(int m, int n, int k, double const *A, int lda,
 
 //- y GEMM whose epilogue takes two sources: D = Escale_y * acc + deriv_x.
 //- kMulAddend multiplies the addend by Escale_x (cuBLAS x has no epilogue).
-//- Same tiles, warps, stages and mainloop as GemmYScale; only the epilogue
-//- differs.  cutlass_y_gemm_scaleadd.h says why deriv_x is read here.
-template <class Set, bool kMulAddend>
+//- Same tiles, warps and mainloop as GemmYScale; only the epilogue differs.
+//- kShallowPipe picks GemmYScaleShallow, which differs only in stage count.
+//- cutlass_y_gemm_scaleadd.h says why deriv_x is read here.
+template <class Set, bool kMulAddend, bool kShallowPipe = false>
 int run_volume_gemm_y_scaleadd(double *deriv_xy, const double *flux_y,
                                const double *D1D_tr, const double *escale_y,
                                const double *deriv_x, const double *escale_x,
@@ -412,7 +427,9 @@ int run_volume_gemm_y_scaleadd(double *deriv_xy, const double *flux_y,
   const int nq2 = Nq * Nq;
   const long long stride_plane = nq2;
 
-  using GemmY = typename Set::GemmYScale;
+  using GemmY = typename cutlass::platform::conditional<
+      kShallowPipe, typename Set::GemmYScaleShallow,
+      typename Set::GemmYScale>::type;
   using Kernel = GemmBatchedScaleAdd<typename GemmY::GemmKernel::Mma,
                                      typename GemmY::GemmKernel::Epilogue, BatchedSwizzle,
                                      kMulAddend>;
@@ -483,8 +500,10 @@ int run_volume_gemms_xy(double *deriv_x, double *deriv_y, const double *flux_x,
   //- deriv_y comes out holding Escale_y * D(flux_y) + deriv_x, so the z
   //- epilogue reads one volume tensor instead of two.  See
   //- cutlass_y_gemm_scaleadd.h.
-  return run_volume_gemm_y_scaleadd<Set, false>(deriv_y, flux_y, D1D_tr, escale + npoint,
-                                                deriv_x, nullptr, Nq, Ne);
+  //- Nq > 64 only: the three-stage y pipeline wins from Nq = 128 up and loses
+  //- at Nq = 64, so the Nq <= 64 branch above keeps the four-stage GemmYScale.
+  return run_volume_gemm_y_scaleadd<Set, false, true>(
+      deriv_y, flux_y, D1D_tr, escale + npoint, deriv_x, nullptr, Nq, Ne);
 }
 
 //- The Nq <= 64 fused branch still uses cuBLAS for x (no Escale epilogue).

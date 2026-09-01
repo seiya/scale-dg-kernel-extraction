@@ -51,6 +51,8 @@ Qualifiers only when they are not the default: `emu` (`CublasEmulation`), `ne{N}
 | `perf_p255_fused_tc.conf` | published p=255 mesh (`Ne=1`, `nstep=20`) |
 | `perf_p7_gemm_emu_n1.conf` | cuBLAS emulation timing (do not use `nstep=1000`) |
 | `val_p7_*` / `val_p7_split.conf` / `val_p15_fused.conf` / `val_p15_split.conf` / `val_p15_gemm_fused.conf` / `val_p31_split.conf` / `val_p31_gemm_fused.conf` / `val_p63_split.conf` / `val_p63_fused_tc.conf` / `val_p127_fused.conf` / `val_p127_split.conf` / `val_p255_*` | numerical checks (`SCALE_DG_VARYING_COEFF=1`) |
+| `perf_p511_gemm.conf` | p=511 published mesh, `CUDAFORTRAN_GEMM` (`Ne=1`, `nstep=20`) |
+| `perf_p511_gemm_fused.conf` | p=511 published mesh, `CUDAFORTRAN_GEMM_FUSED` (`Ne=1`, `nstep=20`) |
 | `val_p{511,575,767,1023}_gemm*.conf` | high-order GEMM / GEMM_FUSED / emu |
 
 Another path on the same mesh: copy the `perf_` file and change `DqdtKernel_Type` only. Do not change `NeX/NeY/NeZ`, `PolyOrder`, `dt`, or `nstep` when comparing kernels.

@@ -1599,3 +1599,21 @@ misaligned address（job `72042`）で範囲外。整列を保つ 2-way 下限�
 二重バッファは shared 上限超過、レジスタ発行版は spill して +4% だった。
 shared conflict、CTA 幅、占有率、命令、同期、面 overlap の契約内候補を測り切り、
 **p=127 FUSED_TC の探索を 621.5 µs/stage で終了する。**
+
+## 追記（2026-09-01）: volume GEMM の y を 3 段にした
+
+`p511_gap_study.md` §12 で `VolumeGemmSet` の y GEMM のパイプライン段数を
+4 → 3 に落とした。占有率は動かず（レジスタが CTA 数を決めている）、
+**命令数が 0.80% 減る**。これらの GEMM は SM スループット 95% の発行律速で、
+4 段目は長いプロローグの代金しか払っていない。利得は `K/TileK = Nq/16` 回の
+ループにその固定費を薄める形なので、次数が上がるほど小さくなる。
+
+この次数での占有 GPU 交互 A/B は次のとおり（詳細と job 番号は
+`p511_gap_study.md` §12.4）。過去の節の数値は当時値としてそのまま残す。
+
+| 経路 | 効果 |
+|---|---:|
+| `CUDAFORTRAN_GEMM_FUSED` (Nq=128) | **−0.762%** |
+| `CUDAFORTRAN_GEMM_CUTE` (Nq=128) | **−0.598%** |
+
+全次数で最大の利得がここに出る。最速は `CUDAFORTRAN_FUSED_TC` のまま。
