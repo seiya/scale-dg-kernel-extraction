@@ -199,6 +199,30 @@ struct VolumeGemmSetP7 : VolumeGemmSet<GS<8, 8, 4>, cutlass::arch::Sm80, 16> {
 
 using P7MmaSet_884 = VolumeGemmSetP7;
 
+//- Nq=16 leaves the generic tiles as predicated as Nq=8 does: the y GEMM is
+//- 16x16x16 per batch against a 64x64 tile, and the z / z-assembly GEMM is
+//- 256x16x16 against a 64x32 tile whose N half is predicated away.  Same
+//- reasoning as VolumeGemmSetP7; the shapes below are the measured winners
+//- (reports/p15_gap_study.md).  Both GEMM_CUTE and GEMM_FUSED take them, so
+//- the two paths keep sharing one volume-GEMM mainloop.
+struct VolumeGemmSetP15 : VolumeGemmSet<GS<8, 8, 4>, cutlass::arch::Sm80, 16> {
+  using GemmY = cutlass::gemm::device::GemmBatched<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, cutlass::arch::Sm80, GS<16, 32, 16>,
+      GS<16, 16, 16>, GS<8, 8, 4>, EpilogueOp, BatchedSwizzle, 3>;
+  using GemmYScale = cutlass::gemm::device::GemmBatched<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, cutlass::arch::Sm80, GS<16, 32, 16>,
+      GS<16, 16, 16>, GS<8, 8, 4>, PointwiseScaleV<1>, BatchedSwizzle, 3>;
+  using GemmZ = cutlass::gemm::device::GemmBatched<
+      double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+      TensorOp, cutlass::arch::Sm80, GS<16, 64, 16>,
+      GS<16, 32, 16>, GS<8, 8, 4>, EpilogueOp, BatchedSwizzle, 3>;
+  using GemmZWide = GemmZ;
+};
+
+using P15MmaSet_884 = VolumeGemmSetP15;
+
 int cutlass_error(const char *what, cutlass::Status st)
 {
   if (st == cutlass::Status::kSuccess) {
@@ -247,12 +271,71 @@ int run_gemm_nn(int m, int n, int k, double const *A, int lda, double const *B,
   return cutlass_error("gemm", gemm_op(args, nullptr, dg_cuda_stream));
 }
 
+//- One launch for any batch count: the device-level operator cannot express
+//- batch > 65535 (it copies batch into grid_tiled_shape.k() via `% 65536`),
+//- but kernel::GemmBatched itself walks `batch_idx += gridDim.z`, so building
+//- Params by hand with the full batch_count and a capped grid.z covers every
+//- batch in a single kernel.  Chunking instead costs one launch per 65535
+//- batches plus, at p=15 (batch = Nq*Ne = 65536 exactly), a second launch that
+//- carries a single 16x16x16 plane.
+template <class GemmBatched>
+int run_gemm_batched_nn_capped(int m, int n, int k, double const *A, int lda,
+                               long long strideA, double const *B, int ldb,
+                               long long strideB, double *C, int ldc,
+                               long long strideC, int batch)
+{
+  using Kernel = typename GemmBatched::GemmKernel;
+
+  typename GemmBatched::Arguments args({m, n, k}, {A, lda}, strideA, {B, ldb},
+                                       strideB, {C, ldc}, strideC, {C, ldc},
+                                       strideC, {1.0, 0.0}, batch);
+  const cutlass::Status can = GemmBatched::can_implement(args);
+  if (can != cutlass::Status::kSuccess) {
+    return cutlass_error("batched capped can_implement", can);
+  }
+
+  auto uargs = GemmBatched::to_underlying_arguments(args);
+  BatchedSwizzle swizzle;
+  cutlass::gemm::GemmCoord grid_shape = cap_batched_grid(
+      swizzle.get_tiled_shape(uargs.problem_size,
+                              {GemmBatched::ThreadblockShape::kM,
+                               GemmBatched::ThreadblockShape::kN,
+                               GemmBatched::ThreadblockShape::kK},
+                              uargs.batch_count),
+      batch);
+
+  typename Kernel::Params params(
+      uargs.problem_size, grid_shape, uargs.ref_A.non_const_ref(), uargs.stride_A,
+      uargs.ref_B.non_const_ref(), uargs.stride_B, uargs.ref_C.non_const_ref(),
+      uargs.stride_C, uargs.ref_D, uargs.stride_D, uargs.epilogue, batch);
+
+  dim3 grid = swizzle.get_grid_shape(grid_shape);
+  dim3 block(Kernel::kThreadCount, 1, 1);
+  int smem_size = int(sizeof(typename Kernel::SharedStorage));
+  if (smem_size >= (48 << 10)) {
+    cudaError_t attr = cudaFuncSetAttribute(
+        cutlass::Kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size);
+    if (attr != cudaSuccess) {
+      return 1;
+    }
+  }
+  cutlass::arch::synclog_setup();
+  cutlass::Kernel<Kernel><<<grid, block, smem_size, dg_cuda_stream>>>(params);
+  return cudaGetLastError() == cudaSuccess ? 0 : 1;
+}
+
 template <class GemmBatched>
 int run_gemm_batched_nn(int m, int n, int k, double const *A, int lda,
                         long long strideA, double const *B, int ldb,
                         long long strideB, double *C, int ldc, long long strideC,
                         int batch)
 {
+  if (batch > kCudaMaxGridZ) {
+    return run_gemm_batched_nn_capped<GemmBatched>(m, n, k, A, lda, strideA, B,
+                                                   ldb, strideB, C, ldc,
+                                                   strideC, batch);
+  }
   // Chunk so each launch stays inside CUDA's grid.z.  Stock GemmBatched
   // copies batch into grid_tiled_shape.k() via `% 65536`, so a single
   // launch at 65536 would still get grid.z = 0 even if we capped later.
@@ -585,6 +668,9 @@ extern "C" int launch_volume_gemm_z(double *deriv_z, const double *flux_z,
   if (Nq == 8 && mma_shape == 0) {
     return run_volume_gemm_z<P7MmaSet_884>(deriv_z, flux_z, D1D_tr, Nq, Ne);
   }
+  if (Nq == 16 && mma_shape == 0) {
+    return run_volume_gemm_z<P15MmaSet_884>(deriv_z, flux_z, D1D_tr, Nq, Ne);
+  }
   switch (mma_shape) {
   case 0:
     return run_volume_gemm_z<MmaSet_884>(deriv_z, flux_z, D1D_tr, Nq, Ne);
@@ -665,6 +751,9 @@ extern "C" int launch_volume_gemm_y(double *deriv_y, const double *flux_y,
   if (Nq == 8 && mma_shape == 0) {
     return run_volume_gemm_y<P7MmaSet_884>(deriv_y, flux_y, D1D_tr, Nq, Ne);
   }
+  if (Nq == 16 && mma_shape == 0) {
+    return run_volume_gemm_y<P15MmaSet_884>(deriv_y, flux_y, D1D_tr, Nq, Ne);
+  }
   switch (mma_shape) {
   case 0:
     return run_volume_gemm_y<MmaSet_884>(deriv_y, flux_y, D1D_tr, Nq, Ne);
@@ -718,6 +807,11 @@ extern "C" int launch_z_gemm_assembly(
   }
   if (Nq == 8 && mma_shape == 0 && !xy_weighted) {
     return run_z_gemm_assembly<P7MmaSet_884, false>(
+        dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d,
+        lift_zpair, escale, Nq, Ne);
+  }
+  if (Nq == 16 && mma_shape == 0 && !xy_weighted) {
+    return run_z_gemm_assembly<P15MmaSet_884, false>(
         dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d,
         lift_zpair, escale, Nq, Ne);
   }

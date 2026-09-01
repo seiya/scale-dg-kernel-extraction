@@ -359,3 +359,29 @@ timeout 180 ncu --set full --csv --kernel-name-base demangled \
   -k 'regex:.*GemmBatchedDqdtAssembly.*' -s 0 -c 1 \
   ./scale-dg_extraction.p7gf_compliant_z1632s3 /tmp/p7gf_ncu_${SLURM_JOB_ID}.conf
 ```
+
+## 11. y の batch を 1 ローンチにした（2026-09-01、採用、−3.3%）
+
+p=15 の [`p15_gap_study.md`](p15_gap_study.md) §25.3 で入れた次数非依存の変更。
+在庫の device-level `GemmBatched` は batch を `% 65536` して `grid.z` に載せる
+ため、`Nq*Ne` が 65535 を超える次数では 65535 件ずつのチャンク launch にして
+いた。p=7 は `Ne=32³` で y batch が 262,144 なので **5 ローンチ**である。
+`kernel::GemmBatched` は `batch_idx += gridDim.z` で歩くので、Params を手で
+組んで `grid.z` を丸めれば 1 ローンチで足りる（`run_gemm_batched_nn_capped`、
+`cuda_cutlass_gemm_fused.cu`）。tile も warp も stage も変えていない。
+
+Slurm job `74632`（c178）、§10 と同じ `namelists/perf_p7_gemm_fused.conf` を
+12 回交互 A/B した中央値:
+
+| 構成 | Main [ms/step] | device [ms/57 stage] | µs/stage | 対 §10 |
+|---|---:|---:|---:|---:|
+| §10 の最終形（5 launch） | 6.04200 | 111.682 | 1959.3 | — |
+| **単一 launch** | **5.85210** | **108.030** | **1895.3** | **−3.27%** |
+
+device のレンジは 111.535--111.772 対 107.855--108.142 で重ならない。基準側は
+§10 の 1960.3 µs を再現している。最終形は **0.741 TFLOP/s**（40.1 の 1.8%）、
+unique **0.832 TB/s**（10.5%）、path **2.16 TB/s**（27.3%）。
+
+数値は `SCALE_DG_VARYING_COEFF=1`、`val_p7_split.conf` 対
+`val_p7_gemm_fused.conf` で max abs **1.77636e-15**、相対 **2.86031e-16**
+（§10.3 と同じ）。最速は `FUSED_TC` のまま。

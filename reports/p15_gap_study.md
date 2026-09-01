@@ -1546,3 +1546,173 @@ timeout 180 nsys profile --stats=true --resolve-symbols=false \
   -o output/nsys_p15gf_role \
   ./scale-dg_extraction.p15gf_role_compliant namelists/perf_p15_gemm_fused.conf
 ```
+
+## 25. Nq=16 に合わせた CUTLASS tile と単一 launch（2026-09-01、採用、−54.6%）
+
+親 `b0572f95e16aa9ffa220f9dc49a7d01d90a398e0`、GB200、
+`make CUDA=1 GPUFLAGS=-gpu=cc100`。入力 `namelists/perf_p15_gemm_fused.conf`
+（`Ne=16³`、`nstep=20`、graph off）。検証は `SCALE_DG_VARYING_COEFF=1` で
+`val_p15_split.conf` 対 `val_p15_gemm_fused.conf`（owned 32,768 点）。
+変更は volume GEMM の tile と launch 形だけなので、`GEMM_CUTE` と
+`GEMM_FUSED` は同じ mainloop を共有したままである（両経路とも速くなる）。
+
+### 25.1 出発点
+
+§24 の nsys（job `73220`）は y 570.3 µs、fused z 504.3 µs で、機構は
+「浅い K・小さい問題に対して tile が大きい」だった。y の問題は 1 batch あたり
+**16×16×16** で tile は 64×64、z（および fused z assembly）は
+**256×16×16** で tile は 64×32 と、M も N も述語で捨てている。これは
+p=7 の [`p7_gemm_fused.md`](p7_gemm_fused.md) §10 と同型で、そこでは tile を
+縮めるだけで −22.6% だった。**他次数で効いて p=15 に未適用**の候補として
+最優先で試した。
+
+### 25.2 tile 探索（login GPU、3-run、device ms / 57 stage）
+
+`VolumeGemmSetP15`（`Nq==16 && mma_shape==0` のときだけ使う set）を足し、
+y と z の TB / warp / stages を振った。制御 `v0`（generic と同じ形）が
+83.15 ms で §24 の 83.10 ms を再現するので、set の配線自体は無害である。
+
+| y (TB/warp/stages) | z (TB/warp/stages) | device ms | 備考 |
+|---|---|---:|---|
+| 64×64 / 32×32 / 4 | 64×32 / 32×32 / 4 | 83.15 | 制御（= §24） |
+| 32×64 / 32×32 / 3 | 同上 | 66.78 | p=7 の勝者形 |
+| 32×32 / 32×16 / 3 | 同上 | 59.70 | |
+| **16×32 / 16×16 / 3** | 同上 | **56.28** | y 最良 |
+| 16×64 / 16×32 / 3 | 同上 | 60.14 | |
+| 16×32 / 16×16 / 4 | 同上 | 57.19 | stages 4 は負け |
+| 16×32 / 16×16 / 5 | 同上 | 58.27 | |
+| 64×64 / 32×32 / 4 | 16×32 / 16×16 / 3 | 72.67 | |
+| 同上 | 32×32 / 32×16 / 3 | 74.31 | |
+| 同上 | **16×64 / 16×32 / 3** | **64.74** | z 最良 |
+| 同上 | 16×64 / 16×32 / 4 | 64.86 | |
+| 同上 | 16×128 / 16×64 / 3 | 108.3 | N を広げ過ぎ |
+| 同上 | 32×64 / 32×32 / 3 | 71.88 | |
+| 同上 | 16×64 / 16×16 / 3 | 71.71 | 4 warp は負け |
+| 同上 | 32×16 / 16×16 / 3 | 88.35 | N=16 ぴったりが最悪 |
+| 同上 | 64×32 / 32×32 / 3 | 84.63 | |
+| **16×32 / 16×16 / 3** | **16×64 / 16×32 / 3** | **37.92** | 採用の組 |
+| 32×32 / 32×16 / 3 | 16×64 / 16×32 / 3 | 41.27 | |
+| 16×64 / 16×32 / 3 | 16×64 / 16×32 / 3 | 41.72 | |
+| 16×32 / 16×16 / 3 | 32×64 / 32×32 / 3 | 45.09 | |
+
+TB が 16×16 の形（および TB M=8）は CUTLASS の
+`mma_tensor_op_tile_iterator_sm80.h:854` の `"Divisibility."` static assert で
+**作れない**。p=7 §10 と同じ制限で、16×32 / 16×16 が実現できる最小の 2 warp
+geometry である。問題サイズちょうどの N=16 tile（32×16）は逆に最悪で、
+述語で捨てる N があっても **N を広く取るほうが速い**（z は 16→32→64 で
+88.4 → 72.7 → 64.7 ms、128 で崩れる）。
+
+### 25.3 単一 launch（batch > 65535）
+
+y は `Nq*Ne = 65536` batch で、在庫の device-level `GemmBatched` は
+`batch % 65536` を `grid.z` に載せるため 65535 + 1 の 2 ローンチに割っていた
+（nsys で 2 本目は 1 平面の 2.4 µs）。`kernel::GemmBatched` 自体は
+`batch_idx += gridDim.z` で歩くので、Params を手で組んで
+`grid.z` を 65535 に丸めれば **1 ローンチ**で全 batch を踏める
+（`run_gemm_batched_nn_capped`）。login 3-run で 37.87 → 37.77 ms
+（**−0.3%**、レンジ非重複）。これは次数非依存の変更で、p=7（batch 262144、
+5 ローンチ → 1）にも効く（§25.7）。
+
+### 25.4 採用値（占有 GPU、12 回交互 A/B）
+
+Slurm job `74631`（c178）、凍結バイナリ `scale-dg_extraction.p15gf_base`
+（親 `b0572f9`）と `scale-dg_extraction.p15gf_new` を 12 回交互に走らせた中央値:
+
+| 経路 | Main [ms/step] | device [ms/57 stage] | µs/stage | 対基準 |
+|---|---:|---:|---:|---:|
+| `GEMM_FUSED` 基準（§24） | 4.56771 | 83.1947 | 1459.6 | — |
+| **`GEMM_FUSED` 採用形** | **2.21574** | **37.7129** | **661.6** | **−54.67%** |
+| `GEMM_CUTE` 基準 | 4.11626 | 74.4457 | 1306.1 | — |
+| `GEMM_CUTE` 採用形 | 2.34606 | 40.2391 | 705.9 | −45.96% |
+
+device のレンジは基準 83.1494--83.2578、採用形 37.6707--37.7684 で重ならない。
+採用形の p=15 `GEMM_FUSED` は **3.14 TFLOP/s**（FP64 peak の 7.8%）、
+unique **2.00 TB/s**（25.3%）、path **4.72 TB/s**（59.7%）。
+
+**これで p=15 の融合パッケージは初めて `GEMM_CUTE` に勝った**（661.6 対
+705.9、**−6.3%**）。§24 では逆に融合が +11.7% 遅く、その差は「浅い K に
+過大な tile」が z assembly により重くのしかかっていたためだった。
+§23 の範囲外 hybrid（cuBLAS y/z、851.7 µs）も、役割準拠のまま
+**1.29 倍**上回った。最速経路は `CUDAFORTRAN_FUSED_TC`（271.8 µs/stage）の
+ままで、比は **5.36 倍 → 2.43 倍**に縮んだ。
+
+### 25.5 数値検証
+
+同じソースの `scale-dg_extraction.p15gf_new` で、`SCALE_DG_VARYING_COEFF=1`
+（`u,v,w,Escale,normal_fn,Fscale` が点ごとに変わる）とし、`Ne=2³` の owned
+32,768 点を `CUDAFORTRAN_SPLIT` と比較した。
+
+| 経路 | max abs | 対応点 rel |
+|---|---:|---:|
+| `CUDAFORTRAN_GEMM_FUSED` | 1.77636e-15 | 3.76300e-16 |
+| `CUDAFORTRAN_GEMM_CUTE` | 0（bit exact） | 0 |
+| p=7 `CUDAFORTRAN_GEMM_FUSED`（§25.7） | 1.77636e-15 | 2.86031e-16 |
+
+§24 と同じ値である。
+
+### 25.6 機構（nsys job `74627`、ncu job `74628`、いずれも c1xx GPU 占有）
+
+nsys（graph off、60 instance）の 1 stage あたり:
+
+| カーネル | §24（1456.8 µs/stage） | 採用形（661.6） |
+|---|---:|---:|
+| CUTLASS y | 570.3（2 launch） | **99.8（1 launch）** |
+| y の 1-batch remainder | 3.2 | **0（消えた）** |
+| fused CUTLASS z assembly | 504.3 | **182.5** |
+| `elembnd_flux` | 138.4 | 138.5 |
+| `volume_flux` | 125.9 | 126.2 |
+| cuBLAS x | 96.8 | 96.9 + 3.3 |
+
+触った 2 本だけが動き、共通の 3 本は動いていない。
+
+ncu（`--set full`、同一 job 内に base / new を並べた）:
+
+| 指標 | y 64×64 s4 | y 16×32 s3 | z 64×32 s4 | z 16×64 s3 |
+|---|---:|---:|---:|---:|
+| 実行命令 | 184.7 M | **81.3 M（−56%）** | 254.4 M | **65.5 M（−74%）** |
+| dynamic shared / block | 65,536 B | **18,432 B** | 49,152 B | **30,720 B** |
+| register / thread | 130 | **64** | 254 | 254 |
+| 達成占有率 | 14.2% | **35.4%** | 12.2% | 12.0% |
+| DRAM throughput | 1.9% | 15.9% | 15.2% | **48.7%** |
+| SM throughput | 28.6% | 69.2% | 47.3% | 39.8% |
+
+1 文で言うと: **この経路は 16×16×16 と 256×16×16 の小問題に対する
+過大な述語 tile の命令と shared footprint で律速していた**。y は命令を
+56%、shared を 72% 削って resident CTA を 2.5 倍にし、z は命令を 74% 削って
+DRAM 利用率を 3.2 倍に押し上げた（`ncu` の時間は採否に使っていない。
+採否は 25.4 の占有 GPU 実時間 A/B）。
+
+### 25.7 横展開: 単一 launch は p=7 にも効く
+
+§25.3 は次数非依存である。p=7（`Ne=32³`、y batch 262,144、5 ローンチ）で
+同じ 2 バイナリを 12 回交互に測った（job `74632`、c178）:
+
+| 経路 | Main [ms/step] | device [ms/57 stage] | µs/stage | 対基準 |
+|---|---:|---:|---:|---:|
+| p=7 `GEMM_FUSED` 基準 | 6.04200 | 111.682 | 1959.3 | — |
+| p=7 `GEMM_FUSED` 単一 launch | **5.85210** | **108.030** | **1895.3** | **−3.27%** |
+
+レンジは 111.535--111.772 と 107.855--108.142 で重ならない。基準は
+[`p7_gemm_fused.md`](p7_gemm_fused.md) §10 の 1960.3 µs を再現している。
+p=31 以上は y batch が 65535 以下（p=31 で 16,384）なので、この変更は届かない。
+
+### 25.8 測って落とした候補
+
+すべて同一条件の login 3-run（差が大きいもの）または占有 GPU A/B。
+
+| 候補 | 結果 | 機構 |
+|---|---:|---|
+| x を cuBLAS から CUTLASS へ（16×64…16×256 を掃引） | 最良で **+10%**（41.7 対 37.9 ms） | M=16, N=1,048,576 の wide GEMM では cuBLAS `32×64` が強い。`Nq<=64` の x ライブラリ分岐は据え置き |
+| z epilogue を 16 B アクセス（`EpilogueOp2`） | **+2.3%** | `Nq=64` で +2.8% だったのと同じ非対称。N=16 では 8 B のまま |
+| z epilogue の shared padding 0 / 4 / 8 / 16 | 4/8/16 は差なし、**0 は +1.3%** | pad 8 の根拠（`cutlass_z_gemm_assembly.h`）は 16×64 tile でも生きている |
+| z を `__launch_bounds__(64, 5..7)` で占有率上げ | **+63%** | 254 register が屋根。上限を切るとスピルする。12% 占有率は律速ではない |
+| xy_weighted の fold を `Nq=16` に開く（y scaleadd + weighted z） | **+3.8%**（数値は 1.77636e-15 で正しい） | 不正アブレーション（weighted z を unweighted driver 上で起動）で z 側の天井は **−47 µs/stage** と測れたが、y が volume tensor を 3 本増やす代償が **+72 µs** で赤字。p=31 の +2.3% と同符号 |
+| `elembnd_flux` を side stream に重ねる | **+4.6%**（39.6 対 37.9 ms） | §23 と同じ。両者とも DRAM を食い、直列化する |
+| `elembnd` 重ね + y 重ね off | **+5.1%** | 同上 |
+| x‖y の重ねを外す | **+1.5%**（38.44 対 37.87 ms） | y を side2 に出す現行 schedule は維持 |
+| y/z の TB を 16×16 に、または TB M=8 に | compile-time `"Divisibility."` | 2 warp 未満の geometry は CUTLASS FP64 TensorOp では作れない |
+
+残る契約内の候補は尽きた。共通の `volume_flux`（126 µs で 7V ≒ DRAM ピークの
+94%）と `elembnd_flux`（138 µs）は `GEMM` 経路と同一カーネルなので、
+この経路として独立に最適化しない。x（cuBLAS 97 µs）、y（99.8 µs）、
+z assembly（182.5 µs）はいずれも上表の掃引で最良形に到達している。
