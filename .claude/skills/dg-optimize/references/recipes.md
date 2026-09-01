@@ -28,6 +28,13 @@ for i in 1 2 3; do ./scale-dg_extraction namelists/perf_p63_fused_tc.conf | tail
 - `WarmupStep`（既定 1、graph 経路では 2 以上に自動昇格）で先頭ステップは計時外。
   `nstep` は変えない。
 - 3〜5 回の中央値。レンジが重なる差は「差が無い」と書く。
+- **`Cal_tend/(3*measured_steps)` を絶対値として使わない。** `Timer` は GPU 同期の
+  無い純ホスト時計なので `Cal_tend` は 1 stage 分だけ短く出る（`p767_gap_study.md`
+  §15。p=767 で `nstep` を振ると per-stage が 55.4〜60.1 ms と 8.5% 動く一方、
+  増分の傾きは 60.64 で一定）。偏りは `1/(3*steps)`。**同一 conf の A/B は無傷**
+  だが、次数や conf をまたぐ絶対値には `Main per step` か、`nstep` を 2 点以上
+  振った増分の傾きを使う。`Cal_tend` の傾きは `Main`/3 と一致し、RK 更新など
+  タイマ区間の外で enqueue された仕事も含む。
 - **採否を決める計測は sbatch で占有した GPU 上で**、変種を交互に 10〜12 回。
   ログインノードは他人と共有で、同じ実行ファイルでも 0.5% ほどぶれる。
   1 % 未満の差はこれをやらないと判定できない。
