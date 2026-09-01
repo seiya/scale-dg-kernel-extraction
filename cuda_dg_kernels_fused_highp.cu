@@ -11,8 +11,11 @@ extern cudaStream_t dg_cuda_stream;
 
 #define P15_CC_THREADS 512
 #define P31_CC_XZ_THREADS 512
-#define P31_CC_Y_THREADS 512
-#define P31_CC_XZ_SMEM (58880)
+// Number of j planes the p=31 xz kernel keeps resident and reduces together.
+#define P31_CC_XZ_NJ 4
+#define P31_CC_XZ_SMEM (8 * (1024 + 192 + 2 * P31_CC_XZ_NJ * 1024 + 2048))
+#define P31_CC_Y_THREADS 256
+#define P31_CC_Y_MINBLK 4
 #ifndef P63_CC_THREADS
 #define P63_CC_THREADS 512
 #endif
@@ -70,8 +73,11 @@ __device__ double p15_face_flux_cc(int fidx, const double *__restrict__ q,
   return 0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
 }
 
-// p=15 CC: 512 threads x 8 k-nodes, 2 blocks/SM. Face gathers issue before
-// the x-panel barrier so they overlap remaining stores.
+// p=15 CC: 512 threads, 2 blocks/SM, each thread owning a 2i x 2j x 2k
+// output tile. Natural-order shared panels and length-16 inner products;
+// the tile shares each direction's per-lane-distinct shared operand over
+// more outputs (p15_gap_study.md sec 27). Face gathers issue before the
+// x-panel barrier so they overlap the remaining panel stores.
 __global__ __launch_bounds__(P15_CC_THREADS, 2) void tendency_fused_p15_cc_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
@@ -83,7 +89,7 @@ __global__ __launch_bounds__(P15_CC_THREADS, 2) void tendency_fused_p15_cc_kerne
 {
   __shared__ double sD1D[256];
   __shared__ double sLift[96];
-  __shared__ double sbuf[4096];
+  __shared__ __align__(16) double sbuf[4096];
   __shared__ double sFace[1536];
 
   const int elem = (int)blockIdx.x;
@@ -92,9 +98,9 @@ __global__ __launch_bounds__(P15_CC_THREADS, 2) void tendency_fused_p15_cc_kerne
   }
 
   const int tid = (int)threadIdx.x;
-  const int i = tid % 16;
-  const int j = (tid / 16) % 16;
-  const int kbase = tid / 256;
+  const int i0 = 2 * (tid & 7);
+  const int j0 = 2 * ((tid >> 3) & 7);
+  const int kb = tid >> 6;
   const int elem_offset = elem * 4096;
   const int face_offset = elem * 1536;
   const int npoint = 4096 * Ne;
@@ -106,15 +112,22 @@ __global__ __launch_bounds__(P15_CC_THREADS, 2) void tendency_fused_p15_cc_kerne
     sLift[tid - 256] = Lift1D[tid - 256];
   }
 
-  int kk[8], nd[8], idx[8];
-  double qv[8], acc[8];
+  // p[jj][kk] -> point (i0..i0+1, j0+jj, kb+8*kk)
+  int nd[2][2], idx[2][2];
+  double2 qv[2][2];
 #pragma unroll
-  for (int m = 0; m < 8; ++m) {
-    kk[m] = kbase + 2 * m;
-    nd[m] = i + j * 16 + kk[m] * 256;
-    idx[m] = elem_offset + nd[m];
-    qv[m] = q[idx[m]];
-    sbuf[nd[m]] = qv[m] * u[idx[m]];
+  for (int kk = 0; kk < 2; ++kk) {
+    const int k = kb + 8 * kk;
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj) {
+      nd[jj][kk] = i0 + (j0 + jj) * 16 + k * 256;
+      idx[jj][kk] = elem_offset + nd[jj][kk];
+      qv[jj][kk] = *reinterpret_cast<const double2 *>(q + idx[jj][kk]);
+      const double2 uu =
+          *reinterpret_cast<const double2 *>(u + idx[jj][kk]);
+      *reinterpret_cast<double2 *>(sbuf + nd[jj][kk]) =
+          make_double2(qv[jj][kk].x * uu.x, qv[jj][kk].y * uu.y);
+    }
   }
   sFace[tid] = p15_face_flux_cc(face_offset + tid, q, u, v, w, VMapM, VMapP,
                                 normal_fn, Fscale, nface);
@@ -124,83 +137,158 @@ __global__ __launch_bounds__(P15_CC_THREADS, 2) void tendency_fused_p15_cc_kerne
                                        VMapM, VMapP, normal_fn, Fscale, nface);
   __syncthreads();
 
-  double s[8];
+  double2 a[2][2];
 #pragma unroll
-  for (int m = 0; m < 8; ++m) {
-    s[m] = 0.0;
-  }
+  for (int jj = 0; jj < 2; ++jj) {
 #pragma unroll
-  for (int l = 0; l < 16; ++l) {
-    const double dm = sD1D[i + l * 16];
-#pragma unroll
-    for (int m = 0; m < 8; ++m) {
-      s[m] += dm * sbuf[l + j * 16 + kk[m] * 256];
+    for (int kk = 0; kk < 2; ++kk) {
+      a[jj][kk] = make_double2(0.0, 0.0);
     }
   }
+  // x: the D1D pair is per-lane distinct and feeds all 8 outputs.
+  {
+    double2 s[2][2];
 #pragma unroll
-  for (int m = 0; m < 8; ++m) {
-    acc[m] = Escale[idx[m]] * s[m];
-  }
-  __syncthreads();
-
+    for (int jj = 0; jj < 2; ++jj)
 #pragma unroll
-  for (int m = 0; m < 8; ++m) {
-    sbuf[nd[m]] = qv[m] * v[idx[m]];
-  }
-  __syncthreads();
-
+      for (int kk = 0; kk < 2; ++kk) s[jj][kk] = make_double2(0.0, 0.0);
 #pragma unroll
-  for (int m = 0; m < 8; ++m) {
-    s[m] = 0.0;
-  }
+    for (int l = 0; l < 16; ++l) {
+      const double2 dm = *reinterpret_cast<const double2 *>(sD1D + i0 + l * 16);
 #pragma unroll
-  for (int l = 0; l < 16; ++l) {
-    const double dm = sD1D[j + l * 16];
+      for (int kk = 0; kk < 2; ++kk) {
+        const int k = kb + 8 * kk;
 #pragma unroll
-    for (int m = 0; m < 8; ++m) {
-      s[m] += dm * sbuf[i + l * 16 + kk[m] * 256];
+        for (int jj = 0; jj < 2; ++jj) {
+          const double b = sbuf[l + (j0 + jj) * 16 + k * 256];
+          s[jj][kk].x += dm.x * b;
+          s[jj][kk].y += dm.y * b;
+        }
+      }
     }
-  }
 #pragma unroll
-  for (int m = 0; m < 8; ++m) {
-    acc[m] += Escale[idx[m] + npoint] * s[m];
+    for (int jj = 0; jj < 2; ++jj)
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk) {
+        const double2 e =
+            *reinterpret_cast<const double2 *>(Escale + idx[jj][kk]);
+        a[jj][kk].x += e.x * s[jj][kk].x;
+        a[jj][kk].y += e.y * s[jj][kk].y;
+      }
   }
   __syncthreads();
 
 #pragma unroll
-  for (int m = 0; m < 8; ++m) {
-    sbuf[nd[m]] = qv[m] * w[idx[m]];
-  }
-  __syncthreads();
-
+  for (int kk = 0; kk < 2; ++kk)
 #pragma unroll
-  for (int m = 0; m < 8; ++m) {
-    s[m] = 0.0;
-  }
-#pragma unroll
-  for (int l = 0; l < 16; ++l) {
-    const double bv = sbuf[i + j * 16 + l * 256];
-#pragma unroll
-    for (int m = 0; m < 8; ++m) {
-      s[m] += sD1D[kk[m] + l * 16] * bv;
+    for (int jj = 0; jj < 2; ++jj) {
+      const double2 vv = *reinterpret_cast<const double2 *>(v + idx[jj][kk]);
+      *reinterpret_cast<double2 *>(sbuf + nd[jj][kk]) =
+          make_double2(qv[jj][kk].x * vv.x, qv[jj][kk].y * vv.y);
     }
-  }
+  __syncthreads();
+
+  // y: the panel pair is per-lane distinct and feeds both j outputs.
+  {
+    double2 s[2][2];
 #pragma unroll
-  for (int m = 0; m < 8; ++m) {
-    acc[m] += Escale[idx[m] + 2 * npoint] * s[m];
+    for (int jj = 0; jj < 2; ++jj)
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk) s[jj][kk] = make_double2(0.0, 0.0);
+#pragma unroll
+    for (int l = 0; l < 16; ++l) {
+      const double2 dj = *reinterpret_cast<const double2 *>(sD1D + j0 + l * 16);
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk) {
+        const double2 fv = *reinterpret_cast<const double2 *>(
+            sbuf + i0 + l * 16 + (kb + 8 * kk) * 256);
+        s[0][kk].x += dj.x * fv.x;
+        s[0][kk].y += dj.x * fv.y;
+        s[1][kk].x += dj.y * fv.x;
+        s[1][kk].y += dj.y * fv.y;
+      }
+    }
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj)
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk) {
+        const double2 e = *reinterpret_cast<const double2 *>(
+            Escale + idx[jj][kk] + npoint);
+        a[jj][kk].x += e.x * s[jj][kk].x;
+        a[jj][kk].y += e.y * s[jj][kk].y;
+      }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int kk = 0; kk < 2; ++kk)
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj) {
+      const double2 ww = *reinterpret_cast<const double2 *>(w + idx[jj][kk]);
+      *reinterpret_cast<double2 *>(sbuf + nd[jj][kk]) =
+          make_double2(qv[jj][kk].x * ww.x, qv[jj][kk].y * ww.y);
+    }
+  __syncthreads();
+
+  // z: the panel pair feeds both k outputs.
+  {
+    double2 s[2][2];
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj)
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk) s[jj][kk] = make_double2(0.0, 0.0);
+#pragma unroll
+    for (int l = 0; l < 16; ++l) {
+      const double d0 = sD1D[kb + l * 16];
+      const double d1 = sD1D[kb + 8 + l * 16];
+#pragma unroll
+      for (int jj = 0; jj < 2; ++jj) {
+        const double2 bv = *reinterpret_cast<const double2 *>(
+            sbuf + i0 + (j0 + jj) * 16 + l * 256);
+        s[jj][0].x += d0 * bv.x;
+        s[jj][0].y += d0 * bv.y;
+        s[jj][1].x += d1 * bv.x;
+        s[jj][1].y += d1 * bv.y;
+      }
+    }
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj)
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk) {
+        const double2 e = *reinterpret_cast<const double2 *>(
+            Escale + idx[jj][kk] + 2 * npoint);
+        a[jj][kk].x += e.x * s[jj][kk].x;
+        a[jj][kk].y += e.y * s[jj][kk].y;
+      }
   }
 
-  const int fa5 = 1024 + i + j * 16;
-  const int fa6 = 1280 + i + j * 16;
+  const double2 l2 = *reinterpret_cast<const double2 *>(sLift + i0 + 16);
+  const double2 l4 = *reinterpret_cast<const double2 *>(sLift + i0 + 48);
 #pragma unroll
-  for (int m = 0; m < 8; ++m) {
-    const int fa1 = i + kk[m] * 16;
-    const int fa2 = 256 + j + kk[m] * 16;
-    const int fa3 = 512 + i + kk[m] * 16;
-    const int fa4 = 768 + j + kk[m] * 16;
-    dqdt[idx[m]] = -(acc[m] + sLift[j] * sFace[fa1] + sLift[i + 16] * sFace[fa2] +
-                     sLift[j + 32] * sFace[fa3] + sLift[i + 48] * sFace[fa4] +
-                     sLift[kk[m] + 64] * sFace[fa5] + sLift[kk[m] + 80] * sFace[fa6]);
+  for (int kk = 0; kk < 2; ++kk) {
+    const int k = kb + 8 * kk;
+    const double l5 = sLift[k + 64];
+    const double l6 = sLift[k + 80];
+    const double2 f1 = *reinterpret_cast<const double2 *>(sFace + i0 + k * 16);
+    const double2 f3 =
+        *reinterpret_cast<const double2 *>(sFace + 512 + i0 + k * 16);
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj) {
+      const int j = j0 + jj;
+      const double lf1 = sLift[j];
+      const double lf3 = sLift[j + 32];
+      const double f2 = sFace[256 + j + k * 16];
+      const double f4 = sFace[768 + j + k * 16];
+      const double2 f5 =
+          *reinterpret_cast<const double2 *>(sFace + 1024 + i0 + j * 16);
+      const double2 f6 =
+          *reinterpret_cast<const double2 *>(sFace + 1280 + i0 + j * 16);
+      *reinterpret_cast<double2 *>(dqdt + idx[jj][kk]) = make_double2(
+          -(a[jj][kk].x + lf1 * f1.x + l2.x * f2 + lf3 * f3.x + l4.x * f4 +
+            l5 * f5.x + l6 * f6.x),
+          -(a[jj][kk].y + lf1 * f1.y + l2.y * f2 + lf3 * f3.y + l4.y * f4 +
+            l5 * f5.y + l6 * f6.y));
+    }
   }
 }
 
@@ -226,6 +314,10 @@ __device__ double p31_face_flux_cc(int fidx, const double *__restrict__ q,
   return 0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
 }
 
+// p=31 CC xz: P31_CC_XZ_NJ j planes resident at once, single buffered, so
+// the two per-lane-distinct D1D loads of the inner product feed
+// 2 x P31_CC_XZ_NJ outputs. 512 threads at 128 registers is the ceiling;
+// widening to NJ = 8 spills (p31_gap_study.md sec 27).
 __global__ __launch_bounds__(P31_CC_XZ_THREADS, 1) void tendency_fused_p31_xz_cc_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
@@ -239,8 +331,8 @@ __global__ __launch_bounds__(P31_CC_XZ_THREADS, 1) void tendency_fused_p31_xz_cc
   double *sD1D = smem;
   double *sLift = sD1D + 1024;
   double *sQU = sLift + 192;
-  double *sQW = sQU + 2 * 1024;
-  double *sfz5 = sQW + 2 * 1024;
+  double *sQW = sQU + P31_CC_XZ_NJ * 1024;
+  double *sfz5 = sQW + P31_CC_XZ_NJ * 1024;
   double *sfz6 = sfz5 + 1024;
 
   const int elem = (int)blockIdx.x >> 1;
@@ -300,59 +392,80 @@ __global__ __launch_bounds__(P31_CC_XZ_THREADS, 1) void tendency_fused_p31_xz_cc
   const double lf6 = sLift[k + 160];
 
   int idx = elem_offset + i0 + j0 * 32 + k * 1024;
-  double2 qv = *reinterpret_cast<const double2 *>(q + idx);
-  double2 uv = *reinterpret_cast<const double2 *>(u + idx);
-  double2 wv = *reinterpret_cast<const double2 *>(w + idx);
 
-  for (int jl = 0; jl < 16; ++jl) {
-    const int j = j0 + jl;
-    const int buf = (jl & 1) * 1024;
-    *reinterpret_cast<double2 *>(sQU + buf + ik) =
-        make_double2(qv.x * uv.x, qv.y * uv.y);
-    *reinterpret_cast<double2 *>(sQW + buf + ik) =
-        make_double2(qv.x * wv.x, qv.y * wv.y);
-    if (jl + 1 < 16) {
-      const int idxn = idx + 32;
-      qv = *reinterpret_cast<const double2 *>(q + idxn);
-      uv = *reinterpret_cast<const double2 *>(u + idxn);
-      wv = *reinterpret_cast<const double2 *>(w + idxn);
+  for (int jp = 0; jp < 16 / P31_CC_XZ_NJ; ++jp) {
+    const int j = j0 + P31_CC_XZ_NJ * jp;
+    if (jp) {
+      __syncthreads();
+    }
+#pragma unroll
+    for (int jj = 0; jj < P31_CC_XZ_NJ; ++jj) {
+      const double2 qv =
+          *reinterpret_cast<const double2 *>(q + idx + 32 * jj);
+      const double2 uv =
+          *reinterpret_cast<const double2 *>(u + idx + 32 * jj);
+      const double2 wv =
+          *reinterpret_cast<const double2 *>(w + idx + 32 * jj);
+      *reinterpret_cast<double2 *>(sQU + 1024 * jj + ik) =
+          make_double2(qv.x * uv.x, qv.y * uv.y);
+      *reinterpret_cast<double2 *>(sQW + 1024 * jj + ik) =
+          make_double2(qv.x * wv.x, qv.y * wv.y);
     }
     __syncthreads();
 
-    double sx0 = 0.0, sx1 = 0.0, sz0 = 0.0, sz1 = 0.0;
+    double sx[P31_CC_XZ_NJ][2], sz[P31_CC_XZ_NJ][2];
+#pragma unroll
+    for (int jj = 0; jj < P31_CC_XZ_NJ; ++jj) {
+      sx[jj][0] = 0.0;
+      sx[jj][1] = 0.0;
+      sz[jj][0] = 0.0;
+      sz[jj][1] = 0.0;
+    }
     for (int l = 0; l < 32; ++l) {
-      const double qu = sQU[buf + l + k * 32];
       const double2 dxi = *reinterpret_cast<const double2 *>(sD1D + i0 + l * 32);
-      sx0 += dxi.x * qu;
-      sx1 += dxi.y * qu;
       const double dk = sD1D[k + l * 32];
-      const double2 qw =
-          *reinterpret_cast<const double2 *>(sQW + buf + i0 + l * 32);
-      sz0 += dk * qw.x;
-      sz1 += dk * qw.y;
+#pragma unroll
+      for (int jj = 0; jj < P31_CC_XZ_NJ; ++jj) {
+        const double qu = sQU[1024 * jj + l + k * 32];
+        sx[jj][0] += dxi.x * qu;
+        sx[jj][1] += dxi.y * qu;
+        const double2 qw =
+            *reinterpret_cast<const double2 *>(sQW + 1024 * jj + i0 + l * 32);
+        sz[jj][0] += dk * qw.x;
+        sz[jj][1] += dk * qw.y;
+      }
     }
 
-    const int src = (tid & 16) + (j >> 1);
-    const double fx2 = (j & 1) ? __shfl_sync(0xffffffff, fx2b, src)
-                               : __shfl_sync(0xffffffff, fx2a, src);
-    const double fx4 = (j & 1) ? __shfl_sync(0xffffffff, fx4b, src)
-                               : __shfl_sync(0xffffffff, fx4a, src);
-    const double2 ex = *reinterpret_cast<const double2 *>(Escale + idx);
-    const double2 ez =
-        *reinterpret_cast<const double2 *>(Escale + idx + 2 * npoint);
-    const double lf1 = sLift[j];
-    const double lf3 = sLift[j + 64];
-    *reinterpret_cast<double2 *>(dqdt + idx) = make_double2(
-        -(ex.x * sx0 + ez.x * sz0 + lf1 * fy1a + lf2a * fx2 + lf3 * fy3a +
-          lf4a * fx4 + lf5 * sfz5[i0 + j * 32] + lf6 * sfz6[i0 + j * 32]),
-        -(ex.y * sx1 + ez.y * sz1 + lf1 * fy1b + lf2b * fx2 + lf3 * fy3b +
-          lf4b * fx4 + lf5 * sfz5[i0 + 1 + j * 32] +
-          lf6 * sfz6[i0 + 1 + j * 32]));
-    idx += 32;
+#pragma unroll
+    for (int jj = 0; jj < P31_CC_XZ_NJ; ++jj) {
+      const int jc = j + jj;
+      const int src = (tid & 16) + (jc >> 1);
+      const double fx2 = (jc & 1) ? __shfl_sync(0xffffffff, fx2b, src)
+                                  : __shfl_sync(0xffffffff, fx2a, src);
+      const double fx4 = (jc & 1) ? __shfl_sync(0xffffffff, fx4b, src)
+                                  : __shfl_sync(0xffffffff, fx4a, src);
+      const double2 ex =
+          *reinterpret_cast<const double2 *>(Escale + idx + 32 * jj);
+      const double2 ez = *reinterpret_cast<const double2 *>(
+          Escale + idx + 32 * jj + 2 * npoint);
+      const double lf1 = sLift[jc];
+      const double lf3 = sLift[jc + 64];
+      *reinterpret_cast<double2 *>(dqdt + idx + 32 * jj) = make_double2(
+          -(ex.x * sx[jj][0] + ez.x * sz[jj][0] + lf1 * fy1a + lf2a * fx2 +
+            lf3 * fy3a + lf4a * fx4 + lf5 * sfz5[i0 + jc * 32] +
+            lf6 * sfz6[i0 + jc * 32]),
+          -(ex.y * sx[jj][1] + ez.y * sz[jj][1] + lf1 * fy1b + lf2b * fx2 +
+            lf3 * fy3b + lf4b * fx4 + lf5 * sfz5[i0 + 1 + jc * 32] +
+            lf6 * sfz6[i0 + 1 + jc * 32]));
+    }
+    idx += 32 * P31_CC_XZ_NJ;
   }
 }
-
-__global__ __launch_bounds__(P31_CC_Y_THREADS, 1) void tendency_fused_p31_y_cc_kernel(
+// p=31 CC y: 256 threads covering two k planes, each thread owning a
+// 2i x 4j tile, 4 blocks/SM. The per-lane-distinct panel load feeds eight
+// outputs and the four D1D rows are two 16 B broadcasts
+// (p31_gap_study.md sec 27).
+__global__ __launch_bounds__(P31_CC_Y_THREADS, P31_CC_Y_MINBLK) void tendency_fused_p31_y_cc_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
@@ -368,41 +481,64 @@ __global__ __launch_bounds__(P31_CC_Y_THREADS, 1) void tendency_fused_p31_y_cc_k
 
   const int tid = (int)threadIdx.x;
   const int i0 = 2 * (tid & 15);
-  const int j = tid >> 4;
-  const int ij = i0 + j * 32;
+  const int j0 = 4 * ((tid >> 4) & 7);
+  const int kp = tid >> 7;
+  const int ij = i0 + j0 * 32;
+  const int pbuf = kp * 1024;
   const int elem_offset = elem * 32768;
   const int npoint = 32768 * Ne;
 
   *reinterpret_cast<double2 *>(sD1D + 2 * tid) =
       *reinterpret_cast<const double2 *>(D1D + 2 * tid);
-  __syncthreads();
+  *reinterpret_cast<double2 *>(sD1D + 512 + 2 * tid) =
+      *reinterpret_cast<const double2 *>(D1D + 512 + 2 * tid);
 
-  for (int kl = 0; kl < 16; ++kl) {
-    const int idx = elem_offset + i0 + j * 32 + (k0 + kl) * 1024;
-    const int buf = (kl & 1) * 1024;
-    const double2 qv = *reinterpret_cast<const double2 *>(q + idx);
-    const double2 vv = *reinterpret_cast<const double2 *>(v + idx);
-    *reinterpret_cast<double2 *>(sQV + buf + ij) =
-        make_double2(qv.x * vv.x, qv.y * vv.y);
+  for (int kl = 0; kl < 16; kl += 2) {
+    const int idx = elem_offset + ij + (k0 + kl + kp) * 1024;
+    __syncthreads();
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const double2 qa =
+          *reinterpret_cast<const double2 *>(q + idx + 32 * jj);
+      const double2 va =
+          *reinterpret_cast<const double2 *>(v + idx + 32 * jj);
+      *reinterpret_cast<double2 *>(sQV + pbuf + ij + 32 * jj) =
+          make_double2(qa.x * va.x, qa.y * va.y);
+    }
     __syncthreads();
 
-    double sy0 = 0.0, sy1 = 0.0;
-    for (int l = 0; l < 32; ++l) {
-      const double dj = sD1D[j + l * 32];
-      const double2 fv =
-          *reinterpret_cast<const double2 *>(sQV + buf + i0 + l * 32);
-      sy0 += dj * fv.x;
-      sy1 += dj * fv.y;
+    double s[8];
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+      s[m] = 0.0;
     }
-    const double2 ey =
-        *reinterpret_cast<const double2 *>(Escale + idx + npoint);
-    double2 out = *reinterpret_cast<double2 *>(dqdt + idx);
-    out.x -= ey.x * sy0;
-    out.y -= ey.y * sy1;
-    *reinterpret_cast<double2 *>(dqdt + idx) = out;
+    for (int l = 0; l < 32; ++l) {
+      const double2 d01 =
+          *reinterpret_cast<const double2 *>(sD1D + j0 + l * 32);
+      const double2 d23 =
+          *reinterpret_cast<const double2 *>(sD1D + j0 + 2 + l * 32);
+      const double2 fv =
+          *reinterpret_cast<const double2 *>(sQV + pbuf + i0 + l * 32);
+      s[0] += d01.x * fv.x;
+      s[1] += d01.x * fv.y;
+      s[2] += d01.y * fv.x;
+      s[3] += d01.y * fv.y;
+      s[4] += d23.x * fv.x;
+      s[5] += d23.x * fv.y;
+      s[6] += d23.y * fv.x;
+      s[7] += d23.y * fv.y;
+    }
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const double2 ey = *reinterpret_cast<const double2 *>(
+          Escale + idx + 32 * jj + npoint);
+      double2 out = *reinterpret_cast<double2 *>(dqdt + idx + 32 * jj);
+      out.x -= ey.x * s[2 * jj];
+      out.y -= ey.y * s[2 * jj + 1];
+      *reinterpret_cast<double2 *>(dqdt + idx + 32 * jj) = out;
+    }
   }
 }
-
 // p=63 CC: one 64x64 plane per block. 512 threads x 8 consecutive k
 // (or j) fit 2 blocks/SM at 64 registers; 1024 threads were occupancy-1
 // and left LDS latency exposed. Natural-order panels (i fastest); not
