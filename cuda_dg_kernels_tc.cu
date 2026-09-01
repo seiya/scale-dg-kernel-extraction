@@ -1479,6 +1479,16 @@ __device__ __forceinline__ int sw31(int idx)
   return idx ^ (((idx >> 5) & 3) << 2);
 }
 
+// Programmatic Dependent Launch for the p=31 fused Tensor Core path.  Here the
+// stage is two grids, xz -> y (the face fluxes are evaluated inside xz), so
+// only the last rung of the p=127 ladder applies: y is made a PDL dependent of
+// xz and waits immediately before its only read of dqdt.
+//   0  ordinary stream order (control)
+//   1  y dependent on xz
+#ifndef P31_PDL_STAGE
+#define P31_PDL_STAGE 1
+#endif
+
 __device__ __forceinline__ double p31_face_flux_tc(
     int fidx, const double *q, const double *u, const double *v,
     const double *w, const int *VMapM, const int *VMapP,
@@ -1600,6 +1610,13 @@ __global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_xz_kernel(
                                VMapP, normal_fn, Fscale, nface);
   }
   __syncthreads();
+
+#if P31_PDL_STAGE >= 1
+  // The face phase above is this grid's only DRAM-latency block; let the y
+  // grid start now.  Its mma does not read dqdt, and the wait sits in front of
+  // the prefetch that does.
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 
   // Lift1D(Nq,6) varies in j for faces 1 and 3, in i for faces 2 and 4 and in
   // k for faces 5 and 6, so six of the eight coefficients this lane needs are
@@ -1736,6 +1753,10 @@ __global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_y_kernel(
 
   const int dqslot = 2 * tid;
   const int nidx0 = elem_offset + i0 + NQ31 * jout + (NQ31 * NQ31) * k0;
+#if P31_PDL_STAGE >= 1
+  // dqdt is what the xz grid writes, and this prefetch is the first read of it.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
   cp_async_16(sDQ + dqslot, dqdt + nidx0);
   asm volatile("cp.async.commit_group;\n" ::);
 
@@ -1785,8 +1806,25 @@ void launch_tendency_fused_p31_impl(
   tendency_fused_p31_xz_kernel<UseTc><<<2 * Ne, P31_THREADS, 0, dg_cuda_stream>>>(
       dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
       Ne);
+#if P31_PDL_STAGE >= 1
+  {
+    cudaLaunchConfig_t ycfg = {};
+    cudaLaunchAttribute yattr[1];
+    ycfg.gridDim = dim3(2 * Ne);
+    ycfg.blockDim = dim3(P31_THREADS);
+    ycfg.dynamicSmemBytes = 0;
+    ycfg.stream = dg_cuda_stream;
+    yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    yattr[0].val.programmaticStreamSerializationAllowed = 1;
+    ycfg.attrs = yattr;
+    ycfg.numAttrs = 1;
+    cudaLaunchKernelEx(&ycfg, tendency_fused_p31_y_kernel<UseTc>, dqdt, D1D, q,
+                       v, Escale, Ne);
+  }
+#else
   tendency_fused_p31_y_kernel<UseTc><<<2 * Ne, P31_THREADS, 0, dg_cuda_stream>>>(
       dqdt, D1D, q, v, Escale, Ne);
+#endif
   check_cuda("tendency_fused_p31 kernels");
 }
 
@@ -1952,6 +1990,51 @@ __device__ __forceinline__ int swu63(int idx)
 // and the y kernel reaches 64 with no spill where the xz kernel spills 128 to
 // 176 bytes and loses 8%.  Section 19 of p63_gap_study.md.
 
+// Programmatic Dependent Launch stage for the p=63 fused Tensor Core path.
+// The three grids of a stage are face flux -> xz -> y, the same shape p=127
+// has, so the same ladder applies (p127_gap_study.md section 19):
+//   0  C++ face kernel, ordinary stream order, no griddepcontrol  (control)
+//   1  face -> xz PDL, hint left implicit at face grid exit
+//   2  as 1 plus griddepcontrol.launch_dependents at the top of the face grid
+//   3  as 2 plus y made a PDL dependent of xz
+// Moving y's wait behind its first panel staging (a fifth rung) was measured
+// and is not a difference; see section 50.4 of p63_gap_study.md.
+#ifndef P63_PDL_STAGE
+#define P63_PDL_STAGE 3
+#endif
+
+// Same numerical flux as the Fortran elembnd_flux_kernel (pair_nq2 = 0).
+// Launched from C++ so it can hint PDL; the dependent xz kernel waits before
+// it reads flux_bnd.  HintFirst puts the hint at the top of the kernel instead
+// of leaving it implicit at grid exit, which is what lets the dependent grid
+// cover this one rather than only its tail (p127_gap_study.md section 19.1).
+template <bool HintFirst>
+__global__ void pdl_elembnd_flux_kernel(
+    double *__restrict__ flux, const double *__restrict__ q,
+    const double *__restrict__ u, const double *__restrict__ v,
+    const double *__restrict__ w, const int *__restrict__ VMapM,
+    const int *__restrict__ VMapP, const double *__restrict__ normal_fn,
+    const double *__restrict__ Fscale, int nface)
+{
+  if (HintFirst) {
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
+  const int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+  if (idx < nface) {
+    const int iM = VMapM[idx] - 1;
+    const int iP = VMapP[idx] - 1;
+    const double qM = q[iM];
+    const double qP = q[iP];
+    const double fn1 = normal_fn[idx];
+    const double fn2 = normal_fn[idx + nface];
+    const double fn3 = normal_fn[idx + 2 * nface];
+    const double VelM = u[iM] * fn1 + v[iM] * fn2 + w[iM] * fn3;
+    const double VelP = u[iP] * fn1 + v[iP] * fn2 + w[iP] * fn3;
+    const double alpha = 0.5 * fabs(VelP + VelM);
+    flux[idx] = 0.5 * Fscale[idx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+  }
+}
+
 template <bool UseTc>
 __global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
@@ -1997,6 +2080,12 @@ __global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_k
     ax[e] = 0.0;
     az[e] = 0.0;
   }
+
+#if P63_PDL_STAGE >= 3
+  // Let the y grid start.  Its mma does not read dqdt; the wait is in front of
+  // the only load that does, the epilogue's read-modify-write prefetch.
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 
   for (int kk = 0; kk < NQ63; kk += BK63) {
     // The barrier that protects the panels from being overwritten belongs at
@@ -2054,6 +2143,12 @@ __global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_k
       }
     }
   }
+
+#if P63_PDL_STAGE >= 1
+  // The epilogue below is the first thing that reads flux_bnd, so this is the
+  // latest point the face grid's stores have to be visible.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
 
   // j is block uniform, so the faces 1 and 3 coefficients and the whole (i,j)
   // face contribution are loop invariant.
@@ -2153,6 +2248,11 @@ __global__ __launch_bounds__(P63Y_THREADS, P63Y_BPSM) void tendency_fused_p63_y_
   // warps, and prefetching it takes that to 0.34.  Section 19.4.
   // The whole plane is 4096 doubles at eo + plane_off and the 512 threads
   // cover it exactly, four 16-byte slots each.
+#if P63_PDL_STAGE >= 3
+  // dqdt is what the xz grid writes, and the prefetch below is this kernel's
+  // only read of it, so this is the latest point the wait can sit.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
 #pragma unroll
   for (int e8 = 0; e8 < 2 * P63Y_TN; ++e8) {
     const int a = e8 / P63Y_TN;
@@ -2221,10 +2321,13 @@ __global__ __launch_bounds__(P63Y_THREADS, P63Y_BPSM) void tendency_fused_p63_y_
 template <bool UseTc>
 void launch_tendency_fused_p63_impl(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *v, const double *w, const double *flux_bnd,
-    const double *Escale, int Ne)
+    const double *u, const double *v, const double *w, double *flux_bnd,
+    const double *Escale, const int *VMapM, const int *VMapP,
+    const double *normal_fn, const double *Fscale, int nface, int Ne)
 {
   const int nblock = NQ63 * Ne;
+  constexpr int FACE_THREADS = 256;
+  const int nblock_face = (nface + FACE_THREADS - 1) / FACE_THREADS;
   const size_t smem_xz = 3 * NQ63 * BK63 * sizeof(double);
   const size_t smem_y = (2 * NQ63 * BK63 + NQ2_63) * sizeof(double);
   static bool opted_in = false;
@@ -2237,31 +2340,87 @@ void launch_tendency_fused_p63_impl(
                          (int)smem_y);
     opted_in = true;
   }
+#if P63_PDL_STAGE >= 1
+  constexpr bool HINT_FIRST = (P63_PDL_STAGE >= 2);
+  {
+    cudaLaunchConfig_t fcfg = {};
+    cudaLaunchAttribute fattr[1];
+    fcfg.gridDim = dim3(nblock_face);
+    fcfg.blockDim = dim3(FACE_THREADS);
+    fcfg.dynamicSmemBytes = 0;
+    fcfg.stream = dg_cuda_stream;
+    fattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    fattr[0].val.programmaticStreamSerializationAllowed = 1;
+    fcfg.attrs = fattr;
+    fcfg.numAttrs = 1;
+    cudaLaunchKernelEx(&fcfg, pdl_elembnd_flux_kernel<HINT_FIRST>, flux_bnd, q,
+                       u, v, w, VMapM, VMapP, normal_fn, Fscale, nface);
+  }
+  {
+    cudaLaunchConfig_t cfg = {};
+    cudaLaunchAttribute attr[1];
+    cfg.gridDim = dim3(nblock);
+    cfg.blockDim = dim3(P63_THREADS);
+    cfg.dynamicSmemBytes = (unsigned)smem_xz;
+    cfg.stream = dg_cuda_stream;
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, tendency_fused_p63_xz_kernel<UseTc>, dqdt, D1D,
+                       Lift1D, q, u, w, flux_bnd, Escale, Ne);
+  }
+#else
+  pdl_elembnd_flux_kernel<false>
+      <<<nblock_face, FACE_THREADS, 0, dg_cuda_stream>>>(
+          flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface);
   tendency_fused_p63_xz_kernel<UseTc>
       <<<nblock, P63_THREADS, smem_xz, dg_cuda_stream>>>(
           dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
+#endif
+#if P63_PDL_STAGE >= 3
+  {
+    cudaLaunchConfig_t ycfg = {};
+    cudaLaunchAttribute yattr[1];
+    ycfg.gridDim = dim3(nblock);
+    ycfg.blockDim = dim3(P63Y_THREADS);
+    ycfg.dynamicSmemBytes = (unsigned)smem_y;
+    ycfg.stream = dg_cuda_stream;
+    yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    yattr[0].val.programmaticStreamSerializationAllowed = 1;
+    ycfg.attrs = yattr;
+    ycfg.numAttrs = 1;
+    cudaLaunchKernelEx(&ycfg, tendency_fused_p63_y_kernel<UseTc>, dqdt, D1D, q,
+                       v, Escale, Ne);
+  }
+#else
   tendency_fused_p63_y_kernel<UseTc>
       <<<nblock, P63Y_THREADS, smem_y, dg_cuda_stream>>>(dqdt, D1D, q, v,
                                                          Escale, Ne);
+#endif
   check_cuda("tendency_fused_p63 kernels");
 }
 
 extern "C" void launch_tendency_fused_p63_dfma(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *v, const double *w, const double *flux_bnd,
-    const double *Escale, int Ne)
+    const double *u, const double *v, const double *w, double *flux_bnd,
+    const double *Escale, const int *VMapM, const int *VMapP,
+    const double *normal_fn, const double *Fscale, int nface, int Ne)
 {
   launch_tendency_fused_p63_impl<false>(dqdt, D1D, Lift1D, q, u, v, w, flux_bnd,
-                                        Escale, Ne);
+                                        Escale, VMapM, VMapP, normal_fn, Fscale,
+                                        nface, Ne);
 }
 
 extern "C" void launch_tendency_fused_p63_tc(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
-    const double *u, const double *v, const double *w, const double *flux_bnd,
-    const double *Escale, int Ne)
+    const double *u, const double *v, const double *w, double *flux_bnd,
+    const double *Escale, const int *VMapM, const int *VMapP,
+    const double *normal_fn, const double *Fscale, int nface, int Ne)
 {
   launch_tendency_fused_p63_impl<true>(dqdt, D1D, Lift1D, q, u, v, w, flux_bnd,
-                                       Escale, Ne);
+                                       Escale, VMapM, VMapP, normal_fn, Fscale,
+                                       nface, Ne);
 }
 
 //============================================================================
@@ -2697,35 +2856,6 @@ __global__ __launch_bounds__(P127_Y_THREADS, P127_Y_BPSM) void tendency_fused_p1
   }
 }
 
-// Same numerical flux as elembnd_flux_kernel (pair_nq2 = 0).  Launched from
-// C++ so it can hint PDL; the xz epilogue waits before reading flux_bnd.
-__global__ void p127_elembnd_flux_kernel(
-    double *__restrict__ flux, const double *__restrict__ q,
-    const double *__restrict__ u, const double *__restrict__ v,
-    const double *__restrict__ w, const int *__restrict__ VMapM,
-    const int *__restrict__ VMapP, const double *__restrict__ normal_fn,
-    const double *__restrict__ Fscale, int nface)
-{
-  // Hint the dependent xz grid immediately so its mma can cover this kernel.
-  // Correctness is the wait in the xz epilogue, which still waits for this
-  // grid's stores.  Hinting at the end (previous) only overlapped the tail.
-  asm volatile("griddepcontrol.launch_dependents;");
-  const int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-  if (idx < nface) {
-    const int iM = VMapM[idx] - 1;
-    const int iP = VMapP[idx] - 1;
-    const double qM = q[iM];
-    const double qP = q[iP];
-    const double fn1 = normal_fn[idx];
-    const double fn2 = normal_fn[idx + nface];
-    const double fn3 = normal_fn[idx + 2 * nface];
-    const double VelM = u[iM] * fn1 + v[iM] * fn2 + w[iM] * fn3;
-    const double VelP = u[iP] * fn1 + v[iP] * fn2 + w[iP] * fn3;
-    const double alpha = 0.5 * fabs(VelP + VelM);
-    flux[idx] = 0.5 * Fscale[idx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
-  }
-}
-
 template <bool UseTc>
 void launch_tendency_fused_p127_impl(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
@@ -2762,7 +2892,7 @@ void launch_tendency_fused_p127_impl(
     fattr[0].val.programmaticStreamSerializationAllowed = 1;
     fcfg.attrs = fattr;
     fcfg.numAttrs = 1;
-    cudaLaunchKernelEx(&fcfg, p127_elembnd_flux_kernel, flux_bnd, q, u, v, w,
+    cudaLaunchKernelEx(&fcfg, pdl_elembnd_flux_kernel<true>, flux_bnd, q, u, v, w,
                        VMapM, VMapP, normal_fn, Fscale, nface);
   }
   {
