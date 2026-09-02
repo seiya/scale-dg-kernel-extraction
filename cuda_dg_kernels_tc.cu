@@ -397,17 +397,22 @@ __global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
 // At that occupancy the un-pipelined loop lost more in exposed global latency
 // than the cheaper mma loop won, so the two changes only pay together.
 
-// Shared tiles are stored as l + 16*outer, l in bits 0-3 and outer in bits
-// 4-9.  Three different access patterns hit these arrays: the mma read (l from
+// Shared tiles are stored as l + BK*outer, l in the low log2(BK) bits and
+// outer above them.  Three different access patterns hit these arrays: the mma read (l from
 // lane%4, outer from lane/4), an outer-fast store (D1D and the y/z fluxes,
 // whose global source runs fastest in the outer index) and an l-fast store
 // (the x flux, whose source runs fastest in l).  Folding bits 4-5 into bits
 // 2-3 fixes the read, and folding bits 6-7 into bits 0-1 fixes the outer-fast
 // store; each fold is over bits the other pattern holds constant, so one
 // function makes all three conflict free at once.
+// LB = log2(BK) is where the outer index starts, so the two folds move with
+// the chunk width: BK = 16 reproduces the shifts 4 and 6 this was written with.
+template <int BK>
 __device__ __forceinline__ int sw255(int idx)
 {
-  return idx ^ (((idx >> 4) & 3) << 2) ^ (((idx >> 6) & 3) << 0);
+  constexpr int LB = (BK == 16) ? 4 : ((BK == 32) ? 5 : 6);
+  static_assert(BK == 16 || BK == 32 || BK == 64, "sw255 chunk width");
+  return idx ^ (((idx >> LB) & 3) << 2) ^ (((idx >> (LB + 2)) & 3) << 0);
 }
 
 // Epilogue: scale the accumulators by Escale, add the two lifted faces this
@@ -425,6 +430,22 @@ __device__ __forceinline__ int sw255(int idx)
 // at DIR=0 and 96 -> 48 at DIR=1/2, worth 8.7% of the kernel; an ablation that
 // strips the epilogue to a bare store prices what is left at 9.7%, which is
 // the Escale and dqdt traffic the numerical contract requires.
+// Illegal ablations that price an x+y fusion without paying its register bill.
+// Fusing the two directions would remove exactly two things: x's 16 MB store
+// into dqdt and y's 16 MB read back out of it.  The field these leave behind
+// is wrong; they are ceiling measurements only.
+//
+//   1: x's store predicated off and y's load replaced by zero.  Loose: with
+//      the store under a never-taken branch ptxas sinks the whole x epilogue
+//      into it (168 -> 110 registers), so it also deletes work a fusion keeps.
+//   2: x's store folded into one live-but-never-taken scalar store, which
+//      keeps every Escale / lift / face load and every flop.  Tight.
+//   3: y's dqdt read replaced by zero.  Tight on its own.
+//   4: 2 and 3 together -- the fusion's whole prize.
+#ifndef P255_XYFUSE_ABL
+#define P255_XYFUSE_ABL 0
+#endif
+
 template <int DIR, int BM, int BN, int TM, int TN>
 __device__ __forceinline__ void p255_epilogue(
     double *dqdt, const double *Lift1D, const double *flux_bnd,
@@ -453,6 +474,8 @@ __device__ __forceinline__ void p255_epilogue(
     }
   }
 
+  double xsink = 0.0;
+  (void)xsink;
   double2 dout[TM * TN];
   double2 esy[TM * TN];
   if (DIR != 0) {
@@ -464,7 +487,13 @@ __device__ __forceinline__ void p255_epilogue(
         const int m = m0 + 8 * (TM * wm + a) + row;
         const int node =
             (DIR == 2) ? (eo + n + NQ2 * m) : (eo + n + NQ * m + plane_off);
+#if P255_XYFUSE_ABL == 1 || P255_XYFUSE_ABL == 3 || P255_XYFUSE_ABL == 4
+        dout[TN * a + bb] =
+            (DIR == 1) ? make_double2(0.0, 0.0)
+                       : *reinterpret_cast<const double2 *>(dqdt + node);
+#else
         dout[TN * a + bb] = *reinterpret_cast<const double2 *>(dqdt + node);
+#endif
         esy[TN * a + bb] = *reinterpret_cast<const double2 *>(
             Escale + node + (DIR == 1 ? npoint : 2 * npoint));
       }
@@ -502,8 +531,16 @@ __device__ __forceinline__ void p255_epilogue(
         const double2 es = make_double2(es_pre[2 * e8], es_pre[2 * e8 + 1]);
         const double l0 = c0n.x * ra[a] + c1n.x * rb2[a];
         const double l1 = c0n.y * ra[a] + c1n.y * rb2[a];
+#if P255_XYFUSE_ABL == 1
+        if (npoint < 0)
+          *reinterpret_cast<double2 *>(dqdt + node) =
+              make_double2(-(es.x * c0 + l0), -(es.y * c1 + l1));
+#elif P255_XYFUSE_ABL == 2 || P255_XYFUSE_ABL == 4
+        xsink += -(es.x * c0 + l0) - (es.y * c1 + l1);
+#else
         *reinterpret_cast<double2 *>(dqdt + node) =
             make_double2(-(es.x * c0 + l0), -(es.y * c1 + l1));
+#endif
       } else {
         // Faces 1 and 3 vary in (i,k) and faces 5 and 6 in the linear (i,j)
         // point: here the pair shares the coefficient and the two flux values
@@ -516,6 +553,11 @@ __device__ __forceinline__ void p255_epilogue(
       }
     }
   }
+#if P255_XYFUSE_ABL == 2 || P255_XYFUSE_ABL == 4
+  if (DIR == 0 && xsink == 1.2345e300) {
+    dqdt[eo] = xsink;
+  }
+#endif
 }
 
 // DIR: 0 = x, 1 = y, 2 = z.
@@ -567,8 +609,16 @@ __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
   static_assert(THREADS == 32 * WM * WN, "warp grid must tile the block");
   static_assert(NA % 2 == 0 && NB % 2 == 0, "staging is vectorized");
 
+#if P255_DYNSMEM
+  // BK > 16 needs 2*(BM+BN)*BK doubles, which is past the 48 KB static limit.
+  extern __shared__ __align__(16) double p255_smem[];
+  double(*sA)[BM * BK] = reinterpret_cast<double(*)[BM * BK]>(p255_smem);
+  double(*sB)[BN * BK] =
+      reinterpret_cast<double(*)[BN * BK]>(p255_smem + 2 * BM * BK);
+#else
   __shared__ __align__(16) double sA[2][BM * BK];
   __shared__ __align__(16) double sB[2][BN * BK];
+#endif
 
   const int NQ = NQ255;
   const int NP = NQ * NQ * NQ;
@@ -627,7 +677,7 @@ __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
   // Hoisted shared addresses for the mma loop.  sw255 only ever touches the
   // low four bits of the index, so with l = 4*ks + colk and outer = 8*t + row
   //
-  //   sw255(l + 16*outer) = 16*outer + (colk ^ c) + ((4*ks) ^ ((row & 3) << 2))
+  //   sw255(l + BK*outer) = BK*outer + (colk ^ c) + ((4*ks) ^ ((row & 3) << 2))
   //
   // where c = (2*t + (row >> 2)) & 3: the three fields land in disjoint bits,
   // colk in 0-1, 4*ks in 2-3, 16*outer above.  Both terms are loop invariant.
@@ -638,12 +688,12 @@ __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
 #pragma unroll
   for (int a = 0; a < TM; ++a) {
     const int t = TM * wm + a;
-    abase[a] = 16 * (8 * t + row) + (colk ^ ((2 * t + (row >> 2)) & 3));
+    abase[a] = BK * (8 * t + row) + (colk ^ ((2 * t + (row >> 2)) & 3));
   }
 #pragma unroll
   for (int bb = 0; bb < TN; ++bb) {
     const int t = TN * wn + bb;
-    bbase[bb] = 16 * (8 * t + row) + (colk ^ ((2 * t + (row >> 2)) & 3));
+    bbase[bb] = BK * (8 * t + row) + (colk ^ ((2 * t + (row >> 2)) & 3));
   }
 #pragma unroll
   for (int ks = 0; ks < BK / 4; ++ks) {
@@ -708,7 +758,7 @@ __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
            goes out as one 16-byte store; the xor may swap the two halves. */ \
         const int ll = 2 * (pr % (BK / 2));                                   \
         const int o = pr / (BK / 2);                                          \
-        const int i0 = sw255(ll + 16 * o);                                    \
+        const int i0 = sw255<BK>(ll + BK * o);                                    \
         const double v0 = raq[2 * p] * rav[2 * p];                            \
         const double v1 = raq[2 * p + 1] * rav[2 * p + 1];                    \
         *reinterpret_cast<double2 *>(&sA[BUF][i0 & ~1]) =                     \
@@ -716,8 +766,8 @@ __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
       } else {                                                                \
         const int o = 2 * (pr % (BM / 2));                                    \
         const int ll = pr / (BM / 2);                                         \
-        const int i0 = sw255(ll + 16 * o);                                    \
-        const int i1 = sw255(ll + 16 * (o + 1));                              \
+        const int i0 = sw255<BK>(ll + BK * o);                                    \
+        const int i1 = sw255<BK>(ll + BK * (o + 1));                              \
         sA[BUF][pswap ? i1 : i0] = pswap ? raq[2 * p + 1] : raq[2 * p];       \
         sA[BUF][pswap ? i0 : i1] = pswap ? raq[2 * p] : raq[2 * p + 1];       \
       }                                                                       \
@@ -730,8 +780,8 @@ __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
       const double w0 = (DIR == 0) ? rb[2 * p] : rb[2 * p] * rbv[2 * p];      \
       const double w1 =                                                       \
           (DIR == 0) ? rb[2 * p + 1] : rb[2 * p + 1] * rbv[2 * p + 1];        \
-      const int j0 = sw255(ll + 16 * o);                                      \
-      const int j1 = sw255(ll + 16 * (o + 1));                                \
+      const int j0 = sw255<BK>(ll + BK * o);                                      \
+      const int j1 = sw255<BK>(ll + BK * (o + 1));                                \
       sB[BUF][pswap ? j1 : j0] = pswap ? w1 : w0;                             \
       sB[BUF][pswap ? j0 : j1] = pswap ? w0 : w1;                             \
     }                                                                         \
@@ -876,6 +926,29 @@ extern "C" void launch_tendency_fused_p7_tc(
                                       VMapP, normal_fn, Fscale, Escale, Ne);
 }
 
+#if P255_DYNSMEM
+#define P255_DYN_BYTES ((int)P255_SMEM_BYTES)
+#else
+#define P255_DYN_BYTES 0
+#endif
+
+// BK255 > 16 puts the two double-buffered panels past the 48 KB static limit,
+// so they move to dynamic shared memory and the opt-in has to be requested
+// once per instantiation.
+template <int DIR, bool UseTc, bool FuseFace24>
+static void p255_set_smem()
+{
+#if P255_DYNSMEM
+  static bool done = false;
+  if (!done) {
+    cudaFuncSetAttribute(tendency_p255_kernel<DIR, UseTc, FuseFace24>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         P255_DYN_BYTES);
+    done = true;
+  }
+#endif
+}
+
 template <bool UseTc>
 void launch_tendency_xyz_p255_impl(
     double *dqdt, const double *q, const double *u, const double *v,
@@ -883,13 +956,16 @@ void launch_tendency_xyz_p255_impl(
     const double *flux_bnd, const double *Escale, int Ne)
 {
   const int nblock = (NQ255 * NQ255 * NQ255 / (BM255 * BN255)) * Ne;
-  tendency_p255_kernel<0, UseTc, false><<<nblock, TH255, 0, dg_cuda_stream>>>(
+  p255_set_smem<0, UseTc, false>();
+  p255_set_smem<1, UseTc, false>();
+  p255_set_smem<2, UseTc, false>();
+  tendency_p255_kernel<0, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
       dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, v, w, nullptr, nullptr, nullptr,
       nullptr, Ne);
-  tendency_p255_kernel<1, UseTc, false><<<nblock, TH255, 0, dg_cuda_stream>>>(
+  tendency_p255_kernel<1, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
       dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, nullptr, nullptr, nullptr,
       nullptr, nullptr, nullptr, Ne);
-  tendency_p255_kernel<2, UseTc, false><<<nblock, TH255, 0, dg_cuda_stream>>>(
+  tendency_p255_kernel<2, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
       dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, nullptr, nullptr, nullptr,
       nullptr, nullptr, nullptr, Ne);
   check_cuda("p255 fused tendency kernels");
@@ -921,16 +997,19 @@ void launch_tendency_dir_p255_impl(
     const int *VMapP, const double *normal_fn, const double *Fscale, int Ne)
 {
   const int nblock = (NQ255 * NQ255 * NQ255 / (BM255 * BN255)) * Ne;
+  p255_set_smem<0, UseTc, true>();
+  p255_set_smem<1, UseTc, false>();
+  p255_set_smem<2, UseTc, false>();
   if (dir == 0) {
-    tendency_p255_kernel<0, UseTc, true><<<nblock, TH255, 0, dg_cuda_stream>>>(
+    tendency_p255_kernel<0, UseTc, true><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
         dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, v, w, VMapM, VMapP, normal_fn,
         Fscale, Ne);
   } else if (dir == 1) {
-    tendency_p255_kernel<1, UseTc, false><<<nblock, TH255, 0, dg_cuda_stream>>>(
+    tendency_p255_kernel<1, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
         dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, v, w, VMapM, VMapP, normal_fn,
         Fscale, Ne);
   } else {
-    tendency_p255_kernel<2, UseTc, false><<<nblock, TH255, 0, dg_cuda_stream>>>(
+    tendency_p255_kernel<2, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
         dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, v, w, VMapM, VMapP, normal_fn,
         Fscale, Ne);
   }

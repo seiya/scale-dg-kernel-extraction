@@ -153,10 +153,28 @@
 #define NQ255 256
 #define BM255 64
 #define BN255 64
+// p=255 fused Tensor Core chunk width and register budget.  BK255 is the
+// reduction chunk the two shared panels hold; MINB255 is the second
+// __launch_bounds__ argument.  Section 26.3 of p255_gap_study.md measures
+// them; every setting other than the default lost, so the defaults below are
+// production.  BK255 = 32 halves the chunk count (and hence the barriers) but
+// doubles both the shared panels (64 KB, which forces dynamic shared memory)
+// and the prefetch registers (48 -> 96).  It does fit -- 255 registers with no
+// spill at MINB255 = 2 -- but buying that budget costs 9.79% of the stage and
+// the halved barrier count returns nothing: at MINB255 = 2 the BK = 32 form is
+// 1.10% slower than BK = 16, because the barrier was never the bound (barrier
+// stall 3370 against math_pipe 21450 and wait 17870 in the production form).
+// At MINB255 = 3 it spills 100 bytes and costs 31.35%.
+#ifndef BK255
 #define BK255 16
+#endif
 #define TM255 4
 #define TN255 4
 #define TH255 128
+#ifndef MINB255
 #define MINB255 3
+#endif
+#define P255_SMEM_BYTES ((size_t)2 * (BM255 + BN255) * BK255 * sizeof(double))
+#define P255_DYNSMEM (BK255 > 16)
 
 #endif
