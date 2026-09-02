@@ -1349,6 +1349,13 @@ elembnd、OpenACC は volume wall + elembnd）。
 この日の namelist `CUDAFORTRAN_FUSED` は iso-schedule DFMA である。
 旧 Fortran 融合（device 〜324 µs）は CC 最適の旧測であり、DFMA の 427.8 µs とは並べない。
 
+**（追記 2026-09-02）本節の `FUSED_DFMA` 427.8 µs を p=7 の表の値とする。**
+§17 に同じ量の別測定 **424.1 µs**（同日・同 conf・login 3-run 中央値）があり、
+差は 0.87% で 3-run のばらつきの範囲だが、[`README.md`](README.md) の p=7 表の
+他の行（`OPENACC_*`・`SPLIT`・`FUSED_TC`・`GEMM`）は**本節の同一セット**から
+来ているので、行間の比較を別測定の混合にしないために本節の値を採る。
+メカニズム比は 274.9 / 427.8 = 1.56×、§17 の分母では 1.57× で結論は同じ。
+
 ## 16. p=7 TC: z の shared 往復の天井（2026-08-29、不採用）
 
 Fortran 融合がレジスタで z を完結していることの取り分を、p=15 §14.3 と同じ
@@ -1391,7 +1398,9 @@ C++ に戻した。login GPU 1、`conf_perf_p7.conf` の `DqdtKernel_Type` だ�
 | `CUDAFORTRAN_FUSED_TC` | 1.074 | 274.9 |
 
 CC 326.8 µs は旧 Fortran 〜324 µs と同水準。論文の主比は **TC / FUSED = 1.19×**、
-メカニズム比 TC / DFMA は 1.54×。点変化係数、`Ne=2³`、`nstep=1` の owned `dqdt`
+メカニズム比 TC / DFMA は 1.54×。**（追記 2026-09-02）この表の `FUSED_DFMA` 424.1 µs は
+§15 の 427.8 µs と同じ量の別測定である**（差 0.87%）。表の値としては §15 の
+427.8 を採る（理由は §15 の追記）。ここの 424.1 は測定として残す。点変化係数、`Ne=2³`、`nstep=1` の owned `dqdt`
 は `FUSED` と `FUSED_TC` がビット一致、`CUDAFORTRAN_SPLIT` との最大絶対差
 1.78e-15。
 
