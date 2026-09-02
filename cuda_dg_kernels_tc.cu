@@ -490,6 +490,297 @@ __global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
       make_double2(-(acc0 + lift0), -(acc1 + lift1));
 }
 
+// Output-tile (A) variant of the kernel above: one warp owns P7_TC_KP k
+// planes instead of one, so the block has 256/KP threads and every thread
+// holds 2*KP outputs.  It is a separate function, not a template parameter of
+// the production kernel, because the production kernel sits at exactly 32
+// registers with 8 blocks per SM and any restructuring of its two node loads
+// or its epilogue costs it a spill.  Measured in section 23 of
+// reports/tc_paper_survey_2407.09621.md.
+template <bool UseTc>
+__global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_tile_kernel(
+    double *dqdt, const double *D1D, const double *Lift1D, const double *q,
+    const double *u, const double *v, const double *w, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale,
+    const double *Escale, int Ne)
+{
+  __shared__ __align__(16) double sDfrag[64];
+  __shared__ __align__(16) double sLift[48];
+  __shared__ __align__(16) double sflux_bnd[384];
+  // M-side q, u, v and w of the two x-normal faces, indexed by face point.
+  // Fmask gives faces 2 and 4 the nodes 8j + 64k with i fixed, so a warp of
+  // consecutive face points gathers with a stride of 8 doubles and puts every
+  // lane in its own sector: 32 sectors per warp instruction where the y- and
+  // z-normal faces need 8.  ncu (job 49589, source page) attributed all
+  // 24.77 M excessive load sectors of this kernel to those four gathers.  The
+  // values are already in registers here, because the same element's volume
+  // loads produced them, so the two planes are staged instead of re-read.
+  // Field-major with a padded plane stride of 72, so that a face-point warp
+  // reads 32 consecutive doubles and the two planes of one store phase do not
+  // land on the same bank.
+#if !P7_ABL_NOSTAGE
+  __shared__ __align__(16) double sMface[4 * 144];
+#endif
+  __shared__ __align__(16) double sFluxX[512], sFluxY[512], sFluxZ[512];
+  // The z derivative overwrites the z flux it consumes, so the block needs
+  // 15.87 KB instead of 20 KB. See the aliasing note above.
+  double *const sDz = sFluxZ;
+
+  const int elem = (int)blockIdx.x;
+  if (elem >= Ne) {
+    return;
+  }
+  const int tid = (int)threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  constexpr int KP = P7_TC_KP;
+  constexpr int THR = P7_THREADS;
+  constexpr int NWARP = P7_NWARP;
+  const int elem_offset = elem * 512;
+  const int face_offset = elem * 384;
+  const int npoint = 512 * Ne;
+  const int nface = 384 * Ne;
+
+  // 64 fragment elements and 48 lift coefficients.  With 112 threads or more
+  // the one-shot form the production kernel uses is kept verbatim; only KP = 4
+  // (64 threads) needs the strided loop, and writing it that way for every KP
+  // cost 4% at KP = 2.
+  if constexpr (THR >= 112) {
+    if (tid < 64) {
+      const int r = (tid >> 2) & 7;
+      const int c = tid & 3;
+      const int b = tid >> 5;
+      sDfrag[tid] = D1D[r + (b * 4 + c) * 8];
+    } else if (tid < 112) {
+      sLift[tid - 64] = Lift1D[tid - 64];
+    }
+  } else {
+    for (int t = tid; t < 112; t += THR) {
+      if (t < 64) {
+        const int r = (t >> 2) & 7;
+        const int c = t & 3;
+        const int b = t >> 5;
+        sDfrag[t] = D1D[r + (b * 4 + c) * 8];
+      } else {
+        sLift[t - 64] = Lift1D[t - 64];
+      }
+    }
+  }
+  // One thread owns 2*KP nodes: KP = 1 is the two nodes tid and tid + 256 the
+  // production form has always used.
+#pragma unroll
+  for (int t = 0; t < 2 * KP; ++t) {
+    const int node = tid + t * THR;
+    const int idx = elem_offset + node;
+    const double qn = q[idx], un = u[idx], vn = v[idx], wn = w[idx];
+    sFluxX[P7_STXY(node)] = qn * un;
+    sFluxY[P7_STXY(node)] = qn * vn;
+    sFluxZ[P7_STZ(node)] = qn * wn;
+#if !P7_ABL_NOSTAGE
+    stage_xface(sMface, node, qn, un, vn, wn);
+#endif
+  }
+  // sMface is filled by whichever thread owns the node, which is not the
+  // thread that reads it as a face point.
+  __syncthreads();
+
+  // 384 face points covered THR at a time.  At THR = 256 this unrolls to the
+  // two passes the production form was written as: the whole 0-255 range and
+  // then faces 5 and 6 under tid < 128.  Faces 5 and 6 keep the global gather,
+  // because Fmask gives them 32 consecutive nodes per warp, which is already
+  // the ideal sector count.
+#pragma unroll
+  for (int f = 0; f < NFPTOT7; f += THR) {
+    const int fp = tid + f;
+    if (fp >= NFPTOT7) {
+      continue;
+    }
+    const int fidx = face_offset + fp;
+    // Face points 64-127 are face 2 and 192-255 are face 4, so bit 6 of fp
+    // selects the x-normal faces and bit 7 selects which of the two planes.
+    const int iP = VMapP[fidx] - 1;
+    const double fn1 = normal_fn[fidx];
+    const double fn2 = normal_fn[fidx + nface];
+    const double fn3 = normal_fn[fidx + 2 * nface];
+    double qM, VelM;
+#if P7_ABL_NOSTAGE
+    {
+      const int iM = VMapM[fidx] - 1;
+      qM = q[iM];
+      VelM = u[iM] * fn1 + v[iM] * fn2 + w[iM] * fn3;
+    }
+#else
+    if (fp < 256 && (fp & 64) != 0) {
+      const double *const m =
+          sMface + (((fp & 128) != 0) ? XFACE_PLANE : 0) + (fp & 63);
+      qM = m[0];
+      VelM = m[144] * fn1 + m[288] * fn2 + m[432] * fn3;
+    } else {
+      const int iM = VMapM[fidx] - 1;
+      qM = q[iM];
+      VelM = u[iM] * fn1 + v[iM] * fn2 + w[iM] * fn3;
+    }
+#endif
+    const double qP = q[iP];
+    const double VelP = u[iP] * fn1 + v[iP] * fn2 + w[iP] * fn3;
+    const double alpha = 0.5 * fabs(VelP + VelM);
+    sflux_bnd[fp] =
+        0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+  }
+  __syncthreads();
+
+  const int row = lane >> 2;
+  const int colk = lane & 3;
+  const int j0_c = colk * 2;
+  // The A operand of the z contraction and the D1D operand of the x and y
+  // contractions are the same fragment element, D1D[row][colk].
+  const int frag = (row << 2) + colk;
+#if P7_TC_DREG
+  // Section 14 held these two D1D fragment elements in registers and lost:
+  // ptxas had to spill to stay inside the 32-register budget the KP = 1 form
+  // needs for 8 blocks per SM.  The KP = 2 tile has 80 registers, and it also
+  // issues the x/y mma pair KP times, so the reload count this saves is 2*KP,
+  // not 2.  Section 23.9 measures it.
+  const double dfrag0 = sDfrag[frag];
+  const double dfrag1 = sDfrag[frag + 32];
+#define P7_DF0 dfrag0
+#define P7_DF1 dfrag1
+#else
+#define P7_DF0 sDfrag[frag]
+#define P7_DF1 sDfrag[frag + 32]
+#endif
+
+  // Every paired shared access below derives the second address from the first
+  // with one XOR by a constant, instead of swizzling a second index.  The
+  // k0 = 4 operand differs from the k0 = 0 one in a single index bit that no
+  // swizzle here reads, and the c1 accumulator element is one node away from
+  // the c0 one, which sw_dz() leaves in place. Section 11 of
+  // reports/tc_paper_survey_2407.09621.md records what this bought.
+
+  // Dz = D * Fz_panel; warp owns 8 (i,j) columns, all k.  k0 = 4 sets bit 8 of
+  // the node index, above the bits sw_z() folds.  The z panel is contracted
+  // first because it is the only derivative that has to travel through shared
+  // memory: its two barriers then sit before the x and y accumulators exist.
+  // With KP > 1 a warp owns KP column groups; all KP results have to be in
+  // registers before the barrier, because the store overwrites the flux the
+  // mma read.
+  double cz0[KP], cz1[KP];
+#pragma unroll
+  for (int cc = 0; cc < KP; ++cc) {
+    const int wcol = warp + NWARP * cc;
+    const int fz = sw_z(((wcol << 3) + row) + (colk << 6));
+    mma_reset(cz0[cc], cz1[cc]);
+    mma_k8_8x8<UseTc>(cz0[cc], cz1[cc], P7_DF0, sFluxZ[fz],
+                      P7_DF1, sFluxZ[fz ^ 256]);
+  }
+  // sw_z() and sw_dz() permute across warp boundaries, so the z panel needs a
+  // block-wide barrier before it overwrites the flux it was read from.
+  __syncthreads();
+#if (P7_ABL_SHST & 4)
+  static_assert(KP == 1, "the shared-store ablation is written for KP == 1");
+  sDz[tid] = cz0[0];
+  sDz[tid + 256] = cz1[0];
+#else
+#pragma unroll
+  for (int cc = 0; cc < KP; ++cc) {
+    const int wcol = warp + NWARP * cc;
+    const int dz_c = sw_dz(((wcol << 3) + j0_c) + (row << 6));
+    sDz[dz_c] = cz0[cc];
+    sDz[dz_c ^ 1] = cz1[cc];
+  }
+#endif
+  __syncthreads();
+
+  // The x and y derivatives never go through shared memory: the thread that
+  // computes them is the thread that assembles them.  That removes four shared
+  // stores and four shared loads per thread together with their address
+  // arithmetic, and it leaves sFluxX and sFluxY read-only for the whole
+  // kernel, so the two __syncwarp() calls that used to guard the in-place
+  // overwrite are gone.
+  //
+  // Both contractions are evaluated transposed, C = (D*Fx)^T and C = (Fy*D^T)^T,
+  // which costs nothing: with m8n8k4 the transpose is the same two operand
+  // values passed in the opposite order.  It is what makes the epilogue
+  // coalesce.  The accumulator holds C[lane>>2][2*(lane&3)] and its neighbour,
+  // so the untransposed form gave thread lane the nodes
+  //   (lane>>2) + 16*(lane&3) + 64*warp  and  + 8,
+  // whose warp footprint is four 64-byte runs spread over 448 bytes: same
+  // sectors as a contiguous access but twice the cache lines, and measurably
+  // slower on a kernel that sits at 95% L1/TEX.  Transposed, the same thread
+  // owns nodes 2*tid and 2*tid + 1, so a warp covers 64 consecutive nodes and
+  // each of q's neighbours in the epilogue is one aligned 16-byte access.
+  // KP k planes per warp: k = warp for the production form.
+#pragma unroll
+  for (int kk = 0; kk < KP; ++kk) {
+  const int k = warp + NWARP * kk;
+  const int n0 = (k << 6) + (lane << 1);
+  const int nidx0 = elem_offset + n0;
+  double c0, c1;
+
+  // Dx^T = (D * Fx)^T on this k-plane.  sw_xy() flips bit 2 as a function of
+  // bit 4, and k0 = 4 sets bit 2 of the node index, so the operands are fx and
+  // fx^4.
+  double acc0, acc1;
+  {
+    const int fx = sw_xy(colk + (row << 3) + (k << 6));
+    const double2 es = *reinterpret_cast<const double2 *>(Escale + nidx0);
+    mma_reset(c0, c1);
+    mma_k8_8x8<UseTc>(c0, c1, sFluxX[fx], P7_DF0, sFluxX[fx ^ 4],
+                      P7_DF1);
+    acc0 = es.x * c0;
+    acc1 = es.y * c1;
+  }
+
+  // Dy^T = (Fy * D^T)^T.  k0 = 4 sets bit 5 of the node index here, again a
+  // bit sw_xy() does not read.
+  {
+    const int fy = sw_xy(row + (colk << 3) + (k << 6));
+    const double2 es =
+        *reinterpret_cast<const double2 *>(Escale + nidx0 + npoint);
+    mma_reset(c0, c1);
+    mma_k8_8x8<UseTc>(c0, c1, P7_DF0, sFluxY[fy], P7_DF1,
+                      sFluxY[fy ^ 32]);
+    acc0 += es.x * c0;
+    acc1 += es.y * c1;
+  }
+
+  // sw_dz() folds bit 6 into bit 3 and n0 is even, so the second node of the
+  // pair is the neighbour of the first in sDz as well.
+  {
+    const double2 dz = *reinterpret_cast<const double2 *>(sDz + sw_dz(n0));
+    const double2 es =
+        *reinterpret_cast<const double2 *>(Escale + nidx0 + 2 * npoint);
+    acc0 += es.x * dz.x;
+    acc1 += es.y * dz.y;
+  }
+
+  // The node pair differs in i only, so faces 2 and 4 (which vary in j) and
+  // the lift coefficients that go with them are shared between the two, while
+  // faces 1, 3, 5 and 6 shift by one face point.
+  const int i0 = colk * 2;
+  const int face1 = i0 + (k << 3);
+  const int face2 = 64 + row + (k << 3);
+  const int face5 = 256 + (n0 & 63);
+  const double lf1 = sLift[row];
+  const double lf3 = sLift[row + 16];
+  const double lf5 = sLift[k + 32];
+  const double lf6 = sLift[k + 40];
+  const double fb2 = sflux_bnd[face2];
+  const double fb4 = sflux_bnd[face2 + 128];
+  const double lift0 = lf1 * sflux_bnd[face1] + sLift[i0 + 8] * fb2 +
+                       lf3 * sflux_bnd[face1 + 128] + sLift[i0 + 24] * fb4 +
+                       lf5 * sflux_bnd[face5] + lf6 * sflux_bnd[face5 + 64];
+  const double lift1 = lf1 * sflux_bnd[face1 + 1] + sLift[i0 + 9] * fb2 +
+                       lf3 * sflux_bnd[face1 + 129] + sLift[i0 + 25] * fb4 +
+                       lf5 * sflux_bnd[face5 + 1] + lf6 * sflux_bnd[face5 + 65];
+
+  *reinterpret_cast<double2 *>(dqdt + nidx0) =
+      make_double2(-(acc0 + lift0), -(acc1 + lift1));
+  }
+#undef P7_DF0
+#undef P7_DF1
+}
+
 // p=255 (Nq=256) tendency, one direction per launch.
 //
 // Every direction is written as the transposed product
@@ -1023,7 +1314,11 @@ void launch_tendency_fused_p7_impl(
     const int *VMapP, const double *normal_fn, const double *Fscale,
     const double *Escale, int Ne)
 {
+#if P7_TC_KP > 1
+  tendency_fused_p7_tile_kernel<UseTc><<<Ne, P7_THREADS, 0, dg_cuda_stream>>>(
+#else
   tendency_fused_p7_kernel<UseTc><<<Ne, P7_THREADS, 0, dg_cuda_stream>>>(
+#endif
       dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
       Ne);
   check_cuda("tendency_fused_p7_kernel");

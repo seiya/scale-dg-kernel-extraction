@@ -10,12 +10,37 @@
 #define NQ7 8
 #define NP7 512
 #define NFPTOT7 384
-#define P7_THREADS 256
+// Output tile (A) knob for the p=7 TC kernel.  P7_TC_KP is how many k planes
+// one warp owns.  KP = 1 is the form this kernel had until section 23 of
+// reports/tc_paper_survey_2407.09621.md: 256 threads, 2 outputs per thread,
+// 32 registers and 8 blocks per SM, i.e. 100% occupancy with the register
+// file exactly full.  KP = 2 halves the thread count to 128 and gives every
+// thread 4 outputs; at 80 registers and 6 blocks per SM (37.5% occupancy)
+// that is 7.15% of the stage, so it is the production form.  KP = 4 (64
+// threads, 8 outputs) is +10.5% and ends the ladder.  P7_BPSM is the register
+// budget (B) that has to come with the tile: at the KP = 2 tile, 8 blocks per
+// SM is +6.6% and 5 blocks is -0.5%, both against the same 6-block form.
+#ifndef P7_TC_KP
+#define P7_TC_KP 2
+#endif
+#define P7_THREADS (256 / P7_TC_KP)
+#define P7_NWARP (P7_THREADS / 32)
 // Overridable so the out-of-role m16n8k8 ablation below can be built at all:
 // ptxas refuses "mma with .f64 type and shape .m16n8k8" under the 32-register
 // target that __launch_bounds__(256, 8) implies.
 #ifndef P7_BPSM
+#if P7_TC_KP == 1
 #define P7_BPSM 8
+#else
+#define P7_BPSM 6
+#endif
+#endif
+// Section 23.9: hold the two D1D fragment elements in registers instead of
+// reloading them from sDfrag for every mma.  Section 14 rejected this at
+// KP = 1 because the 32-register budget forced a spill; the KP = 2 budget is
+// 80, so the premise changed and it was measured again.
+#ifndef P7_TC_DREG
+#define P7_TC_DREG 0
 #endif
 // Out-of-role ablation knob, default 0 = the production m8n8k4 schedule.
 // 1 replaces each pair of mma.sync.m8n8k4 in the p=7 kernel with one
@@ -165,8 +190,12 @@
 #define P127_XZ_NBUF (P127_XZ_DB + 1)
 
 #define NQ255 256
+#ifndef BM255
 #define BM255 64
+#endif
+#ifndef BN255
 #define BN255 64
+#endif
 // p=255 fused Tensor Core chunk width and register budget.  BK255 is the
 // reduction chunk the two shared panels hold; MINB255 is the second
 // __launch_bounds__ argument.  Section 26.3 of p255_gap_study.md measures
@@ -182,9 +211,15 @@
 #ifndef BK255
 #define BK255 16
 #endif
+#ifndef TM255
 #define TM255 4
+#endif
+#ifndef TN255
 #define TN255 4
+#endif
+#ifndef TH255
 #define TH255 128
+#endif
 #ifndef MINB255
 #define MINB255 3
 #endif
