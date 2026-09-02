@@ -245,7 +245,7 @@ __device__ __forceinline__ void stage_xface(double *sM, int node, double q,
 }
 
 template <bool UseTc>
-__global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
+__global__ __launch_bounds__(P7_THREADS, TCDFMA_BPSM(P7_BPSM, P7_BPSM_DFMA)) void tendency_fused_p7_kernel(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
@@ -498,7 +498,7 @@ __global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
 // or its epilogue costs it a spill.  Measured in section 23 of
 // reports/tc_paper_survey_2407.09621.md.
 template <bool UseTc>
-__global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_tile_kernel(
+__global__ __launch_bounds__(P7_THREADS, TCDFMA_BPSM(P7_BPSM, P7_BPSM_DFMA)) void tendency_fused_p7_tile_kernel(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
@@ -998,7 +998,7 @@ __device__ __forceinline__ void p255_epilogue(
 //     launch-bound combination that fits: 10-35% slower, all of them through
 //     registers and occupancy, never through the operand traffic they save.
 template <int DIR, bool UseTc, bool FuseFace24>
-__global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
+__global__ __launch_bounds__(TH255, TCDFMA_BPSM(MINB255, MINB255_DFMA)) void tendency_p255_kernel(
     double *__restrict__ dqdt, const double *__restrict__ q,
     const double *__restrict__ velocity, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ flux_bnd,
@@ -1626,7 +1626,7 @@ __device__ __forceinline__ int sw_f15(int fp)
   }
 
 template <bool UseTc>
-__global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_kernel(
+__global__ __launch_bounds__(P15_THREADS, TCDFMA_BPSM(P15_MINB, P15_MINB_DFMA)) void tendency_fused_p15_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ v,
@@ -2167,7 +2167,7 @@ __device__ __forceinline__ double p31_face_flux_tc(
 // buffer before the mma of jl reads its own, so the loop needs one barrier per
 // plane instead of two.  Section 30 of p31_gap_study.md has the measurements.
 template <bool UseTc>
-__global__ __launch_bounds__(P31_XZ_THREADS, P31_XZ_MINB) void
+__global__ __launch_bounds__(P31_XZ_THREADS, TCDFMA_BPSM(P31_XZ_MINB, P31_XZ_MINB_DFMA)) void
 tendency_fused_p31_xz_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
@@ -2595,7 +2595,7 @@ __device__ __forceinline__ int ystsh(int idx, int t)
 }
 
 template <bool UseTc>
-__global__ __launch_bounds__(P31_Y_THREADS, P31_Y_MINB) void
+__global__ __launch_bounds__(P31_Y_THREADS, TCDFMA_BPSM(P31_Y_MINB, P31_Y_MINB_DFMA)) void
 tendency_fused_p31_y_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
@@ -3059,7 +3059,7 @@ __global__ void pdl_elembnd_flux_kernel(
 }
 
 template <bool UseTc>
-__global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_kernel(
+__global__ __launch_bounds__(P63_THREADS, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFMA)) void tendency_fused_p63_xz_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ w,
@@ -3299,7 +3299,7 @@ __global__ __launch_bounds__(P63_THREADS, P63_BPSM) void tendency_fused_p63_xz_k
 // which is the z contraction of the first kernel with (i,j) in place of (i,k),
 // so the same two panel shapes and the same swizzle serve it.
 template <bool UseTc>
-__global__ __launch_bounds__(P63Y_THREADS, P63Y_BPSM) void tendency_fused_p63_y_kernel(
+__global__ __launch_bounds__(P63Y_THREADS, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_DFMA)) void tendency_fused_p63_y_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
@@ -3658,7 +3658,7 @@ __device__ __forceinline__ int sw127(int idx)
 // because this kernel holds x and z at once.  See section 23 of
 // p127_gap_study.md for the sweep.
 template <bool UseTc>
-__global__ __launch_bounds__(P127_XZ_THREADS, P127_XZ_MINB) void tendency_fused_p127_xz_kernel(
+__global__ __launch_bounds__(P127_XZ_THREADS, TCDFMA_BPSM(P127_XZ_MINB, P127_XZ_MINB_DFMA)) void tendency_fused_p127_xz_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ w,
@@ -3927,7 +3927,7 @@ __global__ __launch_bounds__(P127_XZ_THREADS, P127_XZ_MINB) void tendency_fused_
 // kernel with (i,j) in place of (i,k), so only the A panel of the two is
 // needed and the block holds 64 KB.
 template <bool UseTc>
-__global__ __launch_bounds__(P127_Y_THREADS, P127_Y_BPSM) void tendency_fused_p127_y_kernel(
+__global__ __launch_bounds__(P127_Y_THREADS, TCDFMA_BPSM(P127_Y_BPSM, P127_Y_BPSM_DFMA)) void tendency_fused_p127_y_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
