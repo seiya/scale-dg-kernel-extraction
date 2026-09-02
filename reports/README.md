@@ -35,31 +35,73 @@ Namelist は `namelists/`、Slurm ジョブは `jobs/` に移し、名前を揃�
 | [`index64_boundary_validation.md`](index64_boundary_validation.md) | 高次数の host-side extent / pointer offset を64-bit安全化。p=7/15/511 の全 owned `dqdt` は変更前後でビット一致、device SASSも一致。性能差は −0.19%〜+0.02%で既存経路への影響なし |
 | [`p31_gap_study.md`](p31_gap_study.md) | 同一 DOF の 6 点目にして最後の点 p=31 (Nq=32)。**最速は `CUDAFORTRAN_FUSED_TC`**（§14、374.8 µs/stage；§16 device 359.7）。**§18–19（2026-08-30）は残り天井を測って探索終了**：xz は `lg_throttle`、y は `mio_throttle`。面 2,4 の天井 −17.8% に対し実装 4 形は +25.6% / +25.6% / ±0 / +31.5%。占有率 50% はスピルまたは `lg_throttle` 増で +25〜29%。採用ゼロ。Nq=32 の Tensor Core 融合カーネル 2 本で CUDA core 融合版の **2.66 倍**、`GEMM` の 1.67 倍。x と z が同じ出力写像を共有するので z の shared 往復が無く、転置形にすると D1D がレジスタに載る。**「p=31 は曲線の極大点」「融合が勝つ上限は p=15」という当初の結論はこれで否定された**（§14.2、§14.1 に訂正注記）。Nq=32 の CUDA core 融合カーネル 2 本、CUTLASS 経路は p=31 で使えるという訂正、**lift と assembly の融合で `GEMM` / `GEMM_CUTE` 経路を全次数 1 割速く**した（p=31 −11.7%、p=63 −12.0%、p=127 −10.2%、ビット一致）。**§20（2026-08-30）は CC 融合 `FUSED` を 992.5 → 718.2 µs/stage（−27.6%、ビット一致）**。**§21–22 の 599.9 µs は cuBLAS-z + separate-lift hybrid で範囲外。§23 は役割を訂正し、共有Nq=32 y tileとface schedulingで準拠 `GEMM_FUSED`を 865.5 → 709.2 µs/stage（−18.1%）**。最速はTCのまま 。**§25（2026-09-01）は PDL 横展開。面は xz 内で評価するので当たるのは「y を xz の PDL 従属にする」段だけで、357.4 → 354.7 µs/stage（−0.76%、job `75804`/`75806`、レンジ非重複、24/24・12/12、ビット一致）**。**§26（同日）は面 2,4 の M 側直アドレスを xz カーネル内で測って +2.48%（job `75832`、0/12、レンジ非重複）で不採用**。命令は −0.31% なのに遅く `No Eligible` が増える —— 消した `VMapM` の coalesced ロードが、占有率 25% のこのカーネルではレイテンシ隠蔽の原資だった。§18–19 の 4 形に続く 5 形目。**§27（同日）は p=255 CC の「1 スレッド複数出力によるオペランド共有」と「レジスタ予算を先に決める」を横展開して CC 融合 `FUSED` を 718.2 → 503.4 µs/stage（−29.9%、job `75854`、12/12 対、レンジ非重複、ビット一致）**: xz を 2i×4j（4 j 平面常駐・先読み放棄）、y を 2i×4j（256 スレッド / 2 k 平面 / 4 ブロック/SM）にすると shared wavefront が xz −35% / y −59%、命令が −17% / −31% 減り、global セクタは 1 本も動かない。**2i×8j は 128 レジスタ天井を超えてスピルし +3.1% に反転する**（DRAM write +27%、bank conflict 12 倍）——「タイルを広げると遅い」という §20.4 の見立ては予算の内側では逆になる。y の 4i×2j は bank が 4-way に落ちて +15%。主比 TC / FUSED は 2.00× → **1.40×**、対 DFMA は 1.10× → 1.57× 。**§28（同日）は `Nq>64` の z epilogue 4 つを p=31 に開こうとして採用ゼロ**：16 B lift +0.94%（job `75869`、12/12、レンジ非重複）、クランプ +2.8%、16 B epilogue +13.9%、3 つ揃えると **+69.1%**。ncu job `75870` は命令が −5.9% なのに時間 2.17 倍で、レジスタ 254 の z が `double2` の lift ステージングを置けず 16.3 M 回スピルする（p=7 は 128 → 164 でスピル 0）。「命令発行律速だから命令を減らせば速い」はレジスタ予算に余裕のある次数でだけ成り立つ |
 
-## 経路の役割（2026-08-29 以降）
+## 経路の役割 —— 何が固定で、何が測定か
 
-最速を取りに行く本番経路は次数ごとの `CUDAFORTRAN_GEMM_FUSED` または
-`CUDAFORTRAN_FUSED_TC` である。融合経路は論文用に 3 つある。GB200 では
-FP64 Tensor Core ピークが CUDA core ピークと同じ（40.1 TFLOP/s）なので、
-iso-schedule の DFMA 置換は屋根の引き上げではない。
+規約の正文は [`AGENTS.md`](../AGENTS.md) の "Implementation Path Roles"。
+ここはその人間向けの解説である。`cbc6cea`（2026-09-02）で、規約が測定を
+先回りして禁じていた箇所を整理した。その整理から `GEMM_FUSED` が
+p=31 で −23.0%、p=7 で −15.2% 出ている（[`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md)）。
 
-固定するものと測るもの:
+### 経路名は契約であって説明ラベルではない
 
-- **B. `CUDAFORTRAN_FUSED` 対 `CUDAFORTRAN_FUSED_TC`**: 同じ数値契約の融合。
-  前者は CUDA core 向けスケジュール（自然順 shared、長さ `Nq` の内積）、
-  後者は本番 Tensor Core。論文の主比。`FUSED` は独立に最速レースしない。
-  namelist `FUSED` は CC カーネルだけを起動する。`FUSED_DFMA` で代行しない。
-- **A. `CUDAFORTRAN_FUSED_TC` 対 `CUDAFORTRAN_FUSED_DFMA`**: 同一
-  `cuda_dg_kernels_tc.cu` で内積だけ MMA / DFMA。メカニズム節用。DFMA は
-  独立に最速化しない。
+**数値の正しさと経路の同一性は独立した 2 要件**で、production に出すには両方が要る。
 
-- `CUDAFORTRAN_GEMM_CUTE`: `GEMM_FUSED` と同じ volume GEMM 本体（mainloop
-  タイルと volume GEMM ごとのライブラリ割り当てを共有）で、融合エピローグが
-  無い版。`GEMM` との差はライブラリ、`GEMM_FUSED` との差は融合パッケージ。
-  割り当ては次数ごとの測定で決まる（`gemm_assignment_and_carrier.md`）。
-  かつての「`Nq<=64` では x を cuBLAS」は 2026-09-02 に全次数で覆った。
+1. 数値契約（点ごとの係数、全 6 面、halo）を守っていること
+2. `DqdtKernel_Type` が指す**経路の定義どおりの実装**であること
 
-`CUDAFORTRAN_GEMM_OZAKI1` / `_OZAKI2` は未融合 `GEMM` と同じ周囲で volume
-GEMM だけを差し替える。cuBLAS native および `CublasEmulation` との比較用。
+全点一致、ビット一致であっても、証明されるのは 1 だけである。ライブラリの
+差し替えも、エピローグの分離も、別アルゴリズムも、それだけでは 2 を満たさない。
+**速い実装に名前を付け替えてよい、という運用にはしない。**
+
+### 論文の 2 本の主比
+
+GB200 では FP64 Tensor Core ピークが CUDA core ピークと同じ（40.1 TFLOP/s）
+なので、iso-schedule の DFMA 置換は屋根の引き上げではない。
+
+- **主比 B: `CUDAFORTRAN_FUSED` 対 `CUDAFORTRAN_FUSED_TC`** —— CUDA core と
+  Tensor Core の比較。実用の答え。
+- **主比 A: `CUDAFORTRAN_FUSED_TC` 対 `CUDAFORTRAN_FUSED_DFMA`** —— 同一ソースで
+  内積だけ MMA / DFMA。機構の答え（速さのどこまでが mma 命令で、どこからが
+  そのために組んだ日程か）。
+
+### 経路ごとの固定と自由
+
+| 経路 | 固定（役割そのもの） | 測定で決まる（自由） |
+|---|---|---|
+| `FUSED` | CUDA core の実装様式（自然順 shared パネル、長さ `Nq` の内積）。TC のフラグメントレイアウトや z の shared 往復を持ち込まない | **速度は全力で追う。** 本番経路であり最適化対象 |
+| `FUSED_TC` | `cuda_dg_kernels_tc.cu`、`UseTc=true`（`mma.sync.m8n8k4`） | 同上 |
+| `FUSED_DFMA` | `FUSED_TC` と同一ソース、`UseTc=false`。内積以外で乖離させたら defect | 独立に最速化はしない（`FUSED_TC` の変更が自動的に入る） |
+| `GEMM` | 未融合、volume GEMM は cuBLAS。周辺カーネルの**分割を GEMM 系 5 経路で共有** | 周辺カーネルの**速度**。共有起動ヘルパ経由で直せば 5 経路に同時に入る |
+| `GEMM_OZAKI1/2` | `GEMM` と同一ドライバ。差し替えるのは volume GEMM 3 本だけ | Ozaki の中身 |
+| `GEMM_CUTE` | 未融合。`GEMM_FUSED` と mainloop タイル・stage 数・swizzle・batch 分割・次数特化・**ライブラリ割り当て**を共有。エピローグは重みなしで `separable_lift_assembly` を別カーネルで回す | 共有される側の設定すべて（ただし `GEMM_FUSED` と同時に） |
+| `GEMM_FUSED` | **3 本の volume GEMM のうち最後のものが**最終の体積重み付けと面 lift/assembly をエピローグに融合する。担い手は cuBLAS になれない | **どの GEMM が担い手か。** 各 GEMM をどのライブラリで回すか。融合パッケージの中身 |
+
+**`FUSED` について 1 点。** 「TC の実装を取り込むな」は速度の制限ではない。
+その形は既に `FUSED_DFMA` として測ってあり、両者を同じにすると
+**iso-schedule アブレーションという列が 1 本消える**（主比 A が失われる）。
+論文の CC 列は「CC 系で最速の経路」であって `FUSED` 固有の属性ではないので、
+仮に TC 日程の方が速くなったら、答えは `FUSED` を書き換えることではなく
+**`FUSED_DFMA` を CC 最速として報告すること**である。実測では
+`FUSED` が全次数で `FUSED_DFMA` より速いので、この制約は何も犠牲にしていない。
+
+**`GEMM` の周辺カーネルについて 1 点。** 共有は「凍結」ではない。GEMM 系は
+論文のライブラリ・ベースラインなので、**弱いベースラインは融合側の勝ちを
+過大に見せる**。周辺カーネルは速くしてよく、実際そうしてきた
+（`volume_flux_kernel` 150 → 125.9 µs など）。ただし共有起動ヘルパを直して
+5 経路に同時に入れる。
+
+**閾値は規約に書かない。** 「`Nq<=64` では x を cuBLAS」のような分岐は、
+規約ではなく**その時点で最速と測れた割り当て**である。実際それは 2026-09-02 に
+全次数で覆った（x に次数専用タイルが無かったことの症状だった）。現在の割り当ては
+gap study が記録する。
+
+### 役割外のアブレーション
+
+天井を測るために役割外の変種を作ってよい。ただし **(a) 範囲外と明記し、
+(b) 性能と機構を記録し、(c) production dispatch から外す**。その数字を
+名前付き経路の本番結果として公表したり、最速表の更新に使ったりしない。
+経路の定義を変えるには `AGENTS.md` の当該節を明示的に編集する必要がある
+——「速かったから」は定義変更の許可ではない。
 
 下の「現時点の結論」と各レポートの表は書かれた時点の値のまま残す。
 
