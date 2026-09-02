@@ -98,6 +98,52 @@ extern cudaStream_t dg_cuda_stream;
 #define P127_CC_Y_NJ (4096 / (P127_CC_Y_THREADS * P127_CC_Y_TI))
 #define P127_CC_Y_STAGE (64 * P127_CC_Y_BK / P127_CC_Y_THREADS)
 #define P255_CC_BPE 65536
+// p=255 CC output tile / register budget knobs.  Section 26.6 of
+// p255_gap_study.md sweeps them; the defaults below are what it adopted
+// (1874.3 -> 1525.0 us/stage, -18.63%, bit identical).  P255_CC_{X,Y}_TI and
+// P255_CC_Z_TL are how many i (line, for z) a thread owns -- the j/k count is
+// four in all three kernels -- and the MINB knobs are the second
+// __launch_bounds__ argument, i.e. the register budget the tile needs.  The
+// old form was TI = 2 with minBlocks = 8 (64 registers, 50% occupancy), which
+// is section 15.68-15.76; this is the next rung of that same ladder, and it
+// stops here (TI = 16 does not fit y's static shared and loses 5-22% in x and
+// z).  P255_CC_ZDG is the rejected form of section 26.5: z reads D1D with
+// __ldg instead of staging it, which halves shared wavefronts but multiplies
+// global requests by 5.2 because z's D index rides threadIdx.y.
+#ifndef P255_CC_ZDG
+#define P255_CC_ZDG 0
+#endif
+#ifndef P255_CC_Z_TL
+#define P255_CC_Z_TL 8
+#endif
+#ifndef P255_CC_Z_MINB
+#define P255_CC_Z_MINB 2
+#endif
+// Same ladder for x and y: P255_CC_{X,Y}_TI is how many i a thread owns (the
+// j count is 4 in both), P255_CC_{X,Y}_MINB the register budget that has to
+// come with it.
+#ifndef P255_CC_X_TI
+#define P255_CC_X_TI 8
+#endif
+#ifndef P255_CC_X_MINB
+#define P255_CC_X_MINB 3
+#endif
+#ifndef P255_CC_Y_TI
+#define P255_CC_Y_TI 8
+#endif
+#ifndef P255_CC_Y_MINB
+#define P255_CC_Y_MINB 2
+#endif
+#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 6
+#define P255_QV(G) (1.0)
+#else
+#define P255_QV(G) (q[G] * velocity[G])
+#endif
+#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 5
+#define P255_D(I) (1.0)
+#else
+#define P255_D(I) (D1D[I])
+#endif
 #ifndef P255_CC_ABLATE
 #define P255_CC_ABLATE 0
 #endif
@@ -1125,36 +1171,52 @@ __global__ __launch_bounds__(P127_CC_Y_THREADS, P127_CC_Y_MINBLK) void tendency_
 
 // One thread writes two outputs so the K-reduction reuses one D/Q operand
 // (ncu 66860: L1/TEX 98%; inner 16→1 is 5058→2188 µs).  128 threads/block.
-__global__ __launch_bounds__(128, 8) void tendency_x_p255_cc_kernel(
+// One thread owns P255_CC_X_TI values of i and four of j, so the K-reduction
+// reuses one shared flux operand across the i it holds (ncu 66860: L1/TEX 98%;
+// inner 16->1 is 5058->2188 us).  128 threads/block.  TI = 2 with eight
+// accumulators and eight blocks per SM was sections 15.60 / 15.75; TI = 8 with
+// 168 registers is section 26.6, worth 9.25% of the stage on its own.  The
+// same tile at the old 64-register budget is +18.4%, which is the (B) sign
+// rule: the budget has to come with the tile.
+__global__ __launch_bounds__(128, P255_CC_X_MINB)
+void tendency_x_p255_cc_kernel(
     double *dqdt, const double *q, const double *velocity, const double *D1D,
     const double *Lift1D, const double *flux_bnd, const double *Escale, int Ne)
 {
+  constexpr int TI = P255_CC_X_TI;
   __shared__ double sQ0[33 * 16];
   __shared__ double sQ1[33 * 16];
 
   const int tx = (int)threadIdx.x;
   const int ty = (int)threadIdx.y;
   const int block0 = (int)blockIdx.x;
-  const int nblock_pe = P255_CC_BPE / 4;
+  const int nblock_pe = (P255_CC_BPE / 2) / TI;
   const int elem = block0 / nblock_pe;
   if (elem >= Ne) {
     return;
   }
+  constexpr int NPAIR = 256 / (16 * TI);
   int local_block = block0 % nblock_pe;
-  const int k = local_block / 64;
-  local_block %= 64;
-  const int quad_j = local_block / 8;
-  const int pair_i = local_block % 8;
-  const int i0 = pair_i * 32 + tx;
-  const int i1 = i0 + 16;
+  const int k = local_block / (8 * NPAIR);
+  local_block %= 8 * NPAIR;
+  const int quad_j = local_block / NPAIR;
+  const int pair_i = local_block % NPAIR;
+  int iv[TI];
+#pragma unroll
+  for (int u = 0; u < TI; ++u) {
+    iv[u] = pair_i * (16 * TI) + tx + 16 * u;
+  }
   const int j0 = quad_j * 32 + ty;
-  const int j1 = j0 + 8;
-  const int j2 = j0 + 16;
-  const int j3 = j0 + 24;
   const int elem_offset = elem * 16777216;
 
-  double s00 = 0.0, s01 = 0.0, s02 = 0.0, s03 = 0.0;
-  double s10 = 0.0, s11 = 0.0, s12 = 0.0, s13 = 0.0;
+  double acc[TI][4];
+#pragma unroll
+  for (int u = 0; u < TI; ++u) {
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+      acc[u][a] = 0.0;
+    }
+  }
   for (int ltile = 0; ltile < 8; ++ltile) {
 #if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 6
     sQ0[ty * 33 + tx] = 1.0;
@@ -1171,17 +1233,17 @@ __global__ __launch_bounds__(128, 8) void tendency_x_p255_cc_kernel(
     sQ0[ty * 33 + tx] = q[gidx] * velocity[gidx];
     gidx = elem_offset + (l + 16) + j0 * 256 + k * 65536;
     sQ0[ty * 33 + tx + 16] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + l + j1 * 256 + k * 65536;
+    gidx = elem_offset + l + (j0 + 8) * 256 + k * 65536;
     sQ0[(ty + 8) * 33 + tx] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + (l + 16) + j1 * 256 + k * 65536;
+    gidx = elem_offset + (l + 16) + (j0 + 8) * 256 + k * 65536;
     sQ0[(ty + 8) * 33 + tx + 16] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + l + j2 * 256 + k * 65536;
+    gidx = elem_offset + l + (j0 + 16) * 256 + k * 65536;
     sQ1[ty * 33 + tx] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + (l + 16) + j2 * 256 + k * 65536;
+    gidx = elem_offset + (l + 16) + (j0 + 16) * 256 + k * 65536;
     sQ1[ty * 33 + tx + 16] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + l + j3 * 256 + k * 65536;
+    gidx = elem_offset + l + (j0 + 24) * 256 + k * 65536;
     sQ1[(ty + 8) * 33 + tx] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + (l + 16) + j3 * 256 + k * 65536;
+    gidx = elem_offset + (l + 16) + (j0 + 24) * 256 + k * 65536;
     sQ1[(ty + 8) * 33 + tx + 16] = q[gidx] * velocity[gidx];
 #endif
 #if P255_CC_ABLATE != 4
@@ -1194,25 +1256,30 @@ __global__ __launch_bounds__(128, 8) void tendency_x_p255_cc_kernel(
     for (int t = 0; t < 32; ++t)
 #endif
     {
+      double d[TI];
 #if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 5
-      const double d0 = 1.0;
-      const double d1 = 1.0;
+#pragma unroll
+      for (int u = 0; u < TI; ++u) {
+        d[u] = 1.0;
+      }
 #else
-      const double d0 = __ldg(D1D + i0 + (ltile * 32 + t) * 256);
-      const double d1 = __ldg(D1D + i1 + (ltile * 32 + t) * 256);
+#pragma unroll
+      for (int u = 0; u < TI; ++u) {
+        d[u] = __ldg(D1D + iv[u] + (ltile * 32 + t) * 256);
+      }
 #endif
-      const double f0 = sQ0[ty * 33 + t];
-      const double f1 = sQ0[(ty + 8) * 33 + t];
-      const double f2 = sQ1[ty * 33 + t];
-      const double f3 = sQ1[(ty + 8) * 33 + t];
-      s00 += d0 * f0;
-      s01 += d0 * f1;
-      s02 += d0 * f2;
-      s03 += d0 * f3;
-      s10 += d1 * f0;
-      s11 += d1 * f1;
-      s12 += d1 * f2;
-      s13 += d1 * f3;
+      double f[4];
+      f[0] = sQ0[ty * 33 + t];
+      f[1] = sQ0[(ty + 8) * 33 + t];
+      f[2] = sQ1[ty * 33 + t];
+      f[3] = sQ1[(ty + 8) * 33 + t];
+#pragma unroll
+      for (int u = 0; u < TI; ++u) {
+#pragma unroll
+        for (int a = 0; a < 4; ++a) {
+          acc[u][a] += d[u] * f[a];
+        }
+      }
     }
 #if P255_CC_ABLATE != 4
     if (ltile + 1 < 8) {
@@ -1221,139 +1288,111 @@ __global__ __launch_bounds__(128, 8) void tendency_x_p255_cc_kernel(
 #endif
   }
 
-  const int fp0 = j0 + k * 256;
-  const int fp1 = j1 + k * 256;
-  const int fp2 = j2 + k * 256;
-  const int fp3 = j3 + k * 256;
   const int elem_face_offset = elem * 6 * 65536;
 #if P255_CC_ABLATE == 3
-  int idx = elem_offset + i0 + j0 * 256 + k * 65536;
-  dqdt[idx] = -s00;
-  idx = elem_offset + i0 + j1 * 256 + k * 65536;
-  dqdt[idx] = -s01;
-  idx = elem_offset + i0 + j2 * 256 + k * 65536;
-  dqdt[idx] = -s02;
-  idx = elem_offset + i0 + j3 * 256 + k * 65536;
-  dqdt[idx] = -s03;
-  idx = elem_offset + i1 + j0 * 256 + k * 65536;
-  dqdt[idx] = -s10;
-  idx = elem_offset + i1 + j1 * 256 + k * 65536;
-  dqdt[idx] = -s11;
-  idx = elem_offset + i1 + j2 * 256 + k * 65536;
-  dqdt[idx] = -s12;
-  idx = elem_offset + i1 + j3 * 256 + k * 65536;
-  dqdt[idx] = -s13;
+#pragma unroll
+  for (int u = 0; u < TI; ++u) {
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+      const int idx = elem_offset + iv[u] + (j0 + 8 * a) * 256 + k * 65536;
+      dqdt[idx] = -acc[u][a];
+    }
+  }
 #else
-  const double lift00 =
-      Lift1D[i0 + 256] * flux_bnd[elem_face_offset + 65536 + fp0] +
-      Lift1D[i0 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp0];
-  const double lift01 =
-      Lift1D[i0 + 256] * flux_bnd[elem_face_offset + 65536 + fp1] +
-      Lift1D[i0 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp1];
-  const double lift02 =
-      Lift1D[i0 + 256] * flux_bnd[elem_face_offset + 65536 + fp2] +
-      Lift1D[i0 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp2];
-  const double lift03 =
-      Lift1D[i0 + 256] * flux_bnd[elem_face_offset + 65536 + fp3] +
-      Lift1D[i0 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp3];
-  const double lift10 =
-      Lift1D[i1 + 256] * flux_bnd[elem_face_offset + 65536 + fp0] +
-      Lift1D[i1 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp0];
-  const double lift11 =
-      Lift1D[i1 + 256] * flux_bnd[elem_face_offset + 65536 + fp1] +
-      Lift1D[i1 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp1];
-  const double lift12 =
-      Lift1D[i1 + 256] * flux_bnd[elem_face_offset + 65536 + fp2] +
-      Lift1D[i1 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp2];
-  const double lift13 =
-      Lift1D[i1 + 256] * flux_bnd[elem_face_offset + 65536 + fp3] +
-      Lift1D[i1 + 3 * 256] * flux_bnd[elem_face_offset + 3 * 65536 + fp3];
-  int idx = elem_offset + i0 + j0 * 256 + k * 65536;
-  dqdt[idx] = -(__ldg(Escale + idx) * s00 + lift00);
-  idx = elem_offset + i0 + j1 * 256 + k * 65536;
-  dqdt[idx] = -(__ldg(Escale + idx) * s01 + lift01);
-  idx = elem_offset + i0 + j2 * 256 + k * 65536;
-  dqdt[idx] = -(__ldg(Escale + idx) * s02 + lift02);
-  idx = elem_offset + i0 + j3 * 256 + k * 65536;
-  dqdt[idx] = -(__ldg(Escale + idx) * s03 + lift03);
-  idx = elem_offset + i1 + j0 * 256 + k * 65536;
-  dqdt[idx] = -(__ldg(Escale + idx) * s10 + lift10);
-  idx = elem_offset + i1 + j1 * 256 + k * 65536;
-  dqdt[idx] = -(__ldg(Escale + idx) * s11 + lift11);
-  idx = elem_offset + i1 + j2 * 256 + k * 65536;
-  dqdt[idx] = -(__ldg(Escale + idx) * s12 + lift12);
-  idx = elem_offset + i1 + j3 * 256 + k * 65536;
-  dqdt[idx] = -(__ldg(Escale + idx) * s13 + lift13);
+  double fb1[4], fb3[4];
+#pragma unroll
+  for (int a = 0; a < 4; ++a) {
+    const int fp = (j0 + 8 * a) + k * 256;
+    fb1[a] = flux_bnd[elem_face_offset + 65536 + fp];
+    fb3[a] = flux_bnd[elem_face_offset + 3 * 65536 + fp];
+  }
+#pragma unroll
+  for (int u = 0; u < TI; ++u) {
+    const double c1 = Lift1D[iv[u] + 256];
+    const double c3 = Lift1D[iv[u] + 3 * 256];
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+      const double lift = c1 * fb1[a] + c3 * fb3[a];
+      const int idx = elem_offset + iv[u] + (j0 + 8 * a) * 256 + k * 65536;
+      dqdt[idx] = -(__ldg(Escale + idx) * acc[u][a] + lift);
+    }
+  }
 #endif
 }
 
-__global__ __launch_bounds__(128, 8) void tendency_y_p255_cc_kernel(
+// y holds sD double buffered and P255_CC_Y_TI shared flux planes; a thread
+// owns TI values of i and four of j.  TI = 2 with eight accumulators and eight
+// blocks per SM was sections 15.69 / 15.74 / 15.80 / 15.92; TI = 8 with 168
+// registers is section 26.6, worth 5.92% of the stage on its own.  TI = 16
+// would need 64 KB of static shared and cannot be built.
+__global__ __launch_bounds__(128, P255_CC_Y_MINB)
+void tendency_y_p255_cc_kernel(
     double *dqdt, const double *q, const double *velocity, const double *D1D,
     const double *Lift1D, const double *flux_bnd, const double *Escale, int Ne)
 {
+  constexpr int TI = P255_CC_Y_TI;
   __shared__ double sD[2][16 * 32];
-  __shared__ double sQ0[2][16 * 16];
-  __shared__ double sQ1[2][16 * 16];
+  __shared__ double sQ[TI][2][16 * 16];
 
   const int tx = (int)threadIdx.x;
   const int ty = (int)threadIdx.y;
   const int block0 = (int)blockIdx.x;
-  const int nblock_pe = P255_CC_BPE / 4;
+  const int nblock_pe = (P255_CC_BPE / 2) / TI;
   const int elem = block0 / nblock_pe;
   if (elem >= Ne) {
     return;
   }
+  constexpr int NPAIR = 256 / (16 * TI);
   int local_block = block0 % nblock_pe;
-  const int k = local_block / 64;
-  local_block %= 64;
-  const int quad_j = local_block / 8;
-  const int pair_i = local_block % 8;
-  const int i0 = pair_i * 32 + tx;
-  const int i1 = i0 + 16;
+  const int k = local_block / (8 * NPAIR);
+  local_block %= 8 * NPAIR;
+  const int quad_j = local_block / NPAIR;
+  const int pair_i = local_block % NPAIR;
+  int iv[TI];
+#pragma unroll
+  for (int u = 0; u < TI; ++u) {
+    iv[u] = pair_i * (16 * TI) + tx + 16 * u;
+  }
   const int j0 = quad_j * 32 + ty;
-  const int j1 = j0 + 8;
-  const int j2 = j0 + 16;
-  const int j3 = j0 + 24;
   const int jbase = quad_j * 32;
   const int elem_offset = elem * 16777216;
 
-  double s00 = 0.0, s01 = 0.0, s02 = 0.0, s03 = 0.0;
-  double s10 = 0.0, s11 = 0.0, s12 = 0.0, s13 = 0.0;
+  double acc[TI][4];
+#pragma unroll
+  for (int u = 0; u < TI; ++u) {
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+      acc[u][a] = 0.0;
+    }
+  }
   int p = 0;
   int ft = 0;
-#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 5
-    sD[p][ty * 32 + tx] = 1.0;
-    sD[p][ty * 32 + tx + 16] = 1.0;
-    sD[p][(ty + 8) * 32 + tx] = 1.0;
-    sD[p][(ty + 8) * 32 + tx + 16] = 1.0;
-#else
-    sD[p][ty * 32 + 2 * (tx & 7) + (tx >> 3)] =
-        D1D[jbase + tx + (ft * 16 + ty) * 256];
-    sD[p][ty * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =
-        D1D[jbase + 16 + tx + (ft * 16 + ty) * 256];
-    sD[p][(ty + 8) * 32 + 2 * (tx & 7) + (tx >> 3)] =
-        D1D[jbase + tx + (ft * 16 + ty + 8) * 256];
-    sD[p][(ty + 8) * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =
-        D1D[jbase + 16 + tx + (ft * 16 + ty + 8) * 256];
-#endif
-#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 6
-    sQ0[p][ty * 16 + tx] = 1.0;
-    sQ0[p][(ty + 8) * 16 + tx] = 1.0;
-    sQ1[p][ty * 16 + tx] = 1.0;
-    sQ1[p][(ty + 8) * 16 + tx] = 1.0;
-#else
-    const int l0 = ft * 16 + ty;
-    int gidx = elem_offset + i0 + l0 * 256 + k * 65536;
-    sQ0[p][ty * 16 + tx] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + i0 + (l0 + 8) * 256 + k * 65536;
-    sQ0[p][(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + i1 + l0 * 256 + k * 65536;
-    sQ1[p][ty * 16 + tx] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + i1 + (l0 + 8) * 256 + k * 65536;
-    sQ1[p][(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
-#endif
+#define P255_Y_FILL                                                           \
+  do {                                                                        \
+    _Pragma("unroll") for (int u = 0; u < TI; ++u)                            \
+    {                                                                         \
+      const int l0 = ft * 16 + ty;                                            \
+      int gidx = elem_offset + iv[u] + l0 * 256 + k * 65536;                  \
+      sQ[u][p][ty * 16 + tx] = P255_QV(gidx);                                 \
+      gidx = elem_offset + iv[u] + (l0 + 8) * 256 + k * 65536;                \
+      sQ[u][p][(ty + 8) * 16 + tx] = P255_QV(gidx);                           \
+    }                                                                         \
+  } while (0)
+#define P255_Y_FILLD                                                          \
+  do {                                                                        \
+    sD[p][ty * 32 + 2 * (tx & 7) + (tx >> 3)] =                               \
+        P255_D(jbase + tx + (ft * 16 + ty) * 256);                            \
+    sD[p][ty * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =                          \
+        P255_D(jbase + 16 + tx + (ft * 16 + ty) * 256);                       \
+    sD[p][(ty + 8) * 32 + 2 * (tx & 7) + (tx >> 3)] =                         \
+        P255_D(jbase + tx + (ft * 16 + ty + 8) * 256);                        \
+    sD[p][(ty + 8) * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =                    \
+        P255_D(jbase + 16 + tx + (ft * 16 + ty + 8) * 256);                   \
+  } while (0)
+  P255_Y_FILLD;
+  P255_Y_FILL;
 #if P255_CC_ABLATE != 4
-    __syncthreads();
+  __syncthreads();
 #endif
   for (int ltile = 0; ltile < 16; ++ltile) {
 #pragma unroll
@@ -1367,153 +1406,119 @@ __global__ __launch_bounds__(128, 8) void tendency_y_p255_cc_kernel(
           *reinterpret_cast<const double2 *>(&sD[p][t * 32 + 2 * ty]);
       const double2 dj1 =
           *reinterpret_cast<const double2 *>(&sD[p][t * 32 + 16 + 2 * ty]);
-      const double f0 = sQ0[p][t * 16 + tx];
-      const double f1 = sQ1[p][t * 16 + tx];
-      s00 += f0 * dj0.x;
-      s01 += f0 * dj0.y;
-      s02 += f0 * dj1.x;
-      s03 += f0 * dj1.y;
-      s10 += f1 * dj0.x;
-      s11 += f1 * dj0.y;
-      s12 += f1 * dj1.x;
-      s13 += f1 * dj1.y;
+      double dj[4];
+      dj[0] = dj0.x;
+      dj[1] = dj0.y;
+      dj[2] = dj1.x;
+      dj[3] = dj1.y;
+      double f[TI];
+#pragma unroll
+      for (int u = 0; u < TI; ++u) {
+        f[u] = sQ[u][p][t * 16 + tx];
+      }
+#pragma unroll
+      for (int u = 0; u < TI; ++u) {
+#pragma unroll
+        for (int a = 0; a < 4; ++a) {
+          acc[u][a] += f[u] * dj[a];
+        }
+      }
     }
     if (ltile + 1 < 16) {
       p ^= 1;
       ft = ltile + 1;
-#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 5
-    sD[p][ty * 32 + tx] = 1.0;
-    sD[p][ty * 32 + tx + 16] = 1.0;
-    sD[p][(ty + 8) * 32 + tx] = 1.0;
-    sD[p][(ty + 8) * 32 + tx + 16] = 1.0;
-#else
-    sD[p][ty * 32 + 2 * (tx & 7) + (tx >> 3)] =
-        D1D[jbase + tx + (ft * 16 + ty) * 256];
-    sD[p][ty * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =
-        D1D[jbase + 16 + tx + (ft * 16 + ty) * 256];
-    sD[p][(ty + 8) * 32 + 2 * (tx & 7) + (tx >> 3)] =
-        D1D[jbase + tx + (ft * 16 + ty + 8) * 256];
-    sD[p][(ty + 8) * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =
-        D1D[jbase + 16 + tx + (ft * 16 + ty + 8) * 256];
-#endif
-#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 6
-    sQ0[p][ty * 16 + tx] = 1.0;
-    sQ0[p][(ty + 8) * 16 + tx] = 1.0;
-    sQ1[p][ty * 16 + tx] = 1.0;
-    sQ1[p][(ty + 8) * 16 + tx] = 1.0;
-#else
-    const int l0 = ft * 16 + ty;
-    int gidx = elem_offset + i0 + l0 * 256 + k * 65536;
-    sQ0[p][ty * 16 + tx] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + i0 + (l0 + 8) * 256 + k * 65536;
-    sQ0[p][(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + i1 + l0 * 256 + k * 65536;
-    sQ1[p][ty * 16 + tx] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + i1 + (l0 + 8) * 256 + k * 65536;
-    sQ1[p][(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
-#endif
+      P255_Y_FILLD;
+      P255_Y_FILL;
 #if P255_CC_ABLATE != 4
       __syncthreads();
 #endif
     }
   }
+#undef P255_Y_FILL
+#undef P255_Y_FILLD
 
   const int npoint = 16777216 * Ne;
-  const int fp0 = i0 + k * 256;
-  const int fp1 = i1 + k * 256;
   const int elem_face_offset = elem * 6 * 65536;
 #if P255_CC_ABLATE == 3
-  int idx = elem_offset + i0 + j0 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - s00;
-  idx = elem_offset + i0 + j1 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - s01;
-  idx = elem_offset + i0 + j2 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - s02;
-  idx = elem_offset + i0 + j3 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - s03;
-  idx = elem_offset + i1 + j0 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - s10;
-  idx = elem_offset + i1 + j1 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - s11;
-  idx = elem_offset + i1 + j2 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - s12;
-  idx = elem_offset + i1 + j3 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - s13;
+#pragma unroll
+  for (int u = 0; u < TI; ++u) {
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+      const int idx = elem_offset + iv[u] + (j0 + 8 * a) * 256 + k * 65536;
+      dqdt[idx] = dqdt[idx] - acc[u][a];
+    }
+  }
 #else
-  const double lift00 = Lift1D[j0] * flux_bnd[elem_face_offset + fp0] +
-                        Lift1D[j0 + 2 * 256] *
-                            flux_bnd[elem_face_offset + 2 * 65536 + fp0];
-  const double lift01 = Lift1D[j1] * flux_bnd[elem_face_offset + fp0] +
-                        Lift1D[j1 + 2 * 256] *
-                            flux_bnd[elem_face_offset + 2 * 65536 + fp0];
-  const double lift02 = Lift1D[j2] * flux_bnd[elem_face_offset + fp0] +
-                        Lift1D[j2 + 2 * 256] *
-                            flux_bnd[elem_face_offset + 2 * 65536 + fp0];
-  const double lift03 = Lift1D[j3] * flux_bnd[elem_face_offset + fp0] +
-                        Lift1D[j3 + 2 * 256] *
-                            flux_bnd[elem_face_offset + 2 * 65536 + fp0];
-  const double lift10 = Lift1D[j0] * flux_bnd[elem_face_offset + fp1] +
-                        Lift1D[j0 + 2 * 256] *
-                            flux_bnd[elem_face_offset + 2 * 65536 + fp1];
-  const double lift11 = Lift1D[j1] * flux_bnd[elem_face_offset + fp1] +
-                        Lift1D[j1 + 2 * 256] *
-                            flux_bnd[elem_face_offset + 2 * 65536 + fp1];
-  const double lift12 = Lift1D[j2] * flux_bnd[elem_face_offset + fp1] +
-                        Lift1D[j2 + 2 * 256] *
-                            flux_bnd[elem_face_offset + 2 * 65536 + fp1];
-  const double lift13 = Lift1D[j3] * flux_bnd[elem_face_offset + fp1] +
-                        Lift1D[j3 + 2 * 256] *
-                            flux_bnd[elem_face_offset + 2 * 65536 + fp1];
-  int idx = elem_offset + i0 + j0 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s00 + lift00);
-  idx = elem_offset + i0 + j1 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s01 + lift01);
-  idx = elem_offset + i0 + j2 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s02 + lift02);
-  idx = elem_offset + i0 + j3 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s03 + lift03);
-  idx = elem_offset + i1 + j0 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s10 + lift10);
-  idx = elem_offset + i1 + j1 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s11 + lift11);
-  idx = elem_offset + i1 + j2 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s12 + lift12);
-  idx = elem_offset + i1 + j3 * 256 + k * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * s13 + lift13);
+  double c0[4], c2[4];
+#pragma unroll
+  for (int a = 0; a < 4; ++a) {
+    c0[a] = Lift1D[j0 + 8 * a];
+    c2[a] = Lift1D[j0 + 8 * a + 2 * 256];
+  }
+#pragma unroll
+  for (int u = 0; u < TI; ++u) {
+    const int fp = iv[u] + k * 256;
+    const double fb0 = flux_bnd[elem_face_offset + fp];
+    const double fb2 = flux_bnd[elem_face_offset + 2 * 65536 + fp];
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+      const double lift = c0[a] * fb0 + c2[a] * fb2;
+      const int idx = elem_offset + iv[u] + (j0 + 8 * a) * 256 + k * 65536;
+      dqdt[idx] = dqdt[idx] - (Escale[idx + npoint] * acc[u][a] + lift);
+    }
+  }
 #endif
 }
 
-__global__ __launch_bounds__(128, 8) void tendency_z_p255_cc_kernel(
+// z contracts the whole element at once: a thread owns P255_CC_Z_TL lines of
+// the linear (i,j) index and four k values.  2 lines / 8 accumulators / 8
+// blocks per SM was sections 15.76 and 15.81; 8 lines with 166 registers is
+// section 26.6, worth 2.56% of the stage on its own (4 lines is 1.75%, and at
+// the old 64-register budget it spills 8 bytes).  P255_CC_ZDG drops the shared
+// D panel and reads D1D through __ldg, which is what section 15.8 adopted for
+// x and what section 26.5 measured at +11.26% here.
+__global__ __launch_bounds__(128, P255_CC_Z_MINB)
+void tendency_z_p255_cc_kernel(
     double *dqdt, const double *q, const double *velocity, const double *D1D,
     const double *Lift1D, const double *flux_bnd, const double *Escale, int Ne)
 {
+  constexpr int TL = P255_CC_Z_TL;
+#if !P255_CC_ZDG
   __shared__ double sD[16 * 32];
-  __shared__ double sQ0[16 * 16];
-  __shared__ double sQ1[16 * 16];
+#endif
+  __shared__ double sQ[TL][16 * 16];
 
   const int tx = (int)threadIdx.x;
   const int ty = (int)threadIdx.y;
   const int block0 = (int)blockIdx.x;
-  const int nblock_pe = P255_CC_BPE / 4;
+  const int nblock_pe = (P255_CC_BPE / 2) / TL;
   const int elem = block0 / nblock_pe;
   if (elem >= Ne) {
     return;
   }
   const int local_block = block0 % nblock_pe;
-  const int quad_k = local_block / 2048;
-  const int pair = local_block % 2048;
-  const int line0 = pair * 32 + tx;
-  const int line1 = line0 + 16;
+  const int npair = 4096 / TL;
+  const int quad_k = local_block / npair;
+  const int pair = local_block % npair;
+  int line[TL];
+#pragma unroll
+  for (int u = 0; u < TL; ++u) {
+    line[u] = pair * (16 * TL) + tx + 16 * u;
+  }
   const int k0 = quad_k * 32 + ty;
-  const int k1 = k0 + 8;
-  const int k2 = k0 + 16;
-  const int k3 = k0 + 24;
   const int kbase = quad_k * 32;
   const int elem_offset = elem * 16777216;
 
-  double s00 = 0.0, s01 = 0.0, s02 = 0.0, s03 = 0.0;
-  double s10 = 0.0, s11 = 0.0, s12 = 0.0, s13 = 0.0;
+  double acc[TL][4];
+#pragma unroll
+  for (int u = 0; u < TL; ++u) {
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+      acc[u][a] = 0.0;
+    }
+  }
   for (int ltile = 0; ltile < 16; ++ltile) {
+#if !P255_CC_ZDG
 #if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 5
     sD[ty * 32 + tx] = 1.0;
     sD[ty * 32 + tx + 16] = 1.0;
@@ -1529,21 +1534,24 @@ __global__ __launch_bounds__(128, 8) void tendency_z_p255_cc_kernel(
     sD[(ty + 8) * 32 + 16 + 2 * (tx & 7) + (tx >> 3)] =
         D1D[kbase + 16 + tx + (ltile * 16 + ty + 8) * 256];
 #endif
+#endif
 #if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 6
-    sQ0[ty * 16 + tx] = 1.0;
-    sQ0[(ty + 8) * 16 + tx] = 1.0;
-    sQ1[ty * 16 + tx] = 1.0;
-    sQ1[(ty + 8) * 16 + tx] = 1.0;
+#pragma unroll
+    for (int u = 0; u < TL; ++u) {
+      sQ[u][ty * 16 + tx] = 1.0;
+      sQ[u][(ty + 8) * 16 + tx] = 1.0;
+    }
 #else
-    const int l0 = ltile * 16 + ty;
-    int gidx = elem_offset + line0 + l0 * 65536;
-    sQ0[ty * 16 + tx] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + line0 + (l0 + 8) * 65536;
-    sQ0[(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + line1 + l0 * 65536;
-    sQ1[ty * 16 + tx] = q[gidx] * velocity[gidx];
-    gidx = elem_offset + line1 + (l0 + 8) * 65536;
-    sQ1[(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
+    {
+      const int l0 = ltile * 16 + ty;
+#pragma unroll
+      for (int u = 0; u < TL; ++u) {
+        int gidx = elem_offset + line[u] + l0 * 65536;
+        sQ[u][ty * 16 + tx] = q[gidx] * velocity[gidx];
+        gidx = elem_offset + line[u] + (l0 + 8) * 65536;
+        sQ[u][(ty + 8) * 16 + tx] = q[gidx] * velocity[gidx];
+      }
+    }
 #endif
 #if P255_CC_ABLATE != 4
     __syncthreads();
@@ -1555,20 +1563,43 @@ __global__ __launch_bounds__(128, 8) void tendency_z_p255_cc_kernel(
     for (int t = 0; t < 16; ++t)
 #endif
     {
-      const double2 dk0 =
-          *reinterpret_cast<const double2 *>(&sD[t * 32 + 2 * ty]);
-      const double2 dk1 =
-          *reinterpret_cast<const double2 *>(&sD[t * 32 + 16 + 2 * ty]);
-      const double f0 = sQ0[t * 16 + tx];
-      const double f1 = sQ1[t * 16 + tx];
-      s00 += f0 * dk0.x;
-      s01 += f0 * dk0.y;
-      s02 += f0 * dk1.x;
-      s03 += f0 * dk1.y;
-      s10 += f1 * dk0.x;
-      s11 += f1 * dk0.y;
-      s12 += f1 * dk1.x;
-      s13 += f1 * dk1.y;
+      double dk[4];
+#if P255_CC_ZDG
+#if P255_CC_ABLATE == 2 || P255_CC_ABLATE == 5
+#pragma unroll
+      for (int a = 0; a < 4; ++a) {
+        dk[a] = 1.0;
+      }
+#else
+#pragma unroll
+      for (int a = 0; a < 4; ++a) {
+        dk[a] = __ldg(D1D + k0 + 8 * a + (ltile * 16 + t) * 256);
+      }
+#endif
+#else
+      {
+        const double2 dk0 =
+            *reinterpret_cast<const double2 *>(&sD[t * 32 + 2 * ty]);
+        const double2 dk1 =
+            *reinterpret_cast<const double2 *>(&sD[t * 32 + 16 + 2 * ty]);
+        dk[0] = dk0.x;
+        dk[1] = dk0.y;
+        dk[2] = dk1.x;
+        dk[3] = dk1.y;
+      }
+#endif
+      double f[TL];
+#pragma unroll
+      for (int u = 0; u < TL; ++u) {
+        f[u] = sQ[u][t * 16 + tx];
+      }
+#pragma unroll
+      for (int u = 0; u < TL; ++u) {
+#pragma unroll
+        for (int a = 0; a < 4; ++a) {
+          acc[u][a] += f[u] * dk[a];
+        }
+      }
     }
 #if P255_CC_ABLATE != 4
     if (ltile + 1 < 16) {
@@ -1580,63 +1611,28 @@ __global__ __launch_bounds__(128, 8) void tendency_z_p255_cc_kernel(
   const int npoint = 16777216 * Ne;
   const int elem_face_offset = elem * 6 * 65536;
 #if P255_CC_ABLATE == 3
-  int idx = elem_offset + line0 + k0 * 65536;
-  dqdt[idx] = dqdt[idx] - s00;
-  idx = elem_offset + line0 + k1 * 65536;
-  dqdt[idx] = dqdt[idx] - s01;
-  idx = elem_offset + line0 + k2 * 65536;
-  dqdt[idx] = dqdt[idx] - s02;
-  idx = elem_offset + line0 + k3 * 65536;
-  dqdt[idx] = dqdt[idx] - s03;
-  idx = elem_offset + line1 + k0 * 65536;
-  dqdt[idx] = dqdt[idx] - s10;
-  idx = elem_offset + line1 + k1 * 65536;
-  dqdt[idx] = dqdt[idx] - s11;
-  idx = elem_offset + line1 + k2 * 65536;
-  dqdt[idx] = dqdt[idx] - s12;
-  idx = elem_offset + line1 + k3 * 65536;
-  dqdt[idx] = dqdt[idx] - s13;
+#pragma unroll
+  for (int u = 0; u < TL; ++u) {
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+      const int idx = elem_offset + line[u] + (k0 + 8 * a) * 65536;
+      dqdt[idx] = dqdt[idx] - acc[u][a];
+    }
+  }
 #else
-  const double lift00 =
-      Lift1D[k0 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line0] +
-      Lift1D[k0 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line0];
-  const double lift01 =
-      Lift1D[k1 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line0] +
-      Lift1D[k1 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line0];
-  const double lift02 =
-      Lift1D[k2 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line0] +
-      Lift1D[k2 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line0];
-  const double lift03 =
-      Lift1D[k3 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line0] +
-      Lift1D[k3 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line0];
-  const double lift10 =
-      Lift1D[k0 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line1] +
-      Lift1D[k0 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line1];
-  const double lift11 =
-      Lift1D[k1 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line1] +
-      Lift1D[k1 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line1];
-  const double lift12 =
-      Lift1D[k2 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line1] +
-      Lift1D[k2 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line1];
-  const double lift13 =
-      Lift1D[k3 + 4 * 256] * flux_bnd[elem_face_offset + 4 * 65536 + line1] +
-      Lift1D[k3 + 5 * 256] * flux_bnd[elem_face_offset + 5 * 65536 + line1];
-  int idx = elem_offset + line0 + k0 * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s00 + lift00);
-  idx = elem_offset + line0 + k1 * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s01 + lift01);
-  idx = elem_offset + line0 + k2 * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s02 + lift02);
-  idx = elem_offset + line0 + k3 * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s03 + lift03);
-  idx = elem_offset + line1 + k0 * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s10 + lift10);
-  idx = elem_offset + line1 + k1 * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s11 + lift11);
-  idx = elem_offset + line1 + k2 * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s12 + lift12);
-  idx = elem_offset + line1 + k3 * 65536;
-  dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * s13 + lift13);
+#pragma unroll
+  for (int u = 0; u < TL; ++u) {
+    const double fb4 = flux_bnd[elem_face_offset + 4 * 65536 + line[u]];
+    const double fb5 = flux_bnd[elem_face_offset + 5 * 65536 + line[u]];
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+      const int k = k0 + 8 * a;
+      const double lift =
+          Lift1D[k + 4 * 256] * fb4 + Lift1D[k + 5 * 256] * fb5;
+      const int idx = elem_offset + line[u] + k * 65536;
+      dqdt[idx] = dqdt[idx] - (Escale[idx + 2 * npoint] * acc[u][a] + lift);
+    }
+  }
 #endif
 }
 
@@ -1720,9 +1716,9 @@ extern "C" void launch_tendency_xyz_p255(
   const dim3 threads_x(16, 8);
   const dim3 threads_y(16, 8);
   const dim3 threads_z(16, 8);
-  const int nblock_x = (P255_CC_BPE / 4) * Ne;
-  const int nblock_y = (P255_CC_BPE / 4) * Ne;
-  const int nblock_z = (P255_CC_BPE / 4) * Ne;
+  const int nblock_x = ((P255_CC_BPE / 2) / P255_CC_X_TI) * Ne;
+  const int nblock_y = ((P255_CC_BPE / 2) / P255_CC_Y_TI) * Ne;
+  const int nblock_z = ((P255_CC_BPE / 2) / P255_CC_Z_TL) * Ne;
   tendency_x_p255_cc_kernel<<<nblock_x, threads_x, 0, dg_cuda_stream>>>(
       dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, Ne);
   tendency_y_p255_cc_kernel<<<nblock_y, threads_y, 0, dg_cuda_stream>>>(
