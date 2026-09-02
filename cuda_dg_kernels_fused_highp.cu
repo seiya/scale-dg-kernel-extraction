@@ -20,8 +20,41 @@ extern cudaStream_t dg_cuda_stream;
 #define P63_CC_THREADS 512
 #endif
 #define P63_CC_BPE 64
-#define P63_CC_NK (4096 / P63_CC_THREADS)
-#define P63_CC_MINBLK (1024 / P63_CC_THREADS)
+// p=63 CC output-tile knobs (p63_gap_study.md sec 26).  TI is the number of
+// consecutive i outputs one thread owns; the k (or j) count per thread then
+// follows from the 64x64 plane and the thread count.  TI = 1 with 512 threads
+// is the sec 25 shape.  MINBLK is the register budget: 65536 / (THREADS *
+// MINBLK) registers per thread.
+#ifndef P63_CC_XZ_TI
+#define P63_CC_XZ_TI 2
+#endif
+#ifndef P63_CC_XZ_THREADS
+#define P63_CC_XZ_THREADS 256
+#endif
+#ifndef P63_CC_XZ_MINBLK
+#define P63_CC_XZ_MINBLK 2
+#endif
+#ifndef P63_CC_XZ_BK
+#define P63_CC_XZ_BK 64
+#endif
+#define P63_CC_XZ_STAGE (64 * P63_CC_XZ_BK / P63_CC_XZ_THREADS)
+#define P63_CC_XZ_NI (64 / P63_CC_XZ_TI)
+#define P63_CC_XZ_NK (4096 / (P63_CC_XZ_THREADS * P63_CC_XZ_TI))
+#ifndef P63_CC_Y_TI
+#define P63_CC_Y_TI 2
+#endif
+#ifndef P63_CC_Y_THREADS
+#define P63_CC_Y_THREADS 256
+#endif
+#ifndef P63_CC_Y_MINBLK
+#define P63_CC_Y_MINBLK 2
+#endif
+#ifndef P63_CC_Y_BK
+#define P63_CC_Y_BK 64
+#endif
+#define P63_CC_Y_STAGE (64 * P63_CC_Y_BK / P63_CC_Y_THREADS)
+#define P63_CC_Y_NI (64 / P63_CC_Y_TI)
+#define P63_CC_Y_NJ (4096 / (P63_CC_Y_THREADS * P63_CC_Y_TI))
 #ifndef P127_CC_THREADS
 #define P127_CC_THREADS 512
 #endif
@@ -29,10 +62,41 @@ extern cudaStream_t dg_cuda_stream;
 #ifndef P127_CC_BK
 #define P127_CC_BK 64
 #endif
-#define P127_CC_NK (4096 / P127_CC_THREADS)
-#define P127_CC_KSTRIDE (64 / P127_CC_NK)
-#define P127_CC_MINBLK (1024 / P127_CC_THREADS)
-#define P127_CC_STAGE (64 * P127_CC_BK / P127_CC_THREADS)
+// p=127 CC output-tile knobs (p127_gap_study.md sec 18).  Same two axes as
+// the p=63 knobs above: TI consecutive i outputs per thread, and MINBLK as
+// the register budget.  BK is the l-chunk of sec 17.3 item 2, now separate
+// for xz and y so a wider output tile can buy back the blocks/SM that the
+// shared panel costs.
+#ifndef P127_CC_XZ_TI
+#define P127_CC_XZ_TI 2
+#endif
+#ifndef P127_CC_XZ_THREADS
+#define P127_CC_XZ_THREADS 256
+#endif
+#ifndef P127_CC_XZ_MINBLK
+#define P127_CC_XZ_MINBLK 2
+#endif
+#ifndef P127_CC_XZ_BK
+#define P127_CC_XZ_BK 16
+#endif
+#define P127_CC_XZ_NI (64 / P127_CC_XZ_TI)
+#define P127_CC_XZ_NK (4096 / (P127_CC_XZ_THREADS * P127_CC_XZ_TI))
+#define P127_CC_XZ_STAGE (64 * P127_CC_XZ_BK / P127_CC_XZ_THREADS)
+#ifndef P127_CC_Y_TI
+#define P127_CC_Y_TI 2
+#endif
+#ifndef P127_CC_Y_THREADS
+#define P127_CC_Y_THREADS 128
+#endif
+#ifndef P127_CC_Y_MINBLK
+#define P127_CC_Y_MINBLK 2
+#endif
+#ifndef P127_CC_Y_BK
+#define P127_CC_Y_BK 32
+#endif
+#define P127_CC_Y_NI (64 / P127_CC_Y_TI)
+#define P127_CC_Y_NJ (4096 / (P127_CC_Y_THREADS * P127_CC_Y_TI))
+#define P127_CC_Y_STAGE (64 * P127_CC_Y_BK / P127_CC_Y_THREADS)
 #define P255_CC_BPE 65536
 #ifndef P255_CC_ABLATE
 #define P255_CC_ABLATE 0
@@ -543,17 +607,40 @@ __global__ __launch_bounds__(P31_CC_Y_THREADS, P31_CC_Y_MINBLK) void tendency_fu
 // (or j) fit 2 blocks/SM at 64 registers; 1024 threads were occupancy-1
 // and left LDS latency exposed. Natural-order panels (i fastest); not
 // the TC fragment layout.
-__global__ __launch_bounds__(P63_CC_THREADS, P63_CC_MINBLK) void tendency_fused_p63_xz_cc_kernel(
+// Load TI consecutive doubles as ceil(TI/2) 16 B loads.  With TI = 2 the
+// compiler otherwise keeps two 8 B loads at lane stride 16 B, and each of them
+// touches the whole 512 B warp footprint, so the sector count per request
+// doubles (p63_gap_study.md sec 53.8).
+template <int N>
+__device__ __forceinline__ void cc_ldvec(const double *__restrict__ p,
+                                         double (&o)[N])
+{
+#pragma unroll
+  for (int t = 0; t < N; t += 2) {
+    if constexpr (N == 1) {
+      o[0] = p[0];
+    } else {
+      const double2 v = *reinterpret_cast<const double2 *>(p + t);
+      o[t] = v.x;
+      o[t + 1] = v.y;
+    }
+  }
+}
+
+__global__ __launch_bounds__(P63_CC_XZ_THREADS, P63_CC_XZ_MINBLK) void tendency_fused_p63_xz_cc_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ w,
     const double *__restrict__ flux_bnd, const double *__restrict__ Escale,
     int Ne)
 {
+  constexpr int TI = P63_CC_XZ_TI;
+  constexpr int NK = P63_CC_XZ_NK;
+  constexpr int BK = P63_CC_XZ_BK;
   extern __shared__ __align__(32) double smem_xz[];
   double *sD = smem_xz;
-  double *sFU = smem_xz + 64 * 64;
-  double *sFW = smem_xz + 2 * 64 * 64;
+  double *sFU = smem_xz + 64 * BK;
+  double *sFW = smem_xz + 2 * 64 * BK;
 
   const int elem = (int)blockIdx.x / P63_CC_BPE;
   if (elem >= Ne) {
@@ -561,76 +648,140 @@ __global__ __launch_bounds__(P63_CC_THREADS, P63_CC_MINBLK) void tendency_fused_
   }
   const int j = (int)blockIdx.x % P63_CC_BPE;
   const int tid = (int)threadIdx.x;
-  const int i = tid % 64;
-  const int kb = tid / 64;
+  const int i0 = TI * (tid % P63_CC_XZ_NI);
+  const int kb = tid / P63_CC_XZ_NI;
   const int elem_offset = elem * 262144;
   const int face_offset = elem * 24576;
   const int npoint = 262144 * Ne;
 
-  int kk[P63_CC_NK];
-  double sx[P63_CC_NK], sz[P63_CC_NK];
-  const int kbase = P63_CC_NK * kb;
-  for (int m = 0; m < P63_CC_NK; ++m) {
-    kk[m] = kbase + m;
-    sx[m] = 0.0;
-    sz[m] = 0.0;
-  }
-
-  for (int p = 0; p < P63_CC_NK; ++p) {
-    const int idxp = tid + P63_CC_THREADS * p;
-    const int col = idxp % 64;
-    const int row = idxp / 64;
-    sD[row * 64 + col] = D1D[col + row * 64];
-    const int gidx = elem_offset + col + j * 64 + row * 4096;
-    const double qv = q[gidx];
-    sFU[row * 64 + col] = qv * u[gidx];
-    sFW[row * 64 + col] = qv * w[gidx];
-  }
-  __syncthreads();
-
-  for (int lc = 0; lc < 64; ++lc) {
-    const double dxi = sD[lc * 64 + i];
-    const double fwi = sFW[lc * 64 + i];
+  const int kbase = NK * kb;
+  double sx[NK][TI], sz[NK][TI];
 #pragma unroll
-    for (int m = 0; m < P63_CC_NK; ++m) {
-      sx[m] += dxi * sFU[kk[m] * 64 + lc];
+  for (int m = 0; m < NK; ++m) {
+#pragma unroll
+    for (int t = 0; t < TI; ++t) {
+      sx[m][t] = 0.0;
+      sz[m][t] = 0.0;
+    }
+  }
+
+  for (int l0 = 0; l0 < 64; l0 += BK) {
+    if (l0) {
+      __syncthreads();
+    }
+    for (int p = 0; p < P63_CC_XZ_STAGE; ++p) {
+      const int idxp = tid + P63_CC_XZ_THREADS * p;
+      const int col = idxp % 64;
+      const int row = idxp / 64;
+      sD[row * 64 + col] = D1D[col + (l0 + row) * 64];
+      if constexpr (BK == 64) {
+        // One chunk: the FU and FW staging addresses coincide, so q is read
+        // once (sec 26.4 -- writing them as two expressions costs +47 %
+        // global sectors).
+        const int gidx = elem_offset + col + j * 64 + row * 4096;
+        const double qv = q[gidx];
+        sFU[row * 64 + col] = qv * u[gidx];
+        sFW[row * 64 + col] = qv * w[gidx];
+      } else {
+        int gidx = elem_offset + col + j * 64 + (l0 + row) * 4096;
+        sFW[row * 64 + col] = q[gidx] * w[gidx];
+        const int lcol = idxp % BK;
+        const int krow = idxp / BK;
+        gidx = elem_offset + (l0 + lcol) + j * 64 + krow * 4096;
+        sFU[krow * BK + lcol] = q[gidx] * u[gidx];
+      }
+    }
+    __syncthreads();
+
+    for (int lc = 0; lc < BK; ++lc) {
+    double dxi[TI], fwi[TI];
+#pragma unroll
+    for (int t = 0; t < TI; t += 2) {
+      if constexpr (TI == 1) {
+        dxi[0] = sD[lc * 64 + i0];
+        fwi[0] = sFW[lc * 64 + i0];
+      } else {
+        const double2 dv =
+            *reinterpret_cast<const double2 *>(&sD[lc * 64 + i0 + t]);
+        const double2 fv =
+            *reinterpret_cast<const double2 *>(&sFW[lc * 64 + i0 + t]);
+        dxi[t] = dv.x;
+        dxi[t + 1] = dv.y;
+        fwi[t] = fv.x;
+        fwi[t + 1] = fv.y;
+      }
     }
 #pragma unroll
-    for (int m = 0; m < P63_CC_NK; m += 2) {
+    for (int m = 0; m < NK; ++m) {
+      const double qu = sFU[(kbase + m) * BK + lc];
+#pragma unroll
+      for (int t = 0; t < TI; ++t) {
+        sx[m][t] += dxi[t] * qu;
+      }
+    }
+#pragma unroll
+    for (int m = 0; m < NK; m += 2) {
       const double2 dz =
           *reinterpret_cast<const double2 *>(&sD[lc * 64 + kbase + m]);
-      sz[m] += fwi * dz.x;
-      sz[m + 1] += fwi * dz.y;
+#pragma unroll
+      for (int t = 0; t < TI; ++t) {
+        sz[m][t] += fwi[t] * dz.x;
+        sz[m + 1][t] += fwi[t] * dz.y;
+      }
+    }
     }
   }
 
   const double lf1 = Lift1D[j];
-  const double lf2 = Lift1D[i + 64];
   const double lf3 = Lift1D[j + 128];
-  const double lf4 = Lift1D[i + 192];
-  const double fb5 = flux_bnd[face_offset + 16384 + i + j * 64];
-  const double fb6 = flux_bnd[face_offset + 20480 + i + j * 64];
+  double lf2[TI], lf4[TI], fb5[TI], fb6[TI];
+  cc_ldvec(Lift1D + i0 + 64, lf2);
+  cc_ldvec(Lift1D + i0 + 192, lf4);
+  cc_ldvec(flux_bnd + face_offset + 16384 + i0 + j * 64, fb5);
+  cc_ldvec(flux_bnd + face_offset + 20480 + i0 + j * 64, fb6);
 
-  for (int m = 0; m < P63_CC_NK; ++m) {
-    const int k = kk[m];
-    const int idx = elem_offset + i + j * 64 + k * 4096;
-    dqdt[idx] = -(Escale[idx] * sx[m] + Escale[idx + 2 * npoint] * sz[m] +
-                  lf1 * flux_bnd[face_offset + i + k * 64] +
-                  lf2 * flux_bnd[face_offset + 4096 + j + k * 64] +
-                  lf3 * flux_bnd[face_offset + 8192 + i + k * 64] +
-                  lf4 * flux_bnd[face_offset + 12288 + j + k * 64] +
-                  Lift1D[k + 256] * fb5 + Lift1D[k + 320] * fb6);
+  for (int m = 0; m < NK; ++m) {
+    const int k = kbase + m;
+    const int idx = elem_offset + i0 + j * 64 + k * 4096;
+    const double lf5 = Lift1D[k + 256];
+    const double lf6 = Lift1D[k + 320];
+    const double fbj2 = flux_bnd[face_offset + 4096 + j + k * 64];
+    const double fbj4 = flux_bnd[face_offset + 12288 + j + k * 64];
+    double ex[TI], ez[TI], fb1[TI], fb3[TI];
+    cc_ldvec(Escale + idx, ex);
+    cc_ldvec(Escale + idx + 2 * npoint, ez);
+    cc_ldvec(flux_bnd + face_offset + i0 + k * 64, fb1);
+    cc_ldvec(flux_bnd + face_offset + 8192 + i0 + k * 64, fb3);
+    double out[TI];
+#pragma unroll
+    for (int t = 0; t < TI; ++t) {
+      out[t] = -(ex[t] * sx[m][t] + ez[t] * sz[m][t] + lf1 * fb1[t] +
+                 lf2[t] * fbj2 + lf3 * fb3[t] + lf4[t] * fbj4 +
+                 lf5 * fb5[t] + lf6 * fb6[t]);
+    }
+#pragma unroll
+    for (int t = 0; t < TI; t += 2) {
+      if constexpr (TI == 1) {
+        dqdt[idx] = out[0];
+      } else {
+        *reinterpret_cast<double2 *>(dqdt + idx + t) =
+            make_double2(out[t], out[t + 1]);
+      }
+    }
   }
 }
 
-__global__ __launch_bounds__(P63_CC_THREADS, P63_CC_MINBLK) void tendency_fused_p63_y_cc_kernel(
+__global__ __launch_bounds__(P63_CC_Y_THREADS, P63_CC_Y_MINBLK) void tendency_fused_p63_y_cc_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
 {
+  constexpr int TI = P63_CC_Y_TI;
+  constexpr int NJ = P63_CC_Y_NJ;
+  constexpr int BK = P63_CC_Y_BK;
   extern __shared__ __align__(32) double smem_y[];
   double *sD = smem_y;
-  double *sFV = smem_y + 64 * 64;
+  double *sFV = smem_y + 64 * BK;
 
   const int elem = (int)blockIdx.x / P63_CC_BPE;
   if (elem >= Ne) {
@@ -638,59 +789,95 @@ __global__ __launch_bounds__(P63_CC_THREADS, P63_CC_MINBLK) void tendency_fused_
   }
   const int k = (int)blockIdx.x % P63_CC_BPE;
   const int tid = (int)threadIdx.x;
-  const int i = tid % 64;
-  const int jb = tid / 64;
+  const int i0 = TI * (tid % P63_CC_Y_NI);
+  const int jb = tid / P63_CC_Y_NI;
   const int elem_offset = elem * 262144;
   const int npoint = 262144 * Ne;
 
-  int jj[P63_CC_NK];
-  double sy[P63_CC_NK];
-  const int jbase = P63_CC_NK * jb;
-  for (int m = 0; m < P63_CC_NK; ++m) {
-    jj[m] = jbase + m;
-    sy[m] = 0.0;
-  }
-
-  for (int p = 0; p < P63_CC_NK; ++p) {
-    const int idxp = tid + P63_CC_THREADS * p;
-    const int col = idxp % 64;
-    const int row = idxp / 64;
-    sD[row * 64 + col] = D1D[col + row * 64];
-    const int gidx = elem_offset + col + row * 64 + k * 4096;
-    sFV[row * 64 + col] = q[gidx] * v[gidx];
-  }
-  __syncthreads();
-
-  for (int lc = 0; lc < 64; ++lc) {
-    const double fvi = sFV[lc * 64 + i];
+  const int jbase = NJ * jb;
+  double sy[NJ][TI];
 #pragma unroll
-    for (int m = 0; m < P63_CC_NK; m += 2) {
-      const double2 dy =
-          *reinterpret_cast<const double2 *>(&sD[lc * 64 + jbase + m]);
-      sy[m] += fvi * dy.x;
-      sy[m + 1] += fvi * dy.y;
+  for (int m = 0; m < NJ; ++m) {
+#pragma unroll
+    for (int t = 0; t < TI; ++t) {
+      sy[m][t] = 0.0;
     }
   }
 
-  for (int m = 0; m < P63_CC_NK; ++m) {
-    const int j = jj[m];
-    const int idx = elem_offset + i + j * 64 + k * 4096;
-    dqdt[idx] = dqdt[idx] - Escale[idx + npoint] * sy[m];
+  for (int l0 = 0; l0 < 64; l0 += BK) {
+    if (l0) {
+      __syncthreads();
+    }
+    for (int p = 0; p < P63_CC_Y_STAGE; ++p) {
+      const int idxp = tid + P63_CC_Y_THREADS * p;
+      const int col = idxp % 64;
+      const int row = idxp / 64;
+      sD[row * 64 + col] = D1D[col + (l0 + row) * 64];
+      const int gidx = elem_offset + col + (l0 + row) * 64 + k * 4096;
+      sFV[row * 64 + col] = q[gidx] * v[gidx];
+    }
+    __syncthreads();
+
+    for (int lc = 0; lc < BK; ++lc) {
+    double fvi[TI];
+#pragma unroll
+    for (int t = 0; t < TI; t += 2) {
+      if constexpr (TI == 1) {
+        fvi[0] = sFV[lc * 64 + i0];
+      } else {
+        const double2 fv =
+            *reinterpret_cast<const double2 *>(&sFV[lc * 64 + i0 + t]);
+        fvi[t] = fv.x;
+        fvi[t + 1] = fv.y;
+      }
+    }
+#pragma unroll
+    for (int m = 0; m < NJ; m += 2) {
+      const double2 dy =
+          *reinterpret_cast<const double2 *>(&sD[lc * 64 + jbase + m]);
+#pragma unroll
+      for (int t = 0; t < TI; ++t) {
+        sy[m][t] += fvi[t] * dy.x;
+        sy[m + 1][t] += fvi[t] * dy.y;
+      }
+    }
+    }
+  }
+
+  for (int m = 0; m < NJ; ++m) {
+    const int j = jbase + m;
+    const int idx = elem_offset + i0 + j * 64 + k * 4096;
+#pragma unroll
+    for (int t = 0; t < TI; t += 2) {
+      if constexpr (TI == 1) {
+        dqdt[idx] = dqdt[idx] - Escale[idx + npoint] * sy[m][0];
+      } else {
+        const double2 ey =
+            *reinterpret_cast<const double2 *>(Escale + idx + t + npoint);
+        double2 out = *reinterpret_cast<double2 *>(dqdt + idx + t);
+        out.x -= ey.x * sy[m][t];
+        out.y -= ey.y * sy[m][t + 1];
+        *reinterpret_cast<double2 *>(dqdt + idx + t) = out;
+      }
+    }
   }
 }
 
-__global__ __launch_bounds__(P127_CC_THREADS, 1) void tendency_fused_p127_xz_cc_kernel(
+__global__ __launch_bounds__(P127_CC_XZ_THREADS, P127_CC_XZ_MINBLK) void tendency_fused_p127_xz_cc_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ w,
     const double *__restrict__ flux_bnd, const double *__restrict__ Escale,
     int Ne)
 {
+  constexpr int TI = P127_CC_XZ_TI;
+  constexpr int NK = P127_CC_XZ_NK;
+  constexpr int BK = P127_CC_XZ_BK;
   extern __shared__ __align__(32) double smem_xz[];
   double *sDn = smem_xz;
-  double *sDm = smem_xz + 64 * P127_CC_BK;
-  double *sFU = smem_xz + 2 * 64 * P127_CC_BK;
-  double *sFW = smem_xz + 3 * 64 * P127_CC_BK;
+  double *sDm = smem_xz + 64 * BK;
+  double *sFU = smem_xz + 2 * 64 * BK;
+  double *sFW = smem_xz + 3 * 64 * BK;
 
   const int bidx = (int)blockIdx.x;
   const int ibase = (bidx % 2) * 64;
@@ -702,91 +889,143 @@ __global__ __launch_bounds__(P127_CC_THREADS, 1) void tendency_fused_p127_xz_cc_
   }
 
   const int tid = (int)threadIdx.x;
-  const int i = tid % 64;
-  const int kb = tid / 64;
-  const int ig = ibase + i;
+  const int i0 = TI * (tid % P127_CC_XZ_NI);
+  const int kb = tid / P127_CC_XZ_NI;
+  const int ig = ibase + i0;
   const int elem_offset = elem * 2097152;
   const int face_offset = elem * 98304;
   const int npoint = 2097152 * Ne;
 
-  int kk[P127_CC_NK];
-  double sx[P127_CC_NK], sz[P127_CC_NK];
-  const int kpack = P127_CC_NK * kb;
-  for (int m = 0; m < P127_CC_NK; ++m) {
-    kk[m] = kpack + m;
-    sx[m] = 0.0;
-    sz[m] = 0.0;
+  const int kpack = NK * kb;
+  double sx[NK][TI], sz[NK][TI];
+#pragma unroll
+  for (int m = 0; m < NK; ++m) {
+#pragma unroll
+    for (int t = 0; t < TI; ++t) {
+      sx[m][t] = 0.0;
+      sz[m][t] = 0.0;
+    }
   }
 
-  for (int l0 = 0; l0 < 128; l0 += P127_CC_BK) {
+  for (int l0 = 0; l0 < 128; l0 += BK) {
     if (l0) {
       __syncthreads();
     }
-    for (int p = 0; p < P127_CC_STAGE; ++p) {
-      const int idxp = tid + P127_CC_THREADS * p;
+    for (int p = 0; p < P127_CC_XZ_STAGE; ++p) {
+      const int idxp = tid + P127_CC_XZ_THREADS * p;
       const int col = idxp % 64;
       const int row = idxp / 64;
       sDn[row * 64 + col] = D1D[(ibase + col) + (l0 + row) * 128];
       sDm[row * 64 + col] = D1D[(kbase + col) + (l0 + row) * 128];
-      int gidx = elem_offset + (l0 + col) + j * 128 + (kbase + row) * 16384;
-      sFU[row * 64 + col] = q[gidx] * u[gidx];
-      gidx = elem_offset + (ibase + col) + j * 128 + (l0 + row) * 16384;
+      int gidx = elem_offset + (ibase + col) + j * 128 + (l0 + row) * 16384;
       sFW[row * 64 + col] = q[gidx] * w[gidx];
+      const int lcol = idxp % BK;
+      const int krow = idxp / BK;
+      gidx = elem_offset + (l0 + lcol) + j * 128 + (kbase + krow) * 16384;
+      sFU[krow * BK + lcol] = q[gidx] * u[gidx];
     }
     __syncthreads();
 
-    for (int lc = 0; lc < P127_CC_BK; ++lc) {
+    for (int lc = 0; lc < BK; ++lc) {
 #if P127_CC_ABLATE
-      const double dxi = 1.0;
-      const double fwi = 1.0;
-      for (int m = 0; m < P127_CC_NK; ++m) {
-        sx[m] += dxi * 1.0;
-        sz[m] += fwi * 1.0;
+#pragma unroll
+      for (int m = 0; m < NK; ++m) {
+#pragma unroll
+        for (int t = 0; t < TI; ++t) {
+          sx[m][t] += 1.0;
+          sz[m][t] += 1.0;
+        }
       }
 #else
-      const double dxi = sDn[lc * 64 + i];
-      const double fwi = sFW[lc * 64 + i];
-      for (int m = 0; m < P127_CC_NK; ++m) {
-        sx[m] += dxi * sFU[kk[m] * P127_CC_BK + lc];
+      double dxi[TI], fwi[TI];
+#pragma unroll
+      for (int t = 0; t < TI; t += 2) {
+        if constexpr (TI == 1) {
+          dxi[0] = sDn[lc * 64 + i0];
+          fwi[0] = sFW[lc * 64 + i0];
+        } else {
+          const double2 dv =
+              *reinterpret_cast<const double2 *>(&sDn[lc * 64 + i0 + t]);
+          const double2 fv =
+              *reinterpret_cast<const double2 *>(&sFW[lc * 64 + i0 + t]);
+          dxi[t] = dv.x;
+          dxi[t + 1] = dv.y;
+          fwi[t] = fv.x;
+          fwi[t + 1] = fv.y;
+        }
       }
 #pragma unroll
-      for (int m = 0; m < P127_CC_NK; m += 2) {
+      for (int m = 0; m < NK; ++m) {
+        const double qu = sFU[(kpack + m) * BK + lc];
+#pragma unroll
+        for (int t = 0; t < TI; ++t) {
+          sx[m][t] += dxi[t] * qu;
+        }
+      }
+#pragma unroll
+      for (int m = 0; m < NK; m += 2) {
         const double2 dz =
             *reinterpret_cast<const double2 *>(&sDm[lc * 64 + kpack + m]);
-        sz[m] += fwi * dz.x;
-        sz[m + 1] += fwi * dz.y;
+#pragma unroll
+        for (int t = 0; t < TI; ++t) {
+          sz[m][t] += fwi[t] * dz.x;
+          sz[m + 1][t] += fwi[t] * dz.y;
+        }
       }
 #endif
     }
   }
 
   const double lf1 = Lift1D[j];
-  const double lf2 = Lift1D[ig + 128];
   const double lf3 = Lift1D[j + 256];
-  const double lf4 = Lift1D[ig + 384];
-  const double fb5 = flux_bnd[face_offset + 65536 + ig + j * 128];
-  const double fb6 = flux_bnd[face_offset + 81920 + ig + j * 128];
+  double lf2[TI], lf4[TI], fb5[TI], fb6[TI];
+  cc_ldvec(Lift1D + ig + 128, lf2);
+  cc_ldvec(Lift1D + ig + 384, lf4);
+  cc_ldvec(flux_bnd + face_offset + 65536 + ig + j * 128, fb5);
+  cc_ldvec(flux_bnd + face_offset + 81920 + ig + j * 128, fb6);
 
-  for (int m = 0; m < P127_CC_NK; ++m) {
-    const int k = kbase + kk[m];
+  for (int m = 0; m < NK; ++m) {
+    const int k = kbase + kpack + m;
     const int idx = elem_offset + ig + j * 128 + k * 16384;
-    dqdt[idx] = -(Escale[idx] * sx[m] + Escale[idx + 2 * npoint] * sz[m] +
-                  lf1 * flux_bnd[face_offset + ig + k * 128] +
-                  lf2 * flux_bnd[face_offset + 16384 + j + k * 128] +
-                  lf3 * flux_bnd[face_offset + 32768 + ig + k * 128] +
-                  lf4 * flux_bnd[face_offset + 49152 + j + k * 128] +
-                  Lift1D[k + 512] * fb5 + Lift1D[k + 640] * fb6);
+    const double lf5 = Lift1D[k + 512];
+    const double lf6 = Lift1D[k + 640];
+    const double fbj2 = flux_bnd[face_offset + 16384 + j + k * 128];
+    const double fbj4 = flux_bnd[face_offset + 49152 + j + k * 128];
+    double ex[TI], ez[TI], fb1[TI], fb3[TI];
+    cc_ldvec(Escale + idx, ex);
+    cc_ldvec(Escale + idx + 2 * npoint, ez);
+    cc_ldvec(flux_bnd + face_offset + ig + k * 128, fb1);
+    cc_ldvec(flux_bnd + face_offset + 32768 + ig + k * 128, fb3);
+    double out[TI];
+#pragma unroll
+    for (int t = 0; t < TI; ++t) {
+      out[t] = -(ex[t] * sx[m][t] + ez[t] * sz[m][t] + lf1 * fb1[t] +
+                 lf2[t] * fbj2 + lf3 * fb3[t] + lf4[t] * fbj4 +
+                 lf5 * fb5[t] + lf6 * fb6[t]);
+    }
+#pragma unroll
+    for (int t = 0; t < TI; t += 2) {
+      if constexpr (TI == 1) {
+        dqdt[idx] = out[0];
+      } else {
+        *reinterpret_cast<double2 *>(dqdt + idx + t) =
+            make_double2(out[t], out[t + 1]);
+      }
+    }
   }
 }
 
-__global__ __launch_bounds__(P127_CC_THREADS, P127_CC_MINBLK) void tendency_fused_p127_y_cc_kernel(
+__global__ __launch_bounds__(P127_CC_Y_THREADS, P127_CC_Y_MINBLK) void tendency_fused_p127_y_cc_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
 {
+  constexpr int TI = P127_CC_Y_TI;
+  constexpr int NJ = P127_CC_Y_NJ;
+  constexpr int BK = P127_CC_Y_BK;
   extern __shared__ __align__(32) double smem_y[];
   double *sDm = smem_y;
-  double *sFV = smem_y + 64 * P127_CC_BK;
+  double *sFV = smem_y + 64 * BK;
 
   const int bidx = (int)blockIdx.x;
   const int ibase = (bidx % 2) * 64;
@@ -798,57 +1037,89 @@ __global__ __launch_bounds__(P127_CC_THREADS, P127_CC_MINBLK) void tendency_fuse
   }
 
   const int tid = (int)threadIdx.x;
-  const int i = tid % 64;
-  const int jb = tid / 64;
-  const int ig = ibase + i;
+  const int i0 = TI * (tid % P127_CC_Y_NI);
+  const int jb = tid / P127_CC_Y_NI;
+  const int ig = ibase + i0;
   const int elem_offset = elem * 2097152;
   const int npoint = 2097152 * Ne;
 
-  int jj[P127_CC_NK];
-  double sy[P127_CC_NK];
-  const int jpack = P127_CC_NK * jb;
-  for (int m = 0; m < P127_CC_NK; ++m) {
-    jj[m] = jpack + m;
-    sy[m] = 0.0;
+  const int jpack = NJ * jb;
+  double sy[NJ][TI];
+#pragma unroll
+  for (int m = 0; m < NJ; ++m) {
+#pragma unroll
+    for (int t = 0; t < TI; ++t) {
+      sy[m][t] = 0.0;
+    }
   }
 
-  for (int l0 = 0; l0 < 128; l0 += P127_CC_BK) {
+  for (int l0 = 0; l0 < 128; l0 += BK) {
     if (l0) {
       __syncthreads();
     }
-    for (int p = 0; p < P127_CC_STAGE; ++p) {
-      const int idxp = tid + P127_CC_THREADS * p;
+    for (int p = 0; p < P127_CC_Y_STAGE; ++p) {
+      const int idxp = tid + P127_CC_Y_THREADS * p;
       const int col = idxp % 64;
       const int row = idxp / 64;
       sDm[row * 64 + col] = D1D[(jbase + col) + (l0 + row) * 128];
-      const int gidx = elem_offset + (ibase + col) + (l0 + row) * 128 + k * 16384;
+      const int gidx =
+          elem_offset + (ibase + col) + (l0 + row) * 128 + k * 16384;
       sFV[row * 64 + col] = q[gidx] * v[gidx];
     }
     __syncthreads();
 
-    for (int lc = 0; lc < P127_CC_BK; ++lc) {
+    for (int lc = 0; lc < BK; ++lc) {
 #if P127_CC_ABLATE
-      const double fvi = 1.0;
-      for (int m = 0; m < P127_CC_NK; ++m) {
-        sy[m] += fvi * 1.0;
+#pragma unroll
+      for (int m = 0; m < NJ; ++m) {
+#pragma unroll
+        for (int t = 0; t < TI; ++t) {
+          sy[m][t] += 1.0;
+        }
       }
 #else
-      const double fvi = sFV[lc * 64 + i];
+      double fvi[TI];
 #pragma unroll
-      for (int m = 0; m < P127_CC_NK; m += 2) {
+      for (int t = 0; t < TI; t += 2) {
+        if constexpr (TI == 1) {
+          fvi[0] = sFV[lc * 64 + i0];
+        } else {
+          const double2 fv =
+              *reinterpret_cast<const double2 *>(&sFV[lc * 64 + i0 + t]);
+          fvi[t] = fv.x;
+          fvi[t + 1] = fv.y;
+        }
+      }
+#pragma unroll
+      for (int m = 0; m < NJ; m += 2) {
         const double2 dy =
             *reinterpret_cast<const double2 *>(&sDm[lc * 64 + jpack + m]);
-        sy[m] += fvi * dy.x;
-        sy[m + 1] += fvi * dy.y;
+#pragma unroll
+        for (int t = 0; t < TI; ++t) {
+          sy[m][t] += fvi[t] * dy.x;
+          sy[m + 1][t] += fvi[t] * dy.y;
+        }
       }
 #endif
     }
   }
 
-  for (int m = 0; m < P127_CC_NK; ++m) {
-    const int j = jbase + jj[m];
+  for (int m = 0; m < NJ; ++m) {
+    const int j = jbase + jpack + m;
     const int idx = elem_offset + ig + j * 128 + k * 16384;
-    dqdt[idx] = dqdt[idx] - Escale[idx + npoint] * sy[m];
+#pragma unroll
+    for (int t = 0; t < TI; t += 2) {
+      if constexpr (TI == 1) {
+        dqdt[idx] = dqdt[idx] - Escale[idx + npoint] * sy[m][0];
+      } else {
+        const double2 ey =
+            *reinterpret_cast<const double2 *>(Escale + idx + t + npoint);
+        double2 out = *reinterpret_cast<double2 *>(dqdt + idx + t);
+        out.x -= ey.x * sy[m][t];
+        out.y -= ey.y * sy[m][t + 1];
+        *reinterpret_cast<double2 *>(dqdt + idx + t) = out;
+      }
+    }
   }
 }
 
@@ -1409,15 +1680,15 @@ extern "C" void launch_tendency_fused_p63(
     const double *Escale, int Ne)
 {
   const int nblock = P63_CC_BPE * Ne;
-  const size_t smem_xz = 3 * 64 * 64 * sizeof(double);
-  const size_t smem_y = 2 * 64 * 64 * sizeof(double);
+  const size_t smem_xz = 3 * 64 * P63_CC_XZ_BK * sizeof(double);
+  const size_t smem_y = 2 * 64 * P63_CC_Y_BK * sizeof(double);
   cudaFuncSetAttribute(tendency_fused_p63_xz_cc_kernel,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_xz);
   cudaFuncSetAttribute(tendency_fused_p63_y_cc_kernel,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_y);
-  tendency_fused_p63_xz_cc_kernel<<<nblock, P63_CC_THREADS, smem_xz, dg_cuda_stream>>>(
+  tendency_fused_p63_xz_cc_kernel<<<nblock, P63_CC_XZ_THREADS, smem_xz, dg_cuda_stream>>>(
       dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
-  tendency_fused_p63_y_cc_kernel<<<nblock, P63_CC_THREADS, smem_y, dg_cuda_stream>>>(
+  tendency_fused_p63_y_cc_kernel<<<nblock, P63_CC_Y_THREADS, smem_y, dg_cuda_stream>>>(
       dqdt, D1D, q, v, Escale, Ne);
   check_cuda_cc_hp("tendency_fused_p63_cc_kernels");
 }
@@ -1428,15 +1699,15 @@ extern "C" void launch_tendency_fused_p127(
     const double *Escale, int Ne)
 {
   const int nblock = P127_CC_BPE * Ne;
-  const size_t smem_xz = 4 * 64 * P127_CC_BK * sizeof(double);
-  const size_t smem_y = 2 * 64 * P127_CC_BK * sizeof(double);
+  const size_t smem_xz = 4 * 64 * P127_CC_XZ_BK * sizeof(double);
+  const size_t smem_y = 2 * 64 * P127_CC_Y_BK * sizeof(double);
   cudaFuncSetAttribute(tendency_fused_p127_xz_cc_kernel,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_xz);
   cudaFuncSetAttribute(tendency_fused_p127_y_cc_kernel,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_y);
-  tendency_fused_p127_xz_cc_kernel<<<nblock, P127_CC_THREADS, smem_xz, dg_cuda_stream>>>(
+  tendency_fused_p127_xz_cc_kernel<<<nblock, P127_CC_XZ_THREADS, smem_xz, dg_cuda_stream>>>(
       dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
-  tendency_fused_p127_y_cc_kernel<<<nblock, P127_CC_THREADS, smem_y, dg_cuda_stream>>>(
+  tendency_fused_p127_y_cc_kernel<<<nblock, P127_CC_Y_THREADS, smem_y, dg_cuda_stream>>>(
       dqdt, D1D, q, v, Escale, Ne);
   check_cuda_cc_hp("tendency_fused_p127_cc_kernels");
 }
