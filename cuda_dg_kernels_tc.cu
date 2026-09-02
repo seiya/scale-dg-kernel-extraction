@@ -2752,7 +2752,7 @@ void launch_tendency_fused_p63_impl(
     cudaLaunchAttribute yattr[1];
     ycfg.gridDim = dim3(nblock);
     ycfg.blockDim = dim3(P63Y_THREADS);
-    ycfg.dynamicSmemBytes = 0;
+    ycfg.dynamicSmemBytes = (unsigned)smem_y;
     ycfg.stream = dg_cuda_stream;
     yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     yattr[0].val.programmaticStreamSerializationAllowed = 1;
@@ -3395,7 +3395,7 @@ void launch_tendency_fused_p127_impl(
     cudaLaunchAttribute yattr[1];
     ycfg.gridDim = dim3(nblock_y);
     ycfg.blockDim = dim3(P127_Y_THREADS);
-    ycfg.dynamicSmemBytes = 0;
+    ycfg.dynamicSmemBytes = (unsigned)smem_y;
     ycfg.stream = dg_cuda_stream;
     yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     yattr[0].val.programmaticStreamSerializationAllowed = 1;
