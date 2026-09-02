@@ -1406,3 +1406,51 @@ CC 326.8 µs は旧 Fortran 〜324 µs と同水準。論文の主比は **TC / 
 
 **（追記 2026-08-30）** その後の CC 最適化は [`p7_gap_study.md`](p7_gap_study.md)。
 device 326.3 → **302.8 µs/stage（−7.2%）**、主比 **1.10×**。
+
+## 18. `FUSED_DFMA` を現行ソースで測り直す（2026-09-02、機構比 A 1.551×）
+
+`TODO.md` §2.3。p=7 の `FUSED_DFMA` は §15（427.8 µs/stage）と §17（424.1）の
+2 値があり、`reports/README.md` は §15 の 427.8 を表の値として採っていた。
+どちらも 2026-08-29 の login 3-run で、**現行ソースの測定ではない**。手順・
+入力の作り方・iso-schedule であることの 3 つの証拠・6 次数の一覧は
+[`p63_gap_study.md`](p63_gap_study.md) §55 に共通で書いてある。
+
+- commit `fcf1872` + §55.1 の defect 修正（p=63 / p=127 のみに効く 2 行）
+- job `78053`、node `c384`、GB200 1 GPU、`make CUDA=1 GPUFLAGS=-gpu=cc100`
+- 入力 `namelists/perf_p7_fused_tc.conf`（`Ne=32³`、`nstep=20`、計時 19 ステップ）。
+  `FUSED_DFMA` / `FUSED` は `DqdtKernel_Type` だけ差し替えた作業コピー
+- 12 ラウンド、`FUSED_TC` → `FUSED_DFMA` → `FUSED` の順で交互
+- 物差し: `CUDA device fused tendency` ÷ (19 steps × 3)。§15 / §17 の login
+  3-run と**同じ量**である
+
+| 経路 | device 中央値 [ms] | device min–max [ms] | **µs/stage** | `Step loop per stage` [µs] |
+|---|---:|---:|---:|---:|
+| `CUDAFORTRAN_FUSED_TC` | 15.592 | 15.567–15.644 | **273.54** | 355.10 |
+| `CUDAFORTRAN_FUSED_DFMA` | 24.185 | 24.168–24.198 | **424.31** | 504.95 |
+| `CUDAFORTRAN_FUSED` | 16.686 | 16.674–16.713 | **292.74** | 373.74 |
+
+3 経路のレンジは互いに重ならない。
+
+- **機構比 A = 424.31 / 273.54 = 1.551×**（旧 427.8 / 274.9 = 1.556×、
+  §17 の分母では 1.57×）。`Step loop` では 504.95 / 355.10 = 1.422×。
+- 主比 B = 292.74 / 273.54 = **1.070×**（`p7_gap_study.md` §5 の 292.3 /
+  README の 274.9 で 1.06×）。
+
+**占有 GPU の 12 ラウンド交互で測ると 424.31 µs/stage で、§17 の 424.1 と
+0.05% で一致し、§15 の 427.8 とは 0.82% ずれる。** §1 の注（2026-09-02）が
+「差 0.87% は login 3-run のばらつきの範囲」と書いた見立ては正しく、
+**占有 GPU で測ると §17 側の値が再現する**。表の値としてどちらを採るかという
+判断（§15 の同一セットから採る）は変えない —— 上表の他の行は §15 の
+3-run 中央値だからである —— が、**現行ソースの p=7 `FUSED_DFMA` は
+424.31 µs/stage** であり、機構比 A は **1.551×** である。
+
+p=7 の `FUSED_TC` は §13 の swizzle 以降触っていないので、DFMA が動かないのは
+筋が通っている（`FUSED_TC` 側も 274.9 → 273.54 と 0.49% しか動かない）。
+
+**内積以外に乖離は無い。** `cuda_dg_kernels_tc.cu` で `UseTc` に依存する分岐は
+`mma_m8n8k4_f64` の中の 1 か所だけで、`tendency_fused_p7_kernel<UseTc>` の
+shared レイアウト・スレッド数・面ステージ・エピローグはすべて `UseTc` を見ない
+（[`p63_gap_study.md`](p63_gap_study.md) §55.3）。点変化係数の owned `dqdt`
+4,096 点（`namelists/val_p7_split.conf`、`Ne=2³`）は `FUSED_TC` と
+`FUSED_DFMA` で**ビット一致**、`CUDAFORTRAN_SPLIT` 対照で両者とも
+max abs **1.78e-15**（相対 2.86e-16）。

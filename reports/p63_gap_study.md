@@ -3168,3 +3168,165 @@ unique DRAM **2.44 TB/s（7.9 の 30.9%）**、path DRAM 2.67 TB/s（33.8%）。
 この修正は **p=127 にも同時に入れた**（`p127_gap_study.md` §25）。
 p=15 / p=31 / p=255 の CC カーネルは既にエピローグを `double2` で書いており、
 同じ defect は無い。
+
+## 55. `FUSED_DFMA` を現行ソースで測り直す —— 機構比 A の iso-schedule 化（2026-09-02）
+
+`TODO.md` §2.3。**性能課題ではなく契約の課題**である。`AGENTS.md` は
+`CUDAFORTRAN_FUSED_DFMA` を「`FUSED_TC` と同一ソースで `UseTc=false`、MMA 命令
+だけの iso-schedule アブレーション」と定義しているが、`reports/README.md` が
+公表していた `FUSED_DFMA` の値は**古いバイナリ由来**だった。分子（`FUSED_TC`）
+だけが §18 / §19 / §50 で速くなり、分母（`FUSED_DFMA`）が 2026-08-29 のまま
+だったので、機構比 A はこの時点で iso-schedule ではなかった。
+
+- commit: `fcf1872` に §55.1 の defect 修正 1 か所を当てたもの
+- job `78053`、node `c384`、GB200 1 GPU、`make CUDA=1 GPUFLAGS=-gpu=cc100`
+- 入力: `namelists/perf_p63_fused_tc.conf`（`Ne=4³`、`nstep=20`、計時 19 ステップ）。
+  `FUSED_DFMA` と `FUSED` は同じファイルの `DqdtKernel_Type` **だけ**を差し替えた
+  作業コピー（`namelists/README.md` の指示どおりコミットしない）。
+  `NeX/NeY/NeZ`・`PolyOrder`・`dt`・`nstep` は 3 経路で同一。
+- 12 ラウンド、1 ラウンドごとに `FUSED_TC` → `FUSED_DFMA` → `FUSED` の順で交互。
+
+### 55.1 defect: `4b95aca` が p=63 / p=127 の y カーネルの動的 shared を 0 にしていた
+
+**測り直しの最初の 1 回で、`fcf1872` の `FUSED_TC` と `FUSED_DFMA` が p=63 と
+p=127 で起動しないことが分かった**（`CUDA_ERROR_ILLEGAL_ADDRESS`）。p=7 / 15 /
+31 / 255 は動く。原因は `4b95aca`（p=31 のワープタイルをノブ化したコミット）が
+p=31 と無関係の 2 行を巻き込んでいたことで、`cuda_dg_kernels_tc.cu` の
+
+```c
+    ycfg.dynamicSmemBytes = (unsigned)smem_y;   ->   ycfg.dynamicSmemBytes = 0;
+```
+
+が `launch_tendency_fused_p63_impl` と `launch_tendency_fused_p127_impl` の
+**PDL 経路の y カーネル起動**に入っていた。両カーネルは
+`extern __shared__ double smem63[] / smem127[]` を使うので、動的 shared が 0 の
+まま起動すると `sD` の最初のストアで領域外になる。`#else` 側（PDL 無効時）の
+`<<<...>>>` 起動には `smem_y` が残っていたので、`P63_PDL_STAGE >= 3` /
+`P127_PDL_STAGE >= 3` が既定であるこの構成だけが落ちる。
+
+`(unsigned)smem_y` に戻した。差分は 2 行:
+
+```
+cuda_dg_kernels_tc.cu | 4 ++--
+```
+
+修正後の `FUSED_TC` は p=63 で 408.63 µs/stage、p=127 で 591.93 µs/stage と、
+regression 前に公表されていた §50.6 の **409.2** / `p127_gap_study.md` §23.8 の
+**590.8** をそれぞれ 0.14% / 0.19% の範囲で再現しており、`4b95aca` 以前の
+凍結バイナリ（`scale-dg_extraction.p63p31_final` ほか 3 本、いずれも p=63
+`FUSED_TC` が 23.1–23.4 ms/19 step）とも一致する。**この 2 行以外に p=63 /
+p=127 の挙動を変える差分は無い。**
+
+これは `FUSED_TC` —— 6 次数すべてで最速の本番経路 —— が HEAD で 2 次数について
+起動不能だったという意味であり、`TODO.md` §2.3 が「公表値が古い」と書いていた
+問題より重い。**古い値を放置すると、経路が壊れていることにも気付けない**という
+形で、契約の課題が性能の課題より先に立つことを示した例として記録する。
+
+### 55.2 p=63 の測定（job `78053`、12 ラウンド交互）
+
+物差しは `CUDA device fused tendency` ÷ (19 steps × 3)。`Step loop per stage`
+（halo + RK 更新込みの 1 ステップ ÷3）も併記する。3 種類の物差しの区別は §52.5。
+
+| 経路 | device 中央値 [ms] | device min–max [ms] | **µs/stage** | `Step loop per stage` [µs] |
+|---|---:|---:|---:|---:|
+| `CUDAFORTRAN_FUSED_TC` | 23.292 | 23.153–23.410 | **408.63** | 489.66 |
+| `CUDAFORTRAN_FUSED_DFMA` | 47.794 | 47.739–47.869 | **838.49** | 912.27 |
+| `CUDAFORTRAN_FUSED` | 26.449 | 26.391–26.473 | **464.01** | 544.27 |
+
+3 経路のレンジは互いに重ならない。
+
+- **機構比 A（`FUSED_DFMA` / `FUSED_TC`）= 838.49 / 408.63 = 2.052×**
+  （`Step loop` では 912.27 / 489.66 = 1.863×）。
+- 主比 B（`FUSED` / `FUSED_TC`）= 464.01 / 408.63 = **1.136×**。
+  §54 の 466.1 とは 0.45% 差で、別ジョブ・別ノードのばらつきの範囲。
+
+**旧公表値との差。** `README.md` の p=63 表の `FUSED_DFMA` は 846.2 µs/stage
+（2026-08-29 の login 3-run）で、現行ソースでは **838.49（−0.91%）**。
+この次数の DFMA はほとんど動いていない: `846.2` が測られた 2026-08-29 の時点で
+§18（末尾バリアの前送り）と §19（y 2 CTA / `cp.async` / `sFU`）は既に入って
+おり、その後 `FUSED_TC` に入った変更は §50 の PDL（−2.89%）だけだからである。
+DFMA でもその PDL は同じだけ効くはずだが、実測の −0.91% はそれより小さい。
+**PDL は面カーネルと xz を重ねる最適化で、xz が長い DFMA では隠せる面の
+割合が相対的に小さくなる**という説明が付く（面カーネル自体は mma を使わない
+ので DFMA でも TC でも同じ時間である）。
+
+機構比 A は 846.2 / 409.2 = 2.068× から **2.052×** へ。結論は動かない。
+
+### 55.3 内積以外に乖離が無いことの確認
+
+3 つの独立な証拠で確認した。
+
+1. **構造的（ソース）**: `cuda_dg_kernels_tc.cu` 全体で `UseTc` に依存する
+   分岐は **1 か所だけ**である。
+   ```
+   $ grep -n 'if constexpr (UseTc)\|UseTc ?\|UseTc &&\|UseTc ||\|!UseTc' cuda_dg_kernels_tc.cu
+   21:  if constexpr (UseTc) {
+   ```
+   21 行目は `mma_m8n8k4_f64<UseTc>` の中、すなわち**内積そのもの**である。
+   他の 63 か所の `UseTc` はすべてテンプレート仮引数か
+   `..._kernel<UseTc>` / `..._impl<false|true>` のインスタンス化で、
+   起動形状・shared 量・バリア・エピローグ・PDL 属性はどれも `UseTc` を見ない。
+   `extern "C"` の入口も `launch_..._dfma` / `launch_..._tc` が同一の
+   `launch_..._impl<bool>` を呼ぶだけで、Fortran 側のラッパ
+   （`cuda_cal_dqdt_fused_p63_dfma` / `_tc`、`mod_cuda_dg_kernels.cuf`）と
+   ディスパッチ（`cal_dqdt_cudafortran_fused_dfma` / `_tc`、
+   `mod_advect3d_eq.f90`）も引数・作業配列の確保条件まで対称である。
+2. **`4b95aca` の p=31 ノブも同様**: `P31_XZ_*` / `P31_Y_*` の使用箇所は 55 か所
+   あるが、上の grep が示すとおり `UseTc` 条件下には 1 つも無い。ノブは
+   `tendency_fused_p31_{xz,y}_kernel<UseTc>` と
+   `launch_tendency_fused_p31_impl<UseTc>` の中にあり、**両インスタンス化に
+   等しく効く**。
+3. **数値（実測）**: `SCALE_DG_VARYING_COEFF=1` で 6 次数すべての owned
+   `dqdt(:,1:Ne)` を出力すると、**`FUSED_TC` と `FUSED_DFMA` は全点ビット一致**
+   （p=63 は `namelists/val_p63_split.conf` の `Ne=2³`、2,097,152 点）。
+   `CUDAFORTRAN_SPLIT` 対照では両者とも max abs **2.66e-15**（相対 4.7e-16）。
+   検証条件は §55.4。
+
+### 55.4 数値検証（点変化係数）
+
+`SCALE_DG_VARYING_COEFF=1` で `u,v,w,Escale,normal_fn,Fscale` を点ごとに変え、
+owned `dqdt(:,1:Ne)` 全点を参照実装と比較した（login node、同一実行ファイル）。
+
+| p | 入力 | 参照 | 点数 | `FUSED_DFMA` max abs | `FUSED_TC` max abs | TC 対 DFMA |
+|---:|---|---|---:|---:|---:|---|
+| 7 | `val_p7_split.conf` | `CUDAFORTRAN_SPLIT` | 4,096 | 1.78e-15 | 1.78e-15 | ビット一致 |
+| 15 | `val_p15_split.conf` | `CUDAFORTRAN_SPLIT` | 32,768 | 1.78e-15 | 1.78e-15 | ビット一致 |
+| 31 | `val_p31_split.conf` | `CUDAFORTRAN_SPLIT` | 262,144 | 2.66e-15 | 2.66e-15 | ビット一致 |
+| 63 | `val_p63_split.conf` | `CUDAFORTRAN_SPLIT` | 2,097,152 | 2.66e-15 | 2.66e-15 | ビット一致 |
+| 127 | `val_p127_split.conf` | `CUDAFORTRAN_SPLIT` | 16,777,216 | 3.55e-15 | 3.55e-15 | ビット一致 |
+| 255 | `val_p255_gemm.conf` | `CUDAFORTRAN_GEMM` | 16,777,216 | 3.55e-15 | 3.55e-15 | ビット一致 |
+
+p=255 に `CUDAFORTRAN_SPLIT` は無い（`AGENTS.md` の「p=255 は FUSED /
+FUSED_TC / FUSED_DFMA / GEMM / GEMM_FUSED / GEMM_CUTE のいずれか」）ので、
+参照は `CUDAFORTRAN_GEMM` を採った。
+
+### 55.5 6 次数の機構比 A（同一ジョブ・同一物差し・インターリーブ）
+
+job `78053` の 1 ジョブに 6 次数 × 3 経路 × 12 ラウンドを入れてある。
+**比の両辺は必ず同じジョブ・同じラウンド列から採っている。**
+
+| p | `FUSED_TC` | `FUSED_DFMA` | **機構比 A** | 旧 A | 旧 `FUSED_DFMA` | DFMA の差 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 7 | 273.54 | 424.31 | **1.551×** | 1.556× | 427.8 | −0.82% |
+| 15 | 272.32 | 448.99 | **1.649×** | 1.643× | 446.6 | +0.53% |
+| 31 | 355.56 | 786.71 | **2.213×** | 2.228× | 790.1 | −0.43% |
+| 63 | 408.63 | 838.49 | **2.052×** | 2.068× | 846.2 | −0.91% |
+| 127 | 591.93 | 1455.77 | **2.459×** | 3.618× | 2137.3 | **−31.9%** |
+| 255 | 885.30 | 2017.00 | **2.278×** | 2.261× | 1998.0 | +0.95% |
+
+単位は µs/stage（`CUDA device fused tendency` ÷ (steps × 3)）。旧 A は
+`README.md` が公表していた `FUSED_DFMA` を現行 `FUSED_TC` で割った値。
+
+**動いたのは p=127 だけで、−31.9% と大きい。** ここが `README.md` p=127 節が
+「`FUSED_DFMA` の 2137.3 µs は §15 の測定で、§18–19 の y/面変更は入れていない」
+と自認していた箇所そのものである。§18–20 の y 2 CTA / D1D `cp.async` / PDL と
+§23 の xz ワープタイル + 二重バッファは、**mma を使わない DFMA でも同じだけ
+効いていた**。機構比 A は 3.62× → **2.46×** となり、「MMA 命令だけで 3.6 倍」
+という過大評価が消える。
+
+**残る 5 次数は ±1% 以内**で、比の結論は動かない。p=255 だけ +0.95% と
+**遅くなっている**（§17–§22 の compact 重ね・面 2,4・M 側直アドレス・
+エピローグ先読みは `FUSED_TC` で 912.6 → 883.8 を出したが、DFMA では利得が無く
+わずかに負け）。**同一ジョブでの再測定でなければ 1% の符号は主張できない**ので、
+これは「旧値と現行値がどちらも別ジョブで、差は 1% 以内」という以上の主張は
+しない。次に p=255 の TC を触るときに同一ジョブで確かめる。

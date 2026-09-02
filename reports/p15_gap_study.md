@@ -1953,3 +1953,37 @@ p=15 は **`Step loop per stage` 7.32704e-4 → 7.09523e-4 s（−3.16%）**で
 ほぼ同じ — 効くのはローンチ隙間の絶対量で、p=15 の率が大きいのは
 1 ステージが 733 µs と短いからである。**既定 conf は graph off のまま**
 （graph 再生では `Cal_tend` / `CUDA device *` が出ず、`nsys` も当てられない）。
+
+## 29. `FUSED_DFMA` を現行ソースで測り直す（2026-09-02、機構比 A 1.649×）
+
+`TODO.md` §2.3。手順・入力の作り方・iso-schedule であることの証拠・6 次数の
+一覧は [`p63_gap_study.md`](p63_gap_study.md) §55。本節は p=15 の数値だけを残す。
+
+- commit `fcf1872` + §55.1 の defect 修正（p=63 / p=127 のみに効く 2 行）
+- job `78053`、node `c384`、GB200 1 GPU
+- 入力 `namelists/perf_p15_fused_tc.conf`（`Ne=16³`、`nstep=20`、計時 19 ステップ）
+- 12 ラウンド、`FUSED_TC` → `FUSED_DFMA` → `FUSED` の順で交互
+- 物差し: `CUDA device fused tendency` ÷ (19 steps × 3)
+
+| 経路 | device 中央値 [ms] | device min–max [ms] | **µs/stage** | `Step loop per stage` [µs] |
+|---|---:|---:|---:|---:|
+| `CUDAFORTRAN_FUSED_TC` | 15.522 | 15.464–15.557 | **272.32** | 354.40 |
+| `CUDAFORTRAN_FUSED_DFMA` | 25.592 | 25.558–25.613 | **448.99** | 528.18 |
+| `CUDAFORTRAN_FUSED` | 19.059 | 18.987–19.129 | **334.36** | 417.07 |
+
+3 経路のレンジは互いに重ならない。
+
+- **機構比 A = 448.99 / 272.32 = 1.649×**（旧 446.6 / 271.8 = 1.643×）。
+  `Step loop` では 528.18 / 354.40 = 1.490×。
+- 主比 B = 334.36 / 272.32 = **1.228×**（§27 の 333.8 / README の 271.8 で 1.23×）。
+
+`FUSED_DFMA` は 446.6 → **448.99 µs/stage（+0.53%）**。**p=15 の `FUSED_TC` は
+2026-08-29 以降まったく触っていない**（§20 で契約内の 2 形を測って探索終了、
+採用ゼロ。PDL は §3 で「p=7 / p=15 では一度も言及がない」と `TODO.md` §5 に
+残っているとおり未適用）ので、この 0.5% は別ジョブ・別ノードのばらつきである。
+`FUSED_TC` 側も 271.8 → 272.32（+0.19%）と同じ向きに同じだけ動いており、
+比はほぼそのままである。
+
+点変化係数の owned `dqdt` 32,768 点（`namelists/val_p15_split.conf`、`Ne=2³`）は
+`FUSED_TC` と `FUSED_DFMA` で**ビット一致**、`CUDAFORTRAN_SPLIT` 対照で
+両者とも max abs **1.78e-15**。
