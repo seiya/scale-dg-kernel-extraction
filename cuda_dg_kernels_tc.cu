@@ -165,6 +165,31 @@ __device__ __forceinline__ void mma_k8_8x8(
 // (596 us). Both are recorded in tc_paper_survey_2407.09621.md section 5.
 
 
+// Illegal ablations that price the shared-memory store bank conflicts of the
+// p=7 fused Tensor Core kernel.  Section 13.5 of
+// reports/tc_paper_survey_2407.09621.md recorded that staging the two x-normal
+// faces raised the shared store conflicts from 2.41 M to 4.10 M and left the
+// mechanism open.  P7_ABL_SHST is a bit mask over the three groups of shared
+// stores the kernel has; a set bit replaces that group's addresses with
+// lane-linear ones, which are conflict free by construction and keep the
+// instruction count, the access width and the number of active lanes.
+//   1  the six sFluxX / sFluxY / sFluxZ stores (drops sw_xy / sw_z)
+//   2  the eight stage_xface() stores (drops the j + 8k fold and the plane
+//      stride of 72)
+//   4  the two sDz stores (drops sw_dz)
+// The values are wrong in every non-zero setting, so these builds exist only
+// to measure the ceiling.
+#ifndef P7_ABL_SHST
+#define P7_ABL_SHST 0
+#endif
+// Attribution build: revert faces 2 and 4 to the pre-section-13 form, in which
+// the M side is gathered from global through VMapM and nothing is staged in
+// shared memory.  Numerically correct; it is what the 2.41 M figure was
+// measured on.
+#ifndef P7_ABL_NOSTAGE
+#define P7_ABL_NOSTAGE 0
+#endif
+
 __device__ __forceinline__ int sw_xy(int idx)
 {
   return idx ^ (((idx >> 4) & 1) << 2);
@@ -179,6 +204,14 @@ __device__ __forceinline__ int sw_dz(int idx)
 {
   return idx ^ (((idx >> 6) & 1) << 3);
 }
+
+#if (P7_ABL_SHST & 1)
+#define P7_STXY(i) (i)
+#define P7_STZ(i) (i)
+#else
+#define P7_STXY(i) sw_xy(i)
+#define P7_STZ(i) sw_z(i)
+#endif
 
 // Stage the M-side fields of the two x-normal faces.  Node i + 8j + 64k lies
 // on face 2 when i == 7 and on face 4 when i == 0, and Fmask numbers both
@@ -198,8 +231,12 @@ __device__ __forceinline__ void stage_xface(double *sM, int node, double q,
 {
   const int i = node & 7;
   if (i == 7 || i == 0) {
+#if (P7_ABL_SHST & 2)
+    double *const m = sM + (node & 31);
+#else
     double *const m = sM + ((i == 7) ? 0 : XFACE_PLANE) + ((node >> 3) & 7) +
                       ((node >> 6) << 3);
+#endif
     m[0] = q;
     m[144] = u;
     m[288] = v;
@@ -228,7 +265,9 @@ __global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
   // Field-major with a padded plane stride of 72, so that a face-point warp
   // reads 32 consecutive doubles and the two planes of one store phase do not
   // land on the same bank.
+#if !P7_ABL_NOSTAGE
   __shared__ __align__(16) double sMface[4 * 144];
+#endif
   __shared__ __align__(16) double sFluxX[512], sFluxY[512], sFluxZ[512];
   // The z derivative overwrites the z flux it consumes, so the block needs
   // 15.87 KB instead of 20 KB. See the aliasing note above.
@@ -260,17 +299,21 @@ __global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
   const int idx2 = elem_offset + node2;
   {
     const double q1 = q[idx1], u1 = u[idx1], v1 = v[idx1], w1 = w[idx1];
-    sFluxX[sw_xy(node1)] = q1 * u1;
-    sFluxY[sw_xy(node1)] = q1 * v1;
-    sFluxZ[sw_z(node1)] = q1 * w1;
+    sFluxX[P7_STXY(node1)] = q1 * u1;
+    sFluxY[P7_STXY(node1)] = q1 * v1;
+    sFluxZ[P7_STZ(node1)] = q1 * w1;
+#if !P7_ABL_NOSTAGE
     stage_xface(sMface, node1, q1, u1, v1, w1);
+#endif
   }
   {
     const double q2 = q[idx2], u2 = u[idx2], v2 = v[idx2], w2 = w[idx2];
-    sFluxX[sw_xy(node2)] = q2 * u2;
-    sFluxY[sw_xy(node2)] = q2 * v2;
-    sFluxZ[sw_z(node2)] = q2 * w2;
+    sFluxX[P7_STXY(node2)] = q2 * u2;
+    sFluxY[P7_STXY(node2)] = q2 * v2;
+    sFluxZ[P7_STZ(node2)] = q2 * w2;
+#if !P7_ABL_NOSTAGE
     stage_xface(sMface, node2, q2, u2, v2, w2);
+#endif
   }
   // sMface is filled by whichever thread owns the node, which is not the
   // thread that reads it as a face point.
@@ -285,6 +328,13 @@ __global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
   const double fn2 = normal_fn[fidx + nface];
   const double fn3 = normal_fn[fidx + 2 * nface];
   double qM, VelM;
+#if P7_ABL_NOSTAGE
+  {
+    const int iM = VMapM[fidx] - 1;
+    qM = q[iM];
+    VelM = u[iM] * fn1 + v[iM] * fn2 + w[iM] * fn3;
+  }
+#else
   if ((fp & 64) != 0) {
     const double *const m =
         sMface + (((fp & 128) != 0) ? XFACE_PLANE : 0) + (fp & 63);
@@ -295,6 +345,7 @@ __global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
     qM = q[iM];
     VelM = u[iM] * fn1 + v[iM] * fn2 + w[iM] * fn3;
   }
+#endif
   double qP = q[iP];
   double VelP = u[iP] * fn1 + v[iP] * fn2 + w[iP] * fn3;
   double alpha = 0.5 * fabs(VelP + VelM);
@@ -347,9 +398,14 @@ __global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
   // sw_z() and sw_dz() permute across warp boundaries, so the z panel needs a
   // block-wide barrier before it overwrites the flux it was read from.
   __syncthreads();
+#if (P7_ABL_SHST & 4)
+  sDz[tid] = c0;
+  sDz[tid + 256] = c1;
+#else
   const int dz_c = sw_dz(((warp << 3) + j0_c) + (row << 6));
   sDz[dz_c] = c0;
   sDz[dz_c ^ 1] = c1;
+#endif
   __syncthreads();
 
   // The x and y derivatives never go through shared memory: the thread that
@@ -1741,6 +1797,33 @@ __device__ __forceinline__ int sw31(int idx)
 #define P31_ABL_YNOCPA 0
 #endif
 
+// Illegal / attribution ablations that price faces 2 and 4 of the p=31 xz
+// kernel.  Section 18.2 of p31_gap_study.md measured a ceiling of -17.8% for
+// deleting them, and sections 18.3 / 19.1 / 26 measured five implementable
+// forms that all lost.  These knobs separate the two things a form can change:
+// how much traffic there is, and what shape the M-side address has.
+//   0  production: M side through VMapM, node i + 32*j + 1024*k (stride 32)
+//   1  faces 2 and 4 are not evaluated at all (sf2 = sf4 = 0).  The ceiling of
+//      section 18.2, re-measured at HEAD.  Illegal.
+//   2  evaluated, but the M-side index is the coalesced elem_offset + pl.
+//      Same loads, same fields, same face points; only the address stride
+//      changes from 32 doubles to 1.  This is the prize every one of the five
+//      forms was trying to collect, priced with no toll attached.  Illegal.
+//   3  same as 2 with the P side made coalesced as well.  Illegal.
+//   4  the direct M-side address of section 26 (elem_offset + 31 + 32*pl and
+//      elem_offset + 32*pl), which drops the VMapM load but keeps the stride.
+//      Numerically correct; it reproduces the fifth form (+2.48%) so that it
+//      can be compared with 2 in one job.
+//   6  production M side, but the P-side index is the coalesced
+//      elem_offset + pl.  The one-variable counterpart of 2 for the P side,
+//      with all eight field loads still distinct.  Illegal.
+//   5  M side reuses the P-side index (iM = iP), which deletes the four
+//      strided loads and the VMapM load but keeps the P gather and the flux
+//      arithmetic.  Illegal.
+#ifndef P31_ABL_F24
+#define P31_ABL_F24 0
+#endif
+
 // Programmatic Dependent Launch for the p=31 fused Tensor Core path.  Here the
 // stage is two grids, xz -> y (the face fluxes are evaluated inside xz), so
 // only the last rung of the p=127 ladder applies: y is made a PDL dependent of
@@ -1751,13 +1834,11 @@ __device__ __forceinline__ int sw31(int idx)
 #define P31_PDL_STAGE 1
 #endif
 
-__device__ __forceinline__ double p31_face_flux_tc(
-    int fidx, const double *q, const double *u, const double *v,
-    const double *w, const int *VMapM, const int *VMapP,
-    const double *normal_fn, const double *Fscale, int nface)
+__device__ __forceinline__ double p31_face_flux_core(
+    int fidx, int iM, int iP, const double *q, const double *u,
+    const double *v, const double *w, const double *normal_fn,
+    const double *Fscale, int nface)
 {
-  const int iM = VMapM[fidx] - 1;
-  const int iP = VMapP[fidx] - 1;
   const double n1 = normal_fn[fidx];
   const double n2 = normal_fn[fidx + nface];
   const double n3 = normal_fn[fidx + 2 * nface];
@@ -1767,6 +1848,15 @@ __device__ __forceinline__ double p31_face_flux_tc(
   const double VelP = u[iP] * n1 + v[iP] * n2 + w[iP] * n3;
   const double alpha = 0.5 * fabs(VelP + VelM);
   return 0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
+}
+
+__device__ __forceinline__ double p31_face_flux_tc(
+    int fidx, const double *q, const double *u, const double *v,
+    const double *w, const int *VMapM, const int *VMapP,
+    const double *normal_fn, const double *Fscale, int nface)
+{
+  return p31_face_flux_core(fidx, VMapM[fidx] - 1, VMapP[fidx] - 1, q, u, v, w,
+                            normal_fn, Fscale, nface);
 }
 
 // Warp mma tile and chunk-loop pipelining for the p=31 fused Tensor Core
@@ -1918,10 +2008,48 @@ tendency_fused_p31_xz_kernel(
     const int kk = t >> 4;
     const int pl = (j0 + jl) + NQ31 * kk;
     const int sa = sw31(jl + NQ31 * kk);
+#if P31_ABL_F24 == 1
+    (void)pl;
+    sf2[sa] = 0.0;
+    sf4[sa] = 0.0;
+#elif P31_ABL_F24 == 0
     sf2[sa] = p31_face_flux_tc(face_offset + 1024 + pl, q, u, v, w, VMapM,
                                VMapP, normal_fn, Fscale, nface);
     sf4[sa] = p31_face_flux_tc(face_offset + 3072 + pl, q, u, v, w, VMapM,
                                VMapP, normal_fn, Fscale, nface);
+#else
+    {
+      const int fi2 = face_offset + 1024 + pl;
+      const int fi4 = face_offset + 3072 + pl;
+#if P31_ABL_F24 == 2 || P31_ABL_F24 == 3
+      const int m2 = elem_offset + pl;
+      const int m4 = m2;
+#elif P31_ABL_F24 == 6
+      const int m2 = VMapM[fi2] - 1;
+      const int m4 = VMapM[fi4] - 1;
+#elif P31_ABL_F24 == 4
+      const int m2 = elem_offset + (NQ31 - 1) + NQ31 * pl;
+      const int m4 = elem_offset + NQ31 * pl;
+#else
+      const int m2 = VMapP[fi2] - 1;
+      const int m4 = VMapP[fi4] - 1;
+#endif
+#if P31_ABL_F24 == 3
+      const int p2 = m2;
+      const int p4 = m4;
+#elif P31_ABL_F24 == 6
+      const int p2 = elem_offset + pl;
+      const int p4 = p2;
+#else
+      const int p2 = VMapP[fi2] - 1;
+      const int p4 = VMapP[fi4] - 1;
+#endif
+      sf2[sa] = p31_face_flux_core(fi2, m2, p2, q, u, v, w, normal_fn, Fscale,
+                                   nface);
+      sf4[sa] = p31_face_flux_core(fi4, m4, p4, q, u, v, w, normal_fn, Fscale,
+                                   nface);
+    }
+#endif
   }
   // Faces 5 and 6: 32 i by 16 j.  A warp walks 32 consecutive i at fixed j.
 #pragma unroll
