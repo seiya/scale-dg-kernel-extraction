@@ -22,8 +22,7 @@
 // and whether the y GEMM also added deriv_x into deriv_y
 // (cutlass_y_gemm_scaleadd.h). When they have, this epilogue reads two volume
 // tensors instead of five. Nq <= 64 uses the same kWeighted path after the y
-// epilogue does Ey*acc + Ex*Dx; its x GEMM is still cuBLAS. GemmZWide stays
-// off at Nq = 64 (that change alone is +2.8%).
+// epilogue does Ey*acc + Ex*Dx; its x GEMM is still cuBLAS.
 //
 // This epilogue is instruction-issue bound: removing the lift drops its
 // instruction count by 13.0% and its duration by 12.8%, while the stall
@@ -37,12 +36,17 @@
 //   - the lift's arithmetic moved behind the accumulator's shared round trip
 //     so its two face loads are in flight across the barriers (5 us),
 //   - 16-byte epilogue accesses (7.2 us at p=127, 17 us at p=255; at Nq = 64
-//     the same change costs 2.8%, which is why GemmZWide exists),
+//     the same change measured +2.8% while the 16-byte lift was also on,
+//     which is why GemmZWide exists as a separate switch),
 //     which is why elembnd_flux_kernel interleaves the face planes in pairs
 //     and why the two z-face lift coefficients arrive in their own packed
 //     table.
 // kWeighted and GemmZWide used to ride together. They no longer do: at Nq = 64
-// kWeighted is on (y folds Ex*Dx) and GemmZWide stays off.
+// kWeighted is on (y folds Ex*Dx) and GemmZWide is on while the 16-byte lift
+// is off. The +2.8% recorded above was measured with the 16-byte lift on; with
+// it off the same GemmZWide is -0.95% and takes the kernel from 254 registers
+// with 8 B of spill to 238 with none (reports/gemm_assignment_and_carrier.md).
+// The two interact, so neither is a standalone verdict on the other.
 //
 // The user problem is (m=Nq*Nq, n=Nq) column-major, which CUTLASS solves as
 // the transposed row-major problem. So an epilogue tile row is the z index k

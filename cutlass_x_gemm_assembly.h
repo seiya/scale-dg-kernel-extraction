@@ -49,7 +49,22 @@
 //- here, because y and z are now plain GEMMs.  kYWeighted says Escale_y is
 //- already in deriv_y, kZWeighted says Escale_z is already in deriv_z; with
 //- both, this epilogue reads three volume tensors (Dy, Dz, Ex).
-template <typename Epilogue, bool kYWeighted = false, bool kZWeighted = false>
+//
+//- kAffine and kPaired are the two instruction-count ingredients the Nq > 64
+//- z carrier uses (cutlass_z_gemm_assembly.h): hoisting the index clamps onto
+//- the tile origin so the face gathers stay affine in the row offset, and
+//- issuing the six per-element face loads as three 16-byte loads out of the
+//- interleaved face layout (pair_nq2 in elembnd_flux_kernel) plus a packed
+//- lift-coefficient table.  Both are expressible on x: the x carrier reads
+//- exactly the same three face pairs -- (f1,f3) at jk, (f0,f2) at i+k*Nq and
+//- (f4,f5) at i+j*Nq -- that the interleaved layout groups.  The third
+//- ingredient, 16-byte epilogue accesses, is not in this header: it is the
+//- output tile iterator's kElementsPerAccess and comes from an x tile built
+//- with EpilogueOp2 (XTileWide in cuda_cutlass_gemm_fused.cu), same
+//- threadblock/warp/stage shape as the plain tile so GEMM_CUTE still shares
+//- the mainloop.
+template <typename Epilogue, bool kYWeighted = false, bool kZWeighted = false,
+          bool kAffine = false, bool kPaired = false>
 class EpilogueDqdtAssemblyX : public Epilogue {
 public:
   using OutputTileIterator = typename Epilogue::OutputTileIterator;
@@ -107,7 +122,8 @@ public:
                       OutputTileIterator it_dy, OutputTileIterator it_dz,
                       OutputTileIterator it_ex, OutputTileIterator it_ey,
                       OutputTileIterator it_ez, double const *flux_bnd,
-                      double const *lift1d, int Nq, int nrow, int nq_log2)
+                      double const *lift1d, double const *lift_pair, int Nq,
+                      int nrow, int nq_log2)
   {
     using ThreadMap = typename OutputTileIterator::ThreadMap;
     static int const kEPV = ThreadMap::kElementsPerAccess;
@@ -119,6 +135,26 @@ public:
     const int nq2 = Nq * Nq;
     const int nfp_tot = 6 * nq2;
 
+    //- Packed lift coefficient pairs, layout as pack_lift_pair_kernel writes
+    //- them: [0,2Nq) = (Lift1D(:,1), Lift1D(:,3)) indexed by j, [2Nq,4Nq) =
+    //- (Lift1D(:,2), Lift1D(:,4)) indexed by i, [4Nq,6Nq) = (Lift1D(:,5),
+    //- Lift1D(:,6)) indexed by k.
+    double2 const *py = reinterpret_cast<double2 const *>(lift_pair);
+    double2 const *px = reinterpret_cast<double2 const *>(lift_pair + 2 * Nq);
+    double2 const *pz = reinterpret_cast<double2 const *>(lift_pair + 4 * Nq);
+
+    //- Clamping the tile ORIGIN instead of every index: an out-of-range row
+    //- still reads a valid address and the output iterator predicates the
+    //- store away, so the result is unchanged while the face gathers stay
+    //- affine in the row offset.  Same trade as the z carrier's kAffine.
+    const int kMaxRowOffset = (ThreadMap::Iterations::kRow - 1) * ThreadMap::Delta::kRow +
+                              (ThreadMap::Iterations::kGroup - 1) * ThreadMap::Delta::kGroup +
+                              (ThreadMap::Iterations::kCluster - 1) * ThreadMap::Delta::kCluster;
+    const int kMaxColOffset =
+        (ThreadMap::Iterations::kColumn - 1) * ThreadMap::Delta::kColumn + (kEPV - 1);
+    const int row_limit = max(nrow - 1 - kMaxRowOffset, 0);
+    const int col_limit = max(Nq - 1 - kMaxColOffset, 0);
+
     //- Column-invariant part: i and the two x-face lift coefficients, which
     //- depend on i alone.  operator++ on the output iterator advances only
     //- thread_start_row_, so this survives the kIterations loop.
@@ -126,17 +162,24 @@ public:
     double col_lx1[kCols];
     double col_lx2[kCols];
     {
-      const int start_col = destination_iterator.thread_start_column();
+      const int start_col = kAffine ? min(destination_iterator.thread_start_column(), col_limit)
+                                    : destination_iterator.thread_start_column();
       CUTLASS_PRAGMA_UNROLL
       for (int column = 0; column < ThreadMap::Iterations::kColumn; ++column) {
         CUTLASS_PRAGMA_UNROLL
         for (int e = 0; e < kEPV; ++e) {
           const int cc = column * kEPV + e;
           const int c = start_col + column * ThreadMap::Delta::kColumn + e;
-          const int i = min(c, Nq - 1);
+          const int i = kAffine ? c : min(c, Nq - 1);
           col_i[cc] = i;
-          col_lx1[cc] = lift1d[Nq + i];
-          col_lx2[cc] = lift1d[3 * Nq + i];
+          if (kPaired) {
+            const double2 lxp = px[i];
+            col_lx1[cc] = lxp.x;
+            col_lx2[cc] = lxp.y;
+          } else {
+            col_lx1[cc] = lift1d[Nq + i];
+            col_lx2[cc] = lift1d[3 * Nq + i];
+          }
         }
       }
     }
@@ -161,7 +204,17 @@ public:
 
       // lift(i,j,k), summed in the same (x+y)+z order the two-kernel form used.
       double frag_lift[OutputTileIterator::Fragment::kElements];
-      const int start_row = destination_iterator.thread_start_row();
+      double2 lift_a[kPaired ? OutputTileIterator::Fragment::kElements : 1];
+      double2 lift_c[kPaired ? OutputTileIterator::Fragment::kElements : 1];
+      static int const kFragRows = ThreadMap::Iterations::kRow *
+                                   ThreadMap::Iterations::kGroup *
+                                   ThreadMap::Iterations::kCluster;
+      double row_ly1[kPaired ? kFragRows : 1];
+      double row_ly2[kPaired ? kFragRows : 1];
+      double row_lz1[kPaired ? kFragRows : 1];
+      double row_lz2[kPaired ? kFragRows : 1];
+      const int start_row = kAffine ? min(destination_iterator.thread_start_row(), row_limit)
+                                    : destination_iterator.thread_start_row();
       CUTLASS_PRAGMA_UNROLL
       for (int cluster = 0; cluster < ThreadMap::Iterations::kCluster; ++cluster) {
         CUTLASS_PRAGMA_UNROLL
@@ -177,7 +230,8 @@ public:
             //- The row is the packed index c = j + Nq*k + Nq*Nq*elem.  Every
             //- adopted x tile has TbM dividing Nq*Nq, so elem is in fact
             //- constant over a tile, but nothing here relies on that.
-            const int c = min(start_row + row_offset, nrow - 1);
+            const int c = kAffine ? (start_row + row_offset)
+                                  : min(start_row + row_offset, nrow - 1);
             //- Splitting c costs two integer divisions per row, and unlike the
             //- z and y carriers the x carrier's rows ARE the long axis, so it
             //- pays them once per row iteration instead of hoisting them into
@@ -198,6 +252,38 @@ public:
             }
 
             double const *fb = flux_bnd + static_cast<std::int64_t>(nfp_tot) * elem;
+            const int jk = j + kz * Nq;
+            const int kNq = kz * Nq;
+            const int jNq = j * Nq;
+
+            if (kPaired) {
+              //- Interleaved face layout: pA = (f0,f2), pB = (f1,f3),
+              //- pC = (f4,f5), each at the index the lift reads them at.
+              double2 const *pA = reinterpret_cast<double2 const *>(fb);
+              double2 const *pB = reinterpret_cast<double2 const *>(fb + 2 * nq2);
+              double2 const *pC = reinterpret_cast<double2 const *>(fb + 4 * nq2);
+              const double2 fxp = pB[jk];
+              const double2 lyp = py[j];
+              const double2 lzp = pz[kz];
+              row_ly1[frag_row_idx] = lyp.x;
+              row_ly2[frag_row_idx] = lyp.y;
+              row_lz1[frag_row_idx] = lzp.x;
+              row_lz2[frag_row_idx] = lzp.y;
+              CUTLASS_PRAGMA_UNROLL
+              for (int cc = 0; cc < kCols; ++cc) {
+                const int idx = frag_row_idx * kCols + cc;
+                const int i = col_i[cc];
+                //- Load phase only: keep the two per-element face pairs in
+                //- registers and let the accumulator's shared round trip
+                //- below cover their latency.  The arithmetic runs after
+                //- sli.load(), in the same (lx+ly)+lz order.
+                lift_a[idx] = pA[i + kNq];
+                lift_c[idx] = pC[i + jNq];
+                frag_lift[idx] = col_lx1[cc] * fxp.x + col_lx2[cc] * fxp.y;
+              }
+              continue;
+            }
+
             double const *fb0 = fb;
             double const *fb1 = fb + nq2;
             double const *fb2 = fb + 2 * nq2;
@@ -208,15 +294,12 @@ public:
             //- Row-invariant scalars: the two x-face VALUES (they depend on j
             //- and k only, which is what makes lx separable here), and the y-
             //- and z-face lift coefficients.
-            const int jk = j + kz * Nq;
             const double fx1 = fb1[jk];
             const double fx3 = fb3[jk];
             const double ly1 = lift1d[j];
             const double ly2 = lift1d[2 * Nq + j];
             const double lz1 = lift1d[4 * Nq + kz];
             const double lz2 = lift1d[5 * Nq + kz];
-            const int kNq = kz * Nq;
-            const int jNq = j * Nq;
 
             CUTLASS_PRAGMA_UNROLL
             for (int cc = 0; cc < kCols; ++cc) {
@@ -250,6 +333,27 @@ public:
         sli.add_pointer_offset((1 - kPartitionsK) * kSmemPointerOffset);
       }
 
+      //- Arithmetic phase of the lift, deliberately after the accumulator's
+      //- shared round trip so the two per-element face loads above are in
+      //- flight across the two barriers.  Same (lx+ly)+lz order: frag_lift
+      //- already holds lx.
+      if (kPaired) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int fr = 0; fr < kFragRows; ++fr) {
+          const double ly1 = row_ly1[fr];
+          const double ly2 = row_ly2[fr];
+          const double lz1 = row_lz1[fr];
+          const double lz2 = row_lz2[fr];
+          CUTLASS_PRAGMA_UNROLL
+          for (int cc = 0; cc < kCols; ++cc) {
+            const int idx = fr * kCols + cc;
+            const double ly = ly1 * lift_a[idx].x + ly2 * lift_a[idx].y;
+            const double lz = lz1 * lift_c[idx].x + lz2 * lift_c[idx].y;
+            frag_lift[idx] = (frag_lift[idx] + ly) + lz;
+          }
+        }
+      }
+
       typename OutputTileIterator::Fragment output_fragment;
       auto const *dx = reinterpret_cast<double const *>(&aligned_accum_fragment[0]);
       auto const *dy = reinterpret_cast<double const *>(&frag_dy);
@@ -275,14 +379,16 @@ public:
 //- Non-batched counterpart of GemmBatchedDqdtAssembly / ...Y: the x volume GEMM
 //- is a single large problem, not a batch, so this wraps kernel::Gemm.
 template <typename Mma_, typename Epilogue_, typename ThreadblockSwizzle_,
-          bool kYWeighted = false, bool kZWeighted = false>
+          bool kYWeighted = false, bool kZWeighted = false,
+          bool kAffine = false, bool kPaired = false>
 struct GemmDqdtAssemblyX {
   using Mma = Mma_;
   using Epilogue = Epilogue_;
   using ThreadblockSwizzle = ThreadblockSwizzle_;
   using BaseKernel =
       cutlass::gemm::kernel::Gemm<Mma, Epilogue, ThreadblockSwizzle, false>;
-  using AssemblyEpilogue = EpilogueDqdtAssemblyX<Epilogue, kYWeighted, kZWeighted>;
+  using AssemblyEpilogue =
+      EpilogueDqdtAssemblyX<Epilogue, kYWeighted, kZWeighted, kAffine, kPaired>;
   using WarpCount = typename Mma::WarpCount;
   static int const kThreadCount = 32 * WarpCount::kCount;
 
@@ -292,6 +398,7 @@ struct GemmDqdtAssemblyX {
     double const *ptr_dz{nullptr};
     double const *ptr_flux_bnd{nullptr};
     double const *ptr_lift1d{nullptr};
+    double const *ptr_lift_pair{nullptr};
     int Nq{0};
     int nq_log2{-1};
     double const *ptr_ex{nullptr};
@@ -369,7 +476,8 @@ struct GemmDqdtAssemblyX {
 
     AssemblyEpilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
     epilogue.apply_assembly(iterator_D, accumulators, it_dy, it_dz, it_ex, it_ey, it_ez,
-                            params.ptr_flux_bnd, params.ptr_lift1d, params.Nq,
+                            params.ptr_flux_bnd, params.ptr_lift1d,
+                            params.ptr_lift_pair, params.Nq,
                             gp.problem_size.m(), params.nq_log2);
   }
 };

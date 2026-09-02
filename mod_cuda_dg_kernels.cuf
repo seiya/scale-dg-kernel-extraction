@@ -60,6 +60,11 @@ module mod_cuda_dg_kernels
   ! mesh operator and does not change during a run, so this is built once.
   real(RP), device, allocatable, save :: dg_lift_zpair(:)
   integer, save :: dg_lift_zpair_nq = -1
+  !- Packed lift-coefficient pairs for the x carrier's 16-byte lift: three
+  !- interleaved pairs of length Nq, (col1,col3) then (col2,col4) then
+  !- (col5,col6).  See cutlass_x_gemm_assembly.h.
+  real(RP), device, allocatable, save :: dg_lift_xpair(:)
+  integer, save :: dg_lift_xpair_nq = -1
 
   type(cudaEvent), save :: split_events(5,2)
   logical, save :: split_events_initialized = .false.
@@ -225,6 +230,24 @@ module mod_cuda_dg_kernels
   !                      the carrier instead of the shift/mask one.  A bit is
   !                      cleared when that GEMM is on cuBLAS, which has no
   !                      epilogue.  Default: 1 at Nq = 32, 0 elsewhere.
+  !   SCALE_DG_XPKG     x carrier only.  The three Nq > 64 epilogue
+  !                      ingredients the z carrier bundles: bit 0 = clamp
+  !                      aggregation (hoist the index clamps onto the tile
+  !                      origin), bit 1 = 16-byte lift (interleaved face
+  !                      layout plus packed lift-coefficient pairs), bit 2 =
+  !                      16-byte epilogue accesses (GemmXWide, same mainloop
+  !                      tile).  All three are epilogue-side only.
+  !                      Default: 0 at every order.
+  !   SCALE_DG_ZPKG      z carrier only, Nq = 16 and 64: the same three
+  !                      epilogue ingredients as SCALE_DG_XPKG, on the z
+  !                      carrier.  Unset keeps the order's adopted form
+  !                      (all three off at Nq = 16, clamp aggregation and
+  !                      16-byte lift on at Nq = 64).
+  !   SCALE_DG_ZTILE     index into the order's plain-z CUTLASS tile list in
+  !                      cuda_cutlass_gemm_fused.cu (Nq = 16 only so far).
+  !                      Applies to GEMM_CUTE and GEMM_FUSED alike, since both
+  !                      reach the plain z through launch_volume_gemm_z.
+  !                      Default: -1, the order's adopted set.
   !   SCALE_DG_YSCHED    schedule when the carrier is not z.  With a y carrier,
   !                      0 = x then z on the main stream, 1 = z on the second
   !                      side stream concurrently with x.  With an x carrier,
@@ -254,9 +277,16 @@ module mod_cuda_dg_kernels
     integer :: ysched  = 0   ! 0 = x then z, 1 = z beside x on side2
     integer :: xfwd    = 0   ! x carrier only: bit 0 Escale_y into y,
                              ! bit 1 Escale_z into z
+    integer :: xpkg    = 0   ! x carrier only: bit 0 clamp aggregation,
+                             ! bit 1 16-byte lift, bit 2 16-byte epilogue
+    integer :: z_tile  = -1  ! plain-z CUTLASS tile index, -1 = order default
+    integer :: zpkg    = -1  ! z carrier only: -1 = order default, else
+                             ! bit 0 clamp aggregation, bit 1 16-byte lift,
+                             ! bit 2 16-byte epilogue
   end type dg_gemm_plan_t
 
   !- Cached environment slots for the overrides documented above.
+  integer, save :: x_pkg_env = -2, z_tile_env = -2, z_pkg_env = -2
   integer, save :: x_mode_env = -2, x_tile_env = -2, y_cublas_env = -2
   integer, save :: zcublas_env = -2, carrier_env = -2, ysched_env = -2
   integer, save :: xfwd_env = -2
@@ -734,9 +764,9 @@ module mod_cuda_dg_kernels
     end function launch_volume_gemm_y
 
     function launch_volume_gemm_z(deriv_z, flux_z, D1D_tr, &
-      Nq, Ne, mma_shape) bind(C, name="launch_volume_gemm_z")
+      Nq, Ne, mma_shape, tile) bind(C, name="launch_volume_gemm_z")
       import
-      integer(c_int), value :: Nq, Ne, mma_shape
+      integer(c_int), value :: Nq, Ne, mma_shape, tile
       real(c_double), device :: deriv_z(*)
       real(c_double), device :: flux_z(*)
       real(c_double), device :: D1D_tr(*)
@@ -744,10 +774,11 @@ module mod_cuda_dg_kernels
     end function launch_volume_gemm_z
 
     function launch_z_gemm_assembly(dqdt, flux_z, D1D_tr, deriv_x, deriv_y, &
-      flux_bnd, lift1d, lift_zpair, escale, Nq, Ne, mma_shape, xy_weighted) &
+      flux_bnd, lift1d, lift_zpair, escale, Nq, Ne, mma_shape, xy_weighted, &
+      pkg) &
       bind(C, name="launch_z_gemm_assembly")
       import
-      integer(c_int), value :: Nq, Ne, mma_shape, xy_weighted
+      integer(c_int), value :: Nq, Ne, mma_shape, xy_weighted, pkg
       real(c_double), device :: dqdt(*)
       real(c_double), device :: flux_z(*), D1D_tr(*)
       real(c_double), device :: deriv_x(*), deriv_y(*), escale(*)
@@ -786,14 +817,14 @@ module mod_cuda_dg_kernels
     end function launch_volume_gemm_z_scaled
 
     function launch_x_gemm_assembly(dqdt, flux_x, D1D, deriv_y, deriv_z, &
-      flux_bnd, lift1d, escale, Nq, Ne, mma_shape, tile, weight_mode) &
-      bind(C, name="launch_x_gemm_assembly")
+      flux_bnd, lift1d, lift_pair, escale, Nq, Ne, mma_shape, tile, &
+      weight_mode, pkg) bind(C, name="launch_x_gemm_assembly")
       import
-      integer(c_int), value :: Nq, Ne, mma_shape, tile, weight_mode
+      integer(c_int), value :: Nq, Ne, mma_shape, tile, weight_mode, pkg
       real(c_double), device :: dqdt(*)
       real(c_double), device :: flux_x(*), D1D(*)
       real(c_double), device :: deriv_y(*), deriv_z(*), escale(*)
-      real(c_double), device :: flux_bnd(*), lift1d(*)
+      real(c_double), device :: flux_bnd(*), lift1d(*), lift_pair(*)
       integer(c_int) :: launch_x_gemm_assembly
     end function launch_x_gemm_assembly
   end interface
@@ -1816,24 +1847,28 @@ contains
     type(dg_gemm_plan_t), intent(out) :: plan
 
     select case (Nq)
-    case (8)    !- p=7   x CUTLASS tile 9, y cuBLAS, z carrier, z CUTLASS
-      plan = dg_gemm_plan_t(x_mode=1, x_tile=9, y_lib=1, carrier=0, &
-                            z_lib=0, ysched=0, xfwd=0)
-    case (16)   !- p=15  x CUTLASS tile 5, y CUTLASS, z carrier, z CUTLASS
-      plan = dg_gemm_plan_t(x_mode=1, x_tile=5, y_lib=0, carrier=0, &
-                            z_lib=0, ysched=0, xfwd=0)
-    case (32)   !- p=31  x CUTLASS tile 7 and carrier, y CUTLASS + Escale_y,
-                !-        z cuBLAS, y||z
+    case (8)    !- p=7   x CUTLASS tile 9 and carrier (16-byte epilogue and
+                !-        clamp aggregation), y cuBLAS, z CUTLASS, y||z
+      plan = dg_gemm_plan_t(x_mode=1, x_tile=9, y_lib=1, carrier=2, &
+                            z_lib=0, ysched=1, xfwd=0, xpkg=5, z_tile=-1, zpkg=-1)
+    case (16)   !- p=15  x CUTLASS tile 5 and carrier (16-byte epilogue),
+                !-        y CUTLASS, z CUTLASS, y||z
+      plan = dg_gemm_plan_t(x_mode=1, x_tile=5, y_lib=0, carrier=2, &
+                            z_lib=0, ysched=1, xfwd=0, xpkg=4, z_tile=-1, zpkg=-1)
+    case (32)   !- p=31  x CUTLASS tile 7 and carrier (16-byte epilogue),
+                !-        y CUTLASS, z cuBLAS, y||z
       plan = dg_gemm_plan_t(x_mode=1, x_tile=7, y_lib=0, carrier=2, &
-                            z_lib=1, ysched=1, xfwd=1)
-    case (64)   !- p=63  x CUTLASS tile 3, y CUTLASS, z carrier, z CUTLASS
+                            z_lib=1, ysched=1, xfwd=0, xpkg=4, z_tile=-1, zpkg=-1)
+    case (64)   !- p=63  x CUTLASS tile 3, y CUTLASS, z carrier with the
+                !-        16-byte epilogue and clamp aggregation but NOT the
+                !-        16-byte lift, z CUTLASS
       plan = dg_gemm_plan_t(x_mode=1, x_tile=3, y_lib=0, carrier=0, &
-                            z_lib=0, ysched=0, xfwd=0)
+                            z_lib=0, ysched=0, xfwd=0, xpkg=0, z_tile=-1, zpkg=5)
     case default
       !- Nq > 64: generic CUTLASS x through launch_volume_gemm_x / _xy, and
       !- everything else as it has always been.  Untouched by the sweep.
       plan = dg_gemm_plan_t(x_mode=0, x_tile=0, y_lib=0, carrier=0, &
-                            z_lib=0, ysched=0, xfwd=0)
+                            z_lib=0, ysched=0, xfwd=0, xpkg=0, z_tile=-1, zpkg=-1)
     end select
   end subroutine dg_gemm_defaults
 
@@ -1864,6 +1899,12 @@ contains
     if (ov >= 0) plan%ysched = ov
     ov = dg_env_int("SCALE_DG_XFWD", xfwd_env, -1)
     if (ov >= 0) plan%xfwd = ov
+    ov = dg_env_int("SCALE_DG_XPKG", x_pkg_env, -1)
+    if (ov >= 0) plan%xpkg = ov
+    ov = dg_env_int("SCALE_DG_ZTILE", z_tile_env, -1)
+    if (ov >= 0) plan%z_tile = ov
+    ov = dg_env_int("SCALE_DG_ZPKG", z_pkg_env, -1)
+    if (ov >= 0) plan%zpkg = ov
 
     !- Legality clamps.  They apply to the table and to an override alike.
     !- Only the four swept orders have a CUTLASS x tile list; Nq > 64 takes
@@ -1898,6 +1939,12 @@ contains
     !- Escale forwarding into the non-carriers exists only for the x carrier,
     !- and only for a non-carrier that is CUTLASS (cuBLAS has no epilogue).
     if (plan%carrier /= 2) plan%xfwd = 0
+    !- The epilogue package is an x-carrier-only epilogue change.
+    if (plan%carrier /= 2) plan%xpkg = 0
+    !- The z-carrier package override exists only for the z carrier, and only
+    !- at the two orders launch_z_gemm_assembly instantiates it for.
+    if (plan%carrier /= 0 .or. .not. fuse_epilogue) plan%zpkg = -1
+    if (Nq /= 16 .and. Nq /= 64) plan%zpkg = -1
 
     !- Bit 2 is the row-index-arithmetic ablation and is never cleared here.
     if (plan%y_lib /= 0) plan%xfwd = iand(plan%xfwd, 6)
@@ -1930,7 +1977,7 @@ contains
         0_c_long_long, 0.0_c_double, deriv_z, Nq*Nq, int(Np,c_long_long), Ne)
     else
       istat = launch_volume_gemm_z(deriv_z, flux_z, D1D_tr, Nq, Ne, &
-        cutlass_mma_shape_id)
+        cutlass_mma_shape_id, plan%z_tile)
     end if
   end subroutine launch_volume_gemm_z_common
 
@@ -2449,9 +2496,33 @@ contains
     ! layout: the three 16-byte lift loads are -2.4% there (p7_gemm_fused.md
     ! section 13).  Nq = 16, 32 and 64 lose from it.
     if (fuse_epilogue .and. (Nq >= 64 .or. Nq == 8)) pair_nq2 = nq2
-    !- Neither the x nor the y assembly epilogue reads the interleaved face
-    !- layout, so a carrier other than z must not get it.
-    if (carrier >= 1) pair_nq2 = 0
+    !- SCALE_DG_ZPKG selects the interleaved face layout explicitly.
+    if (fuse_epilogue .and. plan%zpkg >= 0) then
+      if (iand(plan%zpkg, 2) /= 0) then
+        pair_nq2 = nq2
+      else
+        pair_nq2 = 0
+      end if
+    end if
+    !- The y assembly epilogue does not read the interleaved face layout, so a
+    !- y carrier must not get it.  The x carrier CAN read it -- it needs the
+    !- same three pairs -- and does when SCALE_DG_XPKG bit 1 asks for the
+    !- 16-byte lift.
+    if (carrier == 1) pair_nq2 = 0
+    if (carrier == 2) then
+      if (iand(plan%xpkg, 2) /= 0) then
+        pair_nq2 = nq2
+        if (dg_lift_xpair_nq /= Nq) then
+          if (allocated(dg_lift_xpair)) deallocate(dg_lift_xpair)
+          allocate(dg_lift_xpair(6*Nq))
+          call pack_lift_xpair_kernel<<<(Nq+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE, &
+            CUDA_BLOCK_SIZE,0,dg_stream>>>( dg_lift_xpair, Lift1D, Nq )
+          dg_lift_xpair_nq = Nq
+        end if
+      else
+        pair_nq2 = 0
+      end if
+    end if
     if (pair_nq2 /= 0) then
       if (dg_lift_zpair_nq /= Nq) then
         if (allocated(dg_lift_zpair)) deallocate(dg_lift_zpair)
@@ -2618,9 +2689,17 @@ contains
       ! wrong on purpose; it prices the carrier off the stage time.
       continue
     else if (fuse_epilogue .and. carrier == 2) then
-      istat = launch_x_gemm_assembly( &
-        dqdt, flux_x, D1D, deriv_y, deriv_x, flux_bnd, Lift1D, &
-        Escale, Nq, Ne, cutlass_mma_shape_id, plan%x_tile, plan%xfwd )
+      if (iand(plan%xpkg, 2) /= 0) then
+        istat = launch_x_gemm_assembly( &
+          dqdt, flux_x, D1D, deriv_y, deriv_x, flux_bnd, Lift1D, &
+          dg_lift_xpair, Escale, Nq, Ne, cutlass_mma_shape_id, plan%x_tile, &
+          plan%xfwd, plan%xpkg )
+      else
+        istat = launch_x_gemm_assembly( &
+          dqdt, flux_x, D1D, deriv_y, deriv_x, flux_bnd, Lift1D, &
+          Lift1D, Escale, Nq, Ne, cutlass_mma_shape_id, plan%x_tile, &
+          plan%xfwd, plan%xpkg )
+      end if
       if (istat /= 0) call cuda_failure("launch_x_gemm_assembly",istat)
     else if (fuse_epilogue .and. carrier == 1) then
       istat = launch_y_gemm_assembly( &
@@ -2631,12 +2710,14 @@ contains
       if (pair_nq2 /= 0) then
         istat = launch_z_gemm_assembly( &
           dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, Lift1D, &
-          dg_lift_zpair, Escale, Nq, Ne, cutlass_mma_shape_id, xy_weighted )
+          dg_lift_zpair, Escale, Nq, Ne, cutlass_mma_shape_id, xy_weighted, &
+          plan%zpkg )
         if (istat /= 0) call cuda_failure("launch_z_gemm_assembly",istat)
       else
         istat = launch_z_gemm_assembly( &
           dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, Lift1D, &
-          Lift1D, Escale, Nq, Ne, cutlass_mma_shape_id, xy_weighted )
+          Lift1D, Escale, Nq, Ne, cutlass_mma_shape_id, xy_weighted, &
+          plan%zpkg )
         if (istat /= 0) call cuda_failure("launch_z_gemm_assembly",istat)
       end if
     else
@@ -3366,6 +3447,25 @@ contains
       zpair(2*k  ) = lift1d(5*Nq+k)
     end if
   end subroutine pack_lift_zpair_kernel
+
+  !- Packed lift-coefficient pairs for the x assembly epilogue: (col1,col3)
+  !- indexed by j, (col2,col4) indexed by i, (col5,col6) indexed by k.
+  attributes(global) subroutine pack_lift_xpair_kernel( pairs, lift1d, Nq )
+    implicit none
+    integer, value :: Nq
+    real(RP), device :: pairs(*), lift1d(*)
+    integer :: k
+
+    k = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    if (k <= Nq) then
+      pairs(2*k-1)        = lift1d(k)
+      pairs(2*k  )        = lift1d(2*Nq+k)
+      pairs(2*Nq+2*k-1)   = lift1d(Nq+k)
+      pairs(2*Nq+2*k  )   = lift1d(3*Nq+k)
+      pairs(4*Nq+2*k-1)   = lift1d(4*Nq+k)
+      pairs(4*Nq+2*k  )   = lift1d(5*Nq+k)
+    end if
+  end subroutine pack_lift_xpair_kernel
 
   attributes(global) subroutine elembnd_flux_kernel( &
     flux, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
