@@ -359,6 +359,44 @@ using P63XTile9 = XTile<256, 64, 64, 32, 16, 3>;
 using P63XTile10 = XTile<64, 64, 16, 32, 16, 3>;
 using P63XTile11 = XTile<64, 32, 32, 32, 16, 3>;
 
+//- Nq > 64 x tiles.  Above 64 the transposed problem's N is Nq = 128 or 256,
+//- so the generic GemmX (64x128) is already unpredicated at Nq = 128 and
+//- covers N in two tiles at Nq = 256 -- which is why no order-specialized x
+//- tile ever existed here.  Candidate 0 IS that generic tile, bit for bit, so
+//- SCALE_DG_XTILE=0 and the untiled launch_volume_gemm_x must measure the
+//- same; the rest vary the long-axis extent, the warp partition, TileK and
+//- the pipeline depth.  One list serves both orders: the tile shape depends
+//- on Nq only through N = Nq, and TbN = 128 is the widest that fits.
+using PHXTile0 = XTile<64, 128, 32, 64, 16, 3>;
+using PHXTile1 = XTile<128, 128, 64, 64, 16, 3>;
+using PHXTile2 = XTile<128, 128, 32, 64, 16, 3>;
+using PHXTile3 = XTile<64, 128, 32, 32, 16, 3>;
+using PHXTile4 = XTile<32, 128, 16, 64, 16, 3>;
+using PHXTile5 = XTile<64, 64, 32, 32, 16, 3>;
+using PHXTile6 = XTile<64, 128, 32, 64, 16, 4>;
+using PHXTile7 = XTile<64, 128, 32, 64, 32, 3>;
+using PHXTile8 = XTile<256, 128, 64, 64, 16, 3>;
+using PHXTile9 = XTile<64, 128, 64, 64, 16, 3>;
+using PHXTile10 = XTile<128, 64, 64, 32, 16, 3>;
+using PHXTile11 = XTile<64, 128, 16, 64, 16, 3>;
+//- Carrier-motivated candidates.  The epilogue's per-thread fragment is
+//- TbM*TbN/threads elements, and the x carrier holds FIVE of them (the
+//- accumulator plus Dy, Dz, Ex and the lift, or seven with Ey and Ez): tiles
+//- 0-11 all give 32 or 64 doubles per thread at Nq >= 128 and spill.  These
+//- four are the 16-doubles-per-thread shapes, i.e. the same fragment size the
+//- Nq > 64 z carrier's 64x32 tile has, reached four different ways.
+using PHXTile12 = XTile<64, 32, 32, 16, 16, 3>;
+using PHXTile13 = XTile<64, 64, 16, 32, 16, 3>;
+using PHXTile15 = XTile<128, 32, 64, 16, 16, 3>;
+//- Tile 14 (64x128 with a 16x32 warp, 512 threads) is NOT usable: the plain x
+//- GEMM built from it faults with an illegal address at Nq = 128, so it stays
+//- out of both dispatch tables.
+//- Refinements around tile 5, the carrier winner of the first pass.
+using PHXTile16 = XTile<32, 64, 16, 32, 16, 3>;
+using PHXTile17 = XTile<128, 64, 32, 32, 16, 3>;
+using PHXTile18 = XTile<64, 64, 32, 32, 16, 4>;
+using PHXTile19 = XTile<64, 64, 32, 16, 16, 3>;
+
 //- Order-specialized PLAIN z volume GEMM tiles.  The z GEMM is
 //- (m = Nq*Nq, n = Nq, k = Nq) per element with a column-major C, so
 //- GemmBatched runs the transposed problem: the threadblock's M dimension
@@ -1333,6 +1371,32 @@ extern "C" int launch_volume_gemm_x_tiled(double *deriv_x, const double *flux_x,
       break;
     }
     break;
+  case 128:
+  case 256:
+    switch (tile) {
+      DG_X_TILE_CASE(0, PHXTile0)
+      DG_X_TILE_CASE(1, PHXTile1)
+      DG_X_TILE_CASE(2, PHXTile2)
+      DG_X_TILE_CASE(3, PHXTile3)
+      DG_X_TILE_CASE(4, PHXTile4)
+      DG_X_TILE_CASE(5, PHXTile5)
+      DG_X_TILE_CASE(6, PHXTile6)
+      DG_X_TILE_CASE(7, PHXTile7)
+      DG_X_TILE_CASE(8, PHXTile8)
+      DG_X_TILE_CASE(9, PHXTile9)
+      DG_X_TILE_CASE(10, PHXTile10)
+      DG_X_TILE_CASE(11, PHXTile11)
+      DG_X_TILE_CASE(12, PHXTile12)
+      DG_X_TILE_CASE(13, PHXTile13)
+      DG_X_TILE_CASE(15, PHXTile15)
+      DG_X_TILE_CASE(16, PHXTile16)
+      DG_X_TILE_CASE(17, PHXTile17)
+      DG_X_TILE_CASE(18, PHXTile18)
+      DG_X_TILE_CASE(19, PHXTile19)
+    default:
+      break;
+    }
+    break;
   default:
     std::fprintf(stderr, "launch_volume_gemm_x_tiled: no tile set for Nq %d\n",
                  Nq);
@@ -1730,6 +1794,21 @@ extern "C" int launch_y_gemm_assembly(
     return run_y_gemm_assembly<MmaSet_884::GemmY32, false>(
         dqdt, flux_y, D1D_tr, deriv_x, deriv_z, flux_bnd, lift1d, escale, Nq, Ne);
   }
+  if (Nq == 128 || Nq == 256) {
+    //- Nq > 64.  The y mainloop is MmaSet_884::GemmY (64x64, warp 32x32, three
+    //- stages), which is what GEMM_CUTE runs for y at these orders, so the two
+    //- paths keep one tile.  The batched problem is (128,128) or (256,256) per
+    //- batch, so a 64x64 tile is unpredicated -- the fit that decided the
+    //- Nq = 32 y carrier.  What it cannot have is the Nq > 64 epilogue package:
+    //- cutlass_y_gemm_assembly.h has neither the 16-byte epilogue nor the
+    //- clamp aggregation, and that package is worth 5-6% to the x carrier here.
+    if (x_weighted == 2) {
+      return run_y_gemm_assembly<MmaSet_884::GemmY, true>(
+          dqdt, flux_y, D1D_tr, deriv_x, deriv_z, flux_bnd, lift1d, escale, Nq, Ne);
+    }
+    return run_y_gemm_assembly<MmaSet_884::GemmY, false>(
+        dqdt, flux_y, D1D_tr, deriv_x, deriv_z, flux_bnd, lift1d, escale, Nq, Ne);
+  }
   std::fprintf(stderr, "launch_y_gemm_assembly: unsupported Nq %d\n", Nq);
   return 1;
 }
@@ -1833,6 +1912,13 @@ extern "C" int launch_volume_gemm_z_scaled(double *deriv_z, const double *flux_z
       dqdt, flux_x, D1D, deriv_y, deriv_z, flux_bnd, lift1d, lift_pair,        \
       escale, Nq, Ne, (weight_mode & 4) == 0)
 
+//- Sweep-only carrier instantiation: one package (both Escale forwarded,
+//- clamp aggregation, 16-byte epilogue, no 16-byte lift), which is the form
+//- the Nq > 64 package sweep on tile 0 found best.  A tile that wins here is
+//- promoted to the full DG_X_ASM_CASE before it can be adopted.
+#define DG_X_ASM_ONE(TileType)                                                 \
+  return DG_X_ASM_CALL(TileType, true, true, true, false, true);
+
 #define DG_X_ASM_CASE(TileType)                                                \
   switch (weight_mode & 3) {                                                   \
   case 0:                                                                      \
@@ -1882,6 +1968,33 @@ extern "C" int launch_x_gemm_assembly(
   case 64:
     if (tile != 3) break;
     DG_X_ASM_CASE(P63XTile3)
+  case 128:
+  case 256:
+    //- Nq > 64: two candidates are instantiated, the generic-equal tile 0 and
+    //- the fastest alternative the plain-x sweep found.  The carrier's tile is
+    //- shared with GEMM_CUTE by rule, so a carrier on any other tile could
+    //- never be adopted.
+    if (tile == 0) {
+      DG_X_ASM_CASE(PHXTile0)
+    }
+    if (tile == 5) {
+      DG_X_ASM_CASE(PHXTile5)
+    }
+    if (tile == 18) {
+      DG_X_ASM_CASE(PHXTile18)
+    }
+    switch (tile) {
+    case 3: DG_X_ASM_ONE(PHXTile3)
+    case 11: DG_X_ASM_ONE(PHXTile11)
+    case 12: DG_X_ASM_ONE(PHXTile12)
+    case 13: DG_X_ASM_ONE(PHXTile13)
+    case 15: DG_X_ASM_ONE(PHXTile15)
+    case 16: DG_X_ASM_ONE(PHXTile16)
+    case 17: DG_X_ASM_ONE(PHXTile17)
+    case 19: DG_X_ASM_ONE(PHXTile19)
+    default: break;
+    }
+    break;
   default:
     std::fprintf(stderr, "launch_x_gemm_assembly: unsupported Nq %d\n", Nq);
     return 1;
@@ -1894,6 +2007,7 @@ extern "C" int launch_x_gemm_assembly(
 }
 
 #undef DG_X_ASM_CASE
+#undef DG_X_ASM_ONE
 #undef DG_X_ASM_PKG
 #undef DG_X_ASM_CALL
 #undef DG_X_ASM_LB

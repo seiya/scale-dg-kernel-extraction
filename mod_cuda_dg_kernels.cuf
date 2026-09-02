@@ -110,16 +110,30 @@ module mod_cuda_dg_kernels
   !   16   CUTLASS tile 5   CUTLASS  x         CUTLASS   y||z    xpkg 4
   !   32   CUTLASS tile 7   CUTLASS  x         cuBLAS    y||z    xpkg 4
   !   64   CUTLASS tile 3   CUTLASS  z         CUTLASS   default zpkg 5
-  !  >64   generic CUTLASS  CUTLASS  z         CUTLASS   default (as before)
+  !  128   CUTLASS tile 0   CUTLASS  z         CUTLASS   default (Nq>64 pkg)
+  !  256   CUTLASS tile 0   CUTLASS  z         CUTLASS   default (Nq>64 pkg)
+  ! >256   generic CUTLASS  CUTLASS  z         CUTLASS   default (as before)
   !
   ! Epilogue package: bit 0 clamp aggregation, bit 1 16-byte lift, bit 2
   ! 16-byte epilogue.  So xpkg 4 is the wide epilogue alone and xpkg/zpkg 5
   ! is the wide epilogue plus clamp aggregation; the 16-byte lift is off
   ! everywhere.  No Escale factor is forwarded at any order any more.
   !
-  ! Nq > 64 does not reach this table: its x GEMM goes through
-  ! launch_volume_gemm_x / _xy on the generic tiles.  No order above 64 was
-  ! touched by the sweep that produced the rest of the table.
+  ! Nq = 128 and 256 tile 0 IS the generic 64x128 tile (warp 32x64, TileK 16,
+  ! three stages) that launch_volume_gemm_x has always run, so naming it here
+  ! does not change the mainloop of either path.  What it changes is GEMM_CUTE's
+  ! x EPILOGUE: the tiled launcher goes through run_gemm_nn_scaled_repad, which
+  ! pads the accumulator staging tile by 8 the way every other GEMM in this file
+  ! already does, while the untiled launch_volume_gemm_x used the stock,
+  ! unpadded epilogue.  GEMM_FUSED's x already had the pad (it goes through
+  ! run_volume_gemm_x_scale), so this REMOVES a divergence rather than creating
+  ! one.  Worth -0.24% at p=127 and -0.22% at p=255 on GEMM_CUTE, 12/12 with
+  ! disjoint ranges (exclusive GB200, Slurm job 77137).  Above 256 the table
+  ! still says "generic": no tile list exists there, and at Nq >= 512 the x GEMM
+  ! deliberately borrows the batched y tile (run_volume_gemm_x).
+  !
+  ! Nq > 64 keeps the z CARRIER.  Both alternatives were measured at p=127 and
+  ! p=255 and both lose; see the note at the end of the carrier entry below.
   !
   ! What the table is worth (CUDA device us/stage, login-node GB200, 12-pair
   ! interleaved medians; before -> after, ranges disjoint unless noted):
@@ -206,6 +220,56 @@ module mod_cuda_dg_kernels
   !   half-predicates a (16,16) problem and runs 4x the CTAs, and 157% at
   !   Nq = 8, where the smallest buildable tile is 32x64 against an 8x8
   !   output and the kernel takes 255 registers with spill.
+  !
+  ! * The carrier at Nq = 128 and 256: BOTH alternatives measured, BOTH
+  !   rejected, and the z carrier keeps the slot.  Exclusive GB200, Slurm job
+  !   77137, 12 interleaved pairs, ranges disjoint, CUDA device us/stage:
+  !
+  !                     p=127 (Nq=128)          p=255 (Nq=256)
+  !     z carrier        639.6 (adopted)         943.0 (adopted)
+  !     x carrier        680.7  +6.43%  0/12    977.1  +3.63%  0/12
+  !     y carrier        685.2  +7.09%  0/12   1014.4  +7.62%  0/12
+  !
+  !   The x carrier lost as a CARRIER, not as an untuned one.  A first cut on
+  !   the shared 64x128 tile was +59% at p=127, and a 20-tile sweep on both
+  !   paths took that to +6.4% -- so the tile was worth 52 points and the
+  !   remaining 6 are the carrier itself.  The mechanism of the first cut is
+  !   the epilogue fragment: it is TbM*TbN/threads elements and the x carrier
+  !   holds five of them (accumulator, Dy, Dz, Ex, lift), so 64x128 over 128
+  !   threads gives 64 doubles each and takes 255 registers with 304 B of
+  !   spill.  The winning shapes are the 32-doubles ones -- tile 18
+  !   (64x64, warp 32x32, four stages) at 230 registers and ZERO spill, tile 5
+  !   the same with three stages -- which is the same fragment size the
+  !   Nq > 64 z carrier's 64x32 tile has at 254 registers and no spill.  At
+  !   equal occupancy (2 CTAs/SM, 12.5% theoretical, both) and zero spill on
+  !   both sides the x carrier is still 231.4 us against the z carrier's
+  !   191.6 at p=127 and 318.0 against 287.6 at p=255.  The ablation
+  !   accounting closes to 0.0 us at both orders: the whole loss is inside the
+  !   carrier kernel (rest of stage +1.1 us at p=127, +3.4 at p=255).
+  !
+  !   What the x carrier gives up is the Nq > 64 fusion package.  Escale_y
+  !   CAN still be forwarded (-0.60% at p=127, -0.65% at p=255) and Escale_z
+  !   cannot pay for itself (+0.75% / -0.34%), but folding deriv_x into the y
+  !   GEMM is impossible for it -- that fold needs x to run BEFORE y, and the
+  !   carrier runs last -- so its epilogue reads three volume tensors where
+  !   the z carrier reads two.  The narrower tile the x carrier needs is also
+  !   NOT free on the other path: tile 18 costs GEMM_CUTE +1.23% at p=127 and
+  !   +1.35% at p=255 (tile 5 +1.16% / +0.74%), and the tiles must be shared.
+  !
+  !   The y carrier fits the tile perfectly here -- 64x64 against a 128x128 or
+  !   256x256 batch, nothing predicated, which is exactly the fit that won it
+  !   the Nq = 32 slot -- and still loses more than x.  It has no 16-byte
+  !   epilogue and no clamp aggregation (cutlass_y_gemm_assembly.h has
+  !   neither), and on the x carrier at these orders the 16-byte epilogue
+  !   alone is worth -5.2%.
+  !
+  !   Two findings from that sweep that are about the ORDER, not the carrier:
+  !   the shift/mask row split (see the x-carrier entry above) is worth only
+  !   0.8-1.3% at Nq > 64 against 2.7-3.2% at Nq <= 64 -- it decays as the row
+  !   gets longer, the opposite of what was expected -- and the 16-byte lift
+  !   loses on the x carrier here too (+2.5% at p=255, +3.5% at p=127) even
+  !   though the z carrier at the same orders has it ON.  Its sign follows the
+  !   carrier, not the order.
   !
   ! * cuBLAS z at Nq = 32, legal only because z is no longer the carrier (a
   !   carrier cannot be cuBLAS: cuBLAS has no epilogue).  Plain z goes
@@ -1925,8 +1989,16 @@ contains
                 !-        16-byte lift, z CUTLASS
       plan = dg_gemm_plan_t(x_mode=1, x_tile=3, y_lib=0, carrier=0, &
                             z_lib=0, ysched=0, xfwd=0, xpkg=0, z_tile=-1, zpkg=5)
+    case (128, 256)
+                !- p=127 / p=255: the z carrier stays (x carrier +6.4% / +3.6%,
+                !-        y carrier +7.1% / +7.6%).  x tile 0 is the generic
+                !-        64x128 mainloop both paths already ran; naming it here
+                !-        only gives GEMM_CUTE's x epilogue the accumulator pad
+                !-        GEMM_FUSED's x already had.
+      plan = dg_gemm_plan_t(x_mode=1, x_tile=0, y_lib=0, carrier=0, &
+                            z_lib=0, ysched=0, xfwd=0, xpkg=0, z_tile=-1, zpkg=-1)
     case default
-      !- Nq > 64: generic CUTLASS x through launch_volume_gemm_x / _xy, and
+      !- Nq > 256: generic CUTLASS x through launch_volume_gemm_x / _xy, and
       !- everything else as it has always been.  Untouched by the sweep.
       plan = dg_gemm_plan_t(x_mode=0, x_tile=0, y_lib=0, carrier=0, &
                             z_lib=0, ysched=0, xfwd=0, xpkg=0, z_tile=-1, zpkg=-1)
@@ -1970,29 +2042,34 @@ contains
     !- Legality clamps.  They apply to the table and to an override alike.
     !- Only the four swept orders have a CUTLASS x tile list; Nq > 64 takes
     !- launch_volume_gemm_x / _xy and never gets here.
-    if (Nq /= 8 .and. Nq /= 16 .and. Nq /= 32 .and. Nq /= 64) plan%x_mode = 0
+    if (Nq /= 8 .and. Nq /= 16 .and. Nq /= 32 .and. Nq /= 64 .and. &
+        Nq /= 128 .and. Nq /= 256) plan%x_mode = 0
     !- Escale_x forwarding belongs to GEMM_FUSED's fusion package and needs
     !- the partially weighted assembly epilogue, which only the Nq = 8, 16 and
     !- 32 carriers instantiate.  At Nq = 64 the y GEMM already applies
     !- Escale_x, so there is nothing left for x to forward.  GEMM_CUTE demotes
     !- 2 -> 1 (and its ablation twin 4 -> 3) so both paths keep one library
     !- assignment and one mainloop tile.
-    if (plan%x_mode == 2 .and. (.not. fuse_epilogue .or. Nq == 64)) &
-      plan%x_mode = 1
-    if (plan%x_mode == 4 .and. (.not. fuse_epilogue .or. Nq == 64)) &
-      plan%x_mode = 3
+    !- At Nq >= 64 with z carrying, the y GEMM already applies Escale_x, so
+    !- there is nothing left for x to forward.  A y carrier at Nq > 64 is the
+    !- one case above 64 where forwarding Escale_x into x IS meaningful.
+    if (plan%x_mode == 2 .and. (.not. fuse_epilogue .or. &
+        (Nq >= 64 .and. plan%carrier /= 1))) plan%x_mode = 1
+    if (plan%x_mode == 4 .and. (.not. fuse_epilogue .or. &
+        (Nq >= 64 .and. plan%carrier /= 1))) plan%x_mode = 3
     !- Only GEMM_FUSED has a carrier at all, and only Nq = 16 and 32 have a y
     !- assembly kernel.
     if (.not. fuse_epilogue) plan%carrier = 0
-    if (plan%carrier == 1 .and. Nq /= 8 .and. Nq /= 16 .and. Nq /= 32) &
-      plan%carrier = 0
+    if (plan%carrier == 1 .and. Nq /= 8 .and. Nq /= 16 .and. Nq /= 32 .and. &
+        Nq /= 128 .and. Nq /= 256) plan%carrier = 0
     !- The x carrier needs the order's adopted CUTLASS x tile, which is also
     !- the only one launch_x_gemm_assembly instantiates, and it needs x on
     !- CUTLASS at all.  Escale_x forwarding into x is meaningless with x as the
     !- carrier (the carrier applies every weight itself), so mode 2 collapses
     !- to mode 1 there.
     if (plan%carrier == 2) then
-      if (Nq /= 8 .and. Nq /= 16 .and. Nq /= 32 .and. Nq /= 64) plan%carrier = 0
+      if (Nq /= 8 .and. Nq /= 16 .and. Nq /= 32 .and. Nq /= 64 .and. &
+          Nq /= 128 .and. Nq /= 256) plan%carrier = 0
       if (plan%x_mode == 0) plan%carrier = 0
     end if
     if (plan%carrier == 2 .and. plan%x_mode == 2) plan%x_mode = 1
@@ -2723,7 +2800,11 @@ contains
         if (istat /= 0) call cuda_failure("launch_volume_gemm_xy",istat)
       end if
     else
-      if (Nq <= 64) then
+      !- Nq > 64 has no x tile list of its own unless the plan names one: with
+      !- x_mode = 0 there it takes the generic launch_volume_gemm_x, which is
+      !- the same 64x128 tile PHXTile0 spells out.  Whichever it is, GEMM_FUSED
+      !- runs the identical mainloop.
+      if (Nq <= 64 .or. plan%x_mode /= 0) then
         call launch_volume_gemm_x_common( plan, &
           deriv_x, flux_x, D1D, Escale, Nq, Np, Ne, istat )
         if (istat /= 0) call cuda_failure("x-deriv (cute)",istat)

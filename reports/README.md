@@ -341,6 +341,11 @@ iso-schedule DFMA より速い（790.1 / 503.4 = **1.57×**、§20 時点は 1.1
 
 #### p=127（`Ne=2³`、`nstep=100`）
 
+**追記（2026-09-02）: 担い手を測って z のまま。** x 担い手は 639.6 → 680.7 µs/stage
+（**+6.43%**、0/12）、y 担い手は 685.2（+7.09%）。`GEMM_CUTE` は x を共有 tiled
+launcher（同一 64×128 mainloop）に通して repad を揃え **−0.25%**。[`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §3。
+本ファイルの §18–20 の z-epilogue 最適化は**追認された**（担い手を替えても勝てない）。
+
 | 経路 | ms/step | µs/stage | TFLOP/s | vs 40.1 | TB/s unique | vs 7.9 | TB/s path | vs 7.9 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | `CUDAFORTRAN_SPLIT` | 20.99 | 6916.1 | 1.91 | 4.8% | 0.16 | 2.0% | 0.56 | 7.0% |
@@ -362,6 +367,10 @@ iso-schedule DFMA より速い（790.1 / 503.4 = **1.57×**、§20 時点は 1.1
 max abs 3.55e-15（同レポート §17 / §20）。
 
 #### p=255（`Ne=1`、`nstep=20`）
+
+**追記（2026-09-02）: 担い手を測って z のまま。** x 担い手は 943.0 → 977.1 µs/stage
+（**+3.63%**、0/12）、y 担い手は 1014.4（+7.62%）。`GEMM_CUTE` は p=127 と同じ
+repad 揃えで **−0.23%**。[`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §3。§10・§15–22 の z-epilogue 最適化は**追認された**。
 
 | 経路 | ms/step | µs/stage | TFLOP/s | vs 40.1 | TB/s unique | vs 7.9 | TB/s path | vs 7.9 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
