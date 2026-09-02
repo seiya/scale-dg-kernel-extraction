@@ -1507,8 +1507,21 @@ __device__ __forceinline__ double p31_face_flux_tc(
   return 0.5 * Fscale[fidx] * (qP * VelP - qM * VelM - alpha * (qP - qM));
 }
 
+// Warp mma tile and chunk-loop pipelining for the p=31 fused Tensor Core
+// kernels.  The block tile is the whole 32x32 output plane in both kernels, so
+// P31_XZ_TM / P31_XZ_TN (and the y pair) fix the warp grid and therefore the
+// thread count: widening a warp tile can only be paid for with warps.
+//
+//   xz per k step: TM + TN shared loads for 2*TM*TN mma
+//   y  per k step: TM      shared loads for   TM*TN mma
+//
+// P31_*_DB switches the plane loop to the double-buffered form of
+// tendency_p255_kernel: the plane for jl+1 is stored into the other shared
+// buffer before the mma of jl reads its own, so the loop needs one barrier per
+// plane instead of two.  Section 30 of p31_gap_study.md has the measurements.
 template <bool UseTc>
-__global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_xz_kernel(
+__global__ __launch_bounds__(P31_XZ_THREADS, P31_XZ_MINB) void
+tendency_fused_p31_xz_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ v,
@@ -1517,18 +1530,42 @@ __global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_xz_kernel(
     const double *__restrict__ Fscale, const double *__restrict__ Escale,
     int Ne)
 {
+  constexpr int TM = P31_XZ_TM;
+  constexpr int TN = P31_XZ_TN;
+  constexpr int NT = P31_XZ_THREADS;
+  constexpr int NBUF = P31_XZ_NBUF;
+  constexpr int LDIT = 512 / NT;
+
   // sFU and sFW hold the current j plane under ONE address map, node index
   // i + 32*k.  For x the contraction index l is the i field and for z it is
   // the k field, which is why one store path and one global load map serve
   // both panels.
-  __shared__ __align__(16) double sFU[1024], sFW[1024];
   // Faces 2 and 4 are (j,k) planes and faces 5 and 6 are (i,j) planes, so
   // under the mma output map a consumer thread needs 16 j values of the first
   // pair and 32 of the second.  Faces 1 and 3 are (i,k) planes and stay in
   // registers; see the bijection note below.
+  //
+  // Single buffered this is 41.5 KB and stays static.  The double-buffered
+  // form is 57.5 KB, over the 48 KB static limit, so it has to be dynamic --
+  // and that conversion is not free at the 1x1 tile: on its own, with an
+  // otherwise bit-identical kernel, it costs 1.70% (section 30.8 of
+  // p31_gap_study.md).  The two are therefore separate knobs, so the
+  // pipelining A/B is not charged for it.  At the 2x2 tile the sign flips.
+#if P31_XZ_DYN
+  extern __shared__ __align__(16) double smem31[];
+  double *const sFU = smem31;
+  double *const sFW = smem31 + NBUF * 1024;
+  double *const sf2 = smem31 + 2 * NBUF * 1024;
+  double *const sf4 = sf2 + 1024;
+  double *const sf5 = sf4 + 1024;
+  double *const sf6 = sf5 + 512;
+  double *const sLift = sf6 + 512;
+#else
+  __shared__ __align__(16) double sFU[NBUF * 1024], sFW[NBUF * 1024];
   __shared__ __align__(16) double sf2[1024], sf4[1024];
   __shared__ __align__(16) double sf5[512], sf6[512];
   __shared__ __align__(16) double sLift[192];
+#endif
 
   const int elem = (int)blockIdx.x >> 1;
   if (elem >= Ne) {
@@ -1539,8 +1576,8 @@ __global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_xz_kernel(
   const int tid = (int)threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  const int ti = warp & 3;
-  const int tk = warp >> 2;
+  const int ti = warp % P31_XZ_WM;
+  const int tk = warp / P31_XZ_WM;
   const int row = lane >> 2;
   const int colk = lane & 3;
 
@@ -1549,48 +1586,74 @@ __global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_xz_kernel(
   const int npoint = NP31 * Ne;
   const int nface = NFPTOT31 * Ne;
 
-  if (tid < 192) {
-    sLift[tid] = Lift1D[tid];
+  for (int t = tid; t < 192; t += NT) {
+    sLift[t] = Lift1D[t];
   }
+
 
   // D1D is Fortran column major, so D(r,l) is at r + 32*l.  x wants the B
-  // operand D[i][l] with i = 8*ti + row and z the A operand D[k][l] with
-  // k = 8*tk + row; both read column 4*ks + colk, and neither depends on j.
-  double Dx[8], Dz[8];
+  // operand D[i][l] with i = 8*(ti*TM+m) + row and z the A operand D[k][l]
+  // with k = 8*(tk*TN+n) + row; both read column 4*ks + colk, and neither
+  // depends on j.
+  double Dx[TM][8], Dz[TN][8];
 #pragma unroll
-  for (int ks = 0; ks < 8; ++ks) {
-    const int col = NQ31 * (4 * ks + colk);
-    Dx[ks] = D1D[(ti * 8 + row) + col];
-    Dz[ks] = D1D[(tk * 8 + row) + col];
+  for (int m = 0; m < TM; ++m) {
+#pragma unroll
+    for (int ks = 0; ks < 8; ++ks) {
+      Dx[m][ks] = D1D[((ti * TM + m) * 8 + row) + NQ31 * (4 * ks + colk)];
+    }
+  }
+#pragma unroll
+  for (int n = 0; n < TN; ++n) {
+#pragma unroll
+    for (int ks = 0; ks < 8; ++ks) {
+      Dz[n][ks] = D1D[((tk * TN + n) * 8 + row) + NQ31 * (4 * ks + colk)];
+    }
   }
 
-  // Output nodes of this lane, for every j: i = 8*ti + 2*colk and +1 at
-  // k = 8*tk + row.  The pair is adjacent in i, so dqdt and Escale move as
-  // aligned double2.
-  const int i0 = ti * 8 + 2 * colk;
-  const int kout = tk * 8 + row;
+  // Output nodes of this lane, for every j: i = 8*(ti*TM+m) + 2*colk and +1 at
+  // k = 8*(tk*TN+n) + row.  The pair is adjacent in i, so dqdt and Escale move
+  // as aligned double2.
+  int i0[TM], kout[TN];
+#pragma unroll
+  for (int m = 0; m < TM; ++m) {
+    i0[m] = (ti * TM + m) * 8 + 2 * colk;
+  }
+#pragma unroll
+  for (int n = 0; n < TN; ++n) {
+    kout[n] = (tk * TN + n) * 8 + row;
+  }
 
-  // Faces 1 and 3 are (i,k) planes, and (thread, {0,1}) -> i0 + 32*kout and +1
-  // is a bijection onto the 1024 face points, so each thread evaluates exactly
-  // the two points it will consume.  No redistribution, and the gather is
-  // eight 64-byte runs per warp, the same shape as the epilogue.
-  const int p13 = i0 + NQ31 * kout;
-  const double f1a = p31_face_flux_tc(face_offset + p13, q, u, v, w, VMapM,
-                                      VMapP, normal_fn, Fscale, nface);
-  const double f1b = p31_face_flux_tc(face_offset + p13 + 1, q, u, v, w, VMapM,
-                                      VMapP, normal_fn, Fscale, nface);
-  const double f3a = p31_face_flux_tc(face_offset + 2048 + p13, q, u, v, w,
-                                      VMapM, VMapP, normal_fn, Fscale, nface);
-  const double f3b = p31_face_flux_tc(face_offset + 2048 + p13 + 1, q, u, v, w,
-                                      VMapM, VMapP, normal_fn, Fscale, nface);
+  // Faces 1 and 3 are (i,k) planes, and (thread, tile, {0,1}) -> i0 + 32*kout
+  // and +1 is a bijection onto the 1024 face points, so each thread evaluates
+  // exactly the points it will consume.  No redistribution, and the gather is
+  // 64-byte runs per warp, the same shape as the epilogue.
+  double f1a[TM][TN], f1b[TM][TN], f3a[TM][TN], f3b[TM][TN];
+#pragma unroll
+  for (int m = 0; m < TM; ++m) {
+#pragma unroll
+    for (int n = 0; n < TN; ++n) {
+      const int p13 = i0[m] + NQ31 * kout[n];
+      f1a[m][n] = p31_face_flux_tc(face_offset + p13, q, u, v, w, VMapM, VMapP,
+                                   normal_fn, Fscale, nface);
+      f1b[m][n] = p31_face_flux_tc(face_offset + p13 + 1, q, u, v, w, VMapM,
+                                   VMapP, normal_fn, Fscale, nface);
+      f3a[m][n] = p31_face_flux_tc(face_offset + 2048 + p13, q, u, v, w, VMapM,
+                                   VMapP, normal_fn, Fscale, nface);
+      f3b[m][n] = p31_face_flux_tc(face_offset + 2048 + p13 + 1, q, u, v, w,
+                                   VMapM, VMapP, normal_fn, Fscale, nface);
+    }
+  }
 
   // Faces 2 and 4: 16 j by 32 k is exactly 512 points.  The producer takes k
   // from the high nibble so a half warp holds k fixed and walks 16 consecutive
   // j, which is one 128-byte global run and, since the fold source is then
   // constant, a conflict-free shared store.
-  {
-    const int jl = tid & 15;
-    const int kk = tid >> 4;
+#pragma unroll
+  for (int t2 = 0; t2 < 512 / NT; ++t2) {
+    const int t = tid + t2 * NT;
+    const int jl = t & 15;
+    const int kk = t >> 4;
     const int pl = (j0 + jl) + NQ31 * kk;
     const int sa = sw31(jl + NQ31 * kk);
     sf2[sa] = p31_face_flux_tc(face_offset + 1024 + pl, q, u, v, w, VMapM,
@@ -1599,9 +1662,11 @@ __global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_xz_kernel(
                                VMapP, normal_fn, Fscale, nface);
   }
   // Faces 5 and 6: 32 i by 16 j.  A warp walks 32 consecutive i at fixed j.
-  {
-    const int ii = tid & 31;
-    const int jl = tid >> 5;
+#pragma unroll
+  for (int t2 = 0; t2 < 512 / NT; ++t2) {
+    const int t = tid + t2 * NT;
+    const int ii = t & 31;
+    const int jl = t >> 5;
     const int pl = ii + NQ31 * (j0 + jl);
     const int sa = ii + NQ31 * jl;
     sf5[sa] = p31_face_flux_tc(face_offset + 4096 + pl, q, u, v, w, VMapM,
@@ -1609,6 +1674,64 @@ __global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_xz_kernel(
     sf6[sa] = p31_face_flux_tc(face_offset + 5120 + pl, q, u, v, w, VMapM,
                                VMapP, normal_fn, Fscale, nface);
   }
+
+  // Operand base addresses.  For sFU the fold source is kout and for sFW it is
+  // colk, and neither depends on ks, so the k-step is one XOR by a constant on
+  // the x side and one add on the z side.
+  int ax[TN], bz[TM];
+#pragma unroll
+  for (int n = 0; n < TN; ++n) {
+    ax[n] = sw31(colk + NQ31 * kout[n]);
+  }
+#pragma unroll
+  for (int m = 0; m < TM; ++m) {
+    bz[m] = sw31(((ti * TM + m) * 8 + row) + NQ31 * colk);
+  }
+
+  // The plane load is linear and coalesced, which the mma fragment map is not
+  // and does not have to be: a half warp covers 32 consecutive nodes of one k
+  // line, one 256-byte run, and each thread moves a double2 of q, u and w.
+  int ldsh[LDIT], gidx[LDIT];
+#pragma unroll
+  for (int t = 0; t < LDIT; ++t) {
+    const int s = tid + t * NT;
+    const int ldi = 2 * (s & 15);
+    const int ldk = s >> 4;
+    ldsh[t] = sw31(ldi + NQ31 * ldk);
+    gidx[t] = elem_offset + ldi + NQ31 * j0 + (NQ31 * NQ31) * ldk;
+  }
+
+  double2 qp[LDIT], up[LDIT], wp[LDIT];
+#define P31_XZ_LOADREGS()                                                     \
+  do {                                                                        \
+    _Pragma("unroll") for (int t = 0; t < LDIT; ++t)                          \
+    {                                                                         \
+      qp[t] = *reinterpret_cast<const double2 *>(q + gidx[t]);                \
+      up[t] = *reinterpret_cast<const double2 *>(u + gidx[t]);                \
+      wp[t] = *reinterpret_cast<const double2 *>(w + gidx[t]);                \
+      gidx[t] += NQ31;                                                        \
+    }                                                                         \
+  } while (0)
+#define P31_XZ_STORE(BUF)                                                     \
+  do {                                                                        \
+    _Pragma("unroll") for (int t = 0; t < LDIT; ++t)                          \
+    {                                                                         \
+      *reinterpret_cast<double2 *>(sFU + (BUF) * 1024 + ldsh[t]) =            \
+          make_double2(qp[t].x * up[t].x, qp[t].y * up[t].y);                 \
+      *reinterpret_cast<double2 *>(sFW + (BUF) * 1024 + ldsh[t]) =            \
+          make_double2(qp[t].x * wp[t].x, qp[t].y * wp[t].y);                 \
+    }                                                                         \
+  } while (0)
+
+  // One block per SM leaves no second block to interleave with, so the plane
+  // for j+1 is issued before the mma of j consumes the plane for j.
+#if P31_XZ_EARLY
+  P31_XZ_LOADREGS();
+#if P31_XZ_DB
+  P31_XZ_STORE(0);
+  P31_XZ_LOADREGS();
+#endif
+#endif
   __syncthreads();
 
 #if P31_PDL_STAGE >= 1
@@ -1619,82 +1742,134 @@ __global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_xz_kernel(
 #endif
 
   // Lift1D(Nq,6) varies in j for faces 1 and 3, in i for faces 2 and 4 and in
-  // k for faces 5 and 6, so six of the eight coefficients this lane needs are
-  // constant over the j loop and are read once here.
-  const double lf2a = sLift[32 + i0];
-  const double lf2b = sLift[33 + i0];
-  const double lf4a = sLift[96 + i0];
-  const double lf4b = sLift[97 + i0];
-  const double lf5 = sLift[128 + kout];
-  const double lf6 = sLift[160 + kout];
+  // k for faces 5 and 6, so the coefficients that do not vary in j are read
+  // once here.
+  double lf2a[TM], lf2b[TM], lf4a[TM], lf4b[TM], lf5[TN], lf6[TN];
+#pragma unroll
+  for (int m = 0; m < TM; ++m) {
+    lf2a[m] = sLift[32 + i0[m]];
+    lf2b[m] = sLift[33 + i0[m]];
+    lf4a[m] = sLift[96 + i0[m]];
+    lf4b[m] = sLift[97 + i0[m]];
+  }
+#pragma unroll
+  for (int n = 0; n < TN; ++n) {
+    lf5[n] = sLift[128 + kout[n]];
+    lf6[n] = sLift[160 + kout[n]];
+  }
 
-  // Operand base addresses.  For sFU the fold source is kout and for sFW it is
-  // colk, and neither depends on ks, so the k-step is one XOR by a constant on
-  // the x side and one add on the z side.
-  const int ax = sw31(colk + NQ31 * kout);
-  const int bz = sw31((ti * 8 + row) + NQ31 * colk);
-
-  // The plane load is linear and coalesced, which the mma fragment map is not
-  // and does not have to be: a half warp covers 32 consecutive nodes of one k
-  // line, one 256-byte run, and each thread moves a double2 of q, u and w.
-  const int ldi = 2 * (tid & 15);
-  const int ldk = tid >> 4;
-  const int ldsh = sw31(ldi + NQ31 * ldk);
-  int gidx = elem_offset + ldi + NQ31 * j0 + (NQ31 * NQ31) * ldk;
-
-  // One block per SM leaves no second block to interleave with, so the plane
-  // for j+1 is issued before the mma of j consumes the plane for j.
-  double2 qp = *reinterpret_cast<const double2 *>(q + gidx);
-  double2 up = *reinterpret_cast<const double2 *>(u + gidx);
-  double2 wp = *reinterpret_cast<const double2 *>(w + gidx);
+  // P31_XZ_EARLY chooses which side of the face barrier the first plane load
+  // sits on.  At the production 1x1 tile the late form wins by 1.5%: the face
+  // gather is what saturates this kernel's L1/global path (section 18.1), and
+  // a plane load hoisted in front of the barrier competes with it.  Wide warp
+  // tiles move three times as many doubles per thread and prefer the early
+  // form.  The pipelined preamble follows the same choice, paying one extra
+  // barrier when it is late (18 barriers a slab against 33).
+#if !P31_XZ_EARLY
+  P31_XZ_LOADREGS();
+#if P31_XZ_DB
+  P31_XZ_STORE(0);
+  P31_XZ_LOADREGS();
+  __syncthreads();
+#endif
+#endif
 
   for (int jl = 0; jl < JSLAB31; ++jl) {
-    *reinterpret_cast<double2 *>(sFU + ldsh) =
-        make_double2(qp.x * up.x, qp.y * up.y);
-    *reinterpret_cast<double2 *>(sFW + ldsh) =
-        make_double2(qp.x * wp.x, qp.y * wp.y);
+#if P31_XZ_DB
+    const int cur = jl & 1;
     if (jl + 1 < JSLAB31) {
-      gidx += NQ31;
-      qp = *reinterpret_cast<const double2 *>(q + gidx);
-      up = *reinterpret_cast<const double2 *>(u + gidx);
-      wp = *reinterpret_cast<const double2 *>(w + gidx);
+      P31_XZ_STORE(cur ^ 1);
+      if (jl + 2 < JSLAB31) {
+        P31_XZ_LOADREGS();
+      }
+    }
+#else
+    const int cur = 0;
+    P31_XZ_STORE(0);
+    if (jl + 1 < JSLAB31) {
+      P31_XZ_LOADREGS();
     }
     __syncthreads();
+#endif
 
     // x^T = (D * FU)^T and z^T = (FW * D^T)^T on this j plane.  Same output
     // map, separate accumulators, because Escale differs by direction.
-    double cx0, cx1, cz0, cz1;
-    mma_reset(cx0, cx1);
-    mma_reset(cz0, cz1);
+    double cx0[TM][TN], cx1[TM][TN], cz0[TM][TN], cz1[TM][TN];
+#pragma unroll
+    for (int m = 0; m < TM; ++m) {
+#pragma unroll
+      for (int n = 0; n < TN; ++n) {
+        mma_reset(cx0[m][n], cx1[m][n]);
+        mma_reset(cz0[m][n], cz1[m][n]);
+      }
+    }
+    const double *const pFU = sFU + cur * 1024;
+    const double *const pFW = sFW + cur * 1024;
 #pragma unroll
     for (int ks = 0; ks < 8; ++ks) {
-      mma_m8n8k4_f64<UseTc>(cx0, cx1, sFU[ax ^ (4 * ks)], Dx[ks], cx0, cx1);
-      mma_m8n8k4_f64<UseTc>(cz0, cz1, Dz[ks], sFW[bz + 128 * ks], cz0, cz1);
+      double av[TN], bv[TM];
+#pragma unroll
+      for (int n = 0; n < TN; ++n) {
+        av[n] = pFU[ax[n] ^ (4 * ks)];
+      }
+#pragma unroll
+      for (int m = 0; m < TM; ++m) {
+        bv[m] = pFW[bz[m] + 128 * ks];
+      }
+#pragma unroll
+      for (int m = 0; m < TM; ++m) {
+#pragma unroll
+        for (int n = 0; n < TN; ++n) {
+          mma_m8n8k4_f64<UseTc>(cx0[m][n], cx1[m][n], av[n], Dx[m][ks],
+                                cx0[m][n], cx1[m][n]);
+          mma_m8n8k4_f64<UseTc>(cz0[m][n], cz1[m][n], Dz[n][ks], bv[m],
+                                cz0[m][n], cz1[m][n]);
+        }
+      }
     }
 
     const int j = j0 + jl;
-    const int nidx = elem_offset + i0 + NQ31 * j + (NQ31 * NQ31) * kout;
-    const double2 ex = *reinterpret_cast<const double2 *>(Escale + nidx);
-    const double2 ez =
-        *reinterpret_cast<const double2 *>(Escale + nidx + 2 * npoint);
     const double lf1 = sLift[j];
     const double lf3 = sLift[64 + j];
-    const int a24 = sw31(jl + NQ31 * kout);
-    const double fb2 = sf2[a24];
-    const double fb4 = sf4[a24];
-    const double2 fb5 =
-        *reinterpret_cast<const double2 *>(sf5 + i0 + NQ31 * jl);
-    const double2 fb6 =
-        *reinterpret_cast<const double2 *>(sf6 + i0 + NQ31 * jl);
+    // Face values that depend on only one of the two tile indices are read
+    // once outside the tile pair, not once per tile.
+    double fb2[TN], fb4[TN];
+#pragma unroll
+    for (int n = 0; n < TN; ++n) {
+      const int a24 = sw31(jl + NQ31 * kout[n]);
+      fb2[n] = sf2[a24];
+      fb4[n] = sf4[a24];
+    }
+    double2 fb5[TM], fb6[TM];
+#pragma unroll
+    for (int m = 0; m < TM; ++m) {
+      fb5[m] = *reinterpret_cast<const double2 *>(sf5 + i0[m] + NQ31 * jl);
+      fb6[m] = *reinterpret_cast<const double2 *>(sf6 + i0[m] + NQ31 * jl);
+    }
 
-    // Same summation order as tendency_fused_p31_xz_kernel.
-    *reinterpret_cast<double2 *>(dqdt + nidx) = make_double2(
-        -(ex.x * cx0 + ez.x * cz0 + lf1 * f1a + lf2a * fb2 + lf3 * f3a +
-          lf4a * fb4 + lf5 * fb5.x + lf6 * fb6.x),
-        -(ex.y * cx1 + ez.y * cz1 + lf1 * f1b + lf2b * fb2 + lf3 * f3b +
-          lf4b * fb4 + lf5 * fb5.y + lf6 * fb6.y));
+    // Same summation order as the CUDA-core p=31 kernels.
+#pragma unroll
+    for (int m = 0; m < TM; ++m) {
+#pragma unroll
+      for (int n = 0; n < TN; ++n) {
+        const int nidx =
+            elem_offset + i0[m] + NQ31 * j + (NQ31 * NQ31) * kout[n];
+        const double2 ex = *reinterpret_cast<const double2 *>(Escale + nidx);
+        const double2 ez =
+            *reinterpret_cast<const double2 *>(Escale + nidx + 2 * npoint);
+        *reinterpret_cast<double2 *>(dqdt + nidx) = make_double2(
+            -(ex.x * cx0[m][n] + ez.x * cz0[m][n] + lf1 * f1a[m][n] +
+              lf2a[m] * fb2[n] + lf3 * f3a[m][n] + lf4a[m] * fb4[n] +
+              lf5[n] * fb5[m].x + lf6[n] * fb6[m].x),
+            -(ex.y * cx1[m][n] + ez.y * cz1[m][n] + lf1 * f1b[m][n] +
+              lf2b[m] * fb2[n] + lf3 * f3b[m][n] + lf4b[m] * fb4[n] +
+              lf5[n] * fb5[m].y + lf6[n] * fb6[m].y));
+      }
+    }
     __syncthreads();
   }
+#undef P31_XZ_LOADREGS
+#undef P31_XZ_STORE
 }
 
 //> p=31 y volume term, accumulated onto what the xz kernel wrote.
@@ -1703,18 +1878,29 @@ __global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_xz_kernel(
 // C(i,j) = sum_l FV(i,k,l) * D(j,l) is structurally the z contraction of the
 // first kernel: transposed it wants D as the A operand from registers and the
 // plane as the B operand from shared, under the same address map and the same
-// swizzle.  The block owns half an element in k, for the same wave reason.
+// swizzle.  The shared operand depends only on the i tile, so widening the
+// warp tile in j is the direction that pays here.  The block owns half an
+// element in k, for the same wave reason.
 template <bool UseTc>
-__global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_y_kernel(
+__global__ __launch_bounds__(P31_Y_THREADS, P31_Y_MINB) void
+tendency_fused_p31_y_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
 {
-  __shared__ __align__(16) double sFV[1024];
+  constexpr int TM = P31_Y_TM;
+  constexpr int TN = P31_Y_TN;
+  constexpr int NT = P31_Y_THREADS;
+  constexpr int NBUF = P31_Y_NBUF;
+  constexpr int LDIT = 512 / NT;
+  constexpr int NTILE = TM * TN;
+
   // Two 8 KB stages for the dqdt tile the epilogue reads back.  Each thread
-  // asks for the single 16-byte slot it will read, so the buffer needs no
-  // barrier of its own; see section 19.4 of p63_gap_study.md.
-  __shared__ __align__(16) double sDQ[2 * 1024];
+  // asks for the 16-byte slots it will read, so the buffer needs no barrier of
+  // its own; see section 19.4 of p63_gap_study.md.
+  // At most 32 KB in every configuration, so this one stays static.
+  __shared__ __align__(16) double sFV[NBUF * 1024];
+  __shared__ __align__(16) double sDQ[4 * NTILE * NT];
 
   const int elem = (int)blockIdx.x >> 1;
   if (elem >= Ne) {
@@ -1725,75 +1911,171 @@ __global__ __launch_bounds__(P31_THREADS, 1) void tendency_fused_p31_y_kernel(
   const int tid = (int)threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  const int ti = warp & 3;
-  const int tj = warp >> 2;
+  const int ti = warp % P31_Y_WM;
+  const int tj = warp / P31_Y_WM;
   const int row = lane >> 2;
   const int colk = lane & 3;
 
   const int elem_offset = elem * NP31;
   const int npoint = NP31 * Ne;
 
-  double Dy[8];
+  double Dy[TN][8];
 #pragma unroll
-  for (int ks = 0; ks < 8; ++ks) {
-    Dy[ks] = D1D[(tj * 8 + row) + NQ31 * (4 * ks + colk)];
+  for (int n = 0; n < TN; ++n) {
+#pragma unroll
+    for (int ks = 0; ks < 8; ++ks) {
+      Dy[n][ks] = D1D[((tj * TN + n) * 8 + row) + NQ31 * (4 * ks + colk)];
+    }
   }
 
-  const int i0 = ti * 8 + 2 * colk;
-  const int jout = tj * 8 + row;
-  const int by = sw31((ti * 8 + row) + NQ31 * colk);
+  int i0[TM], jout[TN], by[TM];
+#pragma unroll
+  for (int m = 0; m < TM; ++m) {
+    i0[m] = (ti * TM + m) * 8 + 2 * colk;
+    by[m] = sw31(((ti * TM + m) * 8 + row) + NQ31 * colk);
+  }
+#pragma unroll
+  for (int n = 0; n < TN; ++n) {
+    jout[n] = (tj * TN + n) * 8 + row;
+  }
 
-  const int ldi = 2 * (tid & 15);
-  const int ldj = tid >> 4;
-  const int ldsh = sw31(ldi + NQ31 * ldj);
-  int gidx = elem_offset + ldi + NQ31 * ldj + (NQ31 * NQ31) * k0;
+  int ldsh[LDIT], gidx[LDIT];
+#pragma unroll
+  for (int t = 0; t < LDIT; ++t) {
+    const int s = tid + t * NT;
+    const int ldi = 2 * (s & 15);
+    const int ldj = s >> 4;
+    ldsh[t] = sw31(ldi + NQ31 * ldj);
+    gidx[t] = elem_offset + ldi + NQ31 * ldj + (NQ31 * NQ31) * k0;
+  }
 
-  double2 qp = *reinterpret_cast<const double2 *>(q + gidx);
-  double2 vp = *reinterpret_cast<const double2 *>(v + gidx);
+  double2 qp[LDIT], vp[LDIT];
+#define P31_Y_LOADREGS()                                                      \
+  do {                                                                        \
+    _Pragma("unroll") for (int t = 0; t < LDIT; ++t)                          \
+    {                                                                         \
+      qp[t] = *reinterpret_cast<const double2 *>(q + gidx[t]);                \
+      vp[t] = *reinterpret_cast<const double2 *>(v + gidx[t]);                \
+      gidx[t] += NQ31 * NQ31;                                                 \
+    }                                                                         \
+  } while (0)
+#define P31_Y_STORE(BUF)                                                      \
+  do {                                                                        \
+    _Pragma("unroll") for (int t = 0; t < LDIT; ++t)                          \
+    {                                                                         \
+      *reinterpret_cast<double2 *>(sFV + (BUF) * 1024 + ldsh[t]) =            \
+          make_double2(qp[t].x * vp[t].x, qp[t].y * vp[t].y);                 \
+    }                                                                         \
+  } while (0)
 
-  const int dqslot = 2 * tid;
-  const int nidx0 = elem_offset + i0 + NQ31 * jout + (NQ31 * NQ31) * k0;
+  int nidx0[TM][TN];
+#pragma unroll
+  for (int m = 0; m < TM; ++m) {
+#pragma unroll
+    for (int n = 0; n < TN; ++n) {
+      nidx0[m][n] =
+          elem_offset + i0[m] + NQ31 * jout[n] + (NQ31 * NQ31) * k0;
+    }
+  }
+
+  P31_Y_LOADREGS();
+
 #if P31_PDL_STAGE >= 1
   // dqdt is what the xz grid writes, and this prefetch is the first read of it.
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
-  cp_async_16(sDQ + dqslot, dqdt + nidx0);
+#pragma unroll
+  for (int m = 0; m < TM; ++m) {
+#pragma unroll
+    for (int n = 0; n < TN; ++n) {
+      cp_async_16(sDQ + 2 * (tid + NT * (m * TN + n)), dqdt + nidx0[m][n]);
+    }
+  }
   asm volatile("cp.async.commit_group;\n" ::);
 
+#if P31_Y_DB
+  P31_Y_STORE(0);
+  P31_Y_LOADREGS();
+  __syncthreads();
+#endif
+
   for (int kl = 0; kl < JSLAB31; ++kl) {
-    *reinterpret_cast<double2 *>(sFV + ldsh) =
-        make_double2(qp.x * vp.x, qp.y * vp.y);
+#if P31_Y_DB
+    const int cur = kl & 1;
     if (kl + 1 < JSLAB31) {
-      gidx += NQ31 * NQ31;
-      qp = *reinterpret_cast<const double2 *>(q + gidx);
-      vp = *reinterpret_cast<const double2 *>(v + gidx);
+      P31_Y_STORE(cur ^ 1);
+      if (kl + 2 < JSLAB31) {
+        P31_Y_LOADREGS();
+      }
     }
+#else
+    const int cur = 0;
+    P31_Y_STORE(0);
     if (kl + 1 < JSLAB31) {
-      cp_async_16(sDQ + 1024 * ((kl + 1) & 1) + dqslot,
-                  dqdt + nidx0 + (NQ31 * NQ31) * (kl + 1));
+      P31_Y_LOADREGS();
+    }
+#endif
+    if (kl + 1 < JSLAB31) {
+#pragma unroll
+      for (int m = 0; m < TM; ++m) {
+#pragma unroll
+        for (int n = 0; n < TN; ++n) {
+          cp_async_16(sDQ + 2 * NTILE * NT * ((kl + 1) & 1) +
+                          2 * (tid + NT * (m * TN + n)),
+                      dqdt + nidx0[m][n] + (NQ31 * NQ31) * (kl + 1));
+        }
+      }
     }
     asm volatile("cp.async.commit_group;\n" ::);
+#if !P31_Y_DB
     __syncthreads();
+#endif
 
-    double c0, c1;
-    mma_reset(c0, c1);
+    double c0[TM][TN], c1[TM][TN];
+#pragma unroll
+    for (int m = 0; m < TM; ++m) {
+#pragma unroll
+      for (int n = 0; n < TN; ++n) {
+        mma_reset(c0[m][n], c1[m][n]);
+      }
+    }
+    const double *const pFV = sFV + cur * 1024;
 #pragma unroll
     for (int ks = 0; ks < 8; ++ks) {
-      mma_m8n8k4_f64<UseTc>(c0, c1, Dy[ks], sFV[by + 128 * ks], c0, c1);
+      double bv[TM];
+#pragma unroll
+      for (int m = 0; m < TM; ++m) {
+        bv[m] = pFV[by[m] + 128 * ks];
+      }
+#pragma unroll
+      for (int m = 0; m < TM; ++m) {
+#pragma unroll
+        for (int n = 0; n < TN; ++n) {
+          mma_m8n8k4_f64<UseTc>(c0[m][n], c1[m][n], Dy[n][ks], bv[m],
+                                c0[m][n], c1[m][n]);
+        }
+      }
     }
 
-    const int nidx =
-        elem_offset + i0 + NQ31 * jout + (NQ31 * NQ31) * (k0 + kl);
-    const double2 ey =
-        *reinterpret_cast<const double2 *>(Escale + nidx + npoint);
     asm volatile("cp.async.wait_group 1;\n" ::);
-    double2 out = *reinterpret_cast<const double2 *>(
-        sDQ + 1024 * (kl & 1) + dqslot);
-    out.x -= ey.x * c0;
-    out.y -= ey.y * c1;
-    *reinterpret_cast<double2 *>(dqdt + nidx) = out;
+#pragma unroll
+    for (int m = 0; m < TM; ++m) {
+#pragma unroll
+      for (int n = 0; n < TN; ++n) {
+        const int nidx = nidx0[m][n] + (NQ31 * NQ31) * kl;
+        const double2 ey =
+            *reinterpret_cast<const double2 *>(Escale + nidx + npoint);
+        double2 out = *reinterpret_cast<const double2 *>(
+            sDQ + 2 * NTILE * NT * (kl & 1) + 2 * (tid + NT * (m * TN + n)));
+        out.x -= ey.x * c0[m][n];
+        out.y -= ey.y * c1[m][n];
+        *reinterpret_cast<double2 *>(dqdt + nidx) = out;
+      }
+    }
     __syncthreads();
   }
+#undef P31_Y_LOADREGS
+#undef P31_Y_STORE
 }
 
 template <bool UseTc>
@@ -1803,15 +2085,28 @@ void launch_tendency_fused_p31_impl(
     const int *VMapP, const double *normal_fn, const double *Fscale,
     const double *Escale, int Ne)
 {
-  tendency_fused_p31_xz_kernel<UseTc><<<2 * Ne, P31_THREADS, 0, dg_cuda_stream>>>(
-      dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, Escale,
-      Ne);
+#if P31_XZ_DYN
+  constexpr size_t smem_xz = (2 * P31_XZ_NBUF * 1024 + 3264) * sizeof(double);
+  static bool opted_in = false;
+  if (!opted_in) {
+    cudaFuncSetAttribute(tendency_fused_p31_xz_kernel<UseTc>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)smem_xz);
+    opted_in = true;
+  }
+#else
+  constexpr size_t smem_xz = 0;
+#endif
+  tendency_fused_p31_xz_kernel<UseTc>
+      <<<2 * Ne, P31_XZ_THREADS, smem_xz, dg_cuda_stream>>>(
+          dqdt, D1D, Lift1D, q, u, v, w, VMapM, VMapP, normal_fn, Fscale,
+          Escale, Ne);
 #if P31_PDL_STAGE >= 1
   {
     cudaLaunchConfig_t ycfg = {};
     cudaLaunchAttribute yattr[1];
     ycfg.gridDim = dim3(2 * Ne);
-    ycfg.blockDim = dim3(P31_THREADS);
+    ycfg.blockDim = dim3(P31_Y_THREADS);
     ycfg.dynamicSmemBytes = 0;
     ycfg.stream = dg_cuda_stream;
     yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -1822,8 +2117,9 @@ void launch_tendency_fused_p31_impl(
                        v, Escale, Ne);
   }
 #else
-  tendency_fused_p31_y_kernel<UseTc><<<2 * Ne, P31_THREADS, 0, dg_cuda_stream>>>(
-      dqdt, D1D, q, v, Escale, Ne);
+  tendency_fused_p31_y_kernel<UseTc>
+      <<<2 * Ne, P31_Y_THREADS, 0, dg_cuda_stream>>>(dqdt, D1D, q, v, Escale,
+                                                     Ne);
 #endif
   check_cuda("tendency_fused_p31 kernels");
 }
@@ -2456,7 +2752,7 @@ void launch_tendency_fused_p63_impl(
     cudaLaunchAttribute yattr[1];
     ycfg.gridDim = dim3(nblock);
     ycfg.blockDim = dim3(P63Y_THREADS);
-    ycfg.dynamicSmemBytes = (unsigned)smem_y;
+    ycfg.dynamicSmemBytes = 0;
     ycfg.stream = dg_cuda_stream;
     yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     yattr[0].val.programmaticStreamSerializationAllowed = 1;
@@ -3099,7 +3395,7 @@ void launch_tendency_fused_p127_impl(
     cudaLaunchAttribute yattr[1];
     ycfg.gridDim = dim3(nblock_y);
     ycfg.blockDim = dim3(P127_Y_THREADS);
-    ycfg.dynamicSmemBytes = (unsigned)smem_y;
+    ycfg.dynamicSmemBytes = 0;
     ycfg.stream = dg_cuda_stream;
     yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     yattr[0].val.programmaticStreamSerializationAllowed = 1;

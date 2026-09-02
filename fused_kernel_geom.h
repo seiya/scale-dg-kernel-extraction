@@ -23,6 +23,59 @@
 #define NFPTOT31 6144
 #define JSLAB31 16
 #define P31_THREADS 512
+// p=31 fused Tensor Core warp mma tiles and plane-loop pipelining.  The block
+// tile is the full 32x32 output plane in both kernels, so the warp tile fixes
+// the warp grid and hence the thread count; widening a warp tile is paid for
+// with warps and therefore with occupancy.  P31_*_DB switches the plane loop
+// to the double-buffered form (one barrier per plane instead of two), which
+// needs two shared planes and therefore dynamic shared memory.  P31_*_MINB is
+// the second __launch_bounds__ argument, i.e. the register budget.  Section 30
+// of p31_gap_study.md has the sweep; every setting other than the default
+// lost, so the defaults below are the production form.
+#ifndef P31_XZ_TM
+#define P31_XZ_TM 1
+#endif
+#ifndef P31_XZ_TN
+#define P31_XZ_TN 1
+#endif
+#ifndef P31_XZ_DB
+#define P31_XZ_DB 0
+#endif
+#ifndef P31_XZ_MINB
+#define P31_XZ_MINB 1
+#endif
+#define P31_XZ_WM (4 / P31_XZ_TM)
+#define P31_XZ_WN (4 / P31_XZ_TN)
+#define P31_XZ_THREADS (32 * P31_XZ_WM * P31_XZ_WN)
+#define P31_XZ_NBUF (P31_XZ_DB + 1)
+// Which side of the face barrier the first plane load sits on.  Late (0) is
+// 1.40% faster at the 1x1 tile; the wide tiles prefer early.
+#ifndef P31_XZ_EARLY
+#define P31_XZ_EARLY 0
+#endif
+// Dynamic shared memory is forced by the double-buffered form (57.5 KB against
+// a 48 KB static limit) but is a separate knob, because the conversion alone
+// costs 1.70% at the 1x1 tile on an otherwise bit-identical kernel -- and is
+// 1.5% cheaper than static at the 2x2 tile.
+#ifndef P31_XZ_DYN
+#define P31_XZ_DYN P31_XZ_DB
+#endif
+#ifndef P31_Y_TM
+#define P31_Y_TM 1
+#endif
+#ifndef P31_Y_TN
+#define P31_Y_TN 1
+#endif
+#ifndef P31_Y_DB
+#define P31_Y_DB 0
+#endif
+#ifndef P31_Y_MINB
+#define P31_Y_MINB 1
+#endif
+#define P31_Y_WM (4 / P31_Y_TM)
+#define P31_Y_WN (4 / P31_Y_TN)
+#define P31_Y_THREADS (32 * P31_Y_WM * P31_Y_WN)
+#define P31_Y_NBUF (P31_Y_DB + 1)
 
 #define NQ63 64
 #define NP63 262144
