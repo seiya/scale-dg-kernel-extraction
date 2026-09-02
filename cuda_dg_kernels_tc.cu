@@ -1032,9 +1032,53 @@ __device__ __forceinline__ int sw_f15(int fp)
   return fp ^ (((fp >> 4) & 1) << 0) ^ (((fp >> 5) & 1) << 3);
 }
 
-// Read q, u, v and w at an M-side face node.  The two i-boundary planes of the
-// element are in shared memory; every other node still goes to global.  The
-// index is the one VMapM gave, so the test is on the map's own answer.
+// How many of the element's six boundary planes of q, u, v and w are staged
+// in shared memory for the M side of the face flux.  2 is the production form
+// of section 16.6 of p15_gap_study.md (the two i-normal planes, 16 KB); 6
+// stages all of them (48 KB) and is the candidate section 16.6 rejected
+// without writing.  Section 30 of the same report measures it.
+#ifndef P15_MPLANES
+#define P15_MPLANES 2
+#endif
+#if P15_MPLANES == 6
+#define P15_MSTRIDE 1536
+#else
+#define P15_MSTRIDE 512
+#endif
+
+// Illegal ablation: read the M side at the coalesced node index instead of
+// the one VMapM gave.  Measures the ceiling of every M-side gather at once
+// (section 16.9's "M side fully coalesced").  Numerically wrong.
+#ifndef P15_ABL_MCOAL
+#define P15_ABL_MCOAL 0
+#endif
+
+// Read q, u, v and w at an M-side face node.  The staged boundary planes of
+// the element are in shared memory; every other node still goes to global.
+// The index is the one VMapM gave, so the test is on the map's own answer.
+#if P15_MPLANES == 6
+#define LOAD_M(iM, qv, uv, vv, wv)                                             \
+  {                                                                            \
+    const int loc = (iM) - elem_offset;                                        \
+    int sidx = -1;                                                             \
+    if ((unsigned)loc < (unsigned)NP15) {                                      \
+      const int ii = loc & 15;                                                 \
+      const int jj = (loc >> 4) & 15;                                          \
+      const int kk = loc >> 8;                                                 \
+      if (ii == 0) sidx = jj + 16 * kk;                                        \
+      else if (ii == 15) sidx = 256 + jj + 16 * kk;                            \
+      else if (jj == 0) sidx = 512 + ii + 16 * kk;                             \
+      else if (jj == 15) sidx = 768 + ii + 16 * kk;                            \
+      else if (kk == 0) sidx = 1024 + ii + 16 * jj;                            \
+      else if (kk == 15) sidx = 1280 + ii + 16 * jj;                           \
+    }                                                                          \
+    if (sidx >= 0) {                                                           \
+      qv = sMq[sidx]; uv = sMu[sidx]; vv = sMv[sidx]; wv = sMw[sidx];          \
+    } else {                                                                   \
+      qv = q[iM]; uv = u[iM]; vv = v[iM]; wv = w[iM];                          \
+    }                                                                          \
+  }
+#else
 #define LOAD_M(iM, qv, uv, vv, wv)                                             \
   {                                                                            \
     const int loc = (iM) - elem_offset;                                        \
@@ -1044,6 +1088,43 @@ __device__ __forceinline__ int sw_f15(int fp)
       qv = sMq[sidx]; uv = sMu[sidx]; vv = sMv[sidx]; wv = sMw[sidx];          \
     } else {                                                                   \
       qv = q[iM]; uv = u[iM]; vv = v[iM]; wv = w[iM];                          \
+    }                                                                          \
+  }
+#endif
+
+// Write the boundary-plane copies on the way past.  The volume phase has
+// already read these nodes; nothing is assumed about VMapM.  The pair (n,n+1)
+// is adjacent in i, so the j- and k-normal planes take it as one double2 and
+// only the i-normal planes split it.
+#define STAGE_M_PAIR(n, QV, UV, VV, WV)                                        \
+  {                                                                            \
+    const int ii = (n) & 15;                                                   \
+    const int jj = ((n) >> 4) & 15;                                            \
+    const int kk = (n) >> 8;                                                   \
+    if (ii == 0) {                                                             \
+      const int s = jj + 16 * kk;                                              \
+      sMq[s] = QV.x; sMu[s] = UV.x; sMv[s] = VV.x; sMw[s] = WV.x;              \
+    } else if (ii == 14) {                                                     \
+      const int s = 256 + jj + 16 * kk;                                        \
+      sMq[s] = QV.y; sMu[s] = UV.y; sMv[s] = VV.y; sMw[s] = WV.y;              \
+    }                                                                          \
+    int sj = -1;                                                               \
+    if (jj == 0) sj = 512 + ii + 16 * kk;                                      \
+    else if (jj == 15) sj = 768 + ii + 16 * kk;                                \
+    if (sj >= 0) {                                                             \
+      *reinterpret_cast<double2 *>(sMq + sj) = QV;                             \
+      *reinterpret_cast<double2 *>(sMu + sj) = UV;                             \
+      *reinterpret_cast<double2 *>(sMv + sj) = VV;                             \
+      *reinterpret_cast<double2 *>(sMw + sj) = WV;                             \
+    }                                                                          \
+    int sk = -1;                                                               \
+    if (kk == 0) sk = 1024 + ii + 16 * jj;                                     \
+    else if (kk == 15) sk = 1280 + ii + 16 * jj;                               \
+    if (sk >= 0) {                                                             \
+      *reinterpret_cast<double2 *>(sMq + sk) = QV;                             \
+      *reinterpret_cast<double2 *>(sMu + sk) = UV;                             \
+      *reinterpret_cast<double2 *>(sMv + sk) = VV;                             \
+      *reinterpret_cast<double2 *>(sMw + sk) = WV;                             \
     }                                                                          \
   }
 
@@ -1085,9 +1166,9 @@ __global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_kernel(
   // does not.  Staging the whole element instead would need 128 KB more and
   // section 16.2 of p15_gap_study.md measures that carveout at +12%.
   double *const sMq = sLift + 96;
-  double *const sMu = sMq + 512;
-  double *const sMv = sMu + 512;
-  double *const sMw = sMv + 512;
+  double *const sMu = sMq + P15_MSTRIDE;
+  double *const sMv = sMu + P15_MSTRIDE;
+  double *const sMw = sMv + P15_MSTRIDE;
 
   const int elem = (int)blockIdx.x;
   if (elem >= Ne) {
@@ -1165,6 +1246,10 @@ __global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_kernel(
     *reinterpret_cast<double2 *>(sbufZ + sw_z15(nb)) =
         make_double2(qb.x * wb.x, qb.y * wb.y);
 
+#if P15_MPLANES == 6
+    STAGE_M_PAIR(na, qa, ua, va, wa);
+    STAGE_M_PAIR(nb, qb, ub, vb, wb);
+#else
     // na is even and nb = na + 2048, so the two nodes of a pair have i = na&15
     // and that plus one: the low plane can only be the first of a pair and the
     // high plane only the second.  One thread in eight writes.
@@ -1180,6 +1265,7 @@ __global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_kernel(
       sMq[s0] = qa.y; sMu[s0] = ua.y; sMv[s0] = va.y; sMw[s0] = wa.y;
       sMq[s1] = qb.y; sMu[s1] = ub.y; sMv[s1] = vb.y; sMw[s1] = wb.y;
     }
+#endif
   }
 
   __syncthreads();
@@ -1216,7 +1302,12 @@ __global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_kernel(
     const int iM1 = mM.y - 1, iP1 = mP.y - 1;
 
     double qM0, uM0, vM0, wM0;
+#if P15_ABL_MCOAL
+    { const int ic = elem_offset + fp0;
+      qM0 = q[ic]; uM0 = u[ic]; vM0 = v[ic]; wM0 = w[ic]; }
+#else
     LOAD_M(iM0, qM0, uM0, vM0, wM0);
+#endif
     const double qP0 = q[iP0];
     const double VelM0 = uM0 * n0.x + vM0 * n1.x + wM0 * n2.x;
     const double VelP0 = u[iP0] * n0.x + v[iP0] * n1.x + w[iP0] * n2.x;
@@ -1225,7 +1316,12 @@ __global__ __launch_bounds__(P15_THREADS, 1) void tendency_fused_p15_kernel(
         0.5 * fs.x * (qP0 * VelP0 - qM0 * VelM0 - a0 * (qP0 - qM0));
 
     double qM1, uM1, vM1, wM1;
+#if P15_ABL_MCOAL
+    { const int ic = elem_offset + fp0 + 1;
+      qM1 = q[ic]; uM1 = u[ic]; vM1 = v[ic]; wM1 = w[ic]; }
+#else
     LOAD_M(iM1, qM1, uM1, vM1, wM1);
+#endif
     const double qP1 = q[iP1];
     const double VelM1 = uM1 * n0.y + vM1 * n1.y + wM1 * n2.y;
     const double VelP1 = u[iP1] * n0.y + v[iP1] * n1.y + w[iP1] * n2.y;
@@ -1373,7 +1469,7 @@ void launch_tendency_fused_p15_impl(
     const double *Escale, int Ne)
 {
   const int p15_smem =
-      (3 * NP15 + NFPTOT15 + 256 + 96 + 2048) * (int)sizeof(double);
+      (3 * NP15 + NFPTOT15 + 256 + 96 + 4 * P15_MSTRIDE) * (int)sizeof(double);
   static bool p15_optin = false;
   if (!p15_optin) {
     cudaFuncSetAttribute(tendency_fused_p15_kernel<UseTc>,
@@ -1478,6 +1574,26 @@ __device__ __forceinline__ int sw31(int idx)
 {
   return idx ^ (((idx >> 5) & 3) << 2);
 }
+
+// Illegal ablations that price the shared-memory bank conflicts of the p=31
+// fused Tensor Core kernels.  Every shared address that the mma or the
+// epilogue reads (P31_ABL_XZSH) or that the y kernel reads and writes
+// (P31_ABL_YSH) is replaced by a lane-linear one, which is conflict free by
+// construction and keeps the instruction count and the access widths.  The
+// values are wrong, so these builds exist only to measure the ceiling; see
+// section 32 of p31_gap_study.md.
+#ifndef P31_ABL_XZSH
+#define P31_ABL_XZSH 0
+#endif
+#ifndef P31_ABL_YSH
+#define P31_ABL_YSH 0
+#endif
+// Attribution build: drop the sDQ staging buffer and read dqdt straight from
+// global in the y epilogue.  Numerically correct (it is the pre-cp.async form
+// of the kernel), and it tells apart the two shared buffers the y kernel has.
+#ifndef P31_ABL_YNOCPA
+#define P31_ABL_YNOCPA 0
+#endif
 
 // Programmatic Dependent Launch for the p=31 fused Tensor Core path.  Here the
 // stage is two grids, xz -> y (the face fluxes are evaluated inside xz), so
@@ -1810,11 +1926,19 @@ tendency_fused_p31_xz_kernel(
       double av[TN], bv[TM];
 #pragma unroll
       for (int n = 0; n < TN; ++n) {
+#if P31_ABL_XZSH
+        av[n] = pFU[(lane + 64 * ks + 256 * n) & 1023];
+#else
         av[n] = pFU[ax[n] ^ (4 * ks)];
+#endif
       }
 #pragma unroll
       for (int m = 0; m < TM; ++m) {
+#if P31_ABL_XZSH
+        bv[m] = pFW[(lane + 64 * ks + 256 * m) & 1023];
+#else
         bv[m] = pFW[bz[m] + 128 * ks];
+#endif
       }
 #pragma unroll
       for (int m = 0; m < TM; ++m) {
@@ -1836,15 +1960,24 @@ tendency_fused_p31_xz_kernel(
     double fb2[TN], fb4[TN];
 #pragma unroll
     for (int n = 0; n < TN; ++n) {
+#if P31_ABL_XZSH
+      const int a24 = (lane + 32 * n) & 1023;
+#else
       const int a24 = sw31(jl + NQ31 * kout[n]);
+#endif
       fb2[n] = sf2[a24];
       fb4[n] = sf4[a24];
     }
     double2 fb5[TM], fb6[TM];
 #pragma unroll
     for (int m = 0; m < TM; ++m) {
-      fb5[m] = *reinterpret_cast<const double2 *>(sf5 + i0[m] + NQ31 * jl);
-      fb6[m] = *reinterpret_cast<const double2 *>(sf6 + i0[m] + NQ31 * jl);
+#if P31_ABL_XZSH
+      const int a56 = (2 * lane + 64 * m) & 511;
+#else
+      const int a56 = i0[m] + NQ31 * jl;
+#endif
+      fb5[m] = *reinterpret_cast<const double2 *>(sf5 + a56);
+      fb6[m] = *reinterpret_cast<const double2 *>(sf6 + a56);
     }
 
     // Same summation order as the CUDA-core p=31 kernels.
@@ -1881,6 +2014,17 @@ tendency_fused_p31_xz_kernel(
 // swizzle.  The shared operand depends only on the i tile, so widening the
 // warp tile in j is the direction that pays here.  The block owns half an
 // element in k, for the same wave reason.
+__device__ __forceinline__ int ystsh(int idx, int t)
+{
+#if P31_ABL_YSH
+  const int tid = (int)threadIdx.x;
+  return (2 * (tid & 31) + 64 * (tid >> 5) + 512 * t) & 1023;
+#else
+  (void)t;
+  return idx;
+#endif
+}
+
 template <bool UseTc>
 __global__ __launch_bounds__(P31_Y_THREADS, P31_Y_MINB) void
 tendency_fused_p31_y_kernel(
@@ -1963,7 +2107,7 @@ tendency_fused_p31_y_kernel(
   do {                                                                        \
     _Pragma("unroll") for (int t = 0; t < LDIT; ++t)                          \
     {                                                                         \
-      *reinterpret_cast<double2 *>(sFV + (BUF) * 1024 + ldsh[t]) =            \
+      *reinterpret_cast<double2 *>(sFV + (BUF) * 1024 + ystsh(ldsh[t], t)) =            \
           make_double2(qp[t].x * vp[t].x, qp[t].y * vp[t].y);                 \
     }                                                                         \
   } while (0)
@@ -1984,6 +2128,7 @@ tendency_fused_p31_y_kernel(
   // dqdt is what the xz grid writes, and this prefetch is the first read of it.
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
+#if !P31_ABL_YNOCPA
 #pragma unroll
   for (int m = 0; m < TM; ++m) {
 #pragma unroll
@@ -1992,6 +2137,7 @@ tendency_fused_p31_y_kernel(
     }
   }
   asm volatile("cp.async.commit_group;\n" ::);
+#endif
 
 #if P31_Y_DB
   P31_Y_STORE(0);
@@ -2015,6 +2161,7 @@ tendency_fused_p31_y_kernel(
       P31_Y_LOADREGS();
     }
 #endif
+#if !P31_ABL_YNOCPA
     if (kl + 1 < JSLAB31) {
 #pragma unroll
       for (int m = 0; m < TM; ++m) {
@@ -2027,6 +2174,7 @@ tendency_fused_p31_y_kernel(
       }
     }
     asm volatile("cp.async.commit_group;\n" ::);
+#endif
 #if !P31_Y_DB
     __syncthreads();
 #endif
@@ -2045,7 +2193,11 @@ tendency_fused_p31_y_kernel(
       double bv[TM];
 #pragma unroll
       for (int m = 0; m < TM; ++m) {
+#if P31_ABL_YSH
+        bv[m] = pFV[(lane + 64 * ks + 256 * m) & 1023];
+#else
         bv[m] = pFV[by[m] + 128 * ks];
+#endif
       }
 #pragma unroll
       for (int m = 0; m < TM; ++m) {
@@ -2057,7 +2209,9 @@ tendency_fused_p31_y_kernel(
       }
     }
 
+#if !P31_ABL_YNOCPA
     asm volatile("cp.async.wait_group 1;\n" ::);
+#endif
 #pragma unroll
     for (int m = 0; m < TM; ++m) {
 #pragma unroll
@@ -2065,8 +2219,12 @@ tendency_fused_p31_y_kernel(
         const int nidx = nidx0[m][n] + (NQ31 * NQ31) * kl;
         const double2 ey =
             *reinterpret_cast<const double2 *>(Escale + nidx + npoint);
+#if P31_ABL_YNOCPA
+        double2 out = *reinterpret_cast<const double2 *>(dqdt + nidx);
+#else
         double2 out = *reinterpret_cast<const double2 *>(
             sDQ + 2 * NTILE * NT * (kl & 1) + 2 * (tid + NT * (m * TN + n)));
+#endif
         out.x -= ey.x * c0[m][n];
         out.y -= ey.y * c1[m][n];
         *reinterpret_cast<double2 *>(dqdt + nidx) = out;
