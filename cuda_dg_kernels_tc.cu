@@ -48,6 +48,73 @@ __device__ __forceinline__ void mma_reset(double &c0, double &c1)
   c1 = 0.0;
 }
 
+// Out-of-role ablation (P7_TC_M16N8K8, off by default): the same K = 8
+// contraction expressed as one mma.sync.m16n8k8 instead of two
+// mma.sync.m8n8k4.  Fragment map (verified against a CPU reference on
+// sm_100), g = lane>>2, t = lane&3:
+//   A(16x8): a0 = A[g][t]  a1 = A[g+8][t]  a2 = A[g][t+4]  a3 = A[g+8][t+4]
+//   B(8x8) : b0 = B[t][g]  b1 = B[t+4][g]
+//   C(16x8): c0 = C[g][2t]  c1 = C[g][2t+1]  c2 = C[g+8][2t]  c3 = +1
+// The m8n8k4 A and B operands of the k0 = 0 and k0 = 4 halves are exactly
+// a0/a2 and b0/b1, so the drop-in sets a1 = a3 = 0 and drops c2, c3.  The
+// UseTc = false arm walks the same fragments with DFMA and shuffles, so
+// FUSED_DFMA and FUSED_TC stay iso-schedule under the knob as well.
+template <bool UseTc>
+__device__ __forceinline__ void mma_m16n8k8_f64(
+    double &d0, double &d1, double &d2, double &d3, double a0, double a1,
+    double a2, double a3, double b0, double b1, double c0, double c1,
+    double c2, double c3)
+{
+  if constexpr (UseTc) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f64.f64.f64.f64 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+        : "=d"(d0), "=d"(d1), "=d"(d2), "=d"(d3)
+        : "d"(a0), "d"(a1), "d"(a2), "d"(a3), "d"(b0), "d"(b1), "d"(c0),
+          "d"(c1), "d"(c2), "d"(c3));
+  } else {
+    const int lane = (int)threadIdx.x & 31;
+    const int g = lane >> 2;
+    const int n0 = (lane & 3) * 2;
+    double acc0 = c0, acc1 = c1, acc2 = c2, acc3 = c3;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const double alo = (k < 4) ? a0 : a2;
+      const double ahi = (k < 4) ? a1 : a3;
+      const double bb = (k < 4) ? b0 : b1;
+      const int src_a = (g << 2) + (k & 3);
+      const double ak0 = __shfl_sync(0xffffffff, alo, src_a);
+      const double ak1 = __shfl_sync(0xffffffff, ahi, src_a);
+      const double bk0 = __shfl_sync(0xffffffff, bb, (n0 << 2) + (k & 3));
+      const double bk1 = __shfl_sync(0xffffffff, bb, ((n0 + 1) << 2) + (k & 3));
+      acc0 = fma(ak0, bk0, acc0);
+      acc1 = fma(ak0, bk1, acc1);
+      acc2 = fma(ak1, bk0, acc2);
+      acc3 = fma(ak1, bk1, acc3);
+    }
+    d0 = acc0;
+    d1 = acc1;
+    d2 = acc2;
+    d3 = acc3;
+  }
+}
+
+// One K = 8 contraction on an 8x8 output tile: the production form is the two
+// m8n8k4 the path is defined by; P7_TC_M16N8K8 swaps in the wider shape.
+template <bool UseTc>
+__device__ __forceinline__ void mma_k8_8x8(
+    double &c0, double &c1, double a0, double b0, double a1, double b1)
+{
+#if P7_TC_M16N8K8
+  double d2 = 0.0, d3 = 0.0;
+  mma_m16n8k8_f64<UseTc>(c0, c1, d2, d3, a0, 0.0, a1, 0.0, b0, b1, c0, c1, 0.0,
+                         0.0);
+#else
+  mma_m8n8k4_f64<UseTc>(c0, c1, a0, b0, c0, c1);
+  mma_m8n8k4_f64<UseTc>(c0, c1, a1, b1, c0, c1);
+#endif
+}
+
 // Shared-memory layouts for the p=7 fused Tensor Core kernel.
 //
 // ncu (Slurm job 43554) showed the previous natural layouts caused a 3.0-way
@@ -274,8 +341,8 @@ __global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
   {
     const int fz = sw_z(((warp << 3) + row) + (colk << 6));
     mma_reset(c0, c1);
-    mma_m8n8k4_f64<UseTc>(c0, c1, sDfrag[frag], sFluxZ[fz], c0, c1);
-    mma_m8n8k4_f64<UseTc>(c0, c1, sDfrag[frag + 32], sFluxZ[fz ^ 256], c0, c1);
+    mma_k8_8x8<UseTc>(c0, c1, sDfrag[frag], sFluxZ[fz], sDfrag[frag + 32],
+                      sFluxZ[fz ^ 256]);
   }
   // sw_z() and sw_dz() permute across warp boundaries, so the z panel needs a
   // block-wide barrier before it overwrites the flux it was read from.
@@ -314,8 +381,8 @@ __global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
     const int fx = sw_xy(colk + (row << 3) + (k << 6));
     const double2 es = *reinterpret_cast<const double2 *>(Escale + nidx0);
     mma_reset(c0, c1);
-    mma_m8n8k4_f64<UseTc>(c0, c1, sFluxX[fx], sDfrag[frag], c0, c1);
-    mma_m8n8k4_f64<UseTc>(c0, c1, sFluxX[fx ^ 4], sDfrag[frag + 32], c0, c1);
+    mma_k8_8x8<UseTc>(c0, c1, sFluxX[fx], sDfrag[frag], sFluxX[fx ^ 4],
+                      sDfrag[frag + 32]);
     acc0 = es.x * c0;
     acc1 = es.y * c1;
   }
@@ -327,8 +394,8 @@ __global__ __launch_bounds__(P7_THREADS, P7_BPSM) void tendency_fused_p7_kernel(
     const double2 es =
         *reinterpret_cast<const double2 *>(Escale + nidx0 + npoint);
     mma_reset(c0, c1);
-    mma_m8n8k4_f64<UseTc>(c0, c1, sDfrag[frag], sFluxY[fy], c0, c1);
-    mma_m8n8k4_f64<UseTc>(c0, c1, sDfrag[frag + 32], sFluxY[fy ^ 32], c0, c1);
+    mma_k8_8x8<UseTc>(c0, c1, sDfrag[frag], sFluxY[fy], sDfrag[frag + 32],
+                      sFluxY[fy ^ 32]);
     acc0 += es.x * c0;
     acc1 += es.y * c1;
   }

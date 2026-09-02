@@ -11,7 +11,21 @@
 #define NP7 512
 #define NFPTOT7 384
 #define P7_THREADS 256
+// Overridable so the out-of-role m16n8k8 ablation below can be built at all:
+// ptxas refuses "mma with .f64 type and shape .m16n8k8" under the 32-register
+// target that __launch_bounds__(256, 8) implies.
+#ifndef P7_BPSM
 #define P7_BPSM 8
+#endif
+// Out-of-role ablation knob, default 0 = the production m8n8k4 schedule.
+// 1 replaces each pair of mma.sync.m8n8k4 in the p=7 kernel with one
+// mma.sync.m16n8k8 (upper 8 A rows zero, upper accumulator half discarded).
+// AGENTS.md names m8n8k4 in the definition of CUDAFORTRAN_FUSED_TC, so this
+// must never be the default; see reports/tc_paper_survey_2407.09621.md
+// section 19 for what it measures and why it cannot pay on sm_100.
+#ifndef P7_TC_M16N8K8
+#define P7_TC_M16N8K8 0
+#endif
 
 #define NQ15 16
 #define NP15 4096
