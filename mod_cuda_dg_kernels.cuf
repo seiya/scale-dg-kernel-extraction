@@ -105,13 +105,17 @@ module mod_cuda_dg_kernels
   ! With no SCALE_DG_* variable set, nothing below reads the environment:
   ! dg_gemm_defaults is a pure per-order table.
   !
-  !   Nq   x GEMM           y GEMM   epilogue carrier   z GEMM    schedule
-  !    8   CUTLASS tile 9   cuBLAS   z                  CUTLASS   default
-  !   16   CUTLASS tile 5   CUTLASS  z                  CUTLASS   default
-  !   32   CUTLASS tile 7   CUTLASS  x                  cuBLAS    y||z
-  !        (+ Escale_y folded into the y epilogue, GEMM_FUSED only)
-  !   64   CUTLASS tile 3   CUTLASS  z                  CUTLASS   default
-  !  >64   generic CUTLASS  CUTLASS  z                  CUTLASS   default
+  !   Nq   x GEMM           y GEMM   carrier   z GEMM    sched   epi package
+  !    8   CUTLASS tile 9   cuBLAS   x         CUTLASS   y||z    xpkg 5
+  !   16   CUTLASS tile 5   CUTLASS  x         CUTLASS   y||z    xpkg 4
+  !   32   CUTLASS tile 7   CUTLASS  x         cuBLAS    y||z    xpkg 4
+  !   64   CUTLASS tile 3   CUTLASS  z         CUTLASS   default zpkg 5
+  !  >64   generic CUTLASS  CUTLASS  z         CUTLASS   default (as before)
+  !
+  ! Epilogue package: bit 0 clamp aggregation, bit 1 16-byte lift, bit 2
+  ! 16-byte epilogue.  So xpkg 4 is the wide epilogue alone and xpkg/zpkg 5
+  ! is the wide epilogue plus clamp aggregation; the 16-byte lift is off
+  ! everywhere.  No Escale factor is forwarded at any order any more.
   !
   ! Nq > 64 does not reach this table: its x GEMM goes through
   ! launch_volume_gemm_x / _xy on the generic tiles.  No order above 64 was
@@ -120,14 +124,18 @@ module mod_cuda_dg_kernels
   ! What the table is worth (CUDA device us/stage, login-node GB200, 12-pair
   ! interleaved medians; before -> after, ranges disjoint unless noted):
   !
-  !   p=7   GEMM_FUSED 1747.1 -> 1505.1  (-13.9%)
-  !         GEMM_CUTE  1727.4 -> 1479.5  (-14.3%)
-  !   p=15  GEMM_FUSED  658.0 ->  613.4  ( -6.8%)
-  !         GEMM_CUTE   700.1 ->  655.1  ( -6.4%)
-  !   p=31  GEMM_FUSED  708.0 ->  609.2  (-14.0%)
-  !         GEMM_CUTE   668.1 ->  606.0  ( -9.3%)
-  !   p=63  GEMM_FUSED  571.1 ->  569.6  (-0.27%, marginal, ranges touching)
-  !         GEMM_CUTE   630.4 ->  627.8  (-0.41%, marginal)
+  !   p=7   GEMM_FUSED 1747.1 -> 1482.0  (-15.2%)
+  !         GEMM_CUTE  1727.4 -> 1478.9  (-14.4%)
+  !   p=15  GEMM_FUSED  658.0 ->  597.9  ( -9.1%)
+  !         GEMM_CUTE   700.1 ->  655.2  ( -6.4%)
+  !   p=31  GEMM_FUSED  708.0 ->  545.4  (-23.0%)
+  !         GEMM_CUTE   668.1 ->  605.6  ( -9.3%)
+  !   p=63  GEMM_FUSED  571.1 ->  564.3  ( -1.2%)
+  !         GEMM_CUTE   630.4 ->  628.4  (-0.31%, marginal, ranges touching)
+  !
+  ! GEMM_FUSED beats GEMM_CUTE at Nq = 16, 32 and 64 but NOT at Nq = 8, where
+  ! it is 0.21% behind.  That is a structural limit, not an unexplained gap:
+  ! see the Nq = 8 note under the carrier entry below.
   !
   ! Component by component:
   !
@@ -159,10 +167,35 @@ module mod_cuda_dg_kernels
   !   so it pays two integer divisions per row iteration.  Replacing them with
   !   shifts (every Nq here is a power of two) is worth 2.7-3.2% of the stage
   !   and takes the carrier from 130 to 96 registers; without it the x carrier
-  !   LOSES 9.7% at Nq = 32.  It still loses at every other order: +4.0% at
-  !   Nq = 8, +4.1% at Nq = 16 (the plain z it leaves behind costs 78.2 us
-  !   against the 47.9 us the plain x cost), +18.2% at Nq = 64 (the 128x64
-  !   tile spills: 254 registers with 64-136 bytes of spill stores).
+  !   LOSES 9.7% at Nq = 32.  Under a NARROW epilogue the x carrier also lost
+  !   +4.0% at Nq = 8 and +4.1% at Nq = 16; the 16-byte epilogue (below)
+  !   reverses both, so x now carries at Nq = 8, 16 and 32.  It stays rejected
+  !   at Nq = 64: ceiling 671.4 us/stage, +17.7%.  What binds that is not
+  !   spill -- forwarding both Escale factors drives the spill to zero and it
+  !   still loses 18% -- but the register file as an occupancy cap, 128
+  !   threads x 254 registers being exactly 2 CTAs/SM.  Forcing 3 CTAs makes
+  !   ptxas spill 680/964 bytes for +110%.
+  !
+  !   At Nq = 8 the x carrier is why GEMM_FUSED trails GEMM_CUTE.  N = 8 does
+  !   not build (the FP64 multistage B iterator static-asserts on zero
+  !   contiguous iterations), so Nq = 8 is the ONE order whose carrier tile
+  !   has TbN = 16 against a problem N of 8; every other order matches Nq
+  !   exactly.  Each CTA therefore computes and lifts a full 64x16 tile and
+  !   the OutputTileIterator masks the dead half only at store time --
+  !   thread_inst/inst is 32 at both Nq = 8 and 16, i.e. no lane predication
+  !   saves the work.  Measured (ncu, both orders in one job, identical tile):
+  !   32768 vs 16384 CTAs, 169.3 vs 88.9 M instructions (1.90x) for the same
+  !   DRAM bytes (1031 vs 981 MB) and the same occupancy (24.1%).  The
+  !   epilogue inside the carrier costs 182.1 us at Nq = 8 against 119.8 at
+  !   Nq = 16 and 118.8 at Nq = 32 for the same 16.78 M output points.  The
+  !   differential +62.3 us is 1.34x the 46.5 us that fusing saves, and the
+  !   full accounting closes to 0.1 us at all three orders.  An early exit for
+  !   the dead threads was built, validated bit-identical and rejected: the
+  !   dead columns are lanes of the same warp, so the guard becomes SASS
+  !   predication rather than a branch and saves no issue slots (instructions
+  !   went UP, 170.5 -> 171.0 M; 3/12 pairs, ranges overlapping).  A
+  !   carrier-only narrower tile is not available -- the tile is shared with
+  !   GEMM_CUTE, and run_x_gemm_assembly static_asserts that.
   ! * y as the fused carrier at Nq = 32, the previous holder of this slot:
   !   the epilogue alone goes 218.1 -> 159.2 us (-27%).  With k fixed per
   !   batch, two of the three lift face-point pairs are constant along a tile
@@ -179,13 +212,38 @@ module mod_cuda_dg_kernels
   !   119.7 -> 68.6 us, because the CUTLASS GemmZ 64x32 tile wastes half its
   !   rows on n = Nq = 32.
   !
-  ! * Escale_y forwarded into the y epilogue at Nq = 32, part of GEMM_FUSED's
-  !   fusion package; GEMM_CUTE keeps the plain y with the same mainloop tile.
-  !   Worth 17.4 us/stage (608.1 -> 590.7).  Escale_z cannot join it there
-  !   because z is on cuBLAS; forcing z back to CUTLASS to get it costs far
-  !   more than it saves (667.6 us, +13%).  At Nq = 16, where both can be
-  !   forwarded, they only pay as a PAIR: either one alone is worth 0 to -0.3%
-  !   and the two together are worth -6.4%.
+  ! * The 16-byte epilogue, opened from Nq > 64 down to every order here.  It
+  !   is the largest single item in the table: -7.28% at Nq = 32 (12/12), and
+  !   it is what reverses the x carrier at Nq = 8 and 16.  The carrier kernel
+  !   goes 216.2 -> 172.6 us at Nq = 32 with the rest of the stage unmoved,
+  !   at 124 registers and no spill.  p31_gap_study.md 28 had rejected the
+  !   Nq > 64 package here at +69.1%, but that was the z carrier's 64x32 tile
+  !   at 254 registers spilling 16.3 M times -- a property of the tile, not of
+  !   the order.
+  !
+  !   The other two ingredients of that package stay off.  The 16-byte lift
+  !   loses at all four orders by 2.1-3.2%: it does what it is for (global
+  !   load requests -27 to -34%, instructions -10 to -15%) and pays 124 -> 154
+  !   registers, which costs a CTA per SM at Nq <= 32 and lengthens the
+  !   dependent chain at Nq = 64.  Clamp aggregation is worth +-0.25% and
+  !   changes sign: adopted at Nq = 8 (-0.24%) and Nq = 64 (-0.12%), rejected
+  !   at Nq = 16 and 32.  It is register-neutral and cuts instructions 4.7%
+  !   without changing global load requests at all, and it pays in latency
+  !   cover -- the min() chain it removes was standing between the face
+  !   gathers' issue and their use, so stall_long_scoreboard rises at every
+  !   order.  Which orders that trade pays at is NOT closed; the two winners
+  !   have the lowest baseline long-scoreboard stall but the ordering is not
+  !   monotone in it, and at +-0.25% the remainder is not separable from
+  !   ptxas scheduling.
+  !
+  ! * Escale forwarding is off at every order.  It was adopted at Nq = 32
+  !   under the narrow epilogue, where it was worth 17.4 us: the extra volume
+  !   tensor cost the y GEMM 10.3 us and saved the carrier 27.6 us.  The
+  !   16-byte epilogue cuts a volume tensor's marginal cost in the carrier to
+  !   8.5 us, 3.2x cheaper, and the trade inverts (+0.32%, 12/12).  At Nq = 16
+  !   the two factors only ever paid as a pair, and under the wide epilogue
+  !   the pair is +8.58%.  At Nq = 8 forwarding was +0.53% even under a z
+  !   carrier.
   ! * Escale_x forwarded out of the x epilogue is what the Nq = 32 y carrier
   !   used and is meaningless with x as the carrier (the carrier applies every
   !   weight itself).  The same forwarding at Nq = 8 under a z carrier is
@@ -257,7 +315,10 @@ module mod_cuda_dg_kernels
   !                      derivatives.
   !                      Default: 1 at Nq = 32, 0 elsewhere.
   !   SCALE_DG_ZSKIP     ablation: skip the plain z volume GEMM. Default 0.
-  !   SCALE_DG_CSKIP     ablation: skip the fused carrier kernel. Default 0.
+  !   SCALE_DG_CSKIP     ablation: skip the launch that carries the assembly
+  !                      epilogue -- the fused carrier on GEMM_FUSED, the
+  !                      separate separable_lift_assembly kernel on
+  !                      GEMM_CUTE.  Default 0.
   !   SCALE_DG_FSKIP     ablation: skip the elembnd face flux.    Default 0.
   !   SCALE_DG_VSKIP     ablation: skip the volume flux.          Default 0.
   !
@@ -2684,9 +2745,12 @@ contains
 
     if (fuse_epilogue) call dg_ev_record(4)
 
-    if (fuse_epilogue .and. dg_env_int("SCALE_DG_CSKIP", cskip_env, 0) /= 0) then
-      ! Ablation only: skip the fused carrier kernel entirely.  Numerically
-      ! wrong on purpose; it prices the carrier off the stage time.
+    if (dg_env_int("SCALE_DG_CSKIP", cskip_env, 0) /= 0) then
+      ! Ablation only: skip the fused carrier kernel entirely (GEMM_FUSED),
+      ! or the separate separable_lift_assembly kernel that does the same
+      ! work in GEMM_CUTE.  Numerically wrong on purpose; it prices the
+      ! epilogue-carrying launch off the stage time on either path, which is
+      ! what makes the two comparable.
       continue
     else if (fuse_epilogue .and. carrier == 2) then
       if (iand(plan%xpkg, 2) /= 0) then

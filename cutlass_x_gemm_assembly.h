@@ -26,9 +26,42 @@
 //- epilogue tile ROW is the problem's n index c = j + Nq*k + Nq*Nq*elem (the
 //- long axis) and an epilogue tile COLUMN is the problem's m index i, whose
 //- extent is exactly Nq.  That is the one structural difference from the other
-//- two carriers: the threadblock's N extent equals Nq at every order, so the
-//- carrier tile is never half-predicated the way the y tile is at Nq = 16 and
-//- the z tile is at Nq = 32.
+//- two carriers: the threadblock's N extent equals Nq at Nq = 16, 32 and 64,
+//- so the carrier tile is not half-predicated there the way the y tile is at
+//- Nq = 16 and the z tile is at Nq = 32.
+//
+//- Nq = 8 IS the exception, and it is the whole reason GEMM_FUSED does not
+//- beat GEMM_CUTE at p=7.  N = 8 does not build (see the note beside the
+//- P7XTile list), so TbN is 16 against an n of 8 and every CTA computes a
+//- 64x16 tile of which only 64x8 is kept.  Measured (ncu, one job, GB200,
+//- same 16.78 M output points at both orders, same 64x16 tile, same
+//- warp 16x16, same 128 threads):
+//-
+//-                       Nq = 8      Nq = 16   ratio
+//-   CTAs                 32768       16384     2.00
+//-   instructions        169.3 M      88.9 M    1.90
+//-   DRAM bytes           1031 MB     981 MB    1.05
+//-   L1 sectors           55.0 M      54.0 M    1.02
+//-   registers / occ      126 / 24%   124 / 24% 1.00
+//-   thread_inst/inst     32.0        32.0      1.00
+//-
+//- Same memory work, twice the instructions: the dead half is thrown away by
+//- the OUTPUT ITERATOR's bounds mask only, after the per-slot lift has been
+//- computed.  In stage terms (login-node CSKIP ablations) the epilogue costs
+//- 182.1 us inside the carrier at Nq = 8 against 119.8 us at Nq = 16, and the
+//- 63 us of difference is larger than the 44 us round trip of deriv_x that
+//- fusing saves, so the x carrier is ~17 us DEARER than the plain x GEMM plus
+//- a separate separable_lift_assembly.  That, and nothing else, is why
+//- GEMM_FUSED does not beat GEMM_CUTE at p=7.
+//
+//- Giving the dead threads an early exit does NOT help and is not in the
+//- tree.  It was built and measured: the epilogue thread map puts the dead
+//- columns on LANES of the same warp, not on separate warps, so the guard
+//- becomes SASS predication rather than a branch.  ncu: instructions
+//- 170.5 M -> 171.0 M (up), duration 443.0 -> 445.5 us; interleaved A/B on an
+//- exclusive GB200: 1488.3 -> 1489.6 us/stage, 3/12 wins, ranges overlapping.
+//- The only escape would be a narrower N tile, and N = 8 does not build, so
+//- this is a structural limit at Nq = 8.
 //
 //- Face loads, against the z and y carriers:
 //-   z carrier (rows = k, cols = p = i + j*Nq): lz separable, lx and ly each
