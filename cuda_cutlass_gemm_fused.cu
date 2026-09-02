@@ -805,6 +805,18 @@ int run_volume_gemm_x_scale(double *deriv_x, const double *flux_x,
                             int Ne)
 {
   const int nq2 = Nq * Nq;
+  //- The Nq >= 512 branch below is GEMM_FUSED's x; GEMM_CUTE's x takes
+  //- run_volume_gemm_x, which names Set::GemmY.  AGENTS.md requires the two
+  //- to share one mainloop, so assert it rather than trusting the comments:
+  //- GemmYScaleShallow differs from GemmY in the epilogue output op alone
+  //- (both 64x64 / warp 32x32 / TileK / 3 stages).  Both launchers also go
+  //- through the pad-8 RepadEpilogue (p767_gap_study.md 14.1), so the x
+  //- epilogue divergence that existed at Nq = 128 / 256 has no twin here.
+  static_assert(
+      cutlass::platform::is_same<
+          typename Set::GemmY::GemmKernel::Mma,
+          typename Set::GemmYScaleShallow::GemmKernel::Mma>::value,
+      "Nq>=512: GEMM_CUTE's x/y mainloop must equal GEMM_FUSED's");
   //- p=255 tried batched x and lost 0.7% (p255_gap_study.md §10.4).  At
   //- Nq>=512 the single 64x128 GEMM is 84% of peak while the same-FLOP y
   //- GEMM (64x64 batched) is 95%.  Use y's tile for both CUTE and fused x.

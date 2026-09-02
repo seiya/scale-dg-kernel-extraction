@@ -458,22 +458,73 @@ x+y 融合の賞金も tight アブレーションで **14.9 µs** しかない�
 `reports/gemm_assignment_and_carrier.md` §6 は閉じたが、それは**この一連の作業が
 自分で開けた穴**であって、GEMM 系列全体の棚卸しではない。
 
-- [ ] **`GEMM` パスの周辺カーネル融合。** `volume_flux_kernel` と `elembnd_flux_kernel` を
-  1 本にまとめる案。禁じられておらず、`elembnd_flux_group_kernel` のような別分割も
-  既に存在するのに、測っていない。GEMM 系 5 パス全部に同時に入れる必要がある。
-- [ ] **`GEMM` パスの 3 本並列。** 3 本の volume GEMM は独立なので別ストリームで
-  重ねられる。`GEMM_FUSED` には `overlap_y` 相当があるが `GEMM` には無く、測っていない。
-  低次数で効く可能性（p=15 `GEMM_FUSED` で x‖y を外すと +1.5%）、
-  高次数は赤字（`p575_gap_study.md` §11.1 / §11.7）。
-- [ ] **p≥511 に今回の 2 つの知見を当てる。** (a) 汎用 64×128 の N 述語化
-  （`gemm_assignment_and_carrier.md` §1）、(b) `GEMM_CUTE` の x に repad が
-  入っていなかった食い違い（同 §3。p=127/256 では −0.25% / −0.23%）。
-  **(b) は経路間の差なので、あれば直すべきもの。**
-- [ ] **Ozaki 系列。** 今回まったく触れていない。
-- [ ] **p≥511 の GEMM 系「探索終了」宣言の再点検。** `p511_gap_study.md` §11–§13、
-  `p575_gap_study.md` §11、`p767_gap_study.md` §11–§15、`p1023_gap_study.md` §12–§13。
-  いずれも今回の変更前のツリーで測られている。`p31_gap_study.md` §10 と
-  `p15_gap_study.md` §26.1 が機構ごと反証されたのと同じ形で古い可能性がある。
+**2026-09-03、全 5 行を測って閉じた。記録先は
+[`gemm_assignment_and_carrier.md`](reports/gemm_assignment_and_carrier.md) §9
+（Slurm job `78296` / `78297`、node `c384`、12 ラウンド交互）。**
+
+- [x] ~~**`GEMM` パスの周辺カーネル融合。**~~ **採用**（§9.1）。`flux_all_kernel` を
+  新設し、**GEMM 系 5 経路が共通で通る `launch_flux_all` 1 か所**から起動する
+  （`launch_volume_flux` と同じ扱い）。既定 `SCALE_DG_FLUXFUSE=1` は
+  「face flux が dg_stream 上で volume flux と直列になるときだけ融合する」で、
+  **規則は 5 経路で 1 つ**、発火するかどうかは経路ごとの既存 schedule が決める。
+  `GEMM` −0.066 / −0.171 / −0.279%（p=7/15/31、いずれも 12/12）、
+  `GEMM_CUTE` −0.050 / −0.228%（p=7/15）、p=31 `GEMM_CUTE` は差なし、**負けは無い**。
+  得は 1.1〜1.7 µs/stage で次数にほぼ依存せず、launch 1 本ぶんの定数として読める。
+  **モード 2（side stream の重ねを捨てて必ず融合する）は 3 次数とも負ける**
+  （`GEMM_FUSED` で +0.44 / +0.80 / +1.40%）＝ `p31_early_face` の値段を逆側から
+  測ったことになる。全モード・全経路で owned `dqdt` はビット一致。
+- [x] ~~**`GEMM` パスの 3 本並列。**~~ **採用、本項目で最大の勝ち**（§9.4）。
+  `SCALE_DG_GVOLPAR`（既定 2 ＝ y を side2、z を side1、face flux が side1 に
+  居るときは自動で y のみ）。**7 次数すべて 12/12・レンジ非重複**で
+  **p=7 −1.23% / p=15 −1.89% / p=31 −1.56% / p=63 −1.60% / p=127 −2.82% /
+  p=255 −2.03% / p=511 −0.22%**。
+  **本 TODO が引いていた「高次数は赤字」は成り立たなかった**: 出所の
+  `p575_gap_study.md` §11.1 / §11.7 は `flux_y`/`flux_z` を x GEMM の裏に回す
+  別の話で、volume GEMM 同士の重ねではない。効きは**高次数側で最大**である。
+  `OZAKI1` / `OZAKI2` はこのノブを取らない —— launcher が 1 本のデバイス作業領域を
+  共有し内部で `cudaStreamSynchronize` するため**stream 再入不可**（性能ではなく
+  実装の性質）。したがって `GEMM` 対 `OZAKI` の一軸比較は直列同士で読むこと。
+- [x] ~~**p≥511 に今回の 2 つの知見を当てる。**~~ **どちらも「当てる先が無い」で
+  閉じた**（§9.2 / §9.3）。
+  (b) **経路間差は存在しなかった**: `Nq≥512` の x は単発ではなく batched GEMM で、
+  `GEMM_FUSED` の `run_gemm_batched_nn_scaled` も `GEMM_CUTE` の
+  `run_gemm_batched_nn` も**どちらも `RepadEpilogue<…,8>` を張った capped 版**
+  （`p767_gap_study.md` §14.1 が 2026-09-01 に −0.075% で導入済み）。mainloop も
+  `GemmY` と `GemmYScaleShallow` が epilogue output op だけの違い。
+  **`AGENTS.md` の契約違反は無い。** ただしコメント頼みにしないため
+  `run_volume_gemm_x_scale` に `static_assert` を置き、**Nq≥512 の mainloop 共有も
+  コンパイル時に機械検査される**ようにした。
+  (a) **N 述語化は Nq≥128 で 0%**（汎用 64×128 の N が Nq 以上になる）、
+  Nq≥512 はそもそも単発 64×128 を使っていない。数え上げで閉じた。
+  なお batched x 対単発 x の再点検は `p767_gap_study.md` §14.2 が済ませている
+  （p=767 は差なし、p=575 は −2.94%）。
+- [x] ~~**Ozaki 系列。**~~ **7 次数を現行ツリーで測り直した**（§9.5）。
+  native `GEMM` 比は `OZAKI2` 3.19×（p=7）→ **1.74×**（p=511）、
+  `OZAKI1` 75.4× → 13.1×、`CublasEmulation` 298× → **0.944×**。
+  - **`CublasEmulation` が p=511 で初めて native を下回った**（−5.6%）。
+    `p511_gap_study.md` §9 の 1.50× と逆向きで、p=255 も 8.8× → 2.02× に縮む。
+  - **未解明 1**: 同じ実行ファイルでログイン GPU では p=511 emulation が
+    1.077×（遅い側）に出る。`GEMM` 側は login / 占有ノードで一致するので
+    共有 GPU の混雑では説明できない。
+  - **未解明 2**: `p511_gap_study.md` §8 は `OZAKI1` 1.14× / `OZAKI2` 3.1× と
+    記録しているが、本測定は 13.1× / 1.74× で**順位が逆**。Ozaki パラメータの
+    違いは原因ではない（§8 と同じ 8 slice / 14 moduli で測り直しても順位は同じ）。
+  - `OZAKI2` は既定 7 moduli では owned `dqdt` が p=7 3e-01 / p=31 1e+01 と合わず、
+    上の速度は「その精度での速度」である。精度を揃えた 8/14 では p=511 で 2.37×。
+- [x] ~~**p≥511 の GEMM 系「探索終了」宣言の再点検。**~~ **`GEMM_FUSED` の宣言は
+  維持、`GEMM` 側は終了していなかった**（§9.6）。
+  2026-09-02 の担い手・割り当て作業は `dg_gemm_defaults` の
+  `Nq = 8/16/32/64/128/256` の case にしか触れておらず、`Nq > 256` は
+  `case default`（全ノブ 0）＝作業前と同一の起動列なので、
+  **p≥511 の `GEMM_FUSED` / `GEMM_CUTE` は 1 バイトも変わっていない**。
+  新しい軸（repad / N 述語化 / 担い手 / epilogue パッケージ）はいずれも
+  当てる先が無いか既に当たっている。**残っていたのは未融合ドライバの schedule で、
+  それが §9.4 の −0.222%（p=511、12/12）である** —— §6 が数えている
+  「覆った探索終了宣言」と同じ形の 8 例目。
+  現在地（login 3-run、µs/stage）: `GEMM` 13 299.9 / `GEMM_CUTE` 13 410.9 /
+  **`GEMM_FUSED` 12 437.3（最速）**。`GEMM_CUTE` が `GEMM` に 0.83% 負けるのは
+  `p767_gap_study.md` §13.2 / §14.3 の 0.45〜0.60% と同じ向きで、
+  §9.4 が `GEMM` 側にだけ入ったぶん差が広がっている。
 
 ## 8. 完了（参照用）
 

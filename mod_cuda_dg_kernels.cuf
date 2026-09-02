@@ -476,6 +476,7 @@ module mod_cuda_dg_kernels
   integer, save :: zcublas_env = -2, carrier_env = -2, ysched_env = -2
   integer, save :: xfwd_env = -2
   integer, save :: zskip_env = -2, cskip_env = -2, fskip_env = -2, vskip_env = -2
+  integer, save :: fluxfuse_env = -2, gvolpar_env = -2
 
   public :: cuda_cal_volume_flux
   public :: cuda_cal_volume_deriv
@@ -1165,6 +1166,52 @@ contains
 
     return
   end subroutine dg_side_join
+
+  !> Fork / join the SECOND side stream alone.  dg_side_fork(.true.) also makes
+  !> dg_side_stream wait on the main stream, which would push a face flux that
+  !> is already running there behind the volume flux; these two touch side2
+  !> only.  Used by the unfused GEMM driver to run the y volume GEMM beside x.
+  subroutine dg_side2_fork()
+    implicit none
+    integer :: istat
+
+    call dg_side_stream_init()
+    istat = cudaEventRecord(dg_side_fork_ev,dg_stream)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord(fork2only)",istat)
+    istat = cudaStreamWaitEvent(dg_side2_stream,dg_side_fork_ev,0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaStreamWaitEvent(fork2only)",istat)
+  end subroutine dg_side2_fork
+
+  subroutine dg_side2_join()
+    implicit none
+    integer :: istat
+
+    istat = cudaEventRecord(dg_side2_join_ev,dg_side2_stream)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord(join2only)",istat)
+    istat = cudaStreamWaitEvent(dg_stream,dg_side2_join_ev,0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaStreamWaitEvent(join2only)",istat)
+  end subroutine dg_side2_join
+
+  subroutine dg_side1_fork()
+    implicit none
+    integer :: istat
+
+    call dg_side_stream_init()
+    istat = cudaEventRecord(dg_side_fork_ev,dg_stream)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord(fork1only)",istat)
+    istat = cudaStreamWaitEvent(dg_side_stream,dg_side_fork_ev,0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaStreamWaitEvent(fork1only)",istat)
+  end subroutine dg_side1_fork
+
+  subroutine dg_side1_join()
+    implicit none
+    integer :: istat
+
+    istat = cudaEventRecord(dg_side_join_ev,dg_side_stream)
+    if (istat /= cudaSuccess) call cuda_failure("cudaEventRecord(join1only)",istat)
+    istat = cudaStreamWaitEvent(dg_stream,dg_side_join_ev,0)
+    if (istat /= cudaSuccess) call cuda_failure("cudaStreamWaitEvent(join1only)",istat)
+  end subroutine dg_side1_join
 
   !> Record one measurement boundary on the kernel stream.
   subroutine dg_ev_record(iev)
@@ -2313,30 +2360,75 @@ contains
 
   ! Volume derivatives only.  z is stored in dqdt (beta=0); assembly overwrites
   ! that buffer.  Ozaki backends share this layout with cuBLAS native GEMM.
+  ! gvol_par: how many of the three volume GEMMs run on their own stream.
+  !   0  all three on dg_stream (the schedule every measurement before
+  !      2026-09-03 used)
+  !   1  y beside x on dg_side2_stream, z after the join -- the analogue of
+  !      GEMM_FUSED's overlap_y
+  !   2  y on dg_side2_stream and z on dg_side_stream, i.e. all three
+  !      concurrent.  Only legal when side_free says the face flux is not
+  !      already occupying dg_side_stream.
+  ! Only the cuBLAS backend takes it.  OZAKI1 / OZAKI2 keep the serial
+  ! schedule because their launchers are not stream reentrant: they share one
+  ! device workspace per call site and synchronize dg_cuda_stream internally,
+  ! so two concurrent calls would race on the split / packing buffers.  That
+  ! is a property of those implementations, not a scheduling choice.
   subroutine gemm_volume_xyz(backend, Nq, Ne, nq2, plane_batch, &
     stride_plane, stride_zero, stride_vol, D1D, D1D_tr, &
-    flux_x, flux_y, flux_z, deriv_x, deriv_y, dqdt)
+    flux_x, flux_y, flux_z, deriv_x, deriv_y, dqdt, gvol_par, side_free)
     implicit none
     integer, intent(in) :: backend, Nq, Ne, nq2, plane_batch
     integer(c_long_long), intent(in) :: stride_plane, stride_zero, stride_vol
     real(RP), device, intent(in) :: D1D(*), D1D_tr(*)
     real(RP), device, intent(in) :: flux_x(*), flux_y(*), flux_z(*)
     real(RP), device, intent(out) :: deriv_x(*), deriv_y(*), dqdt(*)
+    integer, intent(in) :: gvol_par
+    logical, intent(in) :: side_free
     integer :: istat
+    integer :: par
+    logical :: zpar
+
+    par = gvol_par
+    if (backend /= GEMM_VOL_CUBLAS) par = 0
+    zpar = (par >= 2) .and. side_free
 
     select case (backend)
     case (GEMM_VOL_CUBLAS)
+      if (par >= 1) then
+        call dg_side2_fork()
+        call dg_set_cuda_stream(dg_side2_stream)
+        istat = cublas_dgemm_strided_batched_impl(0, 0, Nq, Nq, Nq, 1.0_c_double, &
+          flux_y, Nq, stride_plane, D1D_tr, Nq, stride_zero, 0.0_c_double, &
+          deriv_y, Nq, stride_plane, plane_batch)
+        if (istat /= 0) call cuda_failure("cublasDgemm y-deriv(side2)",istat)
+        call dg_set_cuda_stream(dg_stream)
+      end if
+      if (zpar) then
+        call dg_side1_fork()
+        call dg_set_cuda_stream(dg_side_stream)
+        istat = cublas_dgemm_strided_batched_impl(0, 0, nq2, Nq, Nq, 1.0_c_double, &
+          flux_z, nq2, stride_vol, D1D_tr, Nq, stride_zero, 0.0_c_double, &
+          dqdt, nq2, stride_vol, Ne)
+        if (istat /= 0) call cuda_failure("cublasDgemm z-deriv(side1)",istat)
+        call dg_set_cuda_stream(dg_stream)
+      end if
       istat = cublas_dgemm_impl(0, 0, Nq, nq2*Ne, Nq, 1.0_c_double, &
         D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
       if (istat /= 0) call cuda_failure("cublasDgemm x-deriv",istat)
-      istat = cublas_dgemm_strided_batched_impl(0, 0, Nq, Nq, Nq, 1.0_c_double, &
-        flux_y, Nq, stride_plane, D1D_tr, Nq, stride_zero, 0.0_c_double, &
-        deriv_y, Nq, stride_plane, plane_batch)
-      if (istat /= 0) call cuda_failure("cublasDgemm y-deriv",istat)
-      istat = cublas_dgemm_strided_batched_impl(0, 0, nq2, Nq, Nq, 1.0_c_double, &
-        flux_z, nq2, stride_vol, D1D_tr, Nq, stride_zero, 0.0_c_double, &
-        dqdt, nq2, stride_vol, Ne)
-      if (istat /= 0) call cuda_failure("cublasDgemm z-deriv",istat)
+      if (par == 0) then
+        istat = cublas_dgemm_strided_batched_impl(0, 0, Nq, Nq, Nq, 1.0_c_double, &
+          flux_y, Nq, stride_plane, D1D_tr, Nq, stride_zero, 0.0_c_double, &
+          deriv_y, Nq, stride_plane, plane_batch)
+        if (istat /= 0) call cuda_failure("cublasDgemm y-deriv",istat)
+      end if
+      if (.not. zpar) then
+        istat = cublas_dgemm_strided_batched_impl(0, 0, nq2, Nq, Nq, 1.0_c_double, &
+          flux_z, nq2, stride_vol, D1D_tr, Nq, stride_zero, 0.0_c_double, &
+          dqdt, nq2, stride_vol, Ne)
+        if (istat /= 0) call cuda_failure("cublasDgemm z-deriv",istat)
+      end if
+      if (zpar) call dg_side1_join()
+      if (par >= 1) call dg_side2_join()
     case (GEMM_VOL_OZAKI1)
       istat = ozaki1_dgemm(0, 0, Nq, nq2*Ne, Nq, D1D, Nq, flux_x, Nq, deriv_x, Nq)
       if (istat /= 0) call cuda_failure("ozaki1_dgemm x-deriv", istat)
@@ -2389,7 +2481,8 @@ contains
     integer :: istat, nface, npoint, nblock, nblock_face
     integer :: nq2, plane_batch
     integer(c_long_long) :: stride_plane, stride_elem, stride_zero, stride_vol
-    logical :: use_side
+    logical :: use_side, face_fused
+    integer :: fluxfuse
 
     if (.not. gemm_inited) then
       call cuda_gemm_setup(.false.)
@@ -2419,23 +2512,52 @@ contains
     ! (-1.4% on Main) and p=255 (-1.3%, overall_summary_report.md 8.7).
     use_side = dg_side_enabled .and. (Nq >= 64)
 
-    if (.not. use_side) then
-      call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
+    !- Fuse the two flux kernels into one launch (launch_flux_all).  Mode 1
+    !- only where they would be serial on dg_stream anyway; mode 2 also takes
+    !- the face flux off the side stream.
+    fluxfuse = dg_flux_fuse()
+    face_fused = (fluxfuse >= 1 .and. .not. use_side) .or. (fluxfuse >= 2)
+    if (face_fused) use_side = .false.
+
+    if (face_fused) then
+      call launch_flux_all( &
+        flux_x, flux_y, flux_z, flux_bnd, q, u, v, w, VMapM, VMapP, &
+        normal_fn, Fscale, npoint, nface, 0 )
+    else
+      if (.not. use_side) then
+        call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+          flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
+      end if
+
+      call launch_volume_flux( &
+        flux_x, flux_y, flux_z, q, u, v, w, npoint )
+
+      if (use_side) then
+        call dg_side_fork(.false.)
+        call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
+          flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
+      end if
     end if
 
-    call launch_volume_flux( &
-      flux_x, flux_y, flux_z, q, u, v, w, npoint )
-
-    if (use_side) then
-      call dg_side_fork(.false.)
-      call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
-        flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, 0 )
-    end if
-
+    !- SCALE_DG_GVOLPAR: the three volume GEMMs are independent, so they can
+    !- be spread over streams.  GEMM_FUSED has had overlap_y / overlap_xy /
+    !- overlap_z since the carrier work; the unfused driver never did.
+    !- 0 = the serial schedule; 1 = y beside x; 2 = all three.  Only the
+    !- cuBLAS backend takes it (see gemm_volume_xyz).
+    !-
+    !- DEFAULT 2, adopted 2026-09-03 (Slurm job 78297, node c384, 12
+    !- interleaved rounds, all 12/12 with disjoint ranges): mode 1 is
+    !- -1.23 / -1.37 / -1.56 / -1.60 / -2.82 / -2.03 / -0.22% at
+    !- p = 7 / 15 / 31 / 63 / 127 / 255 / 511.  Mode 2 differs from mode 1
+    !- only where dg_side_stream is free, and there it is a wash except at
+    !- Nq = 16, where it takes another -0.53% (12/12, disjoint).  It is never
+    !- worse, so it is the default and degrades to mode 1 on its own when the
+    !- face flux occupies the side stream (Nq >= 64).
+    !- reports/gemm_assignment_and_carrier.md section 9.4.
     call gemm_volume_xyz(backend, Nq, Ne, nq2, plane_batch, &
       stride_plane, stride_zero, stride_vol, D1D, D1D_tr, &
-      flux_x, flux_y, flux_z, deriv_x, deriv_y, dqdt)
+      flux_x, flux_y, flux_z, deriv_x, deriv_y, dqdt, &
+      dg_env_int("SCALE_DG_GVOLPAR", gvolpar_env, 2), .not. use_side)
 
     if (use_side) call dg_side_join(.false.)
 
@@ -2694,6 +2816,8 @@ contains
     logical :: overlap_xy
     type(dg_gemm_plan_t) :: plan
     logical :: use_side, overlap_y, overlap_z, use_side2, p31_early_face
+    logical :: face_fused
+    integer :: fluxfuse
 
     ! y GEMM batches over Nq*Ne planes and CUTLASS puts the batch on grid.z
     ! (CUDA cap 65535).  cuda_cutlass_gemm_fused.cu splits that launch so
@@ -2794,22 +2918,44 @@ contains
     ! SCALE_DG_FSKIP: ablation only, skip the face flux launch (but not the
     ! stream fork) so its cost can be read off the stage time.  Numerically
     ! wrong on purpose.
-    if (.not. use_side) then
-      if (dg_env_int("SCALE_DG_FSKIP", fskip_env, 0) == 0) then
-        call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
-          flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
-      end if
-    else if (p31_early_face) then
-      call dg_side_fork(use_side2)
-      if (dg_env_int("SCALE_DG_FSKIP", fskip_env, 0) == 0) then
-        call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
-          flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
-      end if
+    !- Fuse the two flux kernels into one launch (launch_flux_all), the same
+    !- shared helper cuda_cal_dqdt_gemm_unfused uses, so GEMM / OZAKI1 /
+    !- OZAKI2 / GEMM_CUTE / GEMM_FUSED all get it at once.  Mode 1 fuses only
+    !- where the two would be serial on dg_stream anyway; mode 2 also takes
+    !- the face flux off the side stream (giving that overlap up).  The FSKIP
+    !- ablation prices the face flux by dropping its launch, which the fused
+    !- form cannot express, so it turns fusion off.
+    fluxfuse = dg_flux_fuse()
+    face_fused = ((fluxfuse >= 1 .and. .not. use_side) .or. fluxfuse >= 2) &
+      .and. dg_env_int("SCALE_DG_FSKIP", fskip_env, 0) == 0 &
+      .and. dg_env_int("SCALE_DG_VSKIP", vskip_env, 0) == 0
+    if (face_fused) then
+      use_side = .false.
+      p31_early_face = .false.
     end if
 
-    if (dg_env_int("SCALE_DG_VSKIP", vskip_env, 0) == 0) then
-      call launch_volume_flux( &
-        flux_x, flux_y, flux_z, q, u, v, w, npoint )
+    if (face_fused) then
+      call launch_flux_all( &
+        flux_x, flux_y, flux_z, flux_bnd, q, u, v, w, VMapM, VMapP, &
+        normal_fn, Fscale, npoint, nface, pair_nq2 )
+    else
+      if (.not. use_side) then
+        if (dg_env_int("SCALE_DG_FSKIP", fskip_env, 0) == 0) then
+          call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+            flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
+        end if
+      else if (p31_early_face) then
+        call dg_side_fork(use_side2)
+        if (dg_env_int("SCALE_DG_FSKIP", fskip_env, 0) == 0) then
+          call elembnd_flux_kernel<<<nblock_face,CUDA_BLOCK_SIZE,0,dg_side_stream>>>( &
+            flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, pair_nq2 )
+        end if
+      end if
+
+      if (dg_env_int("SCALE_DG_VSKIP", vskip_env, 0) == 0) then
+        call launch_volume_flux( &
+          flux_x, flux_y, flux_z, q, u, v, w, npoint )
+      end if
     end if
 
     call dg_ev_record(2)
@@ -3254,6 +3400,114 @@ contains
     call volume_flux_kernel<<<nblock_flux,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
       flux_x, flux_y, flux_z, q, u, v, w, npoint )
   end subroutine launch_volume_flux
+
+  ! Volume flux and element-boundary flux in ONE launch.  Both are pure
+  ! streaming kernels over the same q / u / v / w fields, so the concatenated
+  ! grid saves one launch and lets the face threads hit the L2 lines the
+  ! volume threads have just pulled in (VMapM points at a volume node of the
+  ! same element).  The two halves are byte-for-byte the bodies of
+  ! volume_flux_kernel and elembnd_flux_kernel; nothing about the numerics
+  ! changes.  Only reachable when the face flux would otherwise run serially
+  ! on dg_stream ahead of the volume flux -- with the face flux on the side
+  ! stream the fused form would give the overlap back.
+  attributes(global) subroutine flux_all_kernel( &
+    flux_x, flux_y, flux_z, flux, q, u, v, w, VMapM, VMapP, &
+    normal_fn, Fscale, npoint, nface, pair_nq2 )
+    implicit none
+    integer, value :: npoint, nface, pair_nq2
+    real(RP), device :: flux_x(*), flux_y(*), flux_z(*), flux(*)
+    real(RP), device :: q(*), u(*), v(*), w(*)
+    integer, device :: VMapM(*), VMapP(*)
+    real(RP), device :: normal_fn(*), Fscale(*)
+
+    integer :: tid, idx, iM, iP, iout, ir, iface, ipt, igrp, islot
+    real(RP) :: qi, ui, vi, wi
+    real(RP) :: qM, qP, VelM, VelP, alpha
+
+    tid = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    if (tid <= npoint) then
+      idx = tid
+      qi = q(idx)
+      ui = u(idx)
+      vi = v(idx)
+      wi = w(idx)
+      flux_x(idx) = qi*ui
+      flux_y(idx) = qi*vi
+      flux_z(idx) = qi*wi
+    else
+      idx = tid - npoint
+      if (idx <= nface) then
+        iM = VMapM(idx)
+        iP = VMapP(idx)
+        qM = q(iM)
+        qP = q(iP)
+        VelM = u(iM)*normal_fn(idx) &
+             + v(iM)*normal_fn(idx+nface) &
+             + w(iM)*normal_fn(idx+2*nface)
+        VelP = u(iP)*normal_fn(idx) &
+             + v(iP)*normal_fn(idx+nface) &
+             + w(iP)*normal_fn(idx+2*nface)
+        alpha = 0.5_RP*abs(VelP+VelM)
+        if (pair_nq2 == 0) then
+          iout = idx
+        else
+          ir = mod(idx-1, 6*pair_nq2)
+          iface = ir / pair_nq2
+          ipt = mod(ir, pair_nq2)
+          if (iface < 4) then
+            igrp = mod(iface, 2)
+            islot = iface / 2
+          else
+            igrp = 2
+            islot = iface - 4
+          end if
+          iout = (idx-1) - ir + 2*pair_nq2*igrp + 2*ipt + islot + 1
+        end if
+        flux(iout) = 0.5_RP*Fscale(idx)*( &
+          qP*VelP-qM*VelM-alpha*(qP-qM) )
+      end if
+    end if
+  end subroutine flux_all_kernel
+
+  ! Shared launch helper for the fused pair.  Every GEMM path (GEMM, OZAKI1,
+  ! OZAKI2 through cuda_cal_dqdt_gemm_unfused, GEMM_CUTE and GEMM_FUSED
+  ! through cuda_cal_dqdt_gemm_cutlass) reaches the fused flux only here, so
+  ! the five paths cannot diverge on it.
+  subroutine launch_flux_all( &
+    flux_x, flux_y, flux_z, flux_bnd, q, u, v, w, VMapM, VMapP, &
+    normal_fn, Fscale, npoint, nface, pair_nq2 )
+    implicit none
+    integer, intent(in) :: npoint, nface, pair_nq2
+    real(RP), device :: flux_x(*), flux_y(*), flux_z(*), flux_bnd(*)
+    real(RP), device :: q(*), u(*), v(*), w(*)
+    integer, device :: VMapM(*), VMapP(*)
+    real(RP), device :: normal_fn(*), Fscale(*)
+
+    integer :: nblock_all
+
+    nblock_all = (npoint+nface+CUDA_BLOCK_SIZE-1)/CUDA_BLOCK_SIZE
+    call flux_all_kernel<<<nblock_all,CUDA_BLOCK_SIZE,0,dg_stream>>>( &
+      flux_x, flux_y, flux_z, flux_bnd, q, u, v, w, VMapM, VMapP, &
+      normal_fn, Fscale, npoint, nface, pair_nq2 )
+  end subroutine launch_flux_all
+
+  ! SCALE_DG_FLUXFUSE: 0 = separate volume_flux_kernel and elembnd_flux_kernel
+  ! (the form every measurement before 2026-09-03 used), 1 = fuse them into
+  ! flux_all_kernel wherever they would run back to back on dg_stream anyway,
+  ! 2 = fuse them even where the face flux is currently hidden on the side
+  ! stream (which gives that overlap up).  Shared by all five GEMM paths.
+  !
+  ! DEFAULT 1, adopted 2026-09-03 (Slurm job 78296, node c384, 12 interleaved
+  ! rounds): GEMM -0.07 / -0.17 / -0.28% at p = 7 / 15 / 31 (12/12 rounds each)
+  ! and GEMM_CUTE -0.05 / -0.23% at p = 7 / 15 (10/12 and 12/12); p = 31
+  ! GEMM_CUTE is a wash (+0.01%, 5/12, ranges overlap).  Mode 2 loses wherever
+  ! it can be tested (+0.44 / +0.80 / +1.40% on GEMM_FUSED at p = 7 / 15 / 31),
+  ! which is the side stream's value measured from the other side.
+  ! reports/gemm_assignment_and_carrier.md section 9.
+  integer function dg_flux_fuse()
+    implicit none
+    dg_flux_fuse = dg_env_int("SCALE_DG_FLUXFUSE", fluxfuse_env, 1)
+  end function dg_flux_fuse
 
   attributes(global) subroutine volume_deriv_kernel( &
     deriv_x, deriv_y, deriv_z, D1D, D1D_tr, &
