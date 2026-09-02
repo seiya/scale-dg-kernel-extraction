@@ -951,6 +951,81 @@ int run_volume_gemm_z_scaled(double *deriv_z, const double *flux_z,
       stride_vol, deriv_z, nq2, stride_vol, Ne);
 }
 
+//- z volume GEMM whose epilogue folds the y term in: deriv_yz = Escale_z * acc
+//- + deriv_y, where deriv_y already holds Escale_y * Dy (the x carrier's
+//- Escale_y forward, run_volume_gemm_y_scaled).  This is the mirror of
+//- run_volume_gemm_y_scaleadd, which the Nq > 64 z carrier uses to fold
+//- deriv_x into y, and it exists for the same reason: the carrier's epilogue
+//- then reads ONE volume tensor instead of two.  Mainloop, tile, warps,
+//- swizzle and stage count are Set::GemmZScale's, i.e. the ones GEMM_CUTE
+//- runs for the plain z; only the epilogue differs, so the two paths keep one
+//- mainloop.  Fused-only, and only with an x carrier: with z carrying there is
+//- nothing to fold into.
+template <class Set>
+int run_volume_gemm_z_scaleadd(double *deriv_yz, const double *flux_z,
+                               const double *D1D_tr, const double *escale_z,
+                               const double *deriv_y, int Nq, int Ne)
+{
+  const int nq2 = Nq * Nq;
+  const long long stride_vol = static_cast<long long>(nq2) * Nq;
+
+  using GemmZ = typename Set::GemmZScale;
+  using Kernel = GemmBatchedScaleAdd<typename GemmZ::GemmKernel::Mma,
+                                     RepadEpilogue<typename GemmZ::GemmKernel::Epilogue, 8>,
+                                     BatchedSwizzle, false>;
+  static_assert(cutlass::platform::is_same<
+                    typename Set::GemmZ::GemmKernel::Mma,
+                    typename GemmZ::GemmKernel::Mma>::value,
+                "the folded z must share the plain z mainloop");
+
+  cutlass::TensorRef<double const, ColumnMajor> ref_A(flux_z, nq2);
+  cutlass::TensorRef<double const, ColumnMajor> ref_B(D1D_tr, Nq);
+  cutlass::TensorRef<double, ColumnMajor> ref_D(deriv_yz, nq2);
+
+  typename GemmZ::Arguments gemm_args({nq2, Nq, Nq}, ref_A, stride_vol, ref_B, 0,
+                                      ref_D, stride_vol, ref_D, stride_vol,
+                                      typename GemmZ::EpilogueOutputOp::Params(), Ne);
+  cutlass::Status can = GemmZ::can_implement(gemm_args);
+  if (can != cutlass::Status::kSuccess) {
+    return cutlass_error("z-scaleadd can_implement", can);
+  }
+
+  auto uargs = GemmZ::to_underlying_arguments(gemm_args);
+  BatchedSwizzle swizzle;
+  cutlass::gemm::GemmCoord grid_shape = cap_batched_grid(
+      swizzle.get_tiled_shape(uargs.problem_size,
+                              {GemmZ::ThreadblockShape::kM, GemmZ::ThreadblockShape::kN,
+                               GemmZ::ThreadblockShape::kK},
+                              uargs.batch_count),
+      Ne);
+
+  typename Kernel::Params params;
+  params.gemm = typename Kernel::BaseKernel::Params(
+      uargs.problem_size, grid_shape, uargs.ref_A.non_const_ref(), uargs.stride_A,
+      uargs.ref_B.non_const_ref(), uargs.stride_B, uargs.ref_C.non_const_ref(),
+      uargs.stride_C, uargs.ref_D, uargs.stride_D, uargs.epilogue, uargs.batch_count);
+  params.ptr_scale = escale_z;
+  params.ptr_add = deriv_y;
+  params.ptr_mul = nullptr;
+  params.stride_scale = stride_vol;
+  params.stride_add = stride_vol;
+  params.stride_mul = 0;
+
+  dim3 grid = swizzle.get_grid_shape(grid_shape);
+  dim3 block(Kernel::kThreadCount, 1, 1);
+  int smem_size = int(sizeof(typename Kernel::SharedStorage));
+  if (smem_size >= (48 << 10)) {
+    cudaError_t attr = cudaFuncSetAttribute(
+        cutlass::Kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    if (attr != cudaSuccess) {
+      return 1;
+    }
+  }
+  cutlass::arch::synclog_setup();
+  cutlass::Kernel<Kernel><<<grid, block, smem_size, dg_cuda_stream>>>(params);
+  return cudaGetLastError() == cudaSuccess ? 0 : 1;
+}
+
 template <class Set>
 int run_volume_gemms(double *deriv_x, double *deriv_y, double *deriv_z,
                      const double *flux_x, const double *flux_y,
@@ -1154,7 +1229,8 @@ void DgKernelLaunchBounds(typename Operator::Params params)
 }
 
 template <class Tile, bool kYWeighted, bool kZWeighted, bool kAffine = false,
-          bool kPaired = false, bool kWide = false, int kMinCTA = 0>
+          bool kPaired = false, bool kWide = false, int kMinCTA = 0,
+          bool kFold = false>
 int run_x_gemm_assembly(double *dqdt, const double *flux_x, const double *D1D,
                         const double *deriv_y, const double *deriv_z,
                         const double *flux_bnd, const double *lift1d,
@@ -1176,7 +1252,7 @@ int run_x_gemm_assembly(double *dqdt, const double *flux_x, const double *D1D,
   using XEpilogue = RepadEpilogue<typename GemmX::GemmKernel::Epilogue, 8>;
   using Kernel = GemmDqdtAssemblyX<typename GemmX::GemmKernel::Mma, XEpilogue,
                                    Swizzle, kYWeighted, kZWeighted, kAffine,
-                                   kPaired>;
+                                   kPaired, kFold>;
 
   const int nq2 = Nq * Nq;
   const int Np = nq2 * Nq;
@@ -1845,6 +1921,34 @@ extern "C" int launch_volume_gemm_y_scaled(double *deriv_y, const double *flux_y
 }
 
 //- Same for the plain z volume GEMM.
+//- Folded z for the x carrier: deriv_yz = Escale_z * D(flux_z) + deriv_y, with
+//- deriv_y already weighted by Escale_y.  Same mainloop as the plain z above.
+extern "C" int launch_volume_gemm_z_scaleadd(
+    double *deriv_yz, const double *flux_z, const double *D1D_tr,
+    const double *escale_z, const double *deriv_y, int Nq, int Ne,
+    int mma_shape)
+{
+  if (Nq <= 0 || Ne <= 0 || deriv_y == nullptr) {
+    return 1;
+  }
+  switch (mma_shape) {
+  case 0:
+    return run_volume_gemm_z_scaleadd<MmaSet_884>(deriv_yz, flux_z, D1D_tr,
+                                                  escale_z, deriv_y, Nq, Ne);
+  case 1:
+    return run_volume_gemm_z_scaleadd<MmaSet_1684>(deriv_yz, flux_z, D1D_tr,
+                                                   escale_z, deriv_y, Nq, Ne);
+  case 2:
+    return run_volume_gemm_z_scaleadd<MmaSet_1688>(deriv_yz, flux_z, D1D_tr,
+                                                   escale_z, deriv_y, Nq, Ne);
+  case 3:
+    return run_volume_gemm_z_scaleadd<MmaSet_16816>(deriv_yz, flux_z, D1D_tr,
+                                                    escale_z, deriv_y, Nq, Ne);
+  default:
+    return bad_mma_shape(mma_shape);
+  }
+}
+
 extern "C" int launch_volume_gemm_z_scaled(double *deriv_z, const double *flux_z,
                                            const double *D1D_tr,
                                            const double *escale_z, int Nq,
@@ -1912,6 +2016,17 @@ extern "C" int launch_volume_gemm_z_scaled(double *deriv_z, const double *flux_z
       dqdt, flux_x, D1D, deriv_y, deriv_z, flux_bnd, lift1d, lift_pair,        \
       escale, Nq, Ne, (weight_mode & 4) == 0)
 
+//- ABLATION / ceiling measurement, Nq = 64 tile 3 only: the same carrier with
+//- the y term folded into the z GEMM's epilogue (kFold), so the epilogue reads
+//- one volume tensor instead of two.  Both Escale factors are forwarded by
+//- construction.  weight_mode bit 3 selects it; pkg bit 0 is clamp
+//- aggregation and pkg bits 3-4 the occupancy floor, the same encoding the
+//- unfolded ceiling used.
+#define DG_X_ASM_FOLD(AF, MIN)                                                 \
+  run_x_gemm_assembly<P63XTile3, true, true, AF, false, false, MIN, true>(     \
+      dqdt, flux_x, D1D, deriv_y, deriv_z, flux_bnd, lift1d, lift_pair,        \
+      escale, Nq, Ne, (weight_mode & 4) == 0)
+
 //- Sweep-only carrier instantiation: one package (both Escale forwarded,
 //- clamp aggregation, 16-byte epilogue, no 16-byte lift), which is the form
 //- the Nq > 64 package sweep on tile 0 found best.  A tile that wins here is
@@ -1942,6 +2057,26 @@ extern "C" int launch_x_gemm_assembly(
   }
   if (mma_shape != 0) {
     return bad_mma_shape(mma_shape);
+  }
+  if ((weight_mode & 8) != 0 && !(Nq == 64 && tile == 3)) {
+    std::fprintf(stderr,
+                 "launch_x_gemm_assembly: the folded y term is instantiated "
+                 "only at Nq = 64 on tile 3 (got Nq %d tile %d)\n",
+                 Nq, tile);
+    return 1;
+  }
+  if (Nq == 64 && tile == 3 && (weight_mode & 8) != 0) {
+    switch (((pkg >> 3) & 3) * 2 + (pkg & 1)) {
+    case 0: return DG_X_ASM_FOLD(false, 0);
+    case 1: return DG_X_ASM_FOLD(true, 0);
+    case 2: return DG_X_ASM_FOLD(false, 2);
+    case 3: return DG_X_ASM_FOLD(true, 2);
+    case 4: return DG_X_ASM_FOLD(false, 3);
+    case 5: return DG_X_ASM_FOLD(true, 3);
+    default:
+      std::fprintf(stderr, "launch_x_gemm_assembly: bad folded pkg %d\n", pkg);
+      return 1;
+    }
   }
   if (Nq == 64 && tile == 3 && (pkg >> 3) != 0) {
     switch (((pkg >> 3) & 3) * 2 + (pkg & 1)) {
@@ -2011,3 +2146,4 @@ extern "C" int launch_x_gemm_assembly(
 #undef DG_X_ASM_PKG
 #undef DG_X_ASM_CALL
 #undef DG_X_ASM_LB
+#undef DG_X_ASM_FOLD

@@ -190,6 +190,28 @@ module mod_cuda_dg_kernels
   !   threads x 254 registers being exactly 2 CTAs/SM.  Forcing 3 CTAs makes
   !   ptxas spill 680/964 bytes for +110%.
   !
+  !   The last lever on that ceiling was measured and REJECTED: fold Ey*Dy
+  !   into the z GEMM's epilogue (SCALE_DG_XFWD bit 3, run_volume_gemm_z_
+  !   scaleadd, the mirror of the deriv_x-into-y fold the Nq > 64 z carrier
+  !   uses) so the carrier reads ONE volume tensor instead of two.  Exclusive
+  !   GB200, 12 interleaved pairs, CUDA device us/stage: z carrier 564.4,
+  !   best unfolded x carrier 670.5 (+18.80%), best folded x carrier 664.1
+  !   (+17.66%).  The fold is worth 6.4 us, i.e. 6% of the 106 us gap.
+  !   By the CSKIP ablation it moves 27.9 us out of the carrier and pays
+  !   11.2 us for it in the z GEMM, and the two close to 0.0 us against the
+  !   16.7 us the totals moved.  It does what it is for and still loses:
+  !   ncu (mechanism only) has the carrier at 667 -> 527 MB of DRAM, exactly
+  !   the z carrier's 526, and 60.2 -> 51.5 M instructions, BELOW the z
+  !   carrier's 58.9 M -- and the kernel is still 336.8 us against 237.6.
+  !   The whole residual is latency cover at an unchanged occupancy: warp
+  !   latency per issued instruction 8.10 against the z carrier's 4.97, long
+  !   scoreboard 2.98 against 0.88, both at 2 CTAs/SM and 12% achieved.  The
+  !   fold frees 2 registers (254 -> 252, no spill either way); 3 CTAs would
+  !   need 170, so the occupancy cap does not move and cannot be bought back
+  !   this way.  The x carrier at Nq = 64 is not an instruction or a traffic
+  !   problem any more; it is a latency-cover problem, and the fold is off by
+  !   default.
+  !
   !   At Nq = 8 the x carrier is why GEMM_FUSED trails GEMM_CUTE.  N = 8 does
   !   not build (the FP64 multistage B iterator static-asserts on zero
   !   contiguous iterations), so Nq = 8 is the ONE order whose carrier tile
@@ -295,10 +317,39 @@ module mod_cuda_dg_kernels
   !   without changing global load requests at all, and it pays in latency
   !   cover -- the min() chain it removes was standing between the face
   !   gathers' issue and their use, so stall_long_scoreboard rises at every
-  !   order.  Which orders that trade pays at is NOT closed; the two winners
-  !   have the lowest baseline long-scoreboard stall but the ordering is not
-  !   monotone in it, and at +-0.25% the remainder is not separable from
-  !   ptxas scheduling.
+  !   order.  Which orders that trade pays at IS closed now, and the index is
+  !   not a property of the baseline: it is the ratio of the two INCREMENTS.
+  !   Every one of these kernels obeys
+  !
+  !       duration  =  K * instructions * (warp latency per issued
+  !                    instruction) / (resident warps per scheduler)
+  !
+  !   -- the three ncu factors reproduce the measured kernel time to 0.4
+  !   points in all six configurations below -- so the clamp wins exactly
+  !   when the instructions it removes outweigh the latency cover it costs.
+  !   Measured on one exclusive GB200 (12 interleaved pairs, pkg 4 -> 5) with
+  !   the mechanism from one ncu job (* = out-of-role ablation, kept out of
+  !   dispatch, run through SCALE_DG_CARRIER):
+  !
+  !     carrier    base issue%   d(inst)   d(latency)   d(kernel)   d(stage)
+  !     x  Nq=8       61.3        -4.72      +3.26        -1.57      -0.15
+  !     x  Nq=16      56.7        -4.72      +4.15        -1.12      -0.06
+  !     x  Nq=32      54.0        -4.67      +4.29        +0.26      -0.02
+  !     z  Nq=64      39.8        -1.59      +1.64        -0.14      -0.30
+  !     z  Nq=16 *    40.8        -1.35      +9.93        +7.27      +2.70
+  !     x  Nq=64 *    18.4       -14.66      +1.82       -12.97      -5.70
+  !
+  !   Within the x carrier the instruction saving is the same -4.7% at all
+  !   three orders and the ordering is set entirely by the latency term,
+  !   which is monotone: 3.26 < 4.15 < 4.29.  The prediction that the Nq = 8
+  !   carrier is the most issue-bound of the three holds (issue 61.3 > 56.7 >
+  !   54.0) and it does bank the saving best.  The four ADOPTED orders do not
+  !   line up on one index because Nq = 64 is a different kernel: on the z
+  !   carrier the clamp removes only 1.6% of the instructions and only 1.6%
+  !   of the cover, and that lands just on the winning side.  The sign
+  !   follows neither the order nor the carrier on its own -- crossing the
+  !   two shows both flipping (z loses 2.70% at Nq = 16 and wins at 64; x is
+  !   a wash at 32 and wins 5.70% at 64).
   !
   ! * Escale forwarding is off at every order.  It was adopted at Nq = 32
   !   under the narrow epilogue, where it was worth 17.4 us: the extra volume
@@ -344,14 +395,18 @@ module mod_cuda_dg_kernels
   !                      that order's adopted x tile).  AGENTS.md fixes that
   !                      the LAST volume GEMM must fuse the weighting and the
   !                      surface lift, not which GEMM runs last.
-  !                      Default: x at Nq = 32, z elsewhere.
+  !                      Default: x at Nq = 8, 16 and 32, z elsewhere.
   !   SCALE_DG_XFWD     x carrier only.  Which Escale factors the two plain
   !                      GEMMs fold into their own epilogues: bit 0 = Escale_y
   !                      into y, bit 1 = Escale_z into z, bit 2 = ablation,
   !                      force the general integer-division row-index split in
-  !                      the carrier instead of the shift/mask one.  A bit is
+  !                      the carrier instead of the shift/mask one, bit 3 =
+  !                      fold Escale_y*Dy into the z GEMM's epilogue as well
+  !                      (Nq = 64 only), so the carrier reads ONE volume
+  !                      tensor instead of two; it implies bits 0 and 1 and
+  !                      forces the serial y-then-z schedule.  A bit is
   !                      cleared when that GEMM is on cuBLAS, which has no
-  !                      epilogue.  Default: 1 at Nq = 32, 0 elsewhere.
+  !                      epilogue.  Default: 0 at every order.
   !   SCALE_DG_XPKG     x carrier only.  The three Nq > 64 epilogue
   !                      ingredients the z carrier bundles: bit 0 = clamp
   !                      aggregation (hoist the index clamps onto the tile
@@ -359,12 +414,16 @@ module mod_cuda_dg_kernels
   !                      layout plus packed lift-coefficient pairs), bit 2 =
   !                      16-byte epilogue accesses (GemmXWide, same mainloop
   !                      tile).  All three are epilogue-side only.
-  !                      Default: 0 at every order.
+  !                      Default: 5 at Nq = 8, 4 at Nq = 16 and 32, and 0 at
+  !                      the orders where x does not carry.
   !   SCALE_DG_ZPKG      z carrier only, Nq = 16 and 64: the same three
   !                      epilogue ingredients as SCALE_DG_XPKG, on the z
-  !                      carrier.  Unset keeps the order's adopted form
-  !                      (all three off at Nq = 16, clamp aggregation and
-  !                      16-byte lift on at Nq = 64).
+  !                      carrier.  Unset keeps the order's adopted form: -1,
+  !                      which is the z carrier's own per-order default (at
+  !                      Nq = 64 that is 5, the 16-byte epilogue plus clamp
+  !                      aggregation, with the 16-byte lift off).  Nq = 16
+  !                      does not use a z carrier at all any more, so a value
+  !                      there is an out-of-role ablation.
   !   SCALE_DG_ZTILE     index into the order's plain-z CUTLASS tile list in
   !                      cuda_cutlass_gemm_fused.cu (Nq = 16 only so far).
   !                      Applies to GEMM_CUTE and GEMM_FUSED alike, since both
@@ -376,8 +435,9 @@ module mod_cuda_dg_kernels
   !                      0 = y then z on the main stream, 1 = y on the second
   !                      side stream concurrently with z.  The carrier itself
   !                      always runs after the join; it reads the other two
-  !                      derivatives.
-  !                      Default: 1 at Nq = 32, 0 elsewhere.
+  !                      derivatives.  SCALE_DG_XFWD bit 3 forces 0, because
+  !                      the folded z reads y's output.
+  !                      Default: 1 at Nq = 8, 16 and 32, 0 elsewhere.
   !   SCALE_DG_ZSKIP     ablation: skip the plain z volume GEMM. Default 0.
   !   SCALE_DG_CSKIP     ablation: skip the launch that carries the assembly
   !                      epilogue -- the fused carrier on GEMM_FUSED, the
@@ -940,6 +1000,16 @@ module mod_cuda_dg_kernels
       real(c_double), device :: flux_z(*), D1D_tr(*), escale_z(*)
       integer(c_int) :: launch_volume_gemm_z_scaled
     end function launch_volume_gemm_z_scaled
+
+    function launch_volume_gemm_z_scaleadd(deriv_yz, flux_z, D1D_tr, &
+      escale_z, deriv_y, Nq, Ne, mma_shape) &
+      bind(C, name="launch_volume_gemm_z_scaleadd")
+      import
+      integer(c_int), value :: Nq, Ne, mma_shape
+      real(c_double), device :: deriv_yz(*)
+      real(c_double), device :: flux_z(*), D1D_tr(*), escale_z(*), deriv_y(*)
+      integer(c_int) :: launch_volume_gemm_z_scaleadd
+    end function launch_volume_gemm_z_scaleadd
 
     function launch_x_gemm_assembly(dqdt, flux_x, D1D, deriv_y, deriv_z, &
       flux_bnd, lift1d, lift_pair, escale, Nq, Ne, mma_shape, tile, &
@@ -2084,9 +2154,35 @@ contains
     if (plan%carrier /= 0 .or. .not. fuse_epilogue) plan%zpkg = -1
     if (Nq /= 16 .and. Nq /= 64) plan%zpkg = -1
 
-    !- Bit 2 is the row-index-arithmetic ablation and is never cleared here.
-    if (plan%y_lib /= 0) plan%xfwd = iand(plan%xfwd, 6)
-    if (plan%z_lib /= 0) plan%xfwd = iand(plan%xfwd, 5)
+    !- Bit 2 is the row-index-arithmetic ablation and is never cleared here,
+    !- and neither is bit 3, which the block below validates on its own.
+    if (plan%y_lib /= 0) plan%xfwd = iand(plan%xfwd, 14)
+    if (plan%z_lib /= 0) plan%xfwd = iand(plan%xfwd, 13)
+    !- Bit 3 folds Escale_y*Dy into the z GEMM's epilogue so the carrier reads
+    !- one volume tensor.  It is instantiated at Nq = 64 on tile 3 only, it
+    !- needs both other Escale factors forwarded (the folded tensor carries
+    !- them), it needs a CUTLASS z to fold into, and it needs y to run before
+    !- z, which rules out the y-beside-z schedule.
+    if (iand(plan%xfwd, 8) /= 0) then
+      if (Nq /= 64 .or. plan%x_tile /= 3 .or. plan%z_lib /= 0 .or. &
+          plan%y_lib /= 0) then
+        plan%xfwd = iand(plan%xfwd, 7)
+      else
+        plan%xfwd = ior(plan%xfwd, 3)
+        plan%ysched = 0
+      end if
+    end if
+    !- Nq = 64 x carrier: the folded instantiation (xfwd bit 3) and the
+    !- occupancy-floor one (xpkg bits 3-4) are built without kPaired, and
+    !- xpkg bit 1 does not only pick a kernel -- it also switches the face
+    !- layout elembnd_flux_kernel WRITES.  Leaving it set there would hand an
+    !- interleaved face array to a kernel that reads the plain one, which is
+    !- silently wrong (4.7e-13 relative, not roundoff).  Clear it.
+    if (plan%carrier == 2 .and. Nq == 64 .and. &
+        (iand(plan%xfwd, 8) /= 0 .or. iand(plan%xpkg, 24) /= 0)) then
+      plan%xpkg = ibclr(plan%xpkg, 1)
+    end if
+
   end subroutine dg_gemm_plan
 
   ! Shared z mainloop for the paths where z is a plain GEMM: GEMM_CUTE always,
@@ -2731,6 +2827,18 @@ contains
       ! Escale factor folded into their own epilogue (plan%xfwd).  deriv_x has
       ! no buffer of its own; the x GEMM now writes dqdt, so deriv_x is free
       ! and is reused as the deriv_z scratch.
+      if (iand(plan%xfwd, 8) /= 0) then
+        ! Ceiling measurement (SCALE_DG_XFWD bit 3, Nq = 64 only): the z GEMM's
+        ! epilogue adds Escale_y*Dy to Escale_z*Dz, so the carrier reads one
+        ! volume tensor instead of two.  y must therefore run BEFORE z, which
+        ! is why dg_gemm_plan forces the serial schedule with this bit set.
+        call launch_volume_gemm_y_common( plan, &
+          deriv_y, flux_y, D1D_tr, Escale(1,1,2), Nq, Ne, istat )
+        if (istat /= 0) call cuda_failure("launch_volume_gemm_y(fold)",istat)
+        istat = launch_volume_gemm_z_scaleadd( deriv_x, flux_z, D1D_tr, &
+          Escale(1,1,3), deriv_y, Nq, Ne, cutlass_mma_shape_id )
+        if (istat /= 0) call cuda_failure("launch_volume_gemm_z_scaleadd",istat)
+      else
       if (overlap_xy) then
         call dg_set_cuda_stream(dg_side2_stream)
         call launch_volume_gemm_y_common( plan, &
@@ -2745,6 +2853,7 @@ contains
         call launch_volume_gemm_y_common( plan, &
           deriv_y, flux_y, D1D_tr, Escale(1,1,2), Nq, Ne, istat )
         if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
+      end if
       end if
     else if (fuse_epilogue .and. carrier == 1) then
       ! y carrier: x and z run first as plain unweighted GEMMs.  deriv_z has no

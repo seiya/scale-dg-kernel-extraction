@@ -83,7 +83,7 @@ cuda_ozaki1_gemm.o: cuda_ozaki1_gemm.cu
 
 
 # Dependency
-cuda_cutlass_gemm_fused.o: cutlass_z_gemm_assembly.h cutlass_y_gemm_assembly.h cutlass_x_gemm_assembly.h cutlass_f64_kdeep_mma.h
+cuda_cutlass_gemm_fused.o: cutlass_z_gemm_assembly.h cutlass_y_gemm_assembly.h cutlass_x_gemm_assembly.h cutlass_y_gemm_scaleadd.h cutlass_f64_kdeep_mma.h
 mod_mesh.o: mod_common.o
 mod_dg_optr_kernel_opt1.o: mod_common.o
 mod_dg_optr_kernel.o: mod_common.o mod_dg_optr_kernel_opt1.o

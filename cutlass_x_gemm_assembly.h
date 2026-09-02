@@ -96,8 +96,16 @@
 //- with EpilogueOp2 (XTileWide in cuda_cutlass_gemm_fused.cu), same
 //- threadblock/warp/stage shape as the plain tile so GEMM_CUTE still shares
 //- the mainloop.
+//- kFold is the one further step the fusion package allows on the x carrier:
+//- the z GEMM's own epilogue has already added Ey*Dy to Ez*Dz (a
+//- GemmBatchedScaleAdd on the z shape, the mirror of the deriv_x-into-y fold
+//- the Nq > 64 z carrier uses), so the carrier reads ONE volume tensor where
+//- kYWeighted && kZWeighted read two.  It requires both forwards, and it
+//- requires y to run before z, so it is incompatible with SCALE_DG_YSCHED = 1.
+//- The sum order changes from (Ex*Dx + Ey*Dy) + Ez*Dz to
+//- Ex*Dx + (Ey*Dy + Ez*Dz), which is a roundoff-level difference.
 template <typename Epilogue, bool kYWeighted = false, bool kZWeighted = false,
-          bool kAffine = false, bool kPaired = false>
+          bool kAffine = false, bool kPaired = false, bool kFold = false>
 class EpilogueDqdtAssemblyX : public Epilogue {
 public:
   using OutputTileIterator = typename Epilogue::OutputTileIterator;
@@ -220,17 +228,19 @@ public:
     #pragma unroll(1)
     for (int iter = 0; iter < OutputTileIterator::kIterations; ++iter) {
       typename OutputTileIterator::Fragment frag_dy, frag_dz, frag_ex, frag_ey, frag_ez;
-      it_dy.load(frag_dy);
+      if (!kFold) {
+        it_dy.load(frag_dy);
+        ++it_dy;
+      }
       it_dz.load(frag_dz);
       it_ex.load(frag_ex);
-      ++it_dy;
       ++it_dz;
       ++it_ex;
-      if (!kYWeighted) {
+      if (!kYWeighted && !kFold) {
         it_ey.load(frag_ey);
         ++it_ey;
       }
-      if (!kZWeighted) {
+      if (!kZWeighted && !kFold) {
         it_ez.load(frag_ez);
         ++it_ez;
       }
@@ -398,9 +408,14 @@ public:
       auto *out = reinterpret_cast<double *>(&output_fragment);
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < OutputTileIterator::Fragment::kElements; ++i) {
-        const double ty = kYWeighted ? dy[i] : ey[i] * dy[i];
-        const double tz = kZWeighted ? dz[i] : ez[i] * dz[i];
-        out[i] = -(ex[i] * dx[i] + ty + tz + lf[i]);
+        if constexpr (kFold) {
+          //- dz already holds Ey*Dy + Ez*Dz.
+          out[i] = -(ex[i] * dx[i] + dz[i] + lf[i]);
+        } else {
+          const double ty = kYWeighted ? dy[i] : ey[i] * dy[i];
+          const double tz = kZWeighted ? dz[i] : ez[i] * dz[i];
+          out[i] = -(ex[i] * dx[i] + ty + tz + lf[i]);
+        }
       }
 
       destination_iterator.store(output_fragment);
@@ -413,7 +428,7 @@ public:
 //- is a single large problem, not a batch, so this wraps kernel::Gemm.
 template <typename Mma_, typename Epilogue_, typename ThreadblockSwizzle_,
           bool kYWeighted = false, bool kZWeighted = false,
-          bool kAffine = false, bool kPaired = false>
+          bool kAffine = false, bool kPaired = false, bool kFold = false>
 struct GemmDqdtAssemblyX {
   using Mma = Mma_;
   using Epilogue = Epilogue_;
@@ -421,7 +436,10 @@ struct GemmDqdtAssemblyX {
   using BaseKernel =
       cutlass::gemm::kernel::Gemm<Mma, Epilogue, ThreadblockSwizzle, false>;
   using AssemblyEpilogue =
-      EpilogueDqdtAssemblyX<Epilogue, kYWeighted, kZWeighted, kAffine, kPaired>;
+      EpilogueDqdtAssemblyX<Epilogue, kYWeighted, kZWeighted, kAffine, kPaired,
+                            kFold>;
+  static_assert(!kFold || (kYWeighted && kZWeighted),
+                "the folded z tensor already carries both Escale factors");
   using WarpCount = typename Mma::WarpCount;
   static int const kThreadCount = 32 * WarpCount::kCount;
 
