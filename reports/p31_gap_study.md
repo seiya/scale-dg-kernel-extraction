@@ -1234,10 +1234,11 @@ mainloop を優先し、上の特例を `Nq==32` だけに狭めた。job `73791
 ## 23. p=31 の経路役割訂正と準拠 y tile（2026-09-01）
 
 > **2026-09-02 訂正:** 「準拠 `GEMM_FUSED` の限界は 709.2 µs/stage」は
-> 担い手が z に固定されていた前提での結論である。担い手を y に移し、
-> `Escale_x` を x epilogue に前送りし、z を cuBLAS にし、z を x と並走させると
-> **609.2 µs/stage**、`GEMM_CUTE` も **606.0 µs/stage**（[`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §3）。
-> 4 つは組でしか効かず、y 担い手だけなら +5.0% の負けである。
+> 担い手が z に固定されていた前提での結論である。担い手を x に移し、
+> `Escale_y` を y に前送りし、z を cuBLAS にし、y を z と並走させると
+> **590.7 µs/stage**、`GEMM_CUTE` も **606.3 µs/stage**（[`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §3）。
+> 4 つは組でしか効かず、担い手の移動だけなら −0.16%（レンジ接触）である。
+> 担い手 3 候補は全部測った: x 590.7、y 609.2、z 702.6。
 > 本節の x の `Nq<=64` cuBLAS switch 据え置きも、同 §1 で覆った。
 
 親 `feature/cuda` `755538e`、GB200、`make CUDA=1 GPUFLAGS=-gpu=cc100`。
@@ -1693,7 +1694,7 @@ ncu duration 342 → 175 µs。global セクタは同一（17,039,360）。占�
 
 > **2026-09-02 追記:** 本節の棄却理由である「レジスタ 254 で 16.3 M スピル」は
 > **p=31 という次数の性質ではなく、z タイル 64×32 の性質**だった。
-> 担い手を y に移すと同じ次数で 128 レジスタ / スピル 0 になる
+> 担い手を x に移すと同じ次数で 96 レジスタ / スピル 0 になる
 > （[`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §3）。この 4 つは y 担い手の上で再測定する価値がある（未測定）。
 
 [`p7_gemm_fused.md`](p7_gemm_fused.md) §13 の横展開。`GEMM_FUSED` の z

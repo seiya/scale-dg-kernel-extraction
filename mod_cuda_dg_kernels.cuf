@@ -103,8 +103,8 @@ module mod_cuda_dg_kernels
   !   Nq   x GEMM           y GEMM   epilogue carrier   z GEMM    schedule
   !    8   CUTLASS tile 9   cuBLAS   z                  CUTLASS   default
   !   16   CUTLASS tile 5   CUTLASS  z                  CUTLASS   default
-  !   32   CUTLASS tile 7   CUTLASS  y                  cuBLAS    z||x
-  !        (+ Escale_x folded into the x epilogue, GEMM_FUSED only)
+  !   32   CUTLASS tile 7   CUTLASS  x                  cuBLAS    y||z
+  !        (+ Escale_y folded into the y epilogue, GEMM_FUSED only)
   !   64   CUTLASS tile 3   CUTLASS  z                  CUTLASS   default
   !  >64   generic CUTLASS  CUTLASS  z                  CUTLASS   default
   !
@@ -142,23 +142,48 @@ module mod_cuda_dg_kernels
   !   tile and half of K to predication.  At Nq = 16 cuBLAS y is 2.27x
   !   SLOWER, so this is specific to Nq = 8, not a "small Nq" rule.
   !
-  ! * y as the fused carrier at Nq = 32: the epilogue alone goes
-  !   218.1 -> 159.2 us (-27%).  With k fixed per batch, two of the three
-  !   lift face-point pairs are constant along a tile direction (per-element
-  !   face loads 4 -> 2) against one pair for the z carrier.  Registers were
-  !   NOT the constraint: the y carrier uses 128-134 registers with zero
-  !   spill against the z carrier's 254.  The same move LOSES 24.8% at
-  !   Nq = 16, where the 16x32 y tile half-predicates a (16,16) problem and
-  !   runs 4x the CTAs.
+  ! * x as the fused carrier at Nq = 32, replacing the y carrier that held
+  !   this slot before: 609.0 -> 590.7 us/stage (-3.0%, 12/12, disjoint).
+  !   The carrier kernel alone is 223.9 (y) -> 215.8 (x) by the CSKIP
+  !   ablation, and the plain GEMM that the carrier frees is cheaper on the
+  !   x side than on the y side.  For the record the same three-way at
+  !   Nq = 32, carrier kernel priced by CSKIP: z 338.1, y 223.9, x 215.8 us.
+  !   The x carrier's tile is the one tile that fits at EVERY order -- the
+  !   problem's N extent after the transpose is exactly Nq -- but it is also
+  !   the only carrier whose rows are the packed index j + Nq*k + Nq*Nq*elem,
+  !   so it pays two integer divisions per row iteration.  Replacing them with
+  !   shifts (every Nq here is a power of two) is worth 2.7-3.2% of the stage
+  !   and takes the carrier from 130 to 96 registers; without it the x carrier
+  !   LOSES 9.7% at Nq = 32.  It still loses at every other order: +4.0% at
+  !   Nq = 8, +4.1% at Nq = 16 (the plain z it leaves behind costs 78.2 us
+  !   against the 47.9 us the plain x cost), +18.2% at Nq = 64 (the 128x64
+  !   tile spills: 254 registers with 64-136 bytes of spill stores).
+  ! * y as the fused carrier at Nq = 32, the previous holder of this slot:
+  !   the epilogue alone goes 218.1 -> 159.2 us (-27%).  With k fixed per
+  !   batch, two of the three lift face-point pairs are constant along a tile
+  !   direction (per-element face loads 4 -> 2) against one pair for the z
+  !   carrier.  Registers were NOT the constraint there: the y carrier uses
+  !   128-134 registers with zero spill against the z carrier's 254.  The
+  !   same move LOSES 24.8% at Nq = 16, where the 16x32 y tile
+  !   half-predicates a (16,16) problem and runs 4x the CTAs, and 157% at
+  !   Nq = 8, where the smallest buildable tile is 32x64 against an 8x8
+  !   output and the kernel takes 255 registers with spill.
   !
   ! * cuBLAS z at Nq = 32, legal only because z is no longer the carrier (a
   !   carrier cannot be cuBLAS: cuBLAS has no epilogue).  Plain z goes
   !   119.7 -> 68.6 us, because the CUTLASS GemmZ 64x32 tile wastes half its
   !   rows on n = Nq = 32.
   !
-  ! * Escale_x forwarded out of the x epilogue at Nq = 32, part of
-  !   GEMM_FUSED's fusion package; GEMM_CUTE demotes it to the plain CUTLASS
-  !   x and keeps the same mainloop tile.  The same forwarding at Nq = 8 is
+  ! * Escale_y forwarded into the y epilogue at Nq = 32, part of GEMM_FUSED's
+  !   fusion package; GEMM_CUTE keeps the plain y with the same mainloop tile.
+  !   Worth 17.4 us/stage (608.1 -> 590.7).  Escale_z cannot join it there
+  !   because z is on cuBLAS; forcing z back to CUTLASS to get it costs far
+  !   more than it saves (667.6 us, +13%).  At Nq = 16, where both can be
+  !   forwarded, they only pay as a PAIR: either one alone is worth 0 to -0.3%
+  !   and the two together are worth -6.4%.
+  ! * Escale_x forwarded out of the x epilogue is what the Nq = 32 y carrier
+  !   used and is meaningless with x as the carrier (the carrier applies every
+  !   weight itself).  The same forwarding at Nq = 8 under a z carrier is
   !   +0.53%, i.e. a loss -- the extra volume tensor costs x 21.8 us and
   !   saves the z epilogue only 13.5 us -- so Nq = 8 keeps the plain form.
   !
@@ -187,15 +212,26 @@ module mod_cuda_dg_kernels
   !                      0 = CUTLASS, 1 = cuBLAS strided batched.
   !                      Default: cuBLAS at Nq = 32, CUTLASS elsewhere.
   !   SCALE_DG_CARRIER   which volume GEMM carries the GEMM_FUSED assembly
-  !                      epilogue.  0 = z, 1 = y (only Nq = 16 and 32 have a
-  !                      y assembly kernel).  AGENTS.md fixes that the LAST
-  !                      volume GEMM must fuse the weighting and the surface
-  !                      lift, not which GEMM runs last.
-  !                      Default: y at Nq = 32, z elsewhere.
-  !   SCALE_DG_YSCHED    schedule when the carrier is y.  0 = x then z on the
-  !                      main stream, 1 = z on the second side stream
-  !                      concurrently with x.  The carrier itself always runs
-  !                      after the join; it reads deriv_x and deriv_z.
+  !                      epilogue.  0 = z, 1 = y (Nq = 8, 16 and 32 have a y
+  !                      assembly kernel), 2 = x (Nq = 8, 16, 32 and 64, on
+  !                      that order's adopted x tile).  AGENTS.md fixes that
+  !                      the LAST volume GEMM must fuse the weighting and the
+  !                      surface lift, not which GEMM runs last.
+  !                      Default: x at Nq = 32, z elsewhere.
+  !   SCALE_DG_XFWD     x carrier only.  Which Escale factors the two plain
+  !                      GEMMs fold into their own epilogues: bit 0 = Escale_y
+  !                      into y, bit 1 = Escale_z into z, bit 2 = ablation,
+  !                      force the general integer-division row-index split in
+  !                      the carrier instead of the shift/mask one.  A bit is
+  !                      cleared when that GEMM is on cuBLAS, which has no
+  !                      epilogue.  Default: 1 at Nq = 32, 0 elsewhere.
+  !   SCALE_DG_YSCHED    schedule when the carrier is not z.  With a y carrier,
+  !                      0 = x then z on the main stream, 1 = z on the second
+  !                      side stream concurrently with x.  With an x carrier,
+  !                      0 = y then z on the main stream, 1 = y on the second
+  !                      side stream concurrently with z.  The carrier itself
+  !                      always runs after the join; it reads the other two
+  !                      derivatives.
   !                      Default: 1 at Nq = 32, 0 elsewhere.
   !   SCALE_DG_ZSKIP     ablation: skip the plain z volume GEMM. Default 0.
   !   SCALE_DG_CSKIP     ablation: skip the fused carrier kernel. Default 0.
@@ -213,14 +249,17 @@ module mod_cuda_dg_kernels
     integer :: x_mode  = 0   ! 0 cuBLAS, 1 CUTLASS, 2 CUTLASS+Escale_x, 3/4 skip
     integer :: x_tile  = 0   ! index into the order's CUTLASS x tile list
     integer :: y_lib   = 0   ! 0 CUTLASS, 1 cuBLAS, 2 skip
-    integer :: carrier = 0   ! 0 = z carries the fused epilogue, 1 = y does
+    integer :: carrier = 0   ! 0 = z carries the fused epilogue, 1 = y, 2 = x
     integer :: z_lib   = 0   ! 0 CUTLASS, 1 cuBLAS (a plain z only)
     integer :: ysched  = 0   ! 0 = x then z, 1 = z beside x on side2
+    integer :: xfwd    = 0   ! x carrier only: bit 0 Escale_y into y,
+                             ! bit 1 Escale_z into z
   end type dg_gemm_plan_t
 
   !- Cached environment slots for the overrides documented above.
   integer, save :: x_mode_env = -2, x_tile_env = -2, y_cublas_env = -2
   integer, save :: zcublas_env = -2, carrier_env = -2, ysched_env = -2
+  integer, save :: xfwd_env = -2
   integer, save :: zskip_env = -2, cskip_env = -2, fskip_env = -2, vskip_env = -2
 
   public :: cuda_cal_volume_flux
@@ -727,6 +766,36 @@ module mod_cuda_dg_kernels
       real(c_double), device :: flux_bnd(*), lift1d(*)
       integer(c_int) :: launch_y_gemm_assembly
     end function launch_y_gemm_assembly
+
+    function launch_volume_gemm_y_scaled(deriv_y, flux_y, D1D_tr, escale_y, &
+      Nq, Ne, mma_shape) bind(C, name="launch_volume_gemm_y_scaled")
+      import
+      integer(c_int), value :: Nq, Ne, mma_shape
+      real(c_double), device :: deriv_y(*)
+      real(c_double), device :: flux_y(*), D1D_tr(*), escale_y(*)
+      integer(c_int) :: launch_volume_gemm_y_scaled
+    end function launch_volume_gemm_y_scaled
+
+    function launch_volume_gemm_z_scaled(deriv_z, flux_z, D1D_tr, escale_z, &
+      Nq, Ne, mma_shape) bind(C, name="launch_volume_gemm_z_scaled")
+      import
+      integer(c_int), value :: Nq, Ne, mma_shape
+      real(c_double), device :: deriv_z(*)
+      real(c_double), device :: flux_z(*), D1D_tr(*), escale_z(*)
+      integer(c_int) :: launch_volume_gemm_z_scaled
+    end function launch_volume_gemm_z_scaled
+
+    function launch_x_gemm_assembly(dqdt, flux_x, D1D, deriv_y, deriv_z, &
+      flux_bnd, lift1d, escale, Nq, Ne, mma_shape, tile, weight_mode) &
+      bind(C, name="launch_x_gemm_assembly")
+      import
+      integer(c_int), value :: Nq, Ne, mma_shape, tile, weight_mode
+      real(c_double), device :: dqdt(*)
+      real(c_double), device :: flux_x(*), D1D(*)
+      real(c_double), device :: deriv_y(*), deriv_z(*), escale(*)
+      real(c_double), device :: flux_bnd(*), lift1d(*)
+      integer(c_int) :: launch_x_gemm_assembly
+    end function launch_x_gemm_assembly
   end interface
 
 contains
@@ -1749,21 +1818,22 @@ contains
     select case (Nq)
     case (8)    !- p=7   x CUTLASS tile 9, y cuBLAS, z carrier, z CUTLASS
       plan = dg_gemm_plan_t(x_mode=1, x_tile=9, y_lib=1, carrier=0, &
-                            z_lib=0, ysched=0)
+                            z_lib=0, ysched=0, xfwd=0)
     case (16)   !- p=15  x CUTLASS tile 5, y CUTLASS, z carrier, z CUTLASS
       plan = dg_gemm_plan_t(x_mode=1, x_tile=5, y_lib=0, carrier=0, &
-                            z_lib=0, ysched=0)
-    case (32)   !- p=31  x CUTLASS tile 7 + Escale_x, y carrier, z cuBLAS, z||x
-      plan = dg_gemm_plan_t(x_mode=2, x_tile=7, y_lib=0, carrier=1, &
-                            z_lib=1, ysched=1)
+                            z_lib=0, ysched=0, xfwd=0)
+    case (32)   !- p=31  x CUTLASS tile 7 and carrier, y CUTLASS + Escale_y,
+                !-        z cuBLAS, y||z
+      plan = dg_gemm_plan_t(x_mode=1, x_tile=7, y_lib=0, carrier=2, &
+                            z_lib=1, ysched=1, xfwd=1)
     case (64)   !- p=63  x CUTLASS tile 3, y CUTLASS, z carrier, z CUTLASS
       plan = dg_gemm_plan_t(x_mode=1, x_tile=3, y_lib=0, carrier=0, &
-                            z_lib=0, ysched=0)
+                            z_lib=0, ysched=0, xfwd=0)
     case default
       !- Nq > 64: generic CUTLASS x through launch_volume_gemm_x / _xy, and
       !- everything else as it has always been.  Untouched by the sweep.
       plan = dg_gemm_plan_t(x_mode=0, x_tile=0, y_lib=0, carrier=0, &
-                            z_lib=0, ysched=0)
+                            z_lib=0, ysched=0, xfwd=0)
     end select
   end subroutine dg_gemm_defaults
 
@@ -1792,6 +1862,8 @@ contains
     if (ov >= 0) plan%carrier = ov
     ov = dg_env_int("SCALE_DG_YSCHED", ysched_env, -1)
     if (ov >= 0) plan%ysched = ov
+    ov = dg_env_int("SCALE_DG_XFWD", xfwd_env, -1)
+    if (ov >= 0) plan%xfwd = ov
 
     !- Legality clamps.  They apply to the table and to an override alike.
     !- Only the four swept orders have a CUTLASS x tile list; Nq > 64 takes
@@ -1810,24 +1882,48 @@ contains
     !- Only GEMM_FUSED has a carrier at all, and only Nq = 16 and 32 have a y
     !- assembly kernel.
     if (.not. fuse_epilogue) plan%carrier = 0
-    if (Nq /= 16 .and. Nq /= 32) plan%carrier = 0
+    if (plan%carrier == 1 .and. Nq /= 8 .and. Nq /= 16 .and. Nq /= 32) &
+      plan%carrier = 0
+    !- The x carrier needs the order's adopted CUTLASS x tile, which is also
+    !- the only one launch_x_gemm_assembly instantiates, and it needs x on
+    !- CUTLASS at all.  Escale_x forwarding into x is meaningless with x as the
+    !- carrier (the carrier applies every weight itself), so mode 2 collapses
+    !- to mode 1 there.
+    if (plan%carrier == 2) then
+      if (Nq /= 8 .and. Nq /= 16 .and. Nq /= 32 .and. Nq /= 64) plan%carrier = 0
+      if (plan%x_mode == 0) plan%carrier = 0
+    end if
+    if (plan%carrier == 2 .and. plan%x_mode == 2) plan%x_mode = 1
+    if (plan%carrier == 2 .and. plan%x_mode == 4) plan%x_mode = 3
+    !- Escale forwarding into the non-carriers exists only for the x carrier,
+    !- and only for a non-carrier that is CUTLASS (cuBLAS has no epilogue).
+    if (plan%carrier /= 2) plan%xfwd = 0
+
+    !- Bit 2 is the row-index-arithmetic ablation and is never cleared here.
+    if (plan%y_lib /= 0) plan%xfwd = iand(plan%xfwd, 6)
+    if (plan%z_lib /= 0) plan%xfwd = iand(plan%xfwd, 5)
   end subroutine dg_gemm_plan
 
   ! Shared z mainloop for the paths where z is a plain GEMM: GEMM_CUTE always,
   ! and GEMM_FUSED when the carrier is y.  Keeping the library choice in the
   ! plan keeps the two paths on one assignment, as AGENTS.md requires.
   subroutine launch_volume_gemm_z_common(plan, deriv_z, flux_z, D1D_tr, &
-    Nq, Np, Ne, istat)
+    escale_z, Nq, Np, Ne, istat)
     implicit none
     type(dg_gemm_plan_t), intent(in) :: plan
     integer, intent(in) :: Nq, Np, Ne
     real(RP), device, intent(out) :: deriv_z(*)
-    real(RP), device, intent(in) :: flux_z(*), D1D_tr(*)
+    real(RP), device, intent(in) :: flux_z(*), D1D_tr(*), escale_z(*)
     integer, intent(out) :: istat
 
     if (dg_env_int("SCALE_DG_ZSKIP", zskip_env, 0) /= 0) then
       ! Ablation only: skip the z volume GEMM.  Numerically wrong on purpose.
       istat = 0
+    else if (iand(plan%xfwd, 2) /= 0) then
+      ! x carrier only: Escale_z folded into this GEMM's own epilogue.  Same
+      ! tile, warps and stage count as the plain CUTLASS z above.
+      istat = launch_volume_gemm_z_scaled(deriv_z, flux_z, D1D_tr, escale_z, &
+        Nq, Ne, cutlass_mma_shape_id)
     else if (plan%z_lib == 1) then
       istat = cublas_dgemm_strided_batched_impl(0, 0, Nq*Nq, Nq, Nq, &
         1.0_c_double, flux_z, Nq*Nq, int(Np,c_long_long), D1D_tr, Nq, &
@@ -1841,18 +1937,23 @@ contains
   ! Shared y mainloop for GEMM_CUTE and GEMM_FUSED.  Keeping this call in one
   ! place prevents the two comparison paths from silently diverging.
   subroutine launch_volume_gemm_y_common(plan, deriv_y, flux_y, D1D_tr, &
-    Nq, Ne, istat)
+    escale_y, Nq, Ne, istat)
     implicit none
     type(dg_gemm_plan_t), intent(in) :: plan
     integer, intent(in) :: Nq, Ne
     real(RP), device, intent(out) :: deriv_y(*)
-    real(RP), device, intent(in) :: flux_y(*), D1D_tr(*)
+    real(RP), device, intent(in) :: flux_y(*), D1D_tr(*), escale_y(*)
     integer, intent(out) :: istat
 
     if (plan%y_lib == 2) then
       ! Ablation only (SCALE_DG_YCUBLAS=2): skip the y volume GEMM entirely so
       ! its cost can be read off the stage time.  Numerically wrong on purpose.
       istat = 0
+    else if (iand(plan%xfwd, 1) /= 0) then
+      ! x carrier only: Escale_y folded into this GEMM's own epilogue.  Same
+      ! tile, warps and stage count as the plain CUTLASS y below.
+      istat = launch_volume_gemm_y_scaled(deriv_y, flux_y, D1D_tr, escale_y, &
+        Nq, Ne, cutlass_mma_shape_id)
     else if (plan%y_lib == 1) then
       istat = cublas_dgemm_strided_batched_impl(0, 0, Nq, Nq, Nq, 1.0_c_double, &
         flux_y, Nq, int(Nq*Nq,c_long_long), D1D_tr, Nq, 0_c_long_long, &
@@ -2309,6 +2410,7 @@ contains
     integer :: istat, nface, npoint, nblock, nblock_face
     integer :: nq2, xy_weighted, pair_nq2
     integer :: carrier, ysched
+    logical :: overlap_xy
     type(dg_gemm_plan_t) :: plan
     logical :: use_side, overlap_y, overlap_z, use_side2, p31_early_face
 
@@ -2347,6 +2449,9 @@ contains
     ! layout: the three 16-byte lift loads are -2.4% there (p7_gemm_fused.md
     ! section 13).  Nq = 16, 32 and 64 lose from it.
     if (fuse_epilogue .and. (Nq >= 64 .or. Nq == 8)) pair_nq2 = nq2
+    !- Neither the x nor the y assembly epilogue reads the interleaved face
+    !- layout, so a carrier other than z must not get it.
+    if (carrier >= 1) pair_nq2 = 0
     if (pair_nq2 /= 0) then
       if (dg_lift_zpair_nq /= Nq) then
         if (allocated(dg_lift_zpair)) deallocate(dg_lift_zpair)
@@ -2368,13 +2473,16 @@ contains
     ! is not available to it.  It gets the elembnd flux moved onto the side
     ! stream ahead of volume_flux instead -- the schedule Nq = 32 already uses
     ! -- and optionally z beside x on the second side stream (SCALE_DG_YSCHED).
-    if (carrier == 1) p31_early_face = .true.
+    if (carrier >= 1) p31_early_face = .true.
     use_side = dg_side_enabled .and. &
       ((Nq >= 64) .or. p31_early_face)
     overlap_y = fuse_epilogue .and. dg_side_enabled .and. (Nq < 64) .and. &
       (carrier == 0)
     overlap_z = (carrier == 1) .and. dg_side_enabled .and. (ysched == 1)
-    use_side2 = overlap_y .or. overlap_z
+    !- x carrier: y and z both precede the carrier, so the pair that can run
+    !- concurrently is y beside z (SCALE_DG_YSCHED = 1), not y or z beside x.
+    overlap_xy = (carrier == 2) .and. dg_side_enabled .and. (ysched == 1)
+    use_side2 = overlap_y .or. overlap_z .or. overlap_xy
 
     call dg_ev_record(1)
 
@@ -2409,14 +2517,34 @@ contains
       end if
     end if
 
-    if (fuse_epilogue .and. carrier == 1) then
+    if (fuse_epilogue .and. carrier == 2) then
+      ! x carrier: y and z run first as plain GEMMs, optionally with their own
+      ! Escale factor folded into their own epilogue (plan%xfwd).  deriv_x has
+      ! no buffer of its own; the x GEMM now writes dqdt, so deriv_x is free
+      ! and is reused as the deriv_z scratch.
+      if (overlap_xy) then
+        call dg_set_cuda_stream(dg_side2_stream)
+        call launch_volume_gemm_y_common( plan, &
+          deriv_y, flux_y, D1D_tr, Escale(1,1,2), Nq, Ne, istat )
+        call dg_set_cuda_stream(dg_stream)
+        if (istat /= 0) call cuda_failure("launch_volume_gemm_y(side2)",istat)
+      end if
+      call launch_volume_gemm_z_common( plan, &
+        deriv_x, flux_z, D1D_tr, Escale(1,1,3), Nq, Np, Ne, istat )
+      if (istat /= 0) call cuda_failure("launch_volume_gemm_z(x-carrier)",istat)
+      if (.not. overlap_xy) then
+        call launch_volume_gemm_y_common( plan, &
+          deriv_y, flux_y, D1D_tr, Escale(1,1,2), Nq, Ne, istat )
+        if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
+      end if
+    else if (fuse_epilogue .and. carrier == 1) then
       ! y carrier: x and z run first as plain unweighted GEMMs.  deriv_z has no
       ! buffer of its own; the deriv_y array is free because the y GEMM now
       ! writes dqdt, so it is reused as the deriv_z scratch.
       if (overlap_z) then
         call dg_set_cuda_stream(dg_side2_stream)
         call launch_volume_gemm_z_common( plan, &
-          deriv_y, flux_z, D1D_tr, Nq, Np, Ne, istat )
+          deriv_y, flux_z, D1D_tr, Escale(1,1,3), Nq, Np, Ne, istat )
         if (istat /= 0) call cuda_failure("launch_volume_gemm_z(side2)",istat)
         call dg_set_cuda_stream(dg_stream)
       end if
@@ -2425,7 +2553,7 @@ contains
       if (istat /= 0) call cuda_failure("x-deriv (fused y-carrier)",istat)
       if (.not. overlap_z) then
         call launch_volume_gemm_z_common( plan, &
-          deriv_y, flux_z, D1D_tr, Nq, Np, Ne, istat )
+          deriv_y, flux_z, D1D_tr, Escale(1,1,3), Nq, Np, Ne, istat )
         if (istat /= 0) call cuda_failure("launch_volume_gemm_z",istat)
       end if
     else if (fuse_epilogue) then
@@ -2443,7 +2571,7 @@ contains
           if (overlap_y) then
             call dg_set_cuda_stream(dg_side2_stream)
             call launch_volume_gemm_y_common( plan, &
-              deriv_y, flux_y, D1D_tr, Nq, Ne, istat )
+              deriv_y, flux_y, D1D_tr, Escale(1,1,2), Nq, Ne, istat )
             call dg_set_cuda_stream(dg_stream)
             if (istat /= 0) call cuda_failure("launch_volume_gemm_y(side2)",istat)
           end if
@@ -2452,7 +2580,7 @@ contains
           if (istat /= 0) call cuda_failure("x-deriv (fused)",istat)
           if (.not. overlap_y) then
             call launch_volume_gemm_y_common( plan, &
-              deriv_y, flux_y, D1D_tr, Nq, Ne, istat )
+              deriv_y, flux_y, D1D_tr, Escale(1,1,2), Nq, Ne, istat )
             if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
           end if
         end if
@@ -2473,10 +2601,10 @@ contains
         if (istat /= 0) call cuda_failure("launch_volume_gemm_x",istat)
       end if
       call launch_volume_gemm_y_common( plan, &
-        deriv_y, flux_y, D1D_tr, Nq, Ne, istat )
+        deriv_y, flux_y, D1D_tr, Escale(1,1,2), Nq, Ne, istat )
       if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
       call launch_volume_gemm_z_common( plan, &
-        dqdt, flux_z, D1D_tr, Nq, Np, Ne, istat )
+        dqdt, flux_z, D1D_tr, Escale(1,1,3), Nq, Np, Ne, istat )
       if (istat /= 0) call cuda_failure("launch_volume_gemm_z",istat)
     end if
     call dg_ev_record(3)
@@ -2489,6 +2617,11 @@ contains
       ! Ablation only: skip the fused carrier kernel entirely.  Numerically
       ! wrong on purpose; it prices the carrier off the stage time.
       continue
+    else if (fuse_epilogue .and. carrier == 2) then
+      istat = launch_x_gemm_assembly( &
+        dqdt, flux_x, D1D, deriv_y, deriv_x, flux_bnd, Lift1D, &
+        Escale, Nq, Ne, cutlass_mma_shape_id, plan%x_tile, plan%xfwd )
+      if (istat /= 0) call cuda_failure("launch_x_gemm_assembly",istat)
     else if (fuse_epilogue .and. carrier == 1) then
       istat = launch_y_gemm_assembly( &
         dqdt, flux_y, D1D_tr, deriv_x, deriv_y, flux_bnd, Lift1D, &
