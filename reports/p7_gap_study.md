@@ -211,3 +211,42 @@ unique DRAM **5.40 TB/s（7.9 の 68.3%）**。この次数はもともと DRAM 
 （p=15 −1.72%、p=7 −3.44% と小さいながら）勝つ。
 判定基準は「(A) の**大きさ**は shared wavefront の詰まり方で決まる」と
 読み替えるのが正しい。
+
+## 6. p=7 への PDL 適用可否（2026-09-03、適用箇所が無い）
+
+`TODO.md` §5 の 2 件目。Programmatic Dependent Launch は
+[`p127_gap_study.md`](p127_gap_study.md) §19 →
+[`p63_gap_study.md`](p63_gap_study.md) §50 →
+[`p31_gap_study.md`](p31_gap_study.md) §25 と横展開されたが、p=7 では
+一度も言及が無かった。
+
+**全文は [`tc_paper_survey_2407.09621.md`](tc_paper_survey_2407.09621.md) §22**
+（`FUSED_TC` 側、nsys job `78241`、node `c182`）。要点だけ:
+
+- **p=7 の tendency は `FUSED_TC` も `FUSED`（CC）も 1 グリッドである。**
+  `tendency_fused_p7_kernel<<<Ne, P7_THREADS>>>` /
+  `tendency_fused_p7_cc_kernel<<<Ne, P7_CC_THREADS>>>` の 1 本に、面フラックス・
+  3 方向の微分・エピローグが全部入っている。**PDL の段（面 → xz、xz → y）が
+  存在しない。**
+- 1 stage の GPU trace は `rk_update`（OpenACC）→ `update_halo`（OpenACC）→
+  tendency（CUDA C++）の 3 本だけ。CUDA C++ グリッドは 1 本しかなく、
+  前後の隣は OpenACC 生成のローンチで属性を付けられない。
+  一次が Fortran では重ならないことは `p127_gap_study.md` §19.2 が実測済み。
+- PDL が狙える唯一の量は**カーネル間の隙間 9.81 µs = stage の 2.76%**で、
+  これは `UseCudaGraph = .true.` が全額回収する。
+
+CUDA-core 側の graph A/B（login GPU 5-run 中央値、
+`namelists/perf_p7_fused.conf`）:
+
+| | 中央値 [µs/stage] | レンジ | 差 |
+|---|---:|---|---:|
+| graph off（既定） | **374.21** | 373.75–374.63 | — |
+| graph on | **364.02** | 363.89–364.24 | **−2.72%（−10.19 µs）** |
+
+`FUSED_TC` 側の −10.11 µs（§22.3）と 1% 以内で一致する。**取れる µs は
+経路ではなく 1 stage のカーネル本数（3 本）で決まっている。**
+
+**適用不能。実装しない。既定 conf は graph off のまま**（graph 再生では
+`Cal_tend` / `CUDA device *` が出ず `nsys` も当てられない。
+[`README.md`](README.md) の p=7/15/31 `GEMM_FUSED` の graph 記録と同じ判断）。
+**本節で採択したソース変更は無い。**
