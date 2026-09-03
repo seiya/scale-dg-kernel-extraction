@@ -455,12 +455,13 @@ module mod_cuda_dg_kernels
   !                      GEMM_CUTE.  Default 0.
   !   SCALE_DG_FSKIP     ablation: skip the elembnd face flux.    Default 0.
   !   SCALE_DG_VSKIP     ablation: skip the volume flux.          Default 0.
-  !   SCALE_DG_CUTEPAR   OUT-OF-ROLE ablation, GEMM_CUTE only: spread the
-  !                      three (independent, because unfused) volume GEMMs
-  !                      over streams, the way SCALE_DG_GVOLPAR does on the
-  !                      unfused cuBLAS driver.  0 = serial (the shipped
-  !                      GEMM_CUTE), 1 = y beside x, 2 = all three.
-  !                      Default 0; never set from any DqdtKernel_Type.
+  !   SCALE_DG_CUTEPAR   GEMM_CUTE's volume-GEMM schedule, the twin of
+  !                      SCALE_DG_GVOLPAR on the unfused cuBLAS driver: how
+  !                      many of the three (independent, because unfused)
+  !                      volume GEMMs run on their own stream.  0 = serial,
+  !                      1 = y beside x, 2 = all three.  DEFAULT 2, the
+  !                      production schedule; the override exists so the
+  !                      A/B can be repeated.
   !
   ! Each variable is read once and cached in the matching *_env slot below;
   ! -2 means "not read yet" and -1 means "unset, use the table".
@@ -3129,24 +3130,43 @@ contains
         if (istat /= 0) call cuda_failure("launch_volume_gemm_xy",istat)
       end if
     else
-      !- SCALE_DG_CUTEPAR: OUT-OF-ROLE ABLATION, DEFAULT 0 (off).  Not a
-      !- production knob and not reachable from any DqdtKernel_Type; it exists
-      !- only so the schedule axis can be measured on GEMM_CUTE.
+      !- SCALE_DG_CUTEPAR: GEMM_CUTE's volume-GEMM schedule.  This is the
+      !- twin of SCALE_DG_GVOLPAR on the unfused cuBLAS driver, and it uses
+      !- the same fork / join helpers under the same condition, so GEMM,
+      !- OZAKI1, OZAKI2 and GEMM_CUTE all spread the same three GEMMs the
+      !- same way.  That is what makes GEMM vs GEMM_CUTE a one-axis
+      !- (library / mainloop) comparison; see AGENTS.md.
       !-
       !- Without a fused epilogue the three volume GEMMs are independent, so
-      !- all three can run concurrently -- the same fact SCALE_DG_GVOLPAR
-      !- exploits on the unfused cuBLAS driver.  WITH a fused epilogue the
-      !- carrier reads the other two derivatives elementwise (every carrier
-      !- variant takes deriv_x and deriv_y: launch_{x,y,z}_gemm_assembly
-      !- below), so the carrier depends on both and only the two non-carriers
-      !- can overlap.  Fusion therefore REDUCES the overlap opportunity from
-      !- three to two, whichever of x / y / z carries.
+      !- all three can run concurrently.  WITH a fused epilogue the carrier
+      !- reads the other two derivatives elementwise (every carrier variant
+      !- takes deriv_x and deriv_y: launch_{x,y,z}_gemm_assembly below), so
+      !- the carrier depends on both and only the two non-carriers can
+      !- overlap.  Fusion therefore REDUCES the overlap opportunity from
+      !- three to two, whichever of x / y / z carries -- and above Nq = 64
+      !- the xy_weighted fold takes the remaining one as well.  That is the
+      !- price of fusing, and it belongs on the fusion axis
+      !- (GEMM_CUTE vs GEMM_FUSED), not on this one.  Do NOT "fix" the
+      !- difference by taking the overlap away from GEMM_CUTE.
       !-
-      !- 0 = the serial schedule (the shipped GEMM_CUTE); 1 = y beside x on
-      !- side2; 2 = all three, z on side1 as well when the face flux is not
-      !- already occupying it.  Measured in
-      !- reports/gemm_assignment_and_carrier.md section 10.9.
-      cutepar = dg_env_int("SCALE_DG_CUTEPAR", cutepar_env, 0)
+      !- 0 = the serial schedule; 1 = y beside x on side2; 2 = all three,
+      !- z on side1 as well when the face flux is not already occupying it
+      !- (Nq >= 64), which is the same side_free test gemm_volume_xyz uses.
+      !-
+      !- DEFAULT 2, adopted 2026-09-03 by the same reasoning that made
+      !- SCALE_DG_GVOLPAR default 2, and on the user's decision that the
+      !- overlap fusion gives up is a cost of fusing and belongs on the
+      !- fusion axis.  Against the old serial default it is -0.808 / -1.403
+      !- / -1.921 / -1.150 / -2.067 / -1.645 / -0.293 / -0.149 / -0.050 /
+      !- -0.014% at p = 7 / 15 / 31 / 63 / 127 / 255 / 511 / 575 / 767 /
+      !- 1023 (Slurm job 79356, node c389, 12 / 6 interleaved rounds,
+      !- disjoint ranges at 9 of 10 orders; p = 1023 overlaps, i.e. no
+      !- difference).  Mode 2 was a wash against mode 1 everywhere it was
+      !- measured (job 78999) and is never worse, so it is the default and
+      !- degrades to mode 1 on its own when the face flux occupies the side
+      !- stream.
+      !- reports/gemm_assignment_and_carrier.md sections 11.4-11.6 and 13.
+      cutepar = dg_env_int("SCALE_DG_CUTEPAR", cutepar_env, 2)
       cute_zpar = (cutepar >= 2) .and. (.not. use_side)
       if (cutepar >= 1) then
         call dg_side2_fork()
