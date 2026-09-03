@@ -182,6 +182,18 @@ commit `38952e4`、`nstep=20`、`WarmupStep=2`、
 Scheme I は native GEMM と **実質互角**（1.04×）。最速は `GEMM_FUSED`
 （20.5 ms/stage）のまま。
 
+> **（訂正 2026-09-03）** 上表は commit `38952e4` の測定で、そのツリーの
+> `EmulationMantissaControl` の既定は **DYNAMIC** だった（`fd091fc`、2026-08-29 で
+> FIXED に変わる）。`gemm_assignment_and_carrier.md` §9.8.5 が確定させたとおり
+> **DYNAMIC の `OZAKI1` は DG の要求精度を満たさない**（p=7 の owned `dqdt` で
+> 3.04e-01）ので、**上表の `OZAKI1` の比は無効な精度設定での速度である。**
+> 精度を満たす FIXED で測り直すと **`OZAKI1` = 250.1 ms/stage ＝ native の 12.1×**、`OZAKI2` = 33.5 ms/stage ＝ 1.62×
+> （job `78846`、node `c186`、既定 FIXED 55 bit / 7 slices、
+> [`measurement_inventory.md`](measurement_inventory.md) §10.5）。
+> `OZAKI2` は FIXED / ADP・7 / 14 moduli のどれでも数値が合わない（同 §9.8.5）ので、
+> **`OZAKI2` の行はどの設定でも「その精度での速度」である。**
+> **本表は当時の DYNAMIC 既定での測定として書き換えずに残す。**
+
 > **（訂正 2026-08-29）** 上表の native **63.1 ms** は 1 step の device 合計で、
 > RK 3 stage で割っていない。1 stage は約 21.0 ms で、§5 の GEMM 20.912 ms/stage
 > と整合する。Ozaki 比はそのまま読める。
