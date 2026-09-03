@@ -486,6 +486,43 @@ struct VolumeGemmSetP15 : VolumeGemmSet<GS<8, 8, 4>, cutlass::arch::Sm80, 16> {
 
 using P15MmaSet_884 = VolumeGemmSetP15;
 
+//- OUT-OF-ROLE ABLATION (SCALE_DG_ZS3, default 0): the same volume-GEMM set
+//- with every z mainloop one multistage stage shallower.  Restage<> rebuilds a
+//- device::GemmBatched from the typedefs the original exposes, so the tile,
+//- warp partition, MMA shape, epilogue output op and swizzle are carried over
+//- verbatim and only Stages changes.  Both z mainloops are restaged together:
+//- GemmZ is the plain z that GEMM_CUTE (and a non-z carrier of GEMM_FUSED)
+//- runs, GemmZWide is the one the z carrier's assembly kernel runs.  Changing
+//- only one of them would make GEMM_CUTE and GEMM_FUSED differ in the volume
+//- mainloop, which AGENTS.md forbids; changing both is the "shared mainloop
+//- change" the study of gemm_assignment_and_carrier.md section 10.10.8 asked
+//- for.  Default dispatch never reaches these (the knob defaults to 0).
+template <class G, int Stages>
+using Restage = cutlass::gemm::device::GemmBatched<
+    double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
+    TensorOp, typename G::ArchTag, typename G::ThreadblockShape,
+    typename G::WarpShape, typename G::InstructionShape,
+    typename G::EpilogueOutputOp, typename G::ThreadblockSwizzle, Stages>;
+
+template <class Set>
+struct ZStage3Set : Set {
+  using GemmZ = Restage<typename Set::GemmZ, 3>;
+  using GemmZWide = Restage<typename Set::GemmZWide, 3>;
+};
+
+//- ADOPTED (job 79164, gemm_assignment_and_carrier.md section 12): the shared
+//- z mainloop runs three stages deep at Nq = 64, 128 and 256 and four
+//- everywhere else.  Both z mainloops move together and both GEMM_CUTE and
+//- GEMM_FUSED reach them through launch_volume_gemm_z /
+//- launch_z_gemm_assembly, so the two paths keep one tile at every order --
+//- which is what AGENTS.md requires of an order-specialized mainloop.  A
+//- negative zs3 argument means "take this table"; 0 and 1 force the depth,
+//- which is how the A/B was measured.
+inline bool z_stage3_default(int Nq)
+{
+  return Nq == 64 || Nq == 128 || Nq == 256;
+}
+
 int cutlass_error(const char *what, cutlass::Status st)
 {
   if (st == cutlass::Status::kSuccess) {
@@ -1536,10 +1573,28 @@ extern "C" int launch_volume_gemm_x_tiled(double *deriv_x, const double *flux_x,
 
 extern "C" int launch_volume_gemm_z(double *deriv_z, const double *flux_z,
                                     const double *D1D_tr, int Nq, int Ne,
-                                    int mma_shape, int tile)
+                                    int mma_shape, int tile, int zs3)
 {
   if (Nq <= 0 || Ne <= 0) {
     return 1;
+  }
+  //- OUT-OF-ROLE ABLATION (SCALE_DG_ZS3): the shipped mainloop with one fewer
+  //- multistage stage.  It goes with the same change on the carrier z in
+  //- launch_z_gemm_assembly, so GEMM_CUTE and GEMM_FUSED move together.
+  if (zs3 < 0) {
+    zs3 = z_stage3_default(Nq) ? 1 : 0;
+  }
+  if (zs3 != 0 && mma_shape == 0 && tile < 0) {
+    if (Nq == 8) {
+      return run_volume_gemm_z<ZStage3Set<P7MmaSet_884> >(deriv_z, flux_z,
+                                                          D1D_tr, Nq, Ne);
+    }
+    if (Nq == 16) {
+      return run_volume_gemm_z<ZStage3Set<P15MmaSet_884> >(deriv_z, flux_z,
+                                                           D1D_tr, Nq, Ne);
+    }
+    return run_volume_gemm_z<ZStage3Set<MmaSet_884> >(deriv_z, flux_z, D1D_tr,
+                                                      Nq, Ne);
   }
   if (Nq == 16 && mma_shape == 0 && tile >= 0) {
     switch (tile) {
@@ -1752,10 +1807,55 @@ extern "C" int launch_z_gemm_assembly(
     double *dqdt, const double *flux_z, const double *D1D_tr,
     const double *deriv_x, const double *deriv_y, const double *flux_bnd,
     const double *lift1d, const double *lift_zpair, const double *escale,
-    int Nq, int Ne, int mma_shape, int xy_weighted, int pkg)
+    int Nq, int Ne, int mma_shape, int xy_weighted, int pkg, int zs3)
 {
   if (Nq <= 0 || Ne <= 0) {
     return 1;
+  }
+  //- OUT-OF-ROLE ABLATION (SCALE_DG_ZS3): the carrier z with a three-deep
+  //- pipeline.  Only the two configurations production dispatch actually
+  //- reaches at Nq >= 64 are instantiated -- the Nq = 64 package (16-byte
+  //- epilogue + clamp aggregation, no 16-byte lift) and the Nq > 64 default
+  //- (all three on) -- so the knob does not multiply the build.
+  const bool zs3_forced = (zs3 >= 0);
+  if (zs3 < 0) {
+    zs3 = z_stage3_default(Nq) ? 1 : 0;
+  }
+  if (zs3 != 0 && mma_shape == 0 && xy_weighted == 1) {
+    if (Nq == 64 && pkg == 5) {
+      return run_z_gemm_assembly<ZStage3Set<MmaSet_884>, true, true, true,
+                                 false>(dqdt, flux_z, D1D_tr, deriv_x, deriv_y,
+                                        flux_bnd, lift1d, lift_zpair, escale,
+                                        Nq, Ne);
+    }
+    if (Nq > 64 && pkg < 0) {
+      return run_z_gemm_assembly<ZStage3Set<MmaSet_884>, true>(
+          dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d, lift_zpair,
+          escale, Nq, Ne);
+    }
+  }
+  //- Only the two configurations production dispatch reaches are built with
+  //- the shallower pipeline.  Anything else -- an ablation carrier, an
+  //- SCALE_DG_ZPKG override, the SCALE_DG_XYW ablation -- falls through to the
+  //- four-stage form, which is correct and is what those knobs measured
+  //- against anyway.  Say so when the depth was asked for explicitly.
+  if (zs3 != 0 && zs3_forced) {
+    std::fprintf(stderr,
+                 "launch_z_gemm_assembly: no three-stage carrier at Nq %d "
+                 "(xy_weighted %d, pkg %d, mma %d); using four\n", Nq,
+                 xy_weighted, pkg, mma_shape);
+  }
+  //- OUT-OF-ROLE ABLATION (SCALE_DG_XYW=0 at Nq > 64): the five-tensor
+  //- epilogue with the SAME three package ingredients the weighted Nq > 64
+  //- form uses (16-byte epilogue, clamp aggregation, 16-byte paired face
+  //- loads).  Keeping the package fixed is what makes this a one-axis
+  //- measurement of the Escale/deriv_x fold alone; it is also required for
+  //- correctness, because the driver still has elembnd_flux_kernel write the
+  //- interleaved face layout at Nq >= 64.
+  if (xy_weighted == 0 && pkg < 0 && mma_shape == 0 && Nq > 64) {
+    return run_z_gemm_assembly<MmaSet_884, false, true, true, true>(
+        dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, lift1d, lift_zpair,
+        escale, Nq, Ne);
   }
   if (pkg >= 0 && mma_shape == 0 && Nq == 64 && xy_weighted == 1) {
     DG_Z_ASM_PKG(MmaSet_884, true)
