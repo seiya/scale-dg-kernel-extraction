@@ -7,6 +7,25 @@
 // cuda_dg_kernels_fused.cu / cuda_dg_kernels_fused_highp.cu and must not
 // reuse TC thread counts (p=31 CC is 1024 threads, not P31_THREADS).
 
+// --------------------------------------------------------------------------
+// Out-of-role knob: give the UseTc=false (CUDAFORTRAN_FUSED_DFMA)
+// instantiation its own __launch_bounds__ minBlocks, i.e. its own register
+// budget.  AGENTS.md defines FUSED_DFMA as the same source as FUSED_TC with
+// UseTc=false, which makes the register budget shared as well; several orders
+// pay for that with a spill that exists only on the DFMA side.  Measuring the
+// price of the sharing needs a build in which it is not shared, so this knob
+// exists -- default 0, never in production dispatch.  Thread counts are never
+// touched, so the schedule is otherwise identical.  See
+// reports/dfma_register_budget.md.
+#ifndef DFMA_OWN_BPSM
+#define DFMA_OWN_BPSM 0
+#endif
+#if DFMA_OWN_BPSM
+#define TCDFMA_BPSM(tc, dfma) ((UseTc) ? (tc) : (dfma))
+#else
+#define TCDFMA_BPSM(tc, dfma) (tc)
+#endif
+
 #define NQ7 8
 #define NP7 512
 #define NFPTOT7 384
@@ -35,6 +54,9 @@
 #define P7_BPSM 6
 #endif
 #endif
+#ifndef P7_BPSM_DFMA
+#define P7_BPSM_DFMA P7_BPSM
+#endif
 // Section 23.9: hold the two D1D fragment elements in registers instead of
 // reloading them from sDfrag for every mma.  Section 14 rejected this at
 // KP = 1 because the 32-register budget forced a spill; the KP = 2 budget is
@@ -56,6 +78,12 @@
 #define NP15 4096
 #define NFPTOT15 1536
 #define P15_THREADS 1024
+#ifndef P15_MINB
+#define P15_MINB 1
+#endif
+#ifndef P15_MINB_DFMA
+#define P15_MINB_DFMA P15_MINB
+#endif
 
 #define NQ31 32
 #define NP31 32768
@@ -82,6 +110,9 @@
 #endif
 #ifndef P31_XZ_MINB
 #define P31_XZ_MINB 1
+#endif
+#ifndef P31_XZ_MINB_DFMA
+#define P31_XZ_MINB_DFMA P31_XZ_MINB
 #endif
 #define P31_XZ_WM (4 / P31_XZ_TM)
 #define P31_XZ_WN (4 / P31_XZ_TN)
@@ -111,6 +142,9 @@
 #ifndef P31_Y_MINB
 #define P31_Y_MINB 1
 #endif
+#ifndef P31_Y_MINB_DFMA
+#define P31_Y_MINB_DFMA P31_Y_MINB
+#endif
 #define P31_Y_WM (4 / P31_Y_TM)
 #define P31_Y_WN (4 / P31_Y_TN)
 #define P31_Y_THREADS (32 * P31_Y_WM * P31_Y_WN)
@@ -125,7 +159,12 @@
 #define P63_TN (8 / P63_WN)
 #define P63_THREADS (32 * 4 * P63_WN)
 #define P63_STAGE_ITERS (NQ63 * BK63 / P63_THREADS)
+#ifndef P63_BPSM
 #define P63_BPSM 1
+#endif
+#ifndef P63_BPSM_DFMA
+#define P63_BPSM_DFMA P63_BPSM
+#endif
 // p=63 xz chunk-loop pipelining, the same knob as P127_XZ_DB.  At the default
 // BK63 = NQ63 the loop runs once and there is nothing to pipeline; the switch
 // is only meaningful together with a smaller BK63, and measured that way it
@@ -142,7 +181,12 @@
 #define P63Y_TN (8 / P63Y_WN)
 #define P63Y_THREADS (32 * 4 * P63Y_WN)
 #define P63Y_STAGE_ITERS (NQ63 * BK63 / P63Y_THREADS)
+#ifndef P63Y_BPSM
 #define P63Y_BPSM 2
+#endif
+#ifndef P63Y_BPSM_DFMA
+#define P63Y_BPSM_DFMA P63Y_BPSM
+#endif
 
 #define NQ127 128
 #define NP127 2097152
@@ -160,6 +204,9 @@
 #endif
 #ifndef P127_Y_BPSM
 #define P127_Y_BPSM 2
+#endif
+#ifndef P127_Y_BPSM_DFMA
+#define P127_Y_BPSM_DFMA P127_Y_BPSM
 #endif
 #define P127_Y_WM (NQ127 / (8 * P127_Y_TM))
 #define P127_Y_WN (P127_MT / (8 * P127_Y_TN))
@@ -183,6 +230,9 @@
 #endif
 #ifndef P127_XZ_MINB
 #define P127_XZ_MINB 1
+#endif
+#ifndef P127_XZ_MINB_DFMA
+#define P127_XZ_MINB_DFMA P127_XZ_MINB
 #endif
 #define P127_XZ_WM (NQ127 / (8 * P127_XZ_TM))
 #define P127_XZ_WN (P127_MT / (8 * P127_XZ_TN))
@@ -222,6 +272,9 @@
 #endif
 #ifndef MINB255
 #define MINB255 3
+#endif
+#ifndef MINB255_DFMA
+#define MINB255_DFMA MINB255
 #endif
 #define P255_SMEM_BYTES ((size_t)2 * (BM255 + BN255) * BK255 * sizeof(double))
 #define P255_DYNSMEM (BK255 > 16)
