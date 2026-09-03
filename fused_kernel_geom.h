@@ -200,7 +200,9 @@
 #define NQ2_63 4096
 #define NFPTOT63 24576
 #define BK63 64
+#ifndef P63_WN
 #define P63_WN 4
+#endif
 #ifndef P63_WN_DFMA
 #define P63_WN_DFMA P63_WN
 #endif
@@ -229,7 +231,9 @@
 #define P63_XZ_DB 0
 #endif
 #define P63_XZ_NBUF (P63_XZ_DB + 1)
+#ifndef P63Y_WN
 #define P63Y_WN 4
+#endif
 #ifndef P63Y_WN_DFMA
 #define P63Y_WN_DFMA P63Y_WN
 #endif
