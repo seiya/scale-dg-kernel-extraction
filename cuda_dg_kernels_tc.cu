@@ -498,7 +498,7 @@ __global__ __launch_bounds__(P7_THREADS, TCDFMA_BPSM(P7_BPSM, P7_BPSM_DFMA)) voi
 // or its epilogue costs it a spill.  Measured in section 23 of
 // reports/tc_paper_survey_2407.09621.md.
 template <bool UseTc>
-__global__ __launch_bounds__(P7_THREADS, TCDFMA_BPSM(P7_BPSM, P7_BPSM_DFMA)) void tendency_fused_p7_tile_kernel(
+__global__ __launch_bounds__(P7_THREADS_SEL, TCDFMA_BPSM(P7_BPSM, P7_BPSM_DFMA)) void tendency_fused_p7_tile_kernel(
     double *dqdt, const double *D1D, const double *Lift1D, const double *q,
     const double *u, const double *v, const double *w, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale,
@@ -533,9 +533,9 @@ __global__ __launch_bounds__(P7_THREADS, TCDFMA_BPSM(P7_BPSM, P7_BPSM_DFMA)) voi
   const int tid = (int)threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  constexpr int KP = P7_TC_KP;
-  constexpr int THR = P7_THREADS;
-  constexpr int NWARP = P7_NWARP;
+  constexpr int KP = P7_KP_SEL;
+  constexpr int THR = P7_THREADS_SEL;
+  constexpr int NWARP = THR / 32;
   const int elem_offset = elem * 512;
   const int face_offset = elem * 384;
   const int npoint = 512 * Ne;
@@ -997,7 +997,7 @@ __device__ __forceinline__ void p255_epilogue(
 //     launch-bound combination that fits: 10-35% slower, all of them through
 //     registers and occupancy, never through the operand traffic they save.
 template <int DIR, int NQ, bool UseTc, bool FuseFace24>
-__global__ __launch_bounds__(TH255, TCDFMA_BPSM(MINB255, MINB255_DFMA)) void tendency_p255_kernel(
+__global__ __launch_bounds__(TH255_SEL, TCDFMA_BPSM(MINB255, MINB255_DFMA)) void tendency_p255_kernel(
     double *__restrict__ dqdt, const double *__restrict__ q,
     const double *__restrict__ velocity, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ flux_bnd,
@@ -1009,9 +1009,9 @@ __global__ __launch_bounds__(TH255, TCDFMA_BPSM(MINB255, MINB255_DFMA)) void ten
   constexpr int BM = BM255;
   constexpr int BN = BN255;
   constexpr int BK = BK255;
-  constexpr int TM = TM255;
-  constexpr int TN = TN255;
-  constexpr int THREADS = TH255;
+  constexpr int TM = TM255_SEL;
+  constexpr int TN = TN255_SEL;
+  constexpr int THREADS = TH255_SEL;
   constexpr int WM = BM / (8 * TM);
   constexpr int WN = BN / (8 * TN);
   // Staging iterations per thread.  Each one moves a double2, so the pair a
@@ -1313,7 +1313,7 @@ void launch_tendency_fused_p7_impl(
     const double *Escale, int Ne)
 {
 #if P7_TC_KP > 1
-  tendency_fused_p7_tile_kernel<UseTc><<<Ne, P7_THREADS, 0, dg_cuda_stream>>>(
+  tendency_fused_p7_tile_kernel<UseTc><<<Ne, P7_THREADS_SEL, 0, dg_cuda_stream>>>(
 #else
   tendency_fused_p7_kernel<UseTc><<<Ne, P7_THREADS, 0, dg_cuda_stream>>>(
 #endif
@@ -1375,13 +1375,13 @@ void launch_tendency_xyz_p255_impl(
   p255_set_smem<0, NQ255, UseTc, false>();
   p255_set_smem<1, NQ255, UseTc, false>();
   p255_set_smem<2, NQ255, UseTc, false>();
-  tendency_p255_kernel<0, NQ255, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
+  tendency_p255_kernel<0, NQ255, UseTc, false><<<nblock, TH255_SEL, P255_DYN_BYTES, dg_cuda_stream>>>(
       dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, v, w, nullptr, nullptr, nullptr,
       nullptr, Ne);
-  tendency_p255_kernel<1, NQ255, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
+  tendency_p255_kernel<1, NQ255, UseTc, false><<<nblock, TH255_SEL, P255_DYN_BYTES, dg_cuda_stream>>>(
       dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, nullptr, nullptr, nullptr,
       nullptr, nullptr, nullptr, Ne);
-  tendency_p255_kernel<2, NQ255, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
+  tendency_p255_kernel<2, NQ255, UseTc, false><<<nblock, TH255_SEL, P255_DYN_BYTES, dg_cuda_stream>>>(
       dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, nullptr, nullptr, nullptr,
       nullptr, nullptr, nullptr, Ne);
   check_cuda("p255 fused tendency kernels");
@@ -1425,15 +1425,15 @@ void launch_tendency_dir_p255_nq(
   p255_set_smem<1, NQ, UseTc, false>();
   p255_set_smem<2, NQ, UseTc, false>();
   if (dir == 0) {
-    tendency_p255_kernel<0, NQ, UseTc, true><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
+    tendency_p255_kernel<0, NQ, UseTc, true><<<nblock, TH255_SEL, P255_DYN_BYTES, dg_cuda_stream>>>(
         dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, v, w, VMapM, VMapP, normal_fn,
         Fscale, Ne);
   } else if (dir == 1) {
-    tendency_p255_kernel<1, NQ, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
+    tendency_p255_kernel<1, NQ, UseTc, false><<<nblock, TH255_SEL, P255_DYN_BYTES, dg_cuda_stream>>>(
         dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, v, w, VMapM, VMapP, normal_fn,
         Fscale, Ne);
   } else {
-    tendency_p255_kernel<2, NQ, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
+    tendency_p255_kernel<2, NQ, UseTc, false><<<nblock, TH255_SEL, P255_DYN_BYTES, dg_cuda_stream>>>(
         dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, v, w, VMapM, VMapP, normal_fn,
         Fscale, Ne);
   }
@@ -3086,7 +3086,7 @@ __global__ void pdl_elembnd_flux_kernel(
 }
 
 template <bool UseTc>
-__global__ __launch_bounds__(P63_THREADS, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFMA)) void tendency_fused_p63_xz_kernel(
+__global__ __launch_bounds__(P63_THREADS_SEL, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFMA)) void tendency_fused_p63_xz_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ w,
@@ -3125,9 +3125,9 @@ __global__ __launch_bounds__(P63_THREADS, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFMA)) 
   // Eight 8x8 tiles per warp in a 2x4 arrangement, for each of the two
   // directions: 2 + 4 operand loads per k-step instead of the 1 + 8 that a
   // 1x8 shape would need.
-  double ax[2 * 2 * P63_TN], az[2 * 2 * P63_TN];
+  double ax[2 * 2 * P63_TN_SEL], az[2 * 2 * P63_TN_SEL];
 #pragma unroll
-  for (int e = 0; e < 2 * 2 * P63_TN; ++e) {
+  for (int e = 0; e < 2 * 2 * P63_TN_SEL; ++e) {
     ax[e] = 0.0;
     az[e] = 0.0;
   }
@@ -3144,10 +3144,10 @@ __global__ __launch_bounds__(P63_THREADS, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFMA)) 
   // global.
 #define P63_XZ_FU_IDX(P) \
   const int ll = tid & (BK63 - 1);                                            \
-  const int o = (tid / BK63) + (P63_THREADS / BK63) * (P)
+  const int o = (tid / BK63) + (P63_THREADS_SEL / BK63) * (P)
 #define P63_XZ_DW_IDX(P) \
   const int o = tid & 63;                                                     \
-  const int ll = (tid >> 6) + (P63_THREADS / 64) * (P)
+  const int ll = (tid >> 6) + (P63_THREADS_SEL / 64) * (P)
 
 #if P63_XZ_DB
   // Double buffered, the form section 4.1 of p255_gap_study.md measured:
@@ -3155,18 +3155,18 @@ __global__ __launch_bounds__(P63_THREADS, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFMA)) 
   // instead of two, and the next chunk's global loads are in flight across
   // the whole mma loop.  The values stay raw in registers and the q*u and q*w
   // products happen at the store.
-  double pq[P63_STAGE_ITERS], pu[P63_STAGE_ITERS];
-  double pd[P63_STAGE_ITERS], pqw[P63_STAGE_ITERS], pw[P63_STAGE_ITERS];
+  double pq[P63_STAGE_ITERS_SEL], pu[P63_STAGE_ITERS_SEL];
+  double pd[P63_STAGE_ITERS_SEL], pqw[P63_STAGE_ITERS_SEL], pw[P63_STAGE_ITERS_SEL];
 #define P63_XZ_ISSUE(KK)                                                      \
   do {                                                                        \
-    _Pragma("unroll") for (int p = 0; p < P63_STAGE_ITERS; ++p)               \
+    _Pragma("unroll") for (int p = 0; p < P63_STAGE_ITERS_SEL; ++p)               \
     {                                                                         \
       P63_XZ_FU_IDX(p);                                                       \
       const int g = eo + ((KK) + ll) + plane_off + NQ2_63 * o;                \
       pq[p] = q[g];                                                           \
       pu[p] = u[g];                                                           \
     }                                                                         \
-    _Pragma("unroll") for (int p = 0; p < P63_STAGE_ITERS; ++p)               \
+    _Pragma("unroll") for (int p = 0; p < P63_STAGE_ITERS_SEL; ++p)               \
     {                                                                         \
       P63_XZ_DW_IDX(p);                                                       \
       pd[p] = D1D[o + NQ63 * ((KK) + ll)];                                    \
@@ -3177,12 +3177,12 @@ __global__ __launch_bounds__(P63_THREADS, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFMA)) 
   } while (0)
 #define P63_XZ_STORE(BUF)                                                     \
   do {                                                                        \
-    _Pragma("unroll") for (int p = 0; p < P63_STAGE_ITERS; ++p)               \
+    _Pragma("unroll") for (int p = 0; p < P63_STAGE_ITERS_SEL; ++p)               \
     {                                                                         \
       P63_XZ_FU_IDX(p);                                                       \
       sFU[(BUF) * P63_PANEL + swu63(o + BK63 * ll)] = pq[p] * pu[p];          \
     }                                                                         \
-    _Pragma("unroll") for (int p = 0; p < P63_STAGE_ITERS; ++p)               \
+    _Pragma("unroll") for (int p = 0; p < P63_STAGE_ITERS_SEL; ++p)               \
     {                                                                         \
       P63_XZ_DW_IDX(p);                                                       \
       sD[(BUF) * P63_PANEL + swt63(o + BK63 * ll)] = pd[p];                   \
@@ -3209,13 +3209,13 @@ __global__ __launch_bounds__(P63_THREADS, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFMA)) 
       __syncthreads();
     }
 #pragma unroll
-    for (int p = 0; p < P63_STAGE_ITERS; ++p) {
+    for (int p = 0; p < P63_STAGE_ITERS_SEL; ++p) {
       P63_XZ_FU_IDX(p);
       const int g = eo + (kk + ll) + plane_off + NQ2_63 * o;
       sFU[swu63(o + BK63 * ll)] = q[g] * u[g];
     }
 #pragma unroll
-    for (int p = 0; p < P63_STAGE_ITERS; ++p) {
+    for (int p = 0; p < P63_STAGE_ITERS_SEL; ++p) {
       P63_XZ_DW_IDX(p);
       sD[swt63(o + BK63 * ll)] = D1D[o + NQ63 * (kk + ll)];
       const int g = eo + o + plane_off + NQ2_63 * (kk + ll);
@@ -3227,7 +3227,7 @@ __global__ __launch_bounds__(P63_THREADS, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFMA)) 
 #pragma unroll
     for (int ks = 0; ks < BK63 / 4; ++ks) {
       const int l = 4 * ks + colk;
-      double av[2], bv[P63_TN], avz[2], bvz[P63_TN];
+      double av[2], bv[P63_TN_SEL], avz[2], bvz[P63_TN_SEL];
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
         const int m = 8 * (2 * wm + a) + row;
@@ -3235,16 +3235,16 @@ __global__ __launch_bounds__(P63_THREADS, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFMA)) 
         avz[a] = sD[buf * P63_PANEL + swt63(m + BK63 * l)];
       }
 #pragma unroll
-      for (int bb = 0; bb < P63_TN; ++bb) {
-        const int n = 8 * (P63_TN * wn + bb) + row;
+      for (int bb = 0; bb < P63_TN_SEL; ++bb) {
+        const int n = 8 * (P63_TN_SEL * wn + bb) + row;
         bv[bb] = sD[buf * P63_PANEL + swt63(n + BK63 * l)];
         bvz[bb] = sFW[buf * P63_PANEL + swt63(n + BK63 * l)];
       }
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
 #pragma unroll
-        for (int bb = 0; bb < P63_TN; ++bb) {
-          const int e = 2 * (P63_TN * a + bb);
+        for (int bb = 0; bb < P63_TN_SEL; ++bb) {
+          const int e = 2 * (P63_TN_SEL * a + bb);
           mma_m8n8k4_f64<UseTc>(ax[e], ax[e + 1], av[a], bv[bb], ax[e], ax[e + 1]);
           mma_m8n8k4_f64<UseTc>(az[e], az[e + 1], avz[a], bvz[bb], az[e], az[e + 1]);
         }
@@ -3277,11 +3277,11 @@ __global__ __launch_bounds__(P63_THREADS, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFMA)) 
   const double lf3 = Lift1D[jp + 2 * NQ63];
 
 #pragma unroll
-  for (int e8 = 0; e8 < 2 * P63_TN; ++e8) {
-    const int a = e8 / P63_TN;
-    const int bb = e8 % P63_TN;
+  for (int e8 = 0; e8 < 2 * P63_TN_SEL; ++e8) {
+    const int a = e8 / P63_TN_SEL;
+    const int bb = e8 % P63_TN_SEL;
     const int m = 8 * (2 * wm + a) + row;                 // k
-    const int n = 8 * (P63_TN * wn + bb) + 2 * colk;      // i, and i+1
+    const int n = 8 * (P63_TN_SEL * wn + bb) + 2 * colk;      // i, and i+1
     const int node = eo + n + plane_off + NQ2_63 * m;
 
     const double2 ex = *reinterpret_cast<const double2 *>(Escale + node);
@@ -3326,7 +3326,7 @@ __global__ __launch_bounds__(P63_THREADS, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFMA)) 
 // which is the z contraction of the first kernel with (i,j) in place of (i,k),
 // so the same two panel shapes and the same swizzle serve it.
 template <bool UseTc>
-__global__ __launch_bounds__(P63Y_THREADS, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_DFMA)) void tendency_fused_p63_y_kernel(
+__global__ __launch_bounds__(P63Y_THREADS_SEL, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_DFMA)) void tendency_fused_p63_y_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
@@ -3357,9 +3357,9 @@ __global__ __launch_bounds__(P63Y_THREADS, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_DFMA
   const int npoint = NP63 * Ne;
   const int plane_off = NQ2_63 * kp;
 
-  double acc[2 * 2 * P63Y_TN];
+  double acc[2 * 2 * P63Y_TN_SEL];
 #pragma unroll
-  for (int e = 0; e < 2 * 2 * P63Y_TN; ++e) {
+  for (int e = 0; e < 2 * 2 * P63Y_TN_SEL; ++e) {
     acc[e] = 0.0;
   }
 
@@ -3375,10 +3375,10 @@ __global__ __launch_bounds__(P63Y_THREADS, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_DFMA
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
 #pragma unroll
-  for (int e8 = 0; e8 < 2 * P63Y_TN; ++e8) {
-    const int a = e8 / P63Y_TN;
-    const int bb = e8 % P63Y_TN;
-    const int loc = (8 * (P63Y_TN * wn + bb) + 2 * colk) +
+  for (int e8 = 0; e8 < 2 * P63Y_TN_SEL; ++e8) {
+    const int a = e8 / P63Y_TN_SEL;
+    const int bb = e8 % P63Y_TN_SEL;
+    const int loc = (8 * (P63Y_TN_SEL * wn + bb) + 2 * colk) +
                     NQ63 * (8 * (2 * wm + a) + row);
     cp_async_16(sDQ + loc, dqdt + eo + plane_off + loc);
   }
@@ -3389,9 +3389,9 @@ __global__ __launch_bounds__(P63Y_THREADS, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_DFMA
       __syncthreads();
     }
 #pragma unroll
-    for (int p = 0; p < P63Y_STAGE_ITERS; ++p) {
+    for (int p = 0; p < P63Y_STAGE_ITERS_SEL; ++p) {
       const int o = tid & 63;
-      const int ll = (tid >> 6) + (P63Y_THREADS / 64) * p;
+      const int ll = (tid >> 6) + (P63Y_THREADS_SEL / 64) * p;
       sD[swt63(o + BK63 * ll)] = D1D[o + NQ63 * (kk + ll)];
       const int g = eo + o + NQ63 * (kk + ll) + plane_off;
       sFV[sw63(ll + BK63 * o)] = q[g] * v[g];
@@ -3401,20 +3401,20 @@ __global__ __launch_bounds__(P63Y_THREADS, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_DFMA
 #pragma unroll
     for (int ks = 0; ks < BK63 / 4; ++ks) {
       const int l = 4 * ks + colk;
-      double av[2], bv[P63Y_TN];
+      double av[2], bv[P63Y_TN_SEL];
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
         av[a] = sD[swt63((8 * (2 * wm + a) + row) + BK63 * l)];
       }
 #pragma unroll
-      for (int bb = 0; bb < P63Y_TN; ++bb) {
-        bv[bb] = sFV[sw63(l + BK63 * (8 * (P63Y_TN * wn + bb) + row))];
+      for (int bb = 0; bb < P63Y_TN_SEL; ++bb) {
+        bv[bb] = sFV[sw63(l + BK63 * (8 * (P63Y_TN_SEL * wn + bb) + row))];
       }
 #pragma unroll
       for (int a = 0; a < 2; ++a) {
 #pragma unroll
-        for (int bb = 0; bb < P63Y_TN; ++bb) {
-          const int e = 2 * (P63Y_TN * a + bb);
+        for (int bb = 0; bb < P63Y_TN_SEL; ++bb) {
+          const int e = 2 * (P63Y_TN_SEL * a + bb);
           mma_m8n8k4_f64<UseTc>(acc[e], acc[e + 1], av[a], bv[bb], acc[e], acc[e + 1]);
         }
       }
@@ -3424,11 +3424,11 @@ __global__ __launch_bounds__(P63Y_THREADS, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_DFMA
   asm volatile("cp.async.wait_group 0;\n" ::);
 
 #pragma unroll
-  for (int e8 = 0; e8 < 2 * P63Y_TN; ++e8) {
-    const int a = e8 / P63Y_TN;
-    const int bb = e8 % P63Y_TN;
+  for (int e8 = 0; e8 < 2 * P63Y_TN_SEL; ++e8) {
+    const int a = e8 / P63Y_TN_SEL;
+    const int bb = e8 % P63Y_TN_SEL;
     const int m = 8 * (2 * wm + a) + row;                 // j
-    const int n = 8 * (P63Y_TN * wn + bb) + 2 * colk;      // i, and i+1
+    const int n = 8 * (P63Y_TN_SEL * wn + bb) + 2 * colk;      // i, and i+1
     const int node = eo + n + NQ63 * m + plane_off;
     const double2 ey =
         *reinterpret_cast<const double2 *>(Escale + node + npoint);
@@ -3482,7 +3482,7 @@ void launch_tendency_fused_p63_impl(
     cudaLaunchConfig_t cfg = {};
     cudaLaunchAttribute attr[1];
     cfg.gridDim = dim3(nblock);
-    cfg.blockDim = dim3(P63_THREADS);
+    cfg.blockDim = dim3(P63_THREADS_SEL);
     cfg.dynamicSmemBytes = (unsigned)smem_xz;
     cfg.stream = dg_cuda_stream;
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -3497,7 +3497,7 @@ void launch_tendency_fused_p63_impl(
       <<<nblock_face, FACE_THREADS, 0, dg_cuda_stream>>>(
           flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface);
   tendency_fused_p63_xz_kernel<UseTc>
-      <<<nblock, P63_THREADS, smem_xz, dg_cuda_stream>>>(
+      <<<nblock, P63_THREADS_SEL, smem_xz, dg_cuda_stream>>>(
           dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
 #endif
 #if P63_PDL_STAGE >= 3
@@ -3505,7 +3505,7 @@ void launch_tendency_fused_p63_impl(
     cudaLaunchConfig_t ycfg = {};
     cudaLaunchAttribute yattr[1];
     ycfg.gridDim = dim3(nblock);
-    ycfg.blockDim = dim3(P63Y_THREADS);
+    ycfg.blockDim = dim3(P63Y_THREADS_SEL);
     ycfg.dynamicSmemBytes = (unsigned)smem_y;
     ycfg.stream = dg_cuda_stream;
     yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -3517,7 +3517,7 @@ void launch_tendency_fused_p63_impl(
   }
 #else
   tendency_fused_p63_y_kernel<UseTc>
-      <<<nblock, P63Y_THREADS, smem_y, dg_cuda_stream>>>(dqdt, D1D, q, v,
+      <<<nblock, P63Y_THREADS_SEL, smem_y, dg_cuda_stream>>>(dqdt, D1D, q, v,
                                                          Escale, Ne);
 #endif
   check_cuda("tendency_fused_p63 kernels");
@@ -3685,16 +3685,17 @@ __device__ __forceinline__ int sw127(int idx)
 // because this kernel holds x and z at once.  See section 23 of
 // p127_gap_study.md for the sweep.
 template <bool UseTc>
-__global__ __launch_bounds__(P127_XZ_THREADS, TCDFMA_BPSM(P127_XZ_MINB, P127_XZ_MINB_DFMA)) void tendency_fused_p127_xz_kernel(
+__global__ __launch_bounds__(P127_XZ_THREADS_SEL, TCDFMA_BPSM(P127_XZ_MINB, P127_XZ_MINB_DFMA)) void tendency_fused_p127_xz_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
     const double *__restrict__ u, const double *__restrict__ w,
     const double *__restrict__ flux_bnd, const double *__restrict__ Escale,
     int Ne)
 {
-  constexpr int TM = P127_XZ_TM;
-  constexpr int TN = P127_XZ_TN;
-  constexpr int THREADS = P127_XZ_THREADS;
+  constexpr int TM = P127_XZ_TM_SEL;
+  constexpr int TN = P127_XZ_TN_SEL;
+  constexpr int THREADS = P127_XZ_THREADS_SEL;
+  constexpr int XZ_WM = P127_XZ_WM_SEL;
   constexpr int NBUF = P127_XZ_NBUF;
   constexpr int PANEL = NQ127 * BKD127;
   constexpr int NSTAGE = PANEL / THREADS;
@@ -3716,8 +3717,8 @@ __global__ __launch_bounds__(P127_XZ_THREADS, TCDFMA_BPSM(P127_XZ_MINB, P127_XZ_
   const int tid = (int)threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  const int wm = warp % P127_XZ_WM;
-  const int wn = warp / P127_XZ_WM;
+  const int wm = warp % XZ_WM;
+  const int wn = warp / XZ_WM;
   const int row = lane >> 2;
   const int colk = lane & 3;
 
@@ -3977,7 +3978,7 @@ __global__ __launch_bounds__(P127_XZ_THREADS, TCDFMA_BPSM(P127_XZ_MINB, P127_XZ_
 // kernel with (i,j) in place of (i,k), so only the A panel of the two is
 // needed and the block holds 64 KB.
 template <bool UseTc>
-__global__ __launch_bounds__(P127_Y_THREADS, TCDFMA_BPSM(P127_Y_BPSM, P127_Y_BPSM_DFMA)) void tendency_fused_p127_y_kernel(
+__global__ __launch_bounds__(P127_Y_THREADS_SEL, TCDFMA_BPSM(P127_Y_BPSM, P127_Y_BPSM_DFMA)) void tendency_fused_p127_y_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ q, const double *__restrict__ v,
     const double *__restrict__ Escale, int Ne)
@@ -4001,8 +4002,8 @@ __global__ __launch_bounds__(P127_Y_THREADS, TCDFMA_BPSM(P127_Y_BPSM, P127_Y_BPS
   // 16 warps in a 4 x 4 grid with 4x2 mma tiles.  512 threads x 64 registers
   // and 96 KB shared both allow 2 blocks/SM, which the 1024-thread 128 KB
   // shape could not.  ncu job 70955: Block Limit Registers = Shared Mem = 2.
-  const int wm = warp % P127_Y_WM;
-  const int wn = warp / P127_Y_WM;
+  const int wm = warp % P127_Y_WM_SEL;
+  const int wn = warp / P127_Y_WM_SEL;
   const int row = lane >> 2;
   const int colk = lane & 3;
 
@@ -4010,8 +4011,8 @@ __global__ __launch_bounds__(P127_Y_THREADS, TCDFMA_BPSM(P127_Y_BPSM, P127_Y_BPS
   const int npoint = NP127 * Ne;
   const int plane_off = NQ2_127 * kp;
 
-  constexpr int TM = P127_Y_TM;
-  constexpr int TN = P127_Y_TN;
+  constexpr int TM = P127_Y_TM_SEL;
+  constexpr int TN = P127_Y_TN_SEL;
   double acc[2 * TM * TN];
 #pragma unroll
   for (int e = 0; e < 2 * TM * TN; ++e) {
@@ -4032,9 +4033,9 @@ __global__ __launch_bounds__(P127_Y_THREADS, TCDFMA_BPSM(P127_Y_BPSM, P127_Y_BPS
 
   // sFV[i][l] = q*v at (ibase+i, l, kp), staged once at the full depth.
 #pragma unroll
-  for (int p = 0; p < P127_Y_FSTAGE_ITERS; ++p) {
+  for (int p = 0; p < P127_Y_FSTAGE_ITERS_SEL; ++p) {
     const int o = tid & (P127_MT - 1);
-    const int ll = (tid / P127_MT) + (P127_Y_THREADS / P127_MT) * p;
+    const int ll = (tid / P127_MT) + (P127_Y_THREADS_SEL / P127_MT) * p;
     const int g = eo + (ibase + o) + NQ127 * ll + plane_off;
     sFV[sw127(ll + NQ127 * o)] = q[g] * v[g];
   }
@@ -4047,10 +4048,10 @@ __global__ __launch_bounds__(P127_Y_THREADS, TCDFMA_BPSM(P127_Y_BPSM, P127_Y_BPS
   do {                                                                        \
     const int lbase = (BUF) * HALF;                                           \
     _Pragma("unroll") for (int p = 0;                                         \
-                           p < HALF * NQ127 / (2 * P127_Y_THREADS); ++p)      \
+                           p < HALF * NQ127 / (2 * P127_Y_THREADS_SEL); ++p)      \
     {                                                                         \
       const int o = (tid & 63) * 2;                                           \
-      const int ll = (tid / 64) + (P127_Y_THREADS / 64) * p;                  \
+      const int ll = (tid / 64) + (P127_Y_THREADS_SEL / 64) * p;                  \
       cp_async_16(&sDm[swt128(o + NQ127 * (lbase + ll))],                     \
                   D1D + o + NQ127 * ((KK) + ll));                             \
     }                                                                         \
@@ -4157,7 +4158,7 @@ void launch_tendency_fused_p127_impl(
     cudaLaunchConfig_t cfg = {};
     cudaLaunchAttribute attr[1];
     cfg.gridDim = dim3(nblock);
-    cfg.blockDim = dim3(P127_XZ_THREADS);
+    cfg.blockDim = dim3(P127_XZ_THREADS_SEL);
     cfg.dynamicSmemBytes = (unsigned)smem_xz;
     cfg.stream = dg_cuda_stream;
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -4171,7 +4172,7 @@ void launch_tendency_fused_p127_impl(
     cudaLaunchConfig_t ycfg = {};
     cudaLaunchAttribute yattr[1];
     ycfg.gridDim = dim3(nblock_y);
-    ycfg.blockDim = dim3(P127_Y_THREADS);
+    ycfg.blockDim = dim3(P127_Y_THREADS_SEL);
     ycfg.dynamicSmemBytes = (unsigned)smem_y;
     ycfg.stream = dg_cuda_stream;
     yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;

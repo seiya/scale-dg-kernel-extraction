@@ -26,6 +26,45 @@
 #define TCDFMA_BPSM(tc, dfma) (tc)
 #endif
 
+// --------------------------------------------------------------------------
+// Out-of-role knob, one step further than DFMA_OWN_BPSM: give the UseTc=false
+// instantiation its own warp tile, and therefore its own thread count.  This
+// is NOT what AGENTS.md's iso-schedule ablation measures -- with a different
+// block shape the schedule is no longer the same, so nothing built with this
+// knob may be published as the main ratio A.  It exists to answer one
+// question the minBlocks sweep could not: the p=127 xz kernel is already at
+// minBlocks=1 and still spills 112 B, because 512 threads cap a thread at
+// 128 registers.  Only a smaller thread count can lift that cap.
+//
+// What stays fixed in every setting below, so that the variant is still the
+// same algorithm and the same data traffic:
+//   * the block tile, the shared-memory panels and their swizzles,
+//   * the chunk depth (BKD127 / BK63 / BK255 / BKDY127) and the double
+//     buffering,
+//   * the grid, i.e. how many blocks cover the element,
+//   * the summation order inside a thread's own inner product.
+// What changes is only how the block's output tile is cut into warps and
+// threads: the accumulator count per thread, the staging iteration count and
+// the register cap that follows from the thread count.  Because the reduction
+// each accumulator performs is unchanged, the arithmetic is bit-identical;
+// only which thread computes which output moves.
+//
+// p=7 is restricted to P7_TC_KP in {2, 4}: KP=1 selects a different kernel
+// (tendency_fused_p7_kernel instead of the tile kernel), which would be an
+// algorithm change and not a thread-count change.
+//
+// Default 0 -> every SEL macro collapses to the production TC value and the
+// SASS is byte-identical.  Never in production dispatch.
+// See reports/dfma_register_budget.md section 11.
+#ifndef DFMA_OWN_SHAPE
+#define DFMA_OWN_SHAPE 0
+#endif
+#if DFMA_OWN_SHAPE
+#define TCDFMA_SHAPE(tc, dfma) ((UseTc) ? (tc) : (dfma))
+#else
+#define TCDFMA_SHAPE(tc, dfma) (tc)
+#endif
+
 #define NQ7 8
 #define NP7 512
 #define NFPTOT7 384
@@ -42,8 +81,14 @@
 #ifndef P7_TC_KP
 #define P7_TC_KP 2
 #endif
+#ifndef P7_TC_KP_DFMA
+#define P7_TC_KP_DFMA P7_TC_KP
+#endif
 #define P7_THREADS (256 / P7_TC_KP)
 #define P7_NWARP (P7_THREADS / 32)
+// UseTc-dependent forms (DFMA_OWN_SHAPE; collapse to the TC values at 0).
+#define P7_KP_SEL TCDFMA_SHAPE(P7_TC_KP, P7_TC_KP_DFMA)
+#define P7_THREADS_SEL (256 / P7_KP_SEL)
 // Overridable so the out-of-role m16n8k8 ablation below can be built at all:
 // ptxas refuses "mma with .f64 type and shape .m16n8k8" under the 32-register
 // target that __launch_bounds__(256, 8) implies.
@@ -156,8 +201,15 @@
 #define NFPTOT63 24576
 #define BK63 64
 #define P63_WN 4
+#ifndef P63_WN_DFMA
+#define P63_WN_DFMA P63_WN
+#endif
 #define P63_TN (8 / P63_WN)
 #define P63_THREADS (32 * 4 * P63_WN)
+#define P63_WN_SEL TCDFMA_SHAPE(P63_WN, P63_WN_DFMA)
+#define P63_TN_SEL (8 / P63_WN_SEL)
+#define P63_THREADS_SEL (32 * 4 * P63_WN_SEL)
+#define P63_STAGE_ITERS_SEL (NQ63 * BK63 / P63_THREADS_SEL)
 #define P63_STAGE_ITERS (NQ63 * BK63 / P63_THREADS)
 #ifndef P63_BPSM
 #define P63_BPSM 1
@@ -178,8 +230,15 @@
 #endif
 #define P63_XZ_NBUF (P63_XZ_DB + 1)
 #define P63Y_WN 4
+#ifndef P63Y_WN_DFMA
+#define P63Y_WN_DFMA P63Y_WN
+#endif
 #define P63Y_TN (8 / P63Y_WN)
 #define P63Y_THREADS (32 * 4 * P63Y_WN)
+#define P63Y_WN_SEL TCDFMA_SHAPE(P63Y_WN, P63Y_WN_DFMA)
+#define P63Y_TN_SEL (8 / P63Y_WN_SEL)
+#define P63Y_THREADS_SEL (32 * 4 * P63Y_WN_SEL)
+#define P63Y_STAGE_ITERS_SEL (NQ63 * BK63 / P63Y_THREADS_SEL)
 #define P63Y_STAGE_ITERS (NQ63 * BK63 / P63Y_THREADS)
 #ifndef P63Y_BPSM
 #define P63Y_BPSM 2
@@ -208,9 +267,21 @@
 #ifndef P127_Y_BPSM_DFMA
 #define P127_Y_BPSM_DFMA P127_Y_BPSM
 #endif
+#ifndef P127_Y_TM_DFMA
+#define P127_Y_TM_DFMA P127_Y_TM
+#endif
+#ifndef P127_Y_TN_DFMA
+#define P127_Y_TN_DFMA P127_Y_TN
+#endif
 #define P127_Y_WM (NQ127 / (8 * P127_Y_TM))
 #define P127_Y_WN (P127_MT / (8 * P127_Y_TN))
 #define P127_Y_THREADS (32 * P127_Y_WM * P127_Y_WN)
+#define P127_Y_TM_SEL TCDFMA_SHAPE(P127_Y_TM, P127_Y_TM_DFMA)
+#define P127_Y_TN_SEL TCDFMA_SHAPE(P127_Y_TN, P127_Y_TN_DFMA)
+#define P127_Y_WM_SEL (NQ127 / (8 * P127_Y_TM_SEL))
+#define P127_Y_WN_SEL (P127_MT / (8 * P127_Y_TN_SEL))
+#define P127_Y_THREADS_SEL (32 * P127_Y_WM_SEL * P127_Y_WN_SEL)
+#define P127_Y_FSTAGE_ITERS_SEL (P127_MT * NQ127 / P127_Y_THREADS_SEL)
 #define BKDY127 32
 #define P127_Y_FSTAGE_ITERS (P127_MT * NQ127 / P127_Y_THREADS)
 // p=127 xz warp shape and chunk-loop pipelining.  The block tile is 128x64
@@ -251,9 +322,20 @@
 #ifndef P127_XZ_ABLATE_PF
 #define P127_XZ_ABLATE_PF 0
 #endif
+#ifndef P127_XZ_TM_DFMA
+#define P127_XZ_TM_DFMA P127_XZ_TM
+#endif
+#ifndef P127_XZ_TN_DFMA
+#define P127_XZ_TN_DFMA P127_XZ_TN
+#endif
 #define P127_XZ_WM (NQ127 / (8 * P127_XZ_TM))
 #define P127_XZ_WN (P127_MT / (8 * P127_XZ_TN))
 #define P127_XZ_THREADS (32 * P127_XZ_WM * P127_XZ_WN)
+#define P127_XZ_TM_SEL TCDFMA_SHAPE(P127_XZ_TM, P127_XZ_TM_DFMA)
+#define P127_XZ_TN_SEL TCDFMA_SHAPE(P127_XZ_TN, P127_XZ_TN_DFMA)
+#define P127_XZ_WM_SEL (NQ127 / (8 * P127_XZ_TM_SEL))
+#define P127_XZ_WN_SEL (P127_MT / (8 * P127_XZ_TN_SEL))
+#define P127_XZ_THREADS_SEL (32 * P127_XZ_WM_SEL * P127_XZ_WN_SEL)
 #define P127_XZ_NBUF (P127_XZ_DB + 1)
 
 #define NQ255 256
@@ -284,9 +366,18 @@
 #ifndef TN255
 #define TN255 4
 #endif
+#ifndef TM255_DFMA
+#define TM255_DFMA TM255
+#endif
+#ifndef TN255_DFMA
+#define TN255_DFMA TN255
+#endif
 #ifndef TH255
 #define TH255 128
 #endif
+#define TM255_SEL TCDFMA_SHAPE(TM255, TM255_DFMA)
+#define TN255_SEL TCDFMA_SHAPE(TN255, TN255_DFMA)
+#define TH255_SEL (32 * (BM255 / (8 * TM255_SEL)) * (BN255 / (8 * TN255_SEL)))
 #ifndef MINB255
 #define MINB255 3
 #endif
