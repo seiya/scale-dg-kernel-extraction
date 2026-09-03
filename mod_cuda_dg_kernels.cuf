@@ -494,6 +494,16 @@ module mod_cuda_dg_kernels
   integer, save :: zskip_env = -2, cskip_env = -2, fskip_env = -2, vskip_env = -2
   integer, save :: fluxfuse_env = -2, gvolpar_env = -2
   integer, save :: cutepar_env = -2
+  !- zs3_env is the shared z mainloop depth: -1 (the default) takes the
+  !- per-order table in z_stage3_default(), 0 forces four stages and 1 forces
+  !- three.  It is NOT an out-of-role knob -- the table is production, and the
+  !- override exists so the A/B of section 12 can be repeated.  The two below
+  !- ARE out-of-role ablations, default off and unreachable from any
+  !- DqdtKernel_Type.  xyw_env:
+  !- turn the Nq > 64 Escale/deriv_x fold off so the two non-carrier
+  !- volume GEMMs become independent again.  xyovl_env: with the fold
+  !- off, run y beside x on the second side stream.
+  integer, save :: zs3_env = -2, xyw_env = -2, xyovl_env = -2
 
   public :: cuda_cal_volume_flux
   public :: cuda_cal_volume_deriv
@@ -967,9 +977,9 @@ module mod_cuda_dg_kernels
     end function launch_volume_gemm_y
 
     function launch_volume_gemm_z(deriv_z, flux_z, D1D_tr, &
-      Nq, Ne, mma_shape, tile) bind(C, name="launch_volume_gemm_z")
+      Nq, Ne, mma_shape, tile, zs3) bind(C, name="launch_volume_gemm_z")
       import
-      integer(c_int), value :: Nq, Ne, mma_shape, tile
+      integer(c_int), value :: Nq, Ne, mma_shape, tile, zs3
       real(c_double), device :: deriv_z(*)
       real(c_double), device :: flux_z(*)
       real(c_double), device :: D1D_tr(*)
@@ -978,10 +988,10 @@ module mod_cuda_dg_kernels
 
     function launch_z_gemm_assembly(dqdt, flux_z, D1D_tr, deriv_x, deriv_y, &
       flux_bnd, lift1d, lift_zpair, escale, Nq, Ne, mma_shape, xy_weighted, &
-      pkg) &
+      pkg, zs3) &
       bind(C, name="launch_z_gemm_assembly")
       import
-      integer(c_int), value :: Nq, Ne, mma_shape, xy_weighted, pkg
+      integer(c_int), value :: Nq, Ne, mma_shape, xy_weighted, pkg, zs3
       real(c_double), device :: dqdt(*)
       real(c_double), device :: flux_z(*), D1D_tr(*)
       real(c_double), device :: deriv_x(*), deriv_y(*), escale(*)
@@ -2275,7 +2285,8 @@ contains
         0_c_long_long, 0.0_c_double, deriv_z, Nq*Nq, int(Np,c_long_long), Ne)
     else
       istat = launch_volume_gemm_z(deriv_z, flux_z, D1D_tr, Nq, Ne, &
-        cutlass_mma_shape_id, plan%z_tile)
+        cutlass_mma_shape_id, plan%z_tile, &
+        dg_env_int("SCALE_DG_ZS3", zs3_env, -1))
     end if
   end subroutine launch_volume_gemm_z_common
 
@@ -2859,6 +2870,15 @@ contains
     xy_weighted = 0
     pair_nq2 = 0
     if (fuse_epilogue .and. Nq >= 64) xy_weighted = 1
+    !- OUT-OF-ROLE ABLATION (SCALE_DG_XYW = 0, Nq > 64 only; default -1 keeps
+    !- the table).  The Nq >= 64 condition above is a single bracket, but it
+    !- was only ever measured at Nq = 64 (p63_gap_study.md section 25) and
+    !- rejected at Nq = 32.  With the fold off, x and y are plain unweighted
+    !- GEMMs, the carrier reads five volume tensors again, and the two
+    !- non-carriers become independent -- which is what SCALE_DG_XYOVL then
+    !- exploits.  Not reachable from any DqdtKernel_Type.
+    if (fuse_epilogue .and. Nq > 64 .and. &
+        dg_env_int("SCALE_DG_XYW", xyw_env, -1) == 0) xy_weighted = 0
     ! The whole volume-GEMM assignment for this order and path, resolved once:
     ! x library / tile / weighting, y library, which GEMM carries the fused
     ! assembly epilogue (0 = z, 1 = y), z library and the y-carrier schedule.
@@ -2927,8 +2947,14 @@ contains
     if (carrier >= 1) p31_early_face = .true.
     use_side = dg_side_enabled .and. &
       ((Nq >= 64) .or. p31_early_face)
-    overlap_y = fuse_epilogue .and. dg_side_enabled .and. (Nq < 64) .and. &
-      (carrier == 0)
+    overlap_y = fuse_epilogue .and. dg_side_enabled .and. (carrier == 0) .and. &
+      (Nq < 64)
+    !- ABLATION twin of the above (SCALE_DG_XYOVL = 1, default 0): once the
+    !- Nq > 64 fold is off, y no longer reads deriv_x, so the two non-carrier
+    !- volume GEMMs can be overlapped exactly as Nq < 64 overlaps them.
+    if (fuse_epilogue .and. dg_side_enabled .and. carrier == 0 .and. &
+        Nq > 64 .and. xy_weighted == 0 .and. &
+        dg_env_int("SCALE_DG_XYOVL", xyovl_env, 0) == 1) overlap_y = .true.
     overlap_z = (carrier == 1) .and. dg_side_enabled .and. (ysched == 1)
     !- x carrier: y and z both precede the carrier, so the pair that can run
     !- concurrently is y beside z (SCALE_DG_YSCHED = 1), not y or z beside x.
@@ -3070,6 +3096,32 @@ contains
             if (istat /= 0) call cuda_failure("launch_volume_gemm_y",istat)
           end if
         end if
+      else if (xy_weighted == 0) then
+        !- ABLATION (SCALE_DG_XYW=0): the Nq > 64 fold turned off.  x and y
+        !- are the plain unweighted GEMMs GEMM_CUTE runs -- same tiles, same
+        !- stage counts, same libraries -- and the carrier's epilogue applies
+        !- all three Escale factors itself.  With XYOVL=1 y also moves to the
+        !- second side stream, which the fold makes impossible.
+        if (overlap_y) then
+          call dg_set_cuda_stream(dg_side2_stream)
+          call launch_volume_gemm_y_common( plan, &
+            deriv_y, flux_y, D1D_tr, Escale(1,1,2), Nq, Ne, istat )
+          call dg_set_cuda_stream(dg_stream)
+          if (istat /= 0) call cuda_failure("launch_volume_gemm_y(xyw,side2)",istat)
+        end if
+        if (plan%x_mode /= 0) then
+          call launch_volume_gemm_x_common( plan, &
+            deriv_x, flux_x, D1D, Escale, Nq, Np, Ne, istat )
+        else
+          istat = launch_volume_gemm_x( &
+            deriv_x, flux_x, D1D, Nq, Ne, cutlass_mma_shape_id )
+        end if
+        if (istat /= 0) call cuda_failure("x-deriv (xyw)",istat)
+        if (.not. overlap_y) then
+          call launch_volume_gemm_y_common( plan, &
+            deriv_y, flux_y, D1D_tr, Escale(1,1,2), Nq, Ne, istat )
+          if (istat /= 0) call cuda_failure("launch_volume_gemm_y(xyw)",istat)
+        end if
       else
         istat = launch_volume_gemm_xy( &
           deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, Escale, Nq, Ne, &
@@ -3174,13 +3226,13 @@ contains
         istat = launch_z_gemm_assembly( &
           dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, Lift1D, &
           dg_lift_zpair, Escale, Nq, Ne, cutlass_mma_shape_id, xy_weighted, &
-          plan%zpkg )
+          plan%zpkg, dg_env_int("SCALE_DG_ZS3", zs3_env, -1) )
         if (istat /= 0) call cuda_failure("launch_z_gemm_assembly",istat)
       else
         istat = launch_z_gemm_assembly( &
           dqdt, flux_z, D1D_tr, deriv_x, deriv_y, flux_bnd, Lift1D, &
           Lift1D, Escale, Nq, Ne, cutlass_mma_shape_id, xy_weighted, &
-          plan%zpkg )
+          plan%zpkg, dg_env_int("SCALE_DG_ZS3", zs3_env, -1) )
         if (istat /= 0) call cuda_failure("launch_z_gemm_assembly",istat)
       end if
     else
