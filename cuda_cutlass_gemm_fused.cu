@@ -428,6 +428,31 @@ using P15ZTile9 = ZTile<32, 64, 32, 32, 16, 3>;
 using P15ZTile10 = ZTile<16, 128, 16, 64, 16, 4>;
 using P15ZTile11 = ZTile<16, 256, 16, 32, 16, 3>;
 
+//- Generic (Nq >= 32) plain-z candidates.  ABLATION ONLY, for the CTA
+//- fixed-cost study of reports/gemm_assignment_and_carrier.md section 10.10:
+//- the adopted plan keeps z_tile = -1 at every order, so production dispatch
+//- never reaches these and GEMM_CUTE / GEMM_FUSED keep one shared mainloop.
+//- Tile 0 IS the shape VolumeGemmSet::GemmZ already uses, so SCALE_DG_ZTILE=0
+//- and the default must measure the same.  1..4 vary ONLY the multistage
+//- depth and 8 only the mainloop K step: both move the mainloop PROLOGUE
+//- (pipeline fill) and leave the CTA count, hence the last-wave TAIL,
+//- untouched.  5 keeps the depth and halves the CTA count (TbN 32 -> 64),
+//- which moves the tail and leaves the prologue untouched; 7 keeps the CTA
+//- count and doubles the warps per CTA.  6 widens TbM instead, which halves
+//- the CTA count only where Nq > 64 and otherwise predicates half the tile
+//- away -- it is a predication control, not a tail control.  Stages = 2 is
+//- not instantiable: CUTLASS routes it to the two-stage pipelined MmaCore,
+//- which is ambiguous for FP64 TensorOp.
+using ZG0 = ZTile<64, 32, 32, 32, 16, 4>;
+using ZG1 = ZTile<64, 32, 32, 32, 16, 3>;
+using ZG2 = ZTile<64, 32, 32, 32, 16, 5>;
+using ZG3 = ZTile<64, 32, 32, 32, 16, 6>;
+using ZG4 = ZTile<64, 32, 32, 32, 16, 8>;
+using ZG5 = ZTile<64, 64, 32, 32, 16, 4>;
+using ZG6 = ZTile<128, 32, 32, 32, 16, 4>;
+using ZG7 = ZTile<64, 32, 16, 32, 16, 4>;
+using ZG8 = ZTile<64, 32, 32, 32, 32, 4>;
+
 //- Nq=16 leaves the generic tiles as predicated as Nq=8 does: the y GEMM is
 //- 16x16x16 per batch against a 64x64 tile, and the z / z-assembly GEMM is
 //- 256x16x16 against a 64x32 tile whose N half is predicated away.  Same
@@ -1504,6 +1529,11 @@ extern "C" int launch_volume_gemm_x_tiled(double *deriv_x, const double *flux_x,
   case n:                                                                      \
     return run_volume_gemm_z<P15ZTile##n>(deriv_z, flux_z, D1D_tr, Nq, Ne);
 
+//- Same, for the Nq >= 32 ablation list above.
+#define DG_ZG_TILE_CASE(n)                                                     \
+  case n:                                                                      \
+    return run_volume_gemm_z<ZG##n>(deriv_z, flux_z, D1D_tr, Nq, Ne);
+
 extern "C" int launch_volume_gemm_z(double *deriv_z, const double *flux_z,
                                     const double *D1D_tr, int Nq, int Ne,
                                     int mma_shape, int tile)
@@ -1525,6 +1555,23 @@ extern "C" int launch_volume_gemm_z(double *deriv_z, const double *flux_z,
     DG_Z_TILE_CASE(9)
     DG_Z_TILE_CASE(10)
     DG_Z_TILE_CASE(11)
+    default:
+      std::fprintf(stderr, "launch_volume_gemm_z: no z tile %d at Nq %d\n",
+                   tile, Nq);
+      return 1;
+    }
+  }
+  if (Nq >= 32 && mma_shape == 0 && tile >= 0) {
+    switch (tile) {
+    DG_ZG_TILE_CASE(0)
+    DG_ZG_TILE_CASE(1)
+    DG_ZG_TILE_CASE(2)
+    DG_ZG_TILE_CASE(3)
+    DG_ZG_TILE_CASE(4)
+    DG_ZG_TILE_CASE(5)
+    DG_ZG_TILE_CASE(6)
+    DG_ZG_TILE_CASE(7)
+    DG_ZG_TILE_CASE(8)
     default:
       std::fprintf(stderr, "launch_volume_gemm_z: no z tile %d at Nq %d\n",
                    tile, Nq);
