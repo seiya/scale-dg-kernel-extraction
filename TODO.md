@@ -925,6 +925,15 @@ x+y 融合の賞金も tight アブレーションで **14.9 µs** しかない�
   z が cuBLAS だったり別タイルだったりするので次数横断で測り直すこと。
   **本作業では既定を動かしていない**（ノブ `SCALE_DG_ZTILE` の `Nq>=32` 拡張は
   既定 `-1` ＝ production dispatch 外）。
+- [ ] **`xy_weighted` を `Nq>=128` で個別に測ったかどうかが確認できていない（新規、2026-09-03）。**
+  `mod_cuda_dg_kernels.cuf:2861` の条件は `fuse_epilogue .and. Nq >= 64` の
+  一括で、実測の記録があるのは Nq=64（`p63_gap_study.md` §25、x‖y の 595.2 に対し
+  畳み込み 570.9 µs/stage ＝ −4.085%）と、棄却された Nq=32（+2.3%）だけである。
+  **Nq=128 / 256 / 512 で畳み込みが実際に勝つかは確認していない。**
+  この条件は `overlap_y` の `Nq<64` 条件と表裏なので、
+  もし高次数で畳み込みが負けているなら、そこでは重ねを使えるはずであり、
+  `gemm_assignment_and_carrier.md` §11.6 の「Nq>=64 の融合軸は下限」も変わる。
+
 - [ ] **`GEMM` 対 `GEMM_CUTE` の一軸性が壊れている（新規、2026-09-03）。**
   `SCALE_DG_GVOLPAR`（既定 2、§9.4 で採用）は `cuda_cal_dqdt_gemm_unfused` しか
   読まないので、**`GEMM` は 3 本の volume GEMM を別ストリームに分散し、
