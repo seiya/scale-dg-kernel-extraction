@@ -860,14 +860,13 @@ __device__ __forceinline__ int sw255(int idx)
 #define P255_XYFUSE_ABL 0
 #endif
 
-template <int DIR, int BM, int BN, int TM, int TN>
+template <int DIR, int NQ, int BM, int BN, int TM, int TN>
 __device__ __forceinline__ void p255_epilogue(
     double *dqdt, const double *Lift1D, const double *flux_bnd,
     const double *Escale, const double *acc, const double *face24,
     const double *es_pre, int m0, int n0, int wm, int wn, int row, int colk,
     int eo, int efo, int npoint, int plane_off, int kplane)
 {
-  const int NQ = NQ255;
   const int NQ2 = NQ * NQ;
 
   // Per-row (m) quantities: the two face flux values for x, the two lift
@@ -997,7 +996,7 @@ __device__ __forceinline__ void p255_epilogue(
 //   - bigger tiles (64x128, 128x64, 128x128) in every thread-count and
 //     launch-bound combination that fits: 10-35% slower, all of them through
 //     registers and occupancy, never through the operand traffic they save.
-template <int DIR, bool UseTc, bool FuseFace24>
+template <int DIR, int NQ, bool UseTc, bool FuseFace24>
 __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
     double *__restrict__ dqdt, const double *__restrict__ q,
     const double *__restrict__ velocity, const double *__restrict__ D1D,
@@ -1034,7 +1033,6 @@ __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
   __shared__ __align__(16) double sB[2][BN * BK];
 #endif
 
-  const int NQ = NQ255;
   const int NP = NQ * NQ * NQ;
   const int NQ2 = NQ * NQ;
   // x and y: (Nq/BM) m-tiles * (Nq/BN) n-tiles * Nq planes.
@@ -1047,8 +1045,8 @@ __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
     return;
   }
   const int b = (int)blockIdx.x - elem * blocks_per_elem;
-  constexpr int MTILES = NQ255 / BM;
-  constexpr int NTILES = (DIR == 2) ? (NQ255 * NQ255 / BN) : (NQ255 / BN);
+  constexpr int MTILES = NQ / BM;
+  constexpr int NTILES = (DIR == 2) ? (NQ * NQ / BN) : (NQ / BN);
   const int tm = b % MTILES;
   const int tn = (b / MTILES) % NTILES;
   const int kplane = (DIR == 2) ? 0 : (b / MTILES) / NTILES;
@@ -1283,7 +1281,7 @@ __global__ __launch_bounds__(TH255, MINB255) void tendency_p255_kernel(
     __syncthreads();
   }
 
-  p255_epilogue<DIR, BM, BN, TM, TN>(dqdt, Lift1D, flux_bnd, Escale, acc, face24,
+  p255_epilogue<DIR, NQ, BM, BN, TM, TN>(dqdt, Lift1D, flux_bnd, Escale, acc, face24,
                                      esx, m0, n0, wm, wn, row, colk, eo, efo,
                                      npoint, plane_off, kplane);
 }
@@ -1353,13 +1351,13 @@ extern "C" void launch_tendency_fused_p7_tc(
 // BK255 > 16 puts the two double-buffered panels past the 48 KB static limit,
 // so they move to dynamic shared memory and the opt-in has to be requested
 // once per instantiation.
-template <int DIR, bool UseTc, bool FuseFace24>
+template <int DIR, int NQ, bool UseTc, bool FuseFace24>
 static void p255_set_smem()
 {
 #if P255_DYNSMEM
   static bool done = false;
   if (!done) {
-    cudaFuncSetAttribute(tendency_p255_kernel<DIR, UseTc, FuseFace24>,
+    cudaFuncSetAttribute(tendency_p255_kernel<DIR, NQ, UseTc, FuseFace24>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          P255_DYN_BYTES);
     done = true;
@@ -1374,16 +1372,16 @@ void launch_tendency_xyz_p255_impl(
     const double *flux_bnd, const double *Escale, int Ne)
 {
   const int nblock = (NQ255 * NQ255 * NQ255 / (BM255 * BN255)) * Ne;
-  p255_set_smem<0, UseTc, false>();
-  p255_set_smem<1, UseTc, false>();
-  p255_set_smem<2, UseTc, false>();
-  tendency_p255_kernel<0, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
+  p255_set_smem<0, NQ255, UseTc, false>();
+  p255_set_smem<1, NQ255, UseTc, false>();
+  p255_set_smem<2, NQ255, UseTc, false>();
+  tendency_p255_kernel<0, NQ255, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
       dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, v, w, nullptr, nullptr, nullptr,
       nullptr, Ne);
-  tendency_p255_kernel<1, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
+  tendency_p255_kernel<1, NQ255, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
       dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, nullptr, nullptr, nullptr,
       nullptr, nullptr, nullptr, Ne);
-  tendency_p255_kernel<2, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
+  tendency_p255_kernel<2, NQ255, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
       dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, nullptr, nullptr, nullptr,
       nullptr, nullptr, nullptr, Ne);
   check_cuda("p255 fused tendency kernels");
@@ -1407,53 +1405,82 @@ extern "C" void launch_tendency_xyz_p255_tc(
                                       Escale, Ne);
 }
 
-template <bool UseTc>
-void launch_tendency_dir_p255_impl(
+// The tile-type kernel above carries Nq only in its grid and in the number of
+// reduction chunks: shared (32,768 B), registers (168, no spill), the 128
+// threads and the three blocks per SM are all Nq-independent.  That is what
+// lets the same source serve Nq = 256 and Nq = 512; the counting is in
+// reports/p511_gap_study.md section 14.3, and section 15 measures what it buys.
+// Nq = 512 still fits 32-bit node indices (Escale reaches 3*Np = 4.03e8);
+// only Nq = 1024 would need the 64-bit offsets p1023_gap_study.md section 1
+// gave the GEMM path.
+template <bool UseTc, int NQ>
+void launch_tendency_dir_p255_nq(
     int dir, double *dqdt, const double *q, const double *u, const double *v,
     const double *w, const double *D1D, const double *Lift1D,
     const double *flux_bnd, const double *Escale, const int *VMapM,
     const int *VMapP, const double *normal_fn, const double *Fscale, int Ne)
 {
-  const int nblock = (NQ255 * NQ255 * NQ255 / (BM255 * BN255)) * Ne;
-  p255_set_smem<0, UseTc, true>();
-  p255_set_smem<1, UseTc, false>();
-  p255_set_smem<2, UseTc, false>();
+  const int nblock = (NQ / BM255) * (NQ * NQ / BN255) * Ne;
+  p255_set_smem<0, NQ, UseTc, true>();
+  p255_set_smem<1, NQ, UseTc, false>();
+  p255_set_smem<2, NQ, UseTc, false>();
   if (dir == 0) {
-    tendency_p255_kernel<0, UseTc, true><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
+    tendency_p255_kernel<0, NQ, UseTc, true><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
         dqdt, q, u, D1D, Lift1D, flux_bnd, Escale, v, w, VMapM, VMapP, normal_fn,
         Fscale, Ne);
   } else if (dir == 1) {
-    tendency_p255_kernel<1, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
+    tendency_p255_kernel<1, NQ, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
         dqdt, q, v, D1D, Lift1D, flux_bnd, Escale, v, w, VMapM, VMapP, normal_fn,
         Fscale, Ne);
   } else {
-    tendency_p255_kernel<2, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
+    tendency_p255_kernel<2, NQ, UseTc, false><<<nblock, TH255, P255_DYN_BYTES, dg_cuda_stream>>>(
         dqdt, q, w, D1D, Lift1D, flux_bnd, Escale, v, w, VMapM, VMapP, normal_fn,
         Fscale, Ne);
   }
-  check_cuda("p255 fused tendency dir kernel");
+  check_cuda("tile fused tendency dir kernel");
+}
+
+template <bool UseTc>
+void launch_tendency_dir_p255_impl(
+    int dir, double *dqdt, const double *q, const double *u, const double *v,
+    const double *w, const double *D1D, const double *Lift1D,
+    const double *flux_bnd, const double *Escale, const int *VMapM,
+    const int *VMapP, const double *normal_fn, const double *Fscale, int Ne,
+    int nq)
+{
+  if (nq == 512) {
+    launch_tendency_dir_p255_nq<UseTc, 512>(dir, dqdt, q, u, v, w, D1D, Lift1D,
+                                            flux_bnd, Escale, VMapM, VMapP,
+                                            normal_fn, Fscale, Ne);
+  } else {
+    launch_tendency_dir_p255_nq<UseTc, NQ255>(dir, dqdt, q, u, v, w, D1D,
+                                              Lift1D, flux_bnd, Escale, VMapM,
+                                              VMapP, normal_fn, Fscale, Ne);
+  }
 }
 
 extern "C" void launch_tendency_dir_p255_dfma(
     int dir, double *dqdt, const double *q, const double *u, const double *v,
     const double *w, const double *D1D, const double *Lift1D,
     const double *flux_bnd, const double *Escale, const int *VMapM,
-    const int *VMapP, const double *normal_fn, const double *Fscale, int Ne)
+    const int *VMapP, const double *normal_fn, const double *Fscale, int Ne,
+    int nq)
 {
   launch_tendency_dir_p255_impl<false>(dir, dqdt, q, u, v, w, D1D, Lift1D,
                                        flux_bnd, Escale, VMapM, VMapP, normal_fn,
-                                       Fscale, Ne);
+                                       Fscale, Ne, nq);
 }
 
 extern "C" void launch_tendency_dir_p255_tc(
     int dir, double *dqdt, const double *q, const double *u, const double *v,
     const double *w, const double *D1D, const double *Lift1D,
     const double *flux_bnd, const double *Escale, const int *VMapM,
-    const int *VMapP, const double *normal_fn, const double *Fscale, int Ne)
+    const int *VMapP, const double *normal_fn, const double *Fscale, int Ne,
+    int nq)
 {
   launch_tendency_dir_p255_impl<true>(dir, dqdt, q, u, v, w, D1D, Lift1D,
                                       flux_bnd, Escale, VMapM, VMapP, normal_fn,
-                                      Fscale, Ne);
+                                      Fscale, Ne, nq);
 }
 
 //============================================================================

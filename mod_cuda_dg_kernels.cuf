@@ -15,6 +15,10 @@ module mod_cuda_dg_kernels
   integer, parameter :: CUDA_FUSED_P63_NQ = 64
   integer, parameter :: CUDA_FUSED_P127_NQ = 128
   integer, parameter :: CUDA_P255_NQ = 256
+  !- The tile-type fused kernels of cuda_dg_kernels_tc.cu carry Nq only in the
+  !  grid and the chunk count, so the same source also serves Nq = 512.  See
+  !  reports/p511_gap_study.md sections 14.3 and 15.
+  integer, parameter :: CUDA_P511_NQ = 512
   integer, parameter :: GEMM_VOL_CUBLAS = 0
   integer, parameter :: GEMM_VOL_OZAKI1 = 1
   integer, parameter :: GEMM_VOL_OZAKI2 = 2
@@ -742,10 +746,10 @@ module mod_cuda_dg_kernels
 
     subroutine launch_tendency_dir_p255_tc( &
       dir, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
-      VMapM, VMapP, normal_fn, Fscale, Ne) &
+      VMapM, VMapP, normal_fn, Fscale, Ne, nq) &
       bind(C, name="launch_tendency_dir_p255_tc")
       import
-      integer(c_int), value :: dir, Ne
+      integer(c_int), value :: dir, Ne, nq
       real(c_double), device :: dqdt(*), q(*), u(*), v(*), w(*)
       real(c_double), device :: D1D(*), Lift1D(*), flux_bnd(*), Escale(*)
       integer(c_int), device :: VMapM(*), VMapP(*)
@@ -754,10 +758,10 @@ module mod_cuda_dg_kernels
 
     subroutine launch_tendency_dir_p255_dfma( &
       dir, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
-      VMapM, VMapP, normal_fn, Fscale, Ne) &
+      VMapM, VMapP, normal_fn, Fscale, Ne, nq) &
       bind(C, name="launch_tendency_dir_p255_dfma")
       import
-      integer(c_int), value :: dir, Ne
+      integer(c_int), value :: dir, Ne, nq
       real(c_double), device :: dqdt(*), q(*), u(*), v(*), w(*)
       real(c_double), device :: D1D(*), Lift1D(*), flux_bnd(*), Escale(*)
       integer(c_int), device :: VMapM(*), VMapP(*)
@@ -1793,8 +1797,8 @@ contains
     integer(kind=cuda_stream_kind) :: s_rest
     logical :: use_side
 
-    if (Nq /= CUDA_P255_NQ .or. Np /= CUDA_P255_NQ**3) then
-      error stop "cuda_cal_dqdt_fused_p255_dfma requires PolyOrder=255"
+    if ((Nq /= CUDA_P255_NQ .and. Nq /= CUDA_P511_NQ) .or. Np /= Nq**3) then
+      error stop "cuda_cal_dqdt_fused_p255_dfma requires PolyOrder=255 or 511"
     end if
     call dg_ev_begin()
 
@@ -1812,16 +1816,16 @@ contains
     end if
     call launch_tendency_dir_p255_dfma( &
       0, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
-      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int) )
+      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int), int(Nq,c_int) )
     call elembnd_flux_group_kernel<<<nblock_rest,CUDA_BLOCK_SIZE,0,s_rest>>>( &
       flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, nq2, 1 )
     if (use_side) call dg_side_join(.false.)
     call launch_tendency_dir_p255_dfma( &
       1, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
-      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int) )
+      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int), int(Nq,c_int) )
     call launch_tendency_dir_p255_dfma( &
       2, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
-      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int) )
+      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int), int(Nq,c_int) )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("p=255 DFMA tendency kernels",istat)
     call dg_ev_record(2)
@@ -2002,8 +2006,8 @@ contains
     integer(kind=cuda_stream_kind) :: s_rest
     logical :: use_side
 
-    if (Nq /= CUDA_P255_NQ .or. Np /= CUDA_P255_NQ**3) then
-      error stop "cuda_cal_dqdt_fused_p255_tc requires PolyOrder=255"
+    if ((Nq /= CUDA_P255_NQ .and. Nq /= CUDA_P511_NQ) .or. Np /= Nq**3) then
+      error stop "cuda_cal_dqdt_fused_p255_tc requires PolyOrder=255 or 511"
     end if
     call dg_ev_begin()
 
@@ -2021,16 +2025,16 @@ contains
     end if
     call launch_tendency_dir_p255_tc( &
       0, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
-      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int) )
+      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int), int(Nq,c_int) )
     call elembnd_flux_group_kernel<<<nblock_rest,CUDA_BLOCK_SIZE,0,s_rest>>>( &
       flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface, nq2, 1 )
     if (use_side) call dg_side_join(.false.)
     call launch_tendency_dir_p255_tc( &
       1, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
-      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int) )
+      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int), int(Nq,c_int) )
     call launch_tendency_dir_p255_tc( &
       2, dqdt, q, u, v, w, D1D, Lift1D, flux_bnd, Escale, &
-      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int) )
+      VMapM, VMapP, normal_fn, Fscale, int(Ne,c_int), int(Nq,c_int) )
     istat = cudaGetLastError()
     if (istat /= cudaSuccess) call cuda_failure("p=255 TC tendency kernels",istat)
     call dg_ev_record(2)
