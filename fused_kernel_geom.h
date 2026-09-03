@@ -234,6 +234,23 @@
 #ifndef P127_XZ_MINB_DFMA
 #define P127_XZ_MINB_DFMA P127_XZ_MINB
 #endif
+// OUT OF SCOPE / NUMERICALLY INVALID ablation knob (default 0 = off).  When
+// non-zero it shrinks the z accumulator array of tendency_fused_p127_xz_kernel
+// to this many doubles and wraps the index modulo it, which frees registers
+// without touching a single mma, shared load or global load.  It exists only
+// to price the 112 B of local spill that the DFMA instantiation cannot remove
+// through __launch_bounds__ (reports/dfma_register_budget.md).  It must never
+// be enabled in a production build: the z derivative it computes is wrong.
+#ifndef P127_XZ_ABLATE_AZ
+#define P127_XZ_ABLATE_AZ 0
+#endif
+// Second half of the same OUT OF SCOPE / NUMERICALLY INVALID ablation: when
+// non-zero it shrinks the double-buffer prefetch registers pq/pu/pd to this
+// many doubles each and wraps the stage index modulo it.  Same load and store
+// instruction stream, fewer live registers, wrong values in shared memory.
+#ifndef P127_XZ_ABLATE_PF
+#define P127_XZ_ABLATE_PF 0
+#endif
 #define P127_XZ_WM (NQ127 / (8 * P127_XZ_TM))
 #define P127_XZ_WN (P127_MT / (8 * P127_XZ_TN))
 #define P127_XZ_THREADS (32 * P127_XZ_WM * P127_XZ_WN)

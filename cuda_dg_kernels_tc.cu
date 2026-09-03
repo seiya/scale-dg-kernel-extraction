@@ -3726,10 +3726,21 @@ __global__ __launch_bounds__(P127_XZ_THREADS, TCDFMA_BPSM(P127_XZ_MINB, P127_XZ_
   const int npoint = NP127 * Ne;
   const int plane_off = NQ127 * jp;
 
-  double ax[2 * TM * TN], az[2 * TM * TN];
+  constexpr int NACC = 2 * TM * TN;
+#if P127_XZ_ABLATE_AZ
+  // See fused_kernel_geom.h: numerically invalid register-pressure ablation.
+  constexpr int NAZ = P127_XZ_ABLATE_AZ;
+#else
+  constexpr int NAZ = NACC;
+#endif
+#define P127_XZ_AZI(E) ((E) % NAZ)
+  double ax[NACC], az[NAZ];
 #pragma unroll
-  for (int e = 0; e < 2 * TM * TN; ++e) {
+  for (int e = 0; e < NACC; ++e) {
     ax[e] = 0.0;
+  }
+#pragma unroll
+  for (int e = 0; e < NAZ; ++e) {
     az[e] = 0.0;
   }
 
@@ -3784,20 +3795,27 @@ __global__ __launch_bounds__(P127_XZ_THREADS, TCDFMA_BPSM(P127_XZ_MINB, P127_XZ_
   // registers and the q*u multiply happens at the store, because multiplying
   // at issue time would make the pipeline wait on the loads exactly where it
   // is trying not to.  Same shape as tendency_p255_kernel.
-  double pq[NSTAGE], pu[NSTAGE], pd[NSTAGE];
+#if P127_XZ_ABLATE_PF
+  // See fused_kernel_geom.h: numerically invalid register-pressure ablation.
+  constexpr int NPF = P127_XZ_ABLATE_PF;
+#else
+  constexpr int NPF = NSTAGE;
+#endif
+#define P127_XZ_PFI(P) ((P) % NPF)
+  double pq[NPF], pu[NPF], pd[NPF];
 #define P127_XZ_ISSUE(KK)                                                     \
   do {                                                                        \
     _Pragma("unroll") for (int p = 0; p < NSTAGE; ++p)                        \
     {                                                                         \
       P127_XZ_FU_IDX(p);                                                      \
       const int g = eo + ((KK) + ll) + plane_off + NQ2_127 * o;               \
-      pq[p] = q[g];                                                           \
-      pu[p] = u[g];                                                           \
+      pq[P127_XZ_PFI(p)] = q[g];                                            \
+      pu[P127_XZ_PFI(p)] = u[g];                                            \
     }                                                                         \
     _Pragma("unroll") for (int p = 0; p < NSTAGE; ++p)                        \
     {                                                                         \
       P127_XZ_D_IDX(p);                                                       \
-      pd[p] = D1D[o + NQ127 * ((KK) + ll)];                                   \
+      pd[P127_XZ_PFI(p)] = D1D[o + NQ127 * ((KK) + ll)];                    \
     }                                                                         \
   } while (0)
 #define P127_XZ_STORE(BUF)                                                    \
@@ -3805,12 +3823,12 @@ __global__ __launch_bounds__(P127_XZ_THREADS, TCDFMA_BPSM(P127_XZ_MINB, P127_XZ_
     _Pragma("unroll") for (int p = 0; p < NSTAGE; ++p)                        \
     {                                                                         \
       P127_XZ_FU_IDX(p);                                                      \
-      sFU[(BUF) * PANEL + swt128(o + NQ127 * ll)] = pq[p] * pu[p];            \
+      sFU[(BUF) * PANEL + swt128(o + NQ127 * ll)] = pq[P127_XZ_PFI(p)] * pu[P127_XZ_PFI(p)];\
     }                                                                         \
     _Pragma("unroll") for (int p = 0; p < NSTAGE; ++p)                        \
     {                                                                         \
       P127_XZ_D_IDX(p);                                                       \
-      sD[(BUF) * PANEL + swt128(o + NQ127 * ll)] = pd[p];                     \
+      sD[(BUF) * PANEL + swt128(o + NQ127 * ll)] = pd[P127_XZ_PFI(p)];      \
     }                                                                         \
   } while (0)
 
@@ -3870,7 +3888,9 @@ __global__ __launch_bounds__(P127_XZ_THREADS, TCDFMA_BPSM(P127_XZ_MINB, P127_XZ_
         for (int bb = 0; bb < TN; ++bb) {
           const int e = 2 * (TN * a + bb);
           mma_m8n8k4_f64<UseTc>(ax[e], ax[e + 1], av[a], bv[bb], ax[e], ax[e + 1]);
-          mma_m8n8k4_f64<UseTc>(az[e], az[e + 1], avz[a], bvz[bb], az[e], az[e + 1]);
+          mma_m8n8k4_f64<UseTc>(az[P127_XZ_AZI(e)], az[P127_XZ_AZI(e + 1)], avz[a],
+                                bvz[bb], az[P127_XZ_AZI(e)],
+                                az[P127_XZ_AZI(e + 1)]);
         }
       }
     }
@@ -3888,6 +3908,7 @@ __global__ __launch_bounds__(P127_XZ_THREADS, TCDFMA_BPSM(P127_XZ_MINB, P127_XZ_
 #undef P127_XZ_ISSUE
 #undef P127_XZ_STORE
 #endif
+#undef P127_XZ_PFI
 
   asm volatile("griddepcontrol.wait;" ::: "memory");
 
@@ -3940,11 +3961,13 @@ __global__ __launch_bounds__(P127_XZ_THREADS, TCDFMA_BPSM(P127_XZ_MINB, P127_XZ_
 
     // Same summation order as tendency_fused_p127_xz_kernel.
     *reinterpret_cast<double2 *>(dqdt + node) = make_double2(
-        -(ex.x * ax[2 * e8] + ez.x * az[2 * e8] + lf1 * fb1.x + lf2a * fb2 +
-          lf3 * fb3.x + lf4a * fb4 + lf5 * fb5.x + lf6 * fb6.x),
-        -(ex.y * ax[2 * e8 + 1] + ez.y * az[2 * e8 + 1] + lf1 * fb1.y +
-          lf2b * fb2 + lf3 * fb3.y + lf4b * fb4 + lf5 * fb5.y + lf6 * fb6.y));
+        -(ex.x * ax[2 * e8] + ez.x * az[P127_XZ_AZI(2 * e8)] + lf1 * fb1.x +
+          lf2a * fb2 + lf3 * fb3.x + lf4a * fb4 + lf5 * fb5.x + lf6 * fb6.x),
+        -(ex.y * ax[2 * e8 + 1] + ez.y * az[P127_XZ_AZI(2 * e8 + 1)] +
+          lf1 * fb1.y + lf2b * fb2 + lf3 * fb3.y + lf4b * fb4 + lf5 * fb5.y +
+          lf6 * fb6.y));
   }
+#undef P127_XZ_AZI
 }
 
 //> p=127 y volume term, accumulated onto what the xz kernel wrote.
