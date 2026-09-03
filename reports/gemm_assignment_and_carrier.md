@@ -1191,3 +1191,125 @@ if (gemm_emulation_on) par = 0     ! 追加
   ノード・クロック・電力・MPS・混雑・ドライバはいずれも原因ではない
   （§9.7.2 と §9.7.3 のクロスチェック）。
 
+## 9.8 未解明 2 の機構 —— §8 は DYNAMIC を、§9.5 は FIXED を測っている（2026-09-03）
+
+§9.5 が「`p511_gap_study.md` §8 と順位が逆で、`OZAKI1` の比が一桁違う。
+実装変更があったかは確定できていない」と記録した件。**確定した。**
+
+### 9.8.1 §8 の測定条件を突き止める
+
+- §8 は commit **`38952e4`** と書いているが、**そのコミットには p≥511 の
+  Ozaki ゲートが無い**。ゲートを開けたのは次の commit
+  **`dd3c4a7`「Allow Ozaki GEMM paths at p>=511 and record per-p measurements」**
+  で、`git show --stat dd3c4a7` のとおり **§8 の本文を追加したのもこの commit**
+  である。したがって §8 が測ったツリーは `38952e4` ではなく **`dd3c4a7`**。
+  §8 の commit 表記は親を書いた誤りである（測定値の解釈は変わらない）。
+- 入力・物差し・パラメータは §8 の記載どおり `Ne=1`、`nstep=20`、
+  `WarmupStep=2`、`OzakiSliceCount=8`、`OzakiModuliCount=14`、login GPU。
+  §8 の表は **1 step の device 合計**（同節の訂正注記のとおり）。
+
+### 9.8.2 `dd3c4a7` から現行ツリーまでの Ozaki 差分は 2 件しかない
+
+`git log dd3c4a7..44b02a6 -- 'cuda_ozaki*'` は 2 件:
+
+| commit | 内容 | 速度への影響 |
+|---|---|---|
+| `a1cdb57` | Ozaki-I `scale_a` の作業領域を `Nq²×Ne` に right-size | メモリのみ。数値も演算も不変 |
+| **`fd091fc`** | **FP64 emulation の既定を FIXED 55 bit に。「同じ制御が Ozaki-I の early-exit と Ozaki-II の追加 A pack も決める」** | **これが全部** |
+
+`fd091fc` が Ozaki に入れたのは 2 つ:
+
+- **Ozaki-I**: `decompose_a_tn` / `decompose_b_nn` の残差 early-exit
+  (`scales_need_next_slice`) を **`if (!g_state.fixed && ...)` で囲った**。
+  既定が FIXED になったので **early-exit が既定で無効**になり、
+  常に `slice_count` 枚すべてを作る。`run_slice_pairs` はスライス対を回すので
+  仕事は **枚数の 2 乗**で効く。既定の `kDefaultSlices` も 8 → 7 に変わった。
+- **Ozaki-II**: A 側の追加パック（最大 4 スライス）を
+  `const int max_a_slices = g_state.fixed ? 1 : kMaxASlices;` で **FIXED では 1 枚**に。
+  既定の `kDefaultModuli` も 14 → 7 に変わった。
+
+**つまり `fd091fc` は Ozaki-I を重く、Ozaki-II を軽くする。順位が逆になる向きが
+これで説明できる。**
+
+### 9.8.3 §8 を現行ツリーで再現した
+
+`namelists/perf_p511_gemm.conf` の `DqdtKernel_Type` と Ozaki パラメータだけを
+替えた複製（`jobs/perf_p511_gemm_ozaki{1,2}_{FIXED,ADP}.conf`、
+`OzakiSliceCount = 8`、`OzakiModuliCount = 14`、`EmulationMantissaControl` で
+FIXED / ADP を切り替え）を、**ツリー `44b02a6`、login GPU、`SCALE_DG_GVOLPAR=0`**
+（§9.4 のとおり Ozaki は元々このノブを取らないが、native も直列に揃えた）で走らせる。
+物差しは `CUDA device Ozaki-I/II GEMM` ÷54。
+
+| 経路 | 制御 | µs/stage | native（gp0 13 336.6）比 | §8 の記録 |
+|---|---|---:|---:|---:|
+| `OZAKI1` | **ADP（= §8 の既定）** | **15 205** | **1.140×** | **1.14×** ✔ |
+| `OZAKI1` | FIXED（= 現行既定） | 220 857 | 16.6× | — |
+| `OZAKI2` | **ADP（= §8 の既定）** | **41 534** | **3.114×** | **3.1×** ✔ |
+| `OZAKI2` | FIXED（= 現行既定） | 31 573 | 2.37× | — |
+
+**§8 の 1.14× と 3.1× は、現行ツリーで ADP に戻すと 2 桁とも一致する。**
+`OZAKI1` FIXED 220 857 と `OZAKI2` FIXED 31 573 は §9.5 の 221 056 / 31 569 と
+0.1% 以内で一致する。**したがってツリーは §8 以降で Ozaki の演算を変えていない。
+変わったのは既定の精度設定だけである。**
+
+### 9.8.4 仕事量で裏を取る（`SCALE_DG_OZAKI1_SLICE_STATS`）
+
+`OZAKI1` は実際に使ったスライス数を出せる。p=511、8 スライス指定、18 step / 162 GEMM 呼び出し:
+
+| 制御 | s_a / 呼 | s_b / 呼 | s_a·s_b / 呼 | **s_a·s_b 合計 / step（INT8 GEMM の代理）** | device |
+|---|---:|---:|---:|---:|---:|
+| FIXED | 8.00 | 8.00 | 64.0 | **576** | 11.926 s |
+| ADP | min1 max2 mean **1.33** | mean **1.33** | 1.67 | **15** | 0.841 s |
+
+**INT8 GEMM 本数の比は 38.4×、device 時間の比は 14.5×。** 比例しないのは
+分解・パック・CRT など枚数に比例しない固定費があり、ADP 側の小さな GEMM は
+スループットではなく発行レイテンシで律速されるからである。
+**向きと桁は完全に一致し、「早期打ち切りが効いていた／いなくなった」以外の
+説明を必要としない。**
+
+### 9.8.5 精度を揃えた比較（依頼の必須項目）—— **§8 の 1.14× は無効な設定の速度**
+
+p=7 `Ne=2³`、`SCALE_DG_VARYING_COEFF=1`、owned `dqdt(:,1:Ne)` 全 4096 点、
+対 `CUDAFORTRAN_SPLIT` の最大絶対差:
+
+| 経路 | 枚数 | FIXED | ADP |
+|---|---:|---:|---:|
+| **`OZAKI1`** | 7 slices | **3.55e-15** ✔ | **3.04e-01** ✘ |
+| **`OZAKI1`** | 8 slices | **3.55e-15** ✔ | **3.04e-01** ✘ |
+| `OZAKI2` | 7 moduli | 2.97e-01 ✘ | 1.86e-01 ✘ |
+| `OZAKI2` | 14 moduli | 2.97e-01 ✘ | 1.86e-01 ✘ |
+
+読めること:
+
+- **ADP の `OZAKI1` は数値が合わない。** §9.8.4 の統計どおり実効 1.33 枚
+  ≒ 10 bit 級しか作らないので、`scales_need_next_slice` が DG の
+  `D1D` × flux に対して早く打ち切りすぎている。
+  **`p511_gap_study.md` §8 の「Scheme I が native の 1.14× まで縮む」は、
+  DG の要求精度を満たさない設定の速度である。**
+- **DG の要求精度を満たす Ozaki は `OZAKI1` FIXED だけ**（3.55e-15）。
+  その p=511 の速度は **220 857 µs/stage ＝ native の 16.6×**。
+- **`OZAKI2` は FIXED でも ADP でも、7 moduli でも 14 moduli でも合わない**
+  （1.9e-01〜3.0e-01）。**moduli を増やしても改善しない**ので、
+  §9.5 が「moduli 数が足りていない」と書いた読みは訂正する:
+  効いていないのは moduli 数ではなく **A 側の int8 表現**である
+  （FIXED は A を 1 パックしか作らず、ADP でも
+  `matrix_needs_second_slice` が p=7 では 2 枚目を要求していない）。
+  **`OZAKI2` の性能値は 7 次数すべて「その精度での速度」であって、
+  DG に使える設定の速度ではない。**
+
+### 9.8.6 したがって未解明 2 はこう閉じる
+
+- **機構**: `fd091fc`（2026-08-29）が `EmulationMantissaControl` の既定を
+  DYNAMIC から FIXED に変え、その制御が Ozaki-I の残差 early-exit と
+  Ozaki-II の追加 A パックを同時に決めている。§8（2026-08-28）は DYNAMIC を、
+  §9.5（2026-09-03）は FIXED を測った。**両方とも正しい測定であり、
+  違うものを測っている。** 実装の演算そのものは §8 以降変わっていない
+  （§9.8.3 で 2 桁一致を確認）。
+- **順位が逆になる理由**: FIXED 化は Ozaki-I を 14.5× 重くし
+  （スライス対 15 → 576）、Ozaki-II を 1.32× 軽くする（A パック 4 → 1）。
+  **符号が逆なので順位が入れ替わる。**
+- **精度を揃えた結論**: DG の要求精度で比較できるのは `OZAKI1` FIXED だけで、
+  p=511 で native の **16.6×**。**Ozaki は精度を揃えると native に一段と負ける。**
+  §9.5 の「Ozaki は 7 次数すべて native に負ける」は強まりこそすれ弱まらない。
+- `p511_gap_study.md` §8 の表は**書き換えない**。当時の DYNAMIC 既定での
+  測定として残し、§8 に訂正注記を足した。
