@@ -98,10 +98,20 @@ __global__ __launch_bounds__(P7_CC_THREADS, P7_CC_BPSM) void tendency_fused_p7_c
   const int npoint = 512 * Ne;
   const int nface = 384 * Ne;
 
-  if (tid < 64) {
-    sD1D[tid] = D1D[tid];
-  } else if (tid < 112) {
-    sLift[tid - 64] = Lift1D[tid - 64];
+  if constexpr (P7_CC_THREADS >= 112) {
+    if (tid < 64) {
+      sD1D[tid] = D1D[tid];
+    } else if (tid < 112) {
+      sLift[tid - 64] = Lift1D[tid - 64];
+    }
+  } else {
+    // Fewer threads than the 112 operator entries: stage them in a loop.
+    for (int t = tid; t < 64; t += P7_CC_THREADS) {
+      sD1D[t] = D1D[t];
+    }
+    for (int t = tid; t < 48; t += P7_CC_THREADS) {
+      sLift[t] = Lift1D[t];
+    }
   }
 
 #pragma unroll
