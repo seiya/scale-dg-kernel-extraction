@@ -967,27 +967,28 @@ Nq≥64 では `use_side` が真なので gp2 は自動的に gp1 と同一の�
   **1.50× 遅い**と記録している。**方向が逆転している**ので、既発表の
   「emulation は全次数で native より遅い」は現行ツリー・現行 cuBLAS では
   p=511 について成立しない。p=255 も 8.8× から **2.02×** に縮んでいる。
-- **ただしこの 1 点だけは再現に食い違いがある。** 同じ実行ファイルで
-  ログインノードの GPU では p=511 emulation が **14 327 µs/stage（native の 1.077×、
-  遅い側）** に出る。`GEMM` 側は login 13 300 / 占有ノード 13 301 で**一致する**
-  ので、共有 GPU の混雑では説明できない。**未解明として残す**（emulation の
-  カーネルだけがノード間で 14% 動く）。採否には関わらない（emulation は本番経路では
-  ない）が、`AGENTS.md` の基準ではモデルの欠陥である。
+- **~~ただしこの 1 点だけは再現に食い違いがある~~（未解明 1 は §9.7 で閉じた）。**
+  当時の記録は「同じ実行ファイルでログインノードでは 14 327 µs/stage
+  （native の 1.077×、遅い側）に出る、`GEMM` 側は一致するので混雑では
+  説明できない、未解明として残す」だった。**原因はノードではなく
+  `SCALE_DG_GVOLPAR` である。** 上の表は `SCALE_DG_GVOLPAR=0`（直列）で、
+  login の裏取りは既定値 2（3 本並列）で走っていた。詳細と、その過程で
+  見つかった `CublasEmulation` × 並列 schedule の **±Inf 破壊**は §9.7。
 - **Ozaki は 7 次数すべてで native に負ける。** 最良でも p=511 の `OZAKI2` で
   1.74×。`ozaki2_survey_2504.08009.md` の成立条件（演算強度 ≳ 3.82 FLOP/byte、
   p ≳ 500–650）どおり p が上がるほど比は縮むが、**交叉には届かない**。
 - **`OZAKI1` は `OZAKI2` に全次数で負ける**（13.1×〜75×）。
   `ozaki1_implementation_report.md` の「p=7 では OZAKI2 より遅い典型」が
   **全次数の性質**であることが確定した。
-- **`p511_gap_study.md` §8 との食い違い（未解明）。** §8 は
-  `OZAKI1` を native の **1.14×**、`OZAKI2` を **3.1×** と記録している。
-  本測定は 13.1× / 1.74× で、**順位が逆で、`OZAKI1` の比が一桁違う**。
-  Ozaki パラメータの違いは原因ではない: §8 と同じ `OzakiSliceCount = 8` /
-  `OzakiModuliCount = 14` で測り直すと `OZAKI1` は 221 056、`OZAKI2` は 31 569
-  µs/stage で**どちらも既定 7/7 より遅くなる**（順位は変わらない）。
-  §8 のコミットは `38952e4` で、本作業のツリー（`5a2a99a`）との間に
-  `OZAKI1` の実装変更があったかどうかは本作業では確定できていない。
-  **未解明として記録する。**
+- **~~`p511_gap_study.md` §8 との食い違い（未解明）~~（未解明 2 は §9.8 で閉じた）。**
+  当時の記録は「§8 は `OZAKI1` 1.14× / `OZAKI2` 3.1×、本測定は 13.1× / 1.74× で
+  順位が逆、Ozaki パラメータの違いは原因ではない、`OZAKI1` の実装変更が
+  あったかは確定できていない」だった。**原因は実装変更でもパラメータでもなく、
+  `EmulationMantissaControl` の既定値が `fd091fc`（2026-08-29）で
+  DYNAMIC から FIXED に変わったことである。** §8 は DYNAMIC を、
+  §9.5 は FIXED を測っている。しかも **DYNAMIC の `OZAKI1` は数値が合わない**
+  （p=7 で 3.04e-01）ので、§8 の 1.14× は無効な精度設定の速度である。
+  詳細は §9.8。
 - 数値: 点変化係数の owned `dqdt` で `OZAKI1` は p=7 3.55e-15 / p=15 1.33e-14 /
   p=31 4.35e-14（対 `SPLIT`）と丸め誤差級だが、**`OZAKI2` は既定 7 moduli では
   p=7 で 2.97e-01、p=31 で 1.30e+01 と全く合わない**。moduli 数が
@@ -1046,3 +1047,147 @@ z_lib=0, ysched=0, xfwd=0, xpkg=0, z_tile=-1, zpkg=-1` ＝ **すべてゼロ**�
 - **`GEMM` / `OZAKI1` / `OZAKI2` 側は終了していなかった**（3 本並列）。
   `GEMM` については本作業で閉じた。`OZAKI` は §9.4 のとおり
   stream 再入不可という実装上の制約で取れない。
+
+## 9.7 未解明 1 の機構 —— ノードではなく `SCALE_DG_GVOLPAR`。ついでに `CublasEmulation` の破壊バグ（2026-09-03）
+
+§9.5 が「emulation のカーネルだけがノード間で 14% 動く。未解明」と記録した件。
+**再現はした。ただし再現したのは「ノード差」ではなく「ノブ差」である。**
+
+### 9.7.1 測定条件
+
+- ツリー **`44b02a6`**、凍結実行ファイル `scale-dg_extraction.unexp3`
+  （リポジトリ配下）。`make CUDA=1 GPUFLAGS=-gpu=cc100`、HPC SDK 26.3。
+- 入力: `namelists/perf_p511_gemm.conf` と、その `CublasEmulation` だけを
+  `.true.` にした複製 `jobs/perf_p511_gemm_emu.conf`。
+  `NeX/NeY/NeZ`・`PolyOrder`・`dt`・`nstep` は同一。
+- 物差し: `CUDA device GEMM tendency` ÷ (18 × 3) ＝ µs/stage。
+- login GPU（GB200 4 枚のうち 0 番、他プロセスなし、MPS なし、
+  driver 580.173.02、persistence on）と、
+  **占有 GPU（Slurm job `78530` PART B → node `c187`）の両方**で同じ列を走らせた。
+
+### 9.7.2 まず環境を記録した —— DVFS でも混雑でもない
+
+`nvidia-smi` を 1 秒間隔で当てた（login、GPU 0）:
+
+| 実行中 | SM clock | mem clock | power | temp |
+|---|---:|---:|---:|---:|
+| emulation | **2062 MHz（= `clocks.max.sm`）** | 3996 MHz | 496 W | 42 °C |
+| native | **2062 MHz** | 3996 MHz | 651 W | 50 °C |
+
+**両方とも最大 SM クロックに張り付いており、power limit 1200 W に対して
+半分も使っていない。** emulation の方が消費電力は**低い**。
+`nvidia-smi --query-compute-apps` は空、MPS プロセスなし、compute mode Default、
+load average 1〜2 / 144 コア。**クロック・電力・混雑・MPS・ドライバのどれも
+14% を説明しない。** 占有ノード `c187` も `clocks.max.sm` 2062 MHz、
+同じドライバ、persistence on、compute mode Default である。
+
+### 9.7.3 原因 —— §9.5 の 2 つの数字は別のノブで測られていた
+
+§9.5 の表は本文に書いてあるとおり **`SCALE_DG_GVOLPAR=0`（直列）** で採った。
+login の裏取りは**既定値 2（volume GEMM 3 本を別ストリーム）**で走っていた。
+同じ login GPU 上で両方を振ると:
+
+| schedule | native | emulation | emu / native |
+|---|---:|---:|---:|
+| `SCALE_DG_GVOLPAR=0`（直列） | 13 336.6 | **12 596.2** | **0.945×** |
+| `SCALE_DG_GVOLPAR=1`（y だけ別 stream） | — | 14 333.7 | 1.078× |
+| `SCALE_DG_GVOLPAR=2`（既定、3 本並列） | 13 300.3 | 14 330.1 | **1.077×** |
+
+（login、3 run 中央値、µs/stage。native は gp0 13 336.6 / gp2 13 300.3 と
+0.27% しか動かない。）
+
+**§9.5 の占有ノード値 12 561 は gp0 の 12 596 と 0.3% 以内、
+login 値 14 327 は gp2 の 14 330 と 0.02% 以内。** 両方とも再現した。
+`GEMM` 側が login と占有で一致して見えたのは、**native が gp0/gp2 で
+0.27% しか動かないので、schedule が違うことを隠していた**からである。
+
+**ノード仮説はクロスチェックで棄却できる。** 占有 GPU（job `78530` PART B、
+node `c187`）で 4 通りを 3 ラウンド回すと:
+
+| node | gp0 native | gp0 emu | gp2 native | gp2 emu |
+|---|---:|---:|---:|---:|
+| `c187`（占有） | 13 294 | **12 582（0.946×）** | 13 270 | **14 307（1.078×）** |
+| login | 13 337 | **12 596（0.945×）** | 13 300 | **14 330（1.077×）** |
+
+**同じノードの中で両方の符号が出る。** 差の担い手はノードではなくノブである。
+
+### 9.7.4 なぜ並列 schedule で emulation だけが 13.8% 遅くなるのか
+
+`cuda_cublas_gemm.cu` は **cuBLAS ハンドルを 1 本 (`g_handle`) しか持たず、
+FP64 emulation 用に 8 GiB の作業領域 (`g_workspace`) を 1 つだけ**確保して
+`cublasSetWorkspace` で貼っている（cuBLAS が fixed-point emulation の最大所要と
+文書化している量）。`gemm_volume_xyz` は 3 本の volume GEMM を
+`dg_set_cuda_stream` で別ストリームに載せ替えるだけなので、
+**並列にしても同じハンドルと同じ 8 GiB scratch を共有する**。
+表の gp1 が gp2 と同じ 14 330 に張り付いていることが決め手で、
+**2 本目が飛んだ瞬間に全額（+13.8%）が発生し、3 本目はもう何も足さない**。
+これは「帯域が足りない」形ではなく「共有 scratch を 2 者で使えない」形である。
+native DGEMM は emulation ほど作業領域を使わないので gp0/gp2 で 0.27% しか動かない。
+
+**§9.4 が `OZAKI1` / `OZAKI2` にこのノブを与えなかったのと同じ理由が
+`CublasEmulation` にも当てはまっていた。** §9.4 は Ozaki の launcher が
+1 本のデバイス作業領域を共有することを理由に `par = 0` に落としているが、
+**emulation も同じ性質を持つのに落としていなかった。**
+
+### 9.7.5 副産物 —— これは性能問題ではなく**破壊バグ**だった
+
+p=7 `Ne=2³`、`SCALE_DG_VARYING_COEFF=1`、owned `dqdt(:,1:Ne)` 全 4096 点を
+`CUDAFORTRAN_SPLIT` と比較する（`SCALE_DG_DUMP_DQDT`）:
+
+| schedule | 非有限点 | 対 `SPLIT` 最大絶対差 |
+|---|---:|---:|
+| `SCALE_DG_GVOLPAR=0` | 0 | 8.88e-15 |
+| `SCALE_DG_GVOLPAR=1` | 0 | 8.88e-15 |
+| **`SCALE_DG_GVOLPAR=2`（既定）** | **16 / 4096 が ±Inf** | **inf** |
+
+3 回繰り返して 3 回とも同じ 16 点。**既定 schedule と
+`CublasEmulation = .true.` の組み合わせは、2026-09-03 の §9.4 が既定を 2 に
+した時点から owned `dqdt` を壊していた。** §9.5 の表は `SCALE_DG_GVOLPAR=0`
+で採ったので、**§9.5 の数値そのものは汚染されていない**。
+
+### 9.7.6 修正（採用）
+
+`mod_cuda_dg_kernels.cuf` に `gemm_emulation_on` を持たせ
+（`cuda_gemm_setup` が設定）、`gemm_volume_xyz` で
+
+```fortran
+par = gvol_par
+if (backend /= GEMM_VOL_CUBLAS) par = 0
+if (gemm_emulation_on) par = 0     ! 追加
+```
+
+とした。**Ozaki backend と同じ扱いである。** これは性能最適化ではなく
+数値の修正なので既定オフのノブにはしていない。
+
+検証（修正後ビルド、p=7 `Ne=2³`、点変化係数、対 `SPLIT`）:
+
+| | 非有限点 | 最大絶対差 |
+|---|---:|---:|
+| emulation gp0 / gp1 / gp2 | 0 / 0 / 0 | 8.88e-15（3 通りとも） |
+| native `GEMM`（回帰） | 0 | **0.00e+00（ビット一致）** |
+
+修正後の p=511（login、`CUDA device` ÷54）:
+
+| | gp0 | gp2（既定） |
+|---|---:|---:|
+| native | 13 343.5 | 13 300.0 |
+| **emulation** | **12 592.1** | **12 610.1** |
+
+**emulation はノブに依らず 12.6 ms/stage に落ち着く。** native gp2 13 300.0 に対して
+**0.948×**。
+
+### 9.7.7 したがって §9.5 の結論はこう直る
+
+- **`CublasEmulation` は p=511 で native を下回る（0.948×、−5.2%）** ——
+  これは §9.5 が書いたとおりで、**しかも今は既定 schedule でそう出る**。
+  「login では逆に出る」は消えた。
+- `cublas_emulation_survey.md` §4 と `p511_gap_study.md` §9 の
+  「p=511 で 1.50× 遅い」は**当時のツリー・当時の cuBLAS の値として残る**。
+  現行では成立しない。過去の表は書き換えていない。
+- **未解明 1 は閉じた。** 機構は「§9.5 の 2 つの数字は別の
+  `SCALE_DG_GVOLPAR` で測られていた」であり、その差が生まれる理由は
+  「cuBLAS emulation が 1 本のハンドルと 1 つの 8 GiB scratch を共有していて、
+  2 本目が重なった瞬間に全額の +13.8% が出る」である。
+  ノード・クロック・電力・MPS・混雑・ドライバはいずれも原因ではない
+  （§9.7.2 と §9.7.3 のクロスチェック）。
+

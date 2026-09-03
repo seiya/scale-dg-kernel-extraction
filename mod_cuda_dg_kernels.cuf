@@ -94,6 +94,12 @@ module mod_cuda_dg_kernels
   logical, save :: dg_graph_ready = .false.
 
   logical, save :: gemm_inited = .false.
+  ! cuBLAS FP64 emulation shares ONE handle and ONE 8 GiB workspace
+  ! (cuda_cublas_gemm.cu g_handle / g_workspace).  Two volume GEMMs in
+  ! flight at once would use that scratch concurrently, which produces
+  ! +/-Inf in dqdt.  gemm_volume_xyz forces the serial schedule when it
+  ! is on, the same way it does for the Ozaki backends.
+  logical, save :: gemm_emulation_on = .false.
   !- MMA instruction shape of the CUTLASS volume GEMMs; see
   !- cuda_cutlass_set_mma_shape. 0 = SM80 8x8x4, 1 = SM90 16x8x4,
   !- 2 = SM90 16x8x8, 3 = SM90 16x8x16.
@@ -2348,6 +2354,7 @@ contains
     if (present(mantissa_bits)) bits_flag = int(mantissa_bits, c_int)
     istat = cublas_gemm_init(emulate_flag, fixed_flag, bits_flag)
     if (istat /= 0) call cuda_failure("cublas_gemm_init",istat)
+    gemm_emulation_on = emulate
     gemm_inited = .true.
   end subroutine cuda_gemm_setup
 
@@ -2394,6 +2401,7 @@ contains
 
     par = gvol_par
     if (backend /= GEMM_VOL_CUBLAS) par = 0
+    if (gemm_emulation_on) par = 0
     zpar = (par >= 2) .and. side_free
 
     select case (backend)
@@ -2547,7 +2555,8 @@ contains
     !- be spread over streams.  GEMM_FUSED has had overlap_y / overlap_xy /
     !- overlap_z since the carrier work; the unfused driver never did.
     !- 0 = the serial schedule; 1 = y beside x; 2 = all three.  Only the
-    !- cuBLAS backend takes it (see gemm_volume_xyz).
+    !- cuBLAS backend takes it, and only with FP64 emulation off
+    !- (see gemm_volume_xyz).
     !-
     !- DEFAULT 2, adopted 2026-09-03 (Slurm job 78297, node c384, 12
     !- interleaved rounds, all 12/12 with disjoint ranges): mode 1 is
