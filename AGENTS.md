@@ -98,6 +98,16 @@ implementation is fastest.
   `cuda_cal_dqdt_gemm_cutlass(fuse_epilogue, ...)` driver. Keep it that way:
   optimize a surrounding kernel through its shared launch helper (e.g.
   `launch_volume_flux`) so every GEMM path gets it at once.
+  The **schedule of the three volume GEMMs** -- how many of them run on their
+  own stream -- is shared the same way, even though it is not a surrounding
+  kernel and so slipped past the launch-helper rule until 2026-09-03. Without
+  a fused epilogue the three are independent, so all three can be spread;
+  `GEMM`, `OZAKI1`, `OZAKI2` and `GEMM_CUTE` therefore all spread all three,
+  through the same fork/join helpers under the same condition
+  (`SCALE_DG_GVOLPAR` on the unfused driver, `SCALE_DG_CUTEPAR` on the CUTLASS
+  one, both default 2, both degrading on their own when the face flux already
+  occupies the side stream). A change to that schedule lands on all four at
+  once, exactly as a surrounding-kernel change does.
 - `CUDAFORTRAN_GEMM_OZAKI1` / `CUDAFORTRAN_GEMM_OZAKI2`: the same unfused
   driver as `CUDAFORTRAN_GEMM`. Only the three volume GEMMs are replaced.
   Compare them to native cuBLAS and to `CublasEmulation` on that same
@@ -108,7 +118,9 @@ implementation is fastest.
   library assignment as `CUDAFORTRAN_GEMM_FUSED`. Its epilogues are
   unweighted, z is materialized in `dqdt`, and a separate
   `separable_lift_assembly` kernel performs the final weighting and surface
-  lift. `GEMM` vs `GEMM_CUTE` measures the library/mainloop difference. Do
+  lift. It also runs the same three-way volume-GEMM schedule as `GEMM`, per
+  the paragraph above; that is what makes `GEMM` vs `GEMM_CUTE` a one-axis
+  library/mainloop comparison at the default settings of both. Do
   not retune CUTE on its own.
 - `CUDAFORTRAN_GEMM_FUSED`: the fused-epilogue production CUTLASS GEMM path.
   It has the same volume-GEMM mainloops and the same per-GEMM library
@@ -136,6 +148,20 @@ implementation is fastest.
   orders where that measured faster are in the gap studies.
   CUTLASS tile types live in `VolumeGemmSet` (or an explicitly shared
   order-specialized set) in `cuda_cutlass_gemm_fused.cu`.
+  **`GEMM_FUSED` does not share the three-way volume-GEMM schedule, and that
+  is not a defect.** The carrier reads the other two derivatives elementwise,
+  so it cannot start until both have finished: fusing drops the overlap from
+  three GEMMs to two, whichever of x, y or z carries. At `Nq >= 64` the
+  `xy_weighted` fold takes the remaining one as well, because a y that reads
+  `deriv_x` can no longer run beside x -- a trade measured at 6x to 50x in the
+  fold's favour (`gemm_assignment_and_carrier.md` §12.1). **Both are the price
+  of fusing, and the price belongs on the fusion axis**, which is what
+  `GEMM_CUTE` vs `GEMM_FUSED` measures: fusion has to win while paying it.
+  Equalizing the two paths' schedules by taking the overlap away from
+  `GEMM_CUTE` would move that price off the axis that exists to charge it,
+  and would break the library axis as well; do not do it. The "identical
+  launch geometry and batch partitioning" requirement below is about the
+  mainloop each GEMM runs, not about which stream carries it.
 - `CUDAFORTRAN_FUSED`: CUDA-core fused kernels in `cuda_dg_kernels_fused.cu`
   (natural-order shared panels, length-`Nq` inner products). This is the
   paper's "CC fused" column, and it is a full optimization target: make it as
