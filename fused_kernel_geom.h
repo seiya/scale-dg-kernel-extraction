@@ -200,17 +200,40 @@
 #define NQ2_63 4096
 #define NFPTOT63 24576
 #define BK63 64
+// log2 of a warp-grid extent, which is always 1, 2, 4 or 8.  Used instead of
+// a division so that the default build emits the same shift the hand-written
+// `warp >> 2` did; `warp` comes from a signed `(int)threadIdx.x >> 5` and a
+// real division would have to round toward zero.
+#define P63_LOG2_8(x) ((x) == 1 ? 0 : (x) == 2 ? 1 : (x) == 4 ? 2 : 3)
+// Warp grid of the p=63 volume kernels: P63_WM rows by P63_WN columns, each
+// warp owning P63_TM by P63_TN of the 8x8 mma tiles, with
+// P63_WM*P63_TM = P63_WN*P63_TN = 8 so that the block always covers the whole
+// 64x64 plane.  P63_WN was the only knob until section 19 of
+// reports/dfma_register_budget.md; P63_WM opens the other side, which is the
+// A-operand side of the mma here (`av[a]`, a < P63_TM) and therefore the side
+// section 17.1 says is worth twice as much.  Out of role: DFMA-only overrides
+// (P63_WM_DFMA / P63_WN_DFMA under DFMA_OWN_SHAPE), never in production.
+#ifndef P63_WM
+#define P63_WM 4
+#endif
+#ifndef P63_WM_DFMA
+#define P63_WM_DFMA P63_WM
+#endif
 #ifndef P63_WN
 #define P63_WN 4
 #endif
 #ifndef P63_WN_DFMA
 #define P63_WN_DFMA P63_WN
 #endif
+#define P63_TM (8 / P63_WM)
 #define P63_TN (8 / P63_WN)
-#define P63_THREADS (32 * 4 * P63_WN)
+#define P63_THREADS (32 * P63_WM * P63_WN)
+#define P63_WM_SEL TCDFMA_SHAPE(P63_WM, P63_WM_DFMA)
+#define P63_TM_SEL (8 / P63_WM_SEL)
+#define P63_WM_LOG_SEL P63_LOG2_8(P63_WM_SEL)
 #define P63_WN_SEL TCDFMA_SHAPE(P63_WN, P63_WN_DFMA)
 #define P63_TN_SEL (8 / P63_WN_SEL)
-#define P63_THREADS_SEL (32 * 4 * P63_WN_SEL)
+#define P63_THREADS_SEL (32 * P63_WM_SEL * P63_WN_SEL)
 #define P63_STAGE_ITERS_SEL (NQ63 * BK63 / P63_THREADS_SEL)
 #define P63_STAGE_ITERS (NQ63 * BK63 / P63_THREADS)
 #ifndef P63_BPSM
@@ -231,17 +254,27 @@
 #define P63_XZ_DB 0
 #endif
 #define P63_XZ_NBUF (P63_XZ_DB + 1)
+#ifndef P63Y_WM
+#define P63Y_WM 4
+#endif
+#ifndef P63Y_WM_DFMA
+#define P63Y_WM_DFMA P63Y_WM
+#endif
 #ifndef P63Y_WN
 #define P63Y_WN 4
 #endif
 #ifndef P63Y_WN_DFMA
 #define P63Y_WN_DFMA P63Y_WN
 #endif
+#define P63Y_TM (8 / P63Y_WM)
 #define P63Y_TN (8 / P63Y_WN)
-#define P63Y_THREADS (32 * 4 * P63Y_WN)
+#define P63Y_THREADS (32 * P63Y_WM * P63Y_WN)
+#define P63Y_WM_SEL TCDFMA_SHAPE(P63Y_WM, P63Y_WM_DFMA)
+#define P63Y_TM_SEL (8 / P63Y_WM_SEL)
+#define P63Y_WM_LOG_SEL P63_LOG2_8(P63Y_WM_SEL)
 #define P63Y_WN_SEL TCDFMA_SHAPE(P63Y_WN, P63Y_WN_DFMA)
 #define P63Y_TN_SEL (8 / P63Y_WN_SEL)
-#define P63Y_THREADS_SEL (32 * 4 * P63Y_WN_SEL)
+#define P63Y_THREADS_SEL (32 * P63Y_WM_SEL * P63Y_WN_SEL)
 #define P63Y_STAGE_ITERS_SEL (NQ63 * BK63 / P63Y_THREADS_SEL)
 #define P63Y_STAGE_ITERS (NQ63 * BK63 / P63Y_THREADS)
 #ifndef P63Y_BPSM

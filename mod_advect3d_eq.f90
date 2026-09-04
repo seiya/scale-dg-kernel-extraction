@@ -206,9 +206,9 @@ contains
       end if
       if (Np /= 512 .and. Np /= 16**3 .and. Np /= 32**3 .and. &
           Np /= 64**3 .and. Np /= 128**3 .and. Np /= 256**3 .and. &
-          Np /= 512**3) then
+          Np /= 512**3 .and. Np /= 768**3) then
         write(*,*) "CUDAFORTRAN_FUSED_DFMA requires PolyOrder=7, 15, 31, 63, 127, ", &
-          "255 or 511"
+          "255, 511 or 767"
         error stop
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA
@@ -220,9 +220,9 @@ contains
       end if
       if (Np /= 512 .and. Np /= 16**3 .and. Np /= 32**3 .and. &
           Np /= 64**3 .and. Np /= 128**3 .and. Np /= 256**3 .and. &
-          Np /= 512**3) then
+          Np /= 512**3 .and. Np /= 768**3) then
         write(*,*) "CUDAFORTRAN_FUSED_TC requires PolyOrder=7, 15, 31, 63, 127, ", &
-          "255 or 511"
+          "255, 511 or 767"
         error stop
       end if
       dqdt_kernel_typeid = DQDT_KERNEL_CUDAFORTRAN_FUSED_TC
@@ -329,10 +329,13 @@ contains
     ! GEMM_CUTE is the unfused control for GEMM_FUSED and shares its volume
     ! GEMM tiles, so it has to be reachable wherever GEMM_FUSED is: without it
     ! the fused epilogue has no price tag at these degrees.
-    !- p=511 also has the tile-type fused kernels (FUSED_TC / FUSED_DFMA):
-    !  the shape of tendency_p255_kernel carries Nq only in its grid and chunk
-    !  count.  p=575 / 767 / 1023 do not -- reports/p511_gap_study.md section
-    !  14.6 decided not to write them, and section 15 measures p=511.
+    !- p=511 and p=767 also have the tile-type fused kernels (FUSED_TC /
+    !  FUSED_DFMA): the shape of tendency_p255_kernel carries Nq only in its
+    !  grid and chunk count, and 768 divides both BM255/BN255 = 64 and
+    !  BK255 = 16.  p=767 was opened in section 19 of
+    !  reports/dfma_register_budget.md; p=575 has no instance and p=1023
+    !  cannot have one, because 3*Np = 3.22e9 overflows the kernel's 32-bit
+    !  node index (p1023_gap_study.md section 1).
     if ((Np == 512**3 .or. Np == 576**3 .or. Np == 768**3 .or. &
          Np == 1024**3) .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &
@@ -340,14 +343,14 @@ contains
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_CUTE .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2 .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI1 .and. &
-        .not. (Np == 512**3 .and. &
+        .not. ((Np == 512**3 .or. Np == 768**3) .and. &
                (dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .or. &
                 dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA))) then
-      error stop "PolyOrder=511 requires CUDAFORTRAN_GEMM, " // &
+      error stop "PolyOrder=511 and 767 require CUDAFORTRAN_GEMM, " // &
         "CUDAFORTRAN_GEMM_FUSED, CUDAFORTRAN_GEMM_CUTE, " // &
         "CUDAFORTRAN_GEMM_OZAKI2, CUDAFORTRAN_GEMM_OZAKI1, " // &
         "CUDAFORTRAN_FUSED_TC or CUDAFORTRAN_FUSED_DFMA; " // &
-        "PolyOrder=575, 767 or 1023 requires one of the GEMM paths"
+        "PolyOrder=575 or 1023 requires one of the GEMM paths"
     end if
 
     if (dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_FUSED .and. &
@@ -364,8 +367,8 @@ contains
     if ((dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED .or. &
          dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_TC .or. &
          dqdt_kernel_typeid == DQDT_KERNEL_CUDAFORTRAN_FUSED_DFMA) .and. &
-        (Np == 512**3 .or. Np == 256**3 .or. Np == 128**3 .or. &
-         Np == 64**3)) then
+        (Np == 768**3 .or. Np == 512**3 .or. Np == 256**3 .or. &
+         Np == 128**3 .or. Np == 64**3)) then
       allocate(fused_flux_bnd(NfpTot,Ne))
       !$acc enter data create(fused_flux_bnd)
     end if
@@ -1104,7 +1107,7 @@ contains
         normal_fn, Fscale, Escale, fused_flux_bnd, &
         Nq, Np, NfpTot, Ne, NeA, kernel_time )
       !$acc end host_data
-    else if (Nq == 256 .or. Nq == 512) then
+    else if (Nq == 256 .or. Nq == 512 .or. Nq == 768) then
       !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
       !$acc& use_device(normal_fn,Fscale,Escale,fused_flux_bnd)
       call cuda_cal_dqdt_fused_p255_dfma( &
@@ -1113,7 +1116,7 @@ contains
         Nq, Np, NfpTot, Ne, NeA, kernel_time )
       !$acc end host_data
     else
-      error stop "CUDAFORTRAN_FUSED_DFMA requires Nq=8, 16, 32, 64, 128, 256 or 512"
+      error stop "CUDAFORTRAN_FUSED_DFMA requires Nq=8, 16, 32, 64, 128, 256, 512 or 768"
     end if
 
     call accumulate_kernel_time(kernel_time)
@@ -1166,7 +1169,7 @@ contains
         normal_fn, Fscale, Escale, fused_flux_bnd, &
         Nq, Np, NfpTot, Ne, NeA, kernel_time )
       !$acc end host_data
-    else if (Nq == 256 .or. Nq == 512) then
+    else if (Nq == 256 .or. Nq == 512 .or. Nq == 768) then
       !$acc host_data use_device(dqdt,q,u,v,w,D1D,Lift1D,VMapM,VMapP) &
       !$acc& use_device(normal_fn,Fscale,Escale,fused_flux_bnd)
       call cuda_cal_dqdt_fused_p255_tc( &
@@ -1175,7 +1178,7 @@ contains
         Nq, Np, NfpTot, Ne, NeA, kernel_time )
       !$acc end host_data
     else
-      error stop "CUDAFORTRAN_FUSED_TC requires Nq=8, 16, 32, 64, 128, 256 or 512"
+      error stop "CUDAFORTRAN_FUSED_TC requires Nq=8, 16, 32, 64, 128, 256, 512 or 768"
     end if
 
     call accumulate_kernel_time(kernel_time)

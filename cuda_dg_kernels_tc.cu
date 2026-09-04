@@ -1448,7 +1448,15 @@ void launch_tendency_dir_p255_impl(
     const int *VMapP, const double *normal_fn, const double *Fscale, int Ne,
     int nq)
 {
-  if (nq == 512) {
+  if (nq == 768) {
+    // Nq = 768 reaches 3*Np = 1.36e9, still inside a 32-bit node index; only
+    // Nq = 1024 (3.22e9) does not.  Adding this instance changes no code the
+    // Nq = 256 / 512 instances generate; see section 19 of
+    // reports/dfma_register_budget.md.
+    launch_tendency_dir_p255_nq<UseTc, 768>(dir, dqdt, q, u, v, w, D1D, Lift1D,
+                                            flux_bnd, Escale, VMapM, VMapP,
+                                            normal_fn, Fscale, Ne);
+  } else if (nq == 512) {
     launch_tendency_dir_p255_nq<UseTc, 512>(dir, dqdt, q, u, v, w, D1D, Lift1D,
                                             flux_bnd, Escale, VMapM, VMapP,
                                             normal_fn, Fscale, Ne);
@@ -3112,8 +3120,8 @@ __global__ __launch_bounds__(P63_THREADS_SEL, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFM
   const int tid = (int)threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  const int wm = warp & 3;
-  const int wn = warp >> 2;
+  const int wm = warp & (P63_WM_SEL - 1);
+  const int wn = warp >> P63_WM_LOG_SEL;
   const int row = lane >> 2;
   const int colk = lane & 3;
 
@@ -3122,12 +3130,14 @@ __global__ __launch_bounds__(P63_THREADS_SEL, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFM
   const int npoint = NP63 * Ne;
   const int plane_off = NQ63 * jp;
 
-  // Eight 8x8 tiles per warp in a 2x4 arrangement, for each of the two
-  // directions: 2 + 4 operand loads per k-step instead of the 1 + 8 that a
-  // 1x8 shape would need.
-  double ax[2 * 2 * P63_TN_SEL], az[2 * 2 * P63_TN_SEL];
+  // Eight 8x8 tiles per warp, P63_TM by P63_TN, for each of the two
+  // directions: at the default 2x4 that is 2 + 4 operand loads per k-step
+  // instead of the 1 + 8 that a 1x8 shape would need.  P63_TM is the A-operand
+  // side of the mma below, so widening it is worth twice widening P63_TN;
+  // section 19 of reports/dfma_register_budget.md measures the whole grid.
+  double ax[2 * P63_TM_SEL * P63_TN_SEL], az[2 * P63_TM_SEL * P63_TN_SEL];
 #pragma unroll
-  for (int e = 0; e < 2 * 2 * P63_TN_SEL; ++e) {
+  for (int e = 0; e < 2 * P63_TM_SEL * P63_TN_SEL; ++e) {
     ax[e] = 0.0;
     az[e] = 0.0;
   }
@@ -3227,10 +3237,10 @@ __global__ __launch_bounds__(P63_THREADS_SEL, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFM
 #pragma unroll
     for (int ks = 0; ks < BK63 / 4; ++ks) {
       const int l = 4 * ks + colk;
-      double av[2], bv[P63_TN_SEL], avz[2], bvz[P63_TN_SEL];
+      double av[P63_TM_SEL], bv[P63_TN_SEL], avz[P63_TM_SEL], bvz[P63_TN_SEL];
 #pragma unroll
-      for (int a = 0; a < 2; ++a) {
-        const int m = 8 * (2 * wm + a) + row;
+      for (int a = 0; a < P63_TM_SEL; ++a) {
+        const int m = 8 * (P63_TM_SEL * wm + a) + row;
         av[a] = sFU[buf * P63_PANEL + swu63(m + BK63 * l)];
         avz[a] = sD[buf * P63_PANEL + swt63(m + BK63 * l)];
       }
@@ -3241,7 +3251,7 @@ __global__ __launch_bounds__(P63_THREADS_SEL, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFM
         bvz[bb] = sFW[buf * P63_PANEL + swt63(n + BK63 * l)];
       }
 #pragma unroll
-      for (int a = 0; a < 2; ++a) {
+      for (int a = 0; a < P63_TM_SEL; ++a) {
 #pragma unroll
         for (int bb = 0; bb < P63_TN_SEL; ++bb) {
           const int e = 2 * (P63_TN_SEL * a + bb);
@@ -3277,10 +3287,10 @@ __global__ __launch_bounds__(P63_THREADS_SEL, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFM
   const double lf3 = Lift1D[jp + 2 * NQ63];
 
 #pragma unroll
-  for (int e8 = 0; e8 < 2 * P63_TN_SEL; ++e8) {
+  for (int e8 = 0; e8 < P63_TM_SEL * P63_TN_SEL; ++e8) {
     const int a = e8 / P63_TN_SEL;
     const int bb = e8 % P63_TN_SEL;
-    const int m = 8 * (2 * wm + a) + row;                 // k
+    const int m = 8 * (P63_TM_SEL * wm + a) + row;        // k
     const int n = 8 * (P63_TN_SEL * wn + bb) + 2 * colk;      // i, and i+1
     const int node = eo + n + plane_off + NQ2_63 * m;
 
@@ -3348,8 +3358,8 @@ __global__ __launch_bounds__(P63Y_THREADS_SEL, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_
   const int tid = (int)threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  const int wm = warp & 3;
-  const int wn = warp >> 2;
+  const int wm = warp & (P63Y_WM_SEL - 1);
+  const int wn = warp >> P63Y_WM_LOG_SEL;
   const int row = lane >> 2;
   const int colk = lane & 3;
 
@@ -3357,9 +3367,9 @@ __global__ __launch_bounds__(P63Y_THREADS_SEL, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_
   const int npoint = NP63 * Ne;
   const int plane_off = NQ2_63 * kp;
 
-  double acc[2 * 2 * P63Y_TN_SEL];
+  double acc[2 * P63Y_TM_SEL * P63Y_TN_SEL];
 #pragma unroll
-  for (int e = 0; e < 2 * 2 * P63Y_TN_SEL; ++e) {
+  for (int e = 0; e < 2 * P63Y_TM_SEL * P63Y_TN_SEL; ++e) {
     acc[e] = 0.0;
   }
 
@@ -3375,11 +3385,11 @@ __global__ __launch_bounds__(P63Y_THREADS_SEL, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
 #pragma unroll
-  for (int e8 = 0; e8 < 2 * P63Y_TN_SEL; ++e8) {
+  for (int e8 = 0; e8 < P63Y_TM_SEL * P63Y_TN_SEL; ++e8) {
     const int a = e8 / P63Y_TN_SEL;
     const int bb = e8 % P63Y_TN_SEL;
     const int loc = (8 * (P63Y_TN_SEL * wn + bb) + 2 * colk) +
-                    NQ63 * (8 * (2 * wm + a) + row);
+                    NQ63 * (8 * (P63Y_TM_SEL * wm + a) + row);
     cp_async_16(sDQ + loc, dqdt + eo + plane_off + loc);
   }
   asm volatile("cp.async.commit_group;\n" ::);
@@ -3401,17 +3411,17 @@ __global__ __launch_bounds__(P63Y_THREADS_SEL, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_
 #pragma unroll
     for (int ks = 0; ks < BK63 / 4; ++ks) {
       const int l = 4 * ks + colk;
-      double av[2], bv[P63Y_TN_SEL];
+      double av[P63Y_TM_SEL], bv[P63Y_TN_SEL];
 #pragma unroll
-      for (int a = 0; a < 2; ++a) {
-        av[a] = sD[swt63((8 * (2 * wm + a) + row) + BK63 * l)];
+      for (int a = 0; a < P63Y_TM_SEL; ++a) {
+        av[a] = sD[swt63((8 * (P63Y_TM_SEL * wm + a) + row) + BK63 * l)];
       }
 #pragma unroll
       for (int bb = 0; bb < P63Y_TN_SEL; ++bb) {
         bv[bb] = sFV[sw63(l + BK63 * (8 * (P63Y_TN_SEL * wn + bb) + row))];
       }
 #pragma unroll
-      for (int a = 0; a < 2; ++a) {
+      for (int a = 0; a < P63Y_TM_SEL; ++a) {
 #pragma unroll
         for (int bb = 0; bb < P63Y_TN_SEL; ++bb) {
           const int e = 2 * (P63Y_TN_SEL * a + bb);
@@ -3424,10 +3434,10 @@ __global__ __launch_bounds__(P63Y_THREADS_SEL, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_
   asm volatile("cp.async.wait_group 0;\n" ::);
 
 #pragma unroll
-  for (int e8 = 0; e8 < 2 * P63Y_TN_SEL; ++e8) {
+  for (int e8 = 0; e8 < P63Y_TM_SEL * P63Y_TN_SEL; ++e8) {
     const int a = e8 / P63Y_TN_SEL;
     const int bb = e8 % P63Y_TN_SEL;
-    const int m = 8 * (2 * wm + a) + row;                 // j
+    const int m = 8 * (P63Y_TM_SEL * wm + a) + row;       // j
     const int n = 8 * (P63Y_TN_SEL * wn + bb) + 2 * colk;      // i, and i+1
     const int node = eo + n + NQ63 * m + plane_off;
     const double2 ey =
