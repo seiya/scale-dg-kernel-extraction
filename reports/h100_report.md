@@ -198,3 +198,87 @@ make CUDA=1 GPUFLAGS=-gpu=cc90 \
 - **16x8x16 は両機とも不可。** `MmaBase` が warp あたり 2 回以上の GEMM を要求する
   ため K=32 タイルが必須で、shared が倍・occupancy が半分になる分を命令形状の
   利得では取り返せない。
+
+---
+
+## 7. 命令形状ノブの実体化（2026-09-04、tree `5e507b8`）
+
+**§1–§6 は commit `9eed9e5` / `f5794b7`（2026-08-26）の記録であり、表は書き換えない。**
+以下は、その後 GB200 側でツリーが動いた結果として **H100 を測り直す前に
+直さなければならなかった 1 件**と、その修正の検証である。時間の測定は
+含まない（TSUBAME 側の再測定はこれから）。
+
+### 7.1 `CutlassMmaShape` は途中から「半分だけ繋がった」ノブになっていた
+
+`§4` の測定当時（`f5794b7`）、x volume GEMM は汎用の
+`launch_volume_gemm_x` を通っており、命令形状は x/y/z の 3 本すべてに効いて
+いた。**`§4` の数値はその意味でそのまま有効である。**
+
+その後 `51d56a8`（2026-09-02、GEMM ライブラリ割り当てとエピローグ carrier の
+測定）で x volume GEMM に**次数別の専用タイル**が入った
+（Nq=8→tile 9、16→5、32→7、64→3、128/256→0）。この `XTile` テンプレートは
+`GS<8,8,4>` と `Sm80` をハードコードしていたため、`Nq <= 256` では
+
+- `CutlassMmaShape` を変えても **x だけ 8x8x4 のまま**（`GEMM_CUTE` /
+  `GEMM_FUSED` の両方で）、
+- 融合の x carrier（Nq = 8 / 16 / 32）は `mma_shape != 0` を即座に拒否、
+- Nq = 64 の z carrier も採用 package の分岐に形状が無く拒否、
+
+という状態になっていた。低次では `GEMM_CUTE` だけが（x を 8x8x4 に置いたまま）
+起動でき、`GEMM_FUSED` は起動できない。**この非対称は AGENTS.md が
+`GEMM_CUTE` と `GEMM_FUSED` に禁じている「異なる mainloop / 命令形状」**
+そのものなので、この状態の H100 値は公表できない。
+
+### 7.2 実体化した範囲
+
+- `MmaShapeSel<0..3>`（命令形状 → InstructionShape / ArchTag / TileK）を 1 箇所に。
+  16x8x16 だけ `TileK = 32` を要求する（`MmaBase` の
+  `WarpShape::kK / InstShape::kK >= 2` かつ偶数）ので、タイル専用化のある
+  経路では **形状 0〜2 のみ**実体化し、16x8x16 は従来どおり汎用セット限定。
+- `XTile` に InstShape / ArchTag をデフォルト引数付きで追加。**既存のタイル別名の
+  型は 1 ビットも変わらない**（`static_assert` で担保）。各次数の**採用タイルのみ**を
+  形状付きで実体化（`XAdopted8/16/32/64/Hi`）。
+- `VolumeGemmSetP7` / `VolumeGemmSetP15` をテンプレート化。従来、非既定形状の
+  低次 y/z は汎用 64x64 タイルに落ちており、**タイルと命令の 2 軸が同時に
+  動いていた**。これも一軸化された。
+- 融合エピローグ: x carrier は Nq = 8（tile 9 / xpkg 5）、16（tile 5 / xpkg 4）、
+  32（tile 7 / xpkg 4）の**採用構成のみ**、z carrier は Nq = 64 の **zpkg 5 のみ**を
+  形状付きで実体化。`SCALE_DG_XTILE` などの ablation メニュー（weight_mode 4 通り
+  × package 8 通り）は 8x8x4 のまま残す。全部を形状ぶん実体化するとビルドが
+  倍増し、どの次数も使わない組み合わせのために払うことになる。
+- `launch_volume_gemm_x_tiled` に `mma_shape` 引数を追加（Fortran 側の interface と
+  呼び出し 2 箇所も）。
+
+### 7.3 検証（GB200、login GPU、`SCALE_DG_VARYING_COEFF=1`、owned `dqdt` 全 16,777,216 点）
+
+p = 7 / 15 / 31 / 63 / 127 / 255 × `GEMM_CUTE` / `GEMM_FUSED` ×
+`8x8x4` / `16x8x4` / `16x8x8` の 36 通り。対照は p<=127 が
+`CUDAFORTRAN_SPLIT`、p=255 が `CUDAFORTRAN_GEMM`。
+
+| p | `GEMM_CUTE` 3 形状 | `GEMM_FUSED` 3 形状 | 既定形状 変更前バイナリとの比較 |
+|---:|---|---|---|
+| 7 | max abs 0.000e+00 | rel 2.078e-16 | ビット一致 |
+| 15 | 0.000e+00 | 2.078e-16 | ビット一致 |
+| 31 | 0.000e+00 | 2.078e-16 | ビット一致 |
+| 63 | 0.000e+00 | 4.156e-16 | ビット一致 |
+| 127 | 0.000e+00 | 2.078e-16 | ビット一致 |
+| 255 | 0.000e+00 | 2.078e-16 | ビット一致 |
+
+**既定（8x8x4）の出力が変更前の実行ファイルとビット一致である**ことが要点で、
+型レベルの `static_assert` と合わせて、公表済みの GB200 の値は 1 つも
+無効化されない。p >= 511 は `x_mode = 0`（汎用 x）で今回の分岐を通らない。
+
+ビルド確認: cc100（`-gpu=cc100` / `-arch=sm_100`）、**cc90（`-gpu=cc90` /
+`-arch=sm_90`、14 分 30 秒）**、非 CUDA（stub）の 3 モードとも成功。
+現行ツリーは `NVCCFLAGS` を全指定しなくても `GPUNVCCFLAGS=-arch=sm_90` で
+H100 向けにビルドできる（§5 のコマンドはより短く書ける）。
+
+### 7.4 これから測ること
+
+`jobs/tsubame_paths.sh`（未コミット、`jobs/` は gitignore）が
+**現行ツリーの経路 × 次数を H100 で測り直す**ジョブである。§3 の表を
+p = 7 / 15 / 31 / 63 / 127 / 255 / 511 / 575 / 767 と全生存経路に広げ、
+CUTLASS 2 経路は `8x8x4` と `16x8x4` の両方を採る。p = 1023 は payload
+180 GiB で H100 94 GB に載らないので対象外、p = 767 は 78 GiB で綱渡り。
+入力は GB200 の表と同じ `namelists/perf_p*_gemm.conf` から
+`DqdtKernel_Type` だけを差し替えて生成する。

@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
+#include <type_traits>
 
 #include "cutlass/cutlass.h"
 //- Must precede the device-level GEMM headers: it specializes
@@ -130,6 +131,44 @@ public:
 template <int M, int N, int K>
 using GS = cutlass::gemm::GemmShape<M, N, K>;
 
+//- The four MMA instruction shapes the namelist entry CutlassMmaShape selects,
+//- as (InstructionShape, ArchTag, threadblock TileK).  On sm_90 each of the
+//- three 16x8xK forms is one SASS instruction; on sm_100 ptxas expands them
+//- into 2 / 4 / 8 DMMA.8x8x4, which is why the tree's default is 8x8x4 and why
+//- the shape only pays on H100 (reports/h100_report.md section 4,
+//- reports/sm90_mma_shape_survey.md section 6).
+//-
+//- kTileK is not free: MmaBase asserts WarpShape::kK / InstShape::kK >= 2 and
+//- even, so 16x8x16 needs TileK = 32.  Shapes 0-2 share TileK = 16 and can
+//- therefore be dropped into any tile the 8x8x4 path already uses; shape 3
+//- cannot, and stays confined to the generic VolumeGemmSet as before.
+template <int kShape> struct MmaShapeSel;
+template <> struct MmaShapeSel<0> {
+  using Inst = GS<8, 8, 4>;
+  using Arch = cutlass::arch::Sm80;
+  static constexpr int kTileK = 16;
+};
+template <> struct MmaShapeSel<1> {
+  using Inst = GS<16, 8, 4>;
+  using Arch = cutlass::arch::Sm90;
+  static constexpr int kTileK = 16;
+};
+template <> struct MmaShapeSel<2> {
+  using Inst = GS<16, 8, 8>;
+  using Arch = cutlass::arch::Sm90;
+  static constexpr int kTileK = 16;
+};
+template <> struct MmaShapeSel<3> {
+  using Inst = GS<16, 8, 16>;
+  using Arch = cutlass::arch::Sm90;
+  static constexpr int kTileK = 32;
+};
+
+//- Shapes 0-2 are the ones the order-specialized tiles and sets below are
+//- instantiated for.  kMaxTiledShape names that limit in one place so the
+//- launchers can say why shape 3 is refused there.
+constexpr int kMaxTiledShape = 2;
+
 //- One set of volume GEMMs for a given MMA instruction shape. Only InstShape,
 //- ArchTag and the tile K depth vary; the M/N tiles, warp counts and stage
 //- counts below are the ones the 8x8x4 path has always used.
@@ -224,41 +263,63 @@ using MmaSet_1688 = VolumeGemmSet<GS<16, 8, 8>, cutlass::arch::Sm90, 16>;
 using MmaSet_16816 = VolumeGemmSet<GS<16, 8, 16>, cutlass::arch::Sm90, 32>;
 using MmaSet_1684 = VolumeGemmSet<GS<16, 8, 4>, cutlass::arch::Sm90, 16>;
 
+//- The generic set indexed by shape, so a launcher can write one dispatch
+//- instead of a four-way switch per call site.
+template <int kShape> using GenericMmaSet =
+    VolumeGemmSet<typename MmaShapeSel<kShape>::Inst,
+                  typename MmaShapeSel<kShape>::Arch,
+                  MmaShapeSel<kShape>::kTileK>;
+static_assert(std::is_same<GenericMmaSet<0>, MmaSet_884>::value, "shape 0 drifted");
+static_assert(std::is_same<GenericMmaSet<1>, MmaSet_1684>::value, "shape 1 drifted");
+static_assert(std::is_same<GenericMmaSet<2>, MmaSet_1688>::value, "shape 2 drifted");
+static_assert(std::is_same<GenericMmaSet<3>, MmaSet_16816>::value, "shape 3 drifted");
+
 // Nq=8 makes the generic tiles mostly predicated. CUTLASS's FP64 TensorOp
 // multistage iterator needs at least two warps; the measured winners are
 // 32x64 for the 8x8 y batches and 16x32 for the 64x8 z/assembly GEMM.
-struct VolumeGemmSetP7 : VolumeGemmSet<GS<8, 8, 4>, cutlass::arch::Sm80, 16> {
+template <class InstShape, class ArchTag, int TileK>
+struct VolumeGemmSetP7 : VolumeGemmSet<InstShape, ArchTag, TileK> {
   using GemmY = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<32, 64, 16>, GS<32, 32, 16>,
-      GS<8, 8, 4>, EpilogueOp, BatchedSwizzle, 3>;
+      TensorOp, ArchTag, GS<32, 64, TileK>, GS<32, 32, TileK>,
+      InstShape, EpilogueOp, BatchedSwizzle, 3>;
   using GemmYScale = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<32, 64, 16>, GS<32, 32, 16>,
-      GS<8, 8, 4>, PointwiseScaleV<1>, BatchedSwizzle, 3>;
+      TensorOp, ArchTag, GS<32, 64, TileK>, GS<32, 32, TileK>,
+      InstShape, PointwiseScaleV<1>, BatchedSwizzle, 3>;
   using GemmZ = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<16, 32, 16>, GS<16, 16, 16>,
-      GS<8, 8, 4>, EpilogueOp, BatchedSwizzle, 3>;
+      TensorOp, ArchTag, GS<16, 32, TileK>, GS<16, 16, TileK>,
+      InstShape, EpilogueOp, BatchedSwizzle, 3>;
   //- Same tile with 16-byte epilogue accesses.  Only the low-order study of
   //- reports/p7_gemm_fused.md section 13 instantiates it; the mainloop is the
   //- one GemmZ has, so GEMM_CUTE and GEMM_FUSED still share it.
   using GemmZWide = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<16, 32, 16>, GS<16, 16, 16>,
-      GS<8, 8, 4>, EpilogueOp2, BatchedSwizzle, 3>;
+      TensorOp, ArchTag, GS<16, 32, TileK>, GS<16, 16, TileK>,
+      InstShape, EpilogueOp2, BatchedSwizzle, 3>;
   //- Escale-forwarding twins of this set's plain y and z, for the x carrier.
   using GemmYIsoScale = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<32, 64, 16>, GS<32, 32, 16>,
-      GS<8, 8, 4>, PointwiseScaleV<1>, BatchedSwizzle, 3>;
+      TensorOp, ArchTag, GS<32, 64, TileK>, GS<32, 32, TileK>,
+      InstShape, PointwiseScaleV<1>, BatchedSwizzle, 3>;
   using GemmZScale = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<16, 32, 16>, GS<16, 16, 16>,
-      GS<8, 8, 4>, PointwiseScaleV<1>, BatchedSwizzle, 3>;
+      TensorOp, ArchTag, GS<16, 32, TileK>, GS<16, 16, TileK>,
+      InstShape, PointwiseScaleV<1>, BatchedSwizzle, 3>;
 };
 
-using P7MmaSet_884 = VolumeGemmSetP7;
+using P7MmaSet_884 = VolumeGemmSetP7<GS<8, 8, 4>, cutlass::arch::Sm80, 16>;
+//- The same set at MMA instruction shape kShape, for shapes 0-2 (they share
+//- TileK = 16).  Both GEMM_CUTE and GEMM_FUSED select through this alias, so
+//- a non-default shape keeps the order's tiles instead of falling back to the
+//- generic 64x128 / 64x64 / 64x32 set.
+template <int kShape> using P7MmaSet =
+    VolumeGemmSetP7<typename MmaShapeSel<kShape>::Inst,
+                    typename MmaShapeSel<kShape>::Arch,
+                    MmaShapeSel<kShape>::kTileK>;
+static_assert(std::is_same<P7MmaSet<0>, P7MmaSet_884>::value,
+              "Nq=8 default volume GEMM set drifted");
 
 //- Order-specialized x volume GEMM tiles.  The x GEMM is Nq x (nq2*Ne) x Nq
 //- with a column-major C, so device::Gemm runs the transposed problem: the
@@ -271,25 +332,40 @@ using P7MmaSet_884 = VolumeGemmSetP7;
 //- GEMM_CUTE and GEMM_FUSED alike; only the Escale-weighted variant is
 //- fused-only, and it differs from the plain one in the epilogue output op
 //- alone.
-template <int TbM, int TbN, int WM, int WN, int TileK = 16, int Stages = 3>
+//- InstShape / ArchTag default to the 8x8x4 pair, so every tile alias below
+//- and every existing use site keeps exactly the type it had.  A non-default
+//- MMA shape reaches this tile only through XTileS<> further down, which is
+//- what lets GEMM_CUTE and GEMM_FUSED run the SAME tile at a non-default
+//- shape instead of one of them silently falling back to the generic set.
+template <int TbM, int TbN, int WM, int WN, int TileK = 16, int Stages = 3,
+          class InstShape = GS<8, 8, 4>, class ArchTag = cutlass::arch::Sm80>
 struct XTile {
   using GemmX = cutlass::gemm::device::Gemm<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<TbM, TbN, TileK>, GS<WM, WN, TileK>,
-      GS<8, 8, 4>, EpilogueOp, Swizzle, Stages>;
+      TensorOp, ArchTag, GS<TbM, TbN, TileK>, GS<WM, WN, TileK>,
+      InstShape, EpilogueOp, Swizzle, Stages>;
   using GemmXScale = cutlass::gemm::device::Gemm<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<TbM, TbN, TileK>, GS<WM, WN, TileK>,
-      GS<8, 8, 4>, PointwiseScaleV<1>, Swizzle, Stages>;
+      TensorOp, ArchTag, GS<TbM, TbN, TileK>, GS<WM, WN, TileK>,
+      InstShape, PointwiseScaleV<1>, Swizzle, Stages>;
   //- Same threadblock tile, warp partition, MMA shape, swizzle and stage
   //- count with 16-byte epilogue accesses (kElementsPerAccess = 2).  Only the
   //- carrier instantiates it, and only the epilogue differs, so GEMM_CUTE and
   //- GEMM_FUSED still share one mainloop.  Same construction as GemmZWide.
   using GemmXWide = cutlass::gemm::device::Gemm<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<TbM, TbN, TileK>, GS<WM, WN, TileK>,
-      GS<8, 8, 4>, EpilogueOp2, Swizzle, Stages>;
+      TensorOp, ArchTag, GS<TbM, TbN, TileK>, GS<WM, WN, TileK>,
+      InstShape, EpilogueOp2, Swizzle, Stages>;
 };
+
+//- The same tile at MMA instruction shape kShape.  TileK stays the tile's own
+//- (16 everywhere the order-specialized lists use it), which is legal for
+//- shapes 0-2; shape 3 would need 32 and is not offered here.
+template <int kShape, int TbM, int TbN, int WM, int WN, int TileK = 16,
+          int Stages = 3>
+using XTileS = XTile<TbM, TbN, WM, WN, TileK, Stages,
+                     typename MmaShapeSel<kShape>::Inst,
+                     typename MmaShapeSel<kShape>::Arch>;
 
 //- N = 8 does not build: the FP64 multistage B iterator's thread map
 //- degenerates to zero contiguous iterations for a 16x8 tile with 128
@@ -397,6 +473,34 @@ using PHXTile17 = XTile<128, 64, 32, 32, 16, 3>;
 using PHXTile18 = XTile<64, 64, 32, 32, 16, 4>;
 using PHXTile19 = XTile<64, 64, 32, 16, 16, 3>;
 
+//- The ADOPTED x tile of each order, expressed once per MMA instruction shape.
+//- The x GEMM is the one volume GEMM whose tile is order-specialized at every
+//- order up to 256, and until now those tiles hard-coded GS<8,8,4>: selecting
+//- CutlassMmaShape moved the y and z GEMMs and left x on 8x8x4 in BOTH
+//- GEMM_CUTE and GEMM_FUSED, and the fused x carrier (Nq = 8, 16, 32) refused
+//- the shape outright.  These aliases close that.  Only the adopted tile of
+//- each order is instantiated at a non-default shape: the ablation menus above
+//- exist to choose a tile at 8x8x4, and instantiating all of them four times
+//- over would multiply the build for measurements nobody asked for.  The
+//- static_asserts below are the guarantee that shape 0 is the very type the
+//- named tile alias already was, so the default path cannot drift.
+template <int S> using XAdopted8 = XTileS<S, 64, 16, 16, 16, 16, 3>;
+template <int S> using XAdopted16 = XTileS<S, 64, 16, 16, 16, 16, 3>;
+template <int S> using XAdopted32 = XTileS<S, 32, 32, 16, 16, 16, 3>;
+template <int S> using XAdopted64 = XTileS<S, 128, 64, 64, 32, 16, 3>;
+template <int S> using XAdoptedHi = XTileS<S, 64, 128, 32, 64, 16, 3>;
+
+static_assert(std::is_same<XAdopted8<0>, P7XTile9>::value,
+              "Nq=8 adopted x tile drifted from P7XTile9");
+static_assert(std::is_same<XAdopted16<0>, P15XTile5>::value,
+              "Nq=16 adopted x tile drifted from P15XTile5");
+static_assert(std::is_same<XAdopted32<0>, P31XTile7>::value,
+              "Nq=32 adopted x tile drifted from P31XTile7");
+static_assert(std::is_same<XAdopted64<0>, P63XTile3>::value,
+              "Nq=64 adopted x tile drifted from P63XTile3");
+static_assert(std::is_same<XAdoptedHi<0>, PHXTile0>::value,
+              "Nq>64 adopted x tile drifted from PHXTile0");
+
 //- Order-specialized PLAIN z volume GEMM tiles.  The z GEMM is
 //- (m = Nq*Nq, n = Nq, k = Nq) per element with a column-major C, so
 //- GemmBatched runs the transposed problem: the threadblock's M dimension
@@ -459,32 +563,39 @@ using ZG8 = ZTile<64, 32, 32, 32, 32, 4>;
 //- reasoning as VolumeGemmSetP7; the shapes below are the measured winners
 //- (reports/p15_gap_study.md).  Both GEMM_CUTE and GEMM_FUSED take them, so
 //- the two paths keep sharing one volume-GEMM mainloop.
-struct VolumeGemmSetP15 : VolumeGemmSet<GS<8, 8, 4>, cutlass::arch::Sm80, 16> {
+template <class InstShape, class ArchTag, int TileK>
+struct VolumeGemmSetP15 : VolumeGemmSet<InstShape, ArchTag, TileK> {
   using GemmY = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<16, 32, 16>,
-      GS<16, 16, 16>, GS<8, 8, 4>, EpilogueOp, BatchedSwizzle, 3>;
+      TensorOp, ArchTag, GS<16, 32, TileK>,
+      GS<16, 16, TileK>, InstShape, EpilogueOp, BatchedSwizzle, 3>;
   using GemmYScale = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<16, 32, 16>,
-      GS<16, 16, 16>, GS<8, 8, 4>, PointwiseScaleV<1>, BatchedSwizzle, 3>;
+      TensorOp, ArchTag, GS<16, 32, TileK>,
+      GS<16, 16, TileK>, InstShape, PointwiseScaleV<1>, BatchedSwizzle, 3>;
   using GemmZ = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<16, 64, 16>,
-      GS<16, 32, 16>, GS<8, 8, 4>, EpilogueOp, BatchedSwizzle, 3>;
+      TensorOp, ArchTag, GS<16, 64, TileK>,
+      GS<16, 32, TileK>, InstShape, EpilogueOp, BatchedSwizzle, 3>;
   using GemmZWide = GemmZ;
   //- Escale-forwarding twins of this set's plain y and z, for the x carrier.
   using GemmYIsoScale = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<16, 32, 16>,
-      GS<16, 16, 16>, GS<8, 8, 4>, PointwiseScaleV<1>, BatchedSwizzle, 3>;
+      TensorOp, ArchTag, GS<16, 32, TileK>,
+      GS<16, 16, TileK>, InstShape, PointwiseScaleV<1>, BatchedSwizzle, 3>;
   using GemmZScale = cutlass::gemm::device::GemmBatched<
       double, ColumnMajor, double, ColumnMajor, double, ColumnMajor, double,
-      TensorOp, cutlass::arch::Sm80, GS<16, 64, 16>,
-      GS<16, 32, 16>, GS<8, 8, 4>, PointwiseScaleV<1>, BatchedSwizzle, 3>;
+      TensorOp, ArchTag, GS<16, 64, TileK>,
+      GS<16, 32, TileK>, InstShape, PointwiseScaleV<1>, BatchedSwizzle, 3>;
 };
 
-using P15MmaSet_884 = VolumeGemmSetP15;
+using P15MmaSet_884 = VolumeGemmSetP15<GS<8, 8, 4>, cutlass::arch::Sm80, 16>;
+template <int kShape> using P15MmaSet =
+    VolumeGemmSetP15<typename MmaShapeSel<kShape>::Inst,
+                     typename MmaShapeSel<kShape>::Arch,
+                     MmaShapeSel<kShape>::kTileK>;
+static_assert(std::is_same<P15MmaSet<0>, P15MmaSet_884>::value,
+              "Nq=16 default volume GEMM set drifted");
 
 //- OUT-OF-ROLE ABLATION (SCALE_DG_ZS3, default 0): the same volume-GEMM set
 //- with every z mainloop one multistage stage shallower.  Restage<> rebuilds a
@@ -554,6 +665,19 @@ int bad_mma_shape(int mma_shape)
 {
   std::fprintf(stderr, "cutlass volume gemm: unsupported mma_shape %d\n",
                mma_shape);
+  return 1;
+}
+
+//- The order-specialized tiles and sets are instantiated for shapes 0-2 only
+//- (shape 3 needs TileK = 32, which is a different tile, not a different
+//- instruction).  Say which limit was hit rather than "unsupported".
+int bad_tiled_mma_shape(int mma_shape, int Nq)
+{
+  std::fprintf(stderr,
+               "cutlass volume gemm: mma_shape %d has no order-specialized "
+               "tile at Nq %d (0-2 are instantiated; 16x8x16 would need "
+               "TileK = 32, i.e. a different tile)\n",
+               mma_shape, Nq);
   return 1;
 }
 
@@ -1438,13 +1562,44 @@ extern "C" int launch_volume_gemm_x(double *deriv_x, const double *flux_x,
 extern "C" int launch_volume_gemm_x_tiled(double *deriv_x, const double *flux_x,
                                           const double *D1D,
                                           const double *escale, int weighted,
-                                          int Nq, int Ne, int tile)
+                                          int Nq, int Ne, int tile,
+                                          int mma_shape)
 {
   if (Ne <= 0) {
     return 1;
   }
   if (!weighted) {
     escale = nullptr;
+  }
+  //- A non-default MMA instruction shape runs the ADOPTED tile of the order,
+  //- not the generic one.  Until this existed the x GEMM was the one volume
+  //- GEMM CutlassMmaShape could not move at Nq <= 256: its tile hard-coded
+  //- 8x8x4, so selecting 16x8x4 changed y and z and silently left x behind in
+  //- BOTH GEMM_CUTE and GEMM_FUSED.  Only the adopted tile is instantiated per
+  //- shape; the ablation menus below are 8x8x4 measurements and stay that way.
+  if (mma_shape != 0) {
+    if (mma_shape > kMaxTiledShape) {
+      return bad_tiled_mma_shape(mma_shape, Nq);
+    }
+#define DG_X_ADOPTED(TileTpl)                                                  \
+    if (mma_shape == 1) {                                                      \
+      return run_volume_gemm_x_tiled<TileTpl<1> >(deriv_x, flux_x, D1D,        \
+                                                  escale, Nq, Ne);             \
+    }                                                                          \
+    return run_volume_gemm_x_tiled<TileTpl<2> >(deriv_x, flux_x, D1D, escale,  \
+                                                Nq, Ne);
+
+    if (Nq == 8 && tile == 9) { DG_X_ADOPTED(XAdopted8) }
+    if (Nq == 16 && tile == 5) { DG_X_ADOPTED(XAdopted16) }
+    if (Nq == 32 && tile == 7) { DG_X_ADOPTED(XAdopted32) }
+    if (Nq == 64 && tile == 3) { DG_X_ADOPTED(XAdopted64) }
+    if ((Nq == 128 || Nq == 256) && tile == 0) { DG_X_ADOPTED(XAdoptedHi) }
+#undef DG_X_ADOPTED
+    std::fprintf(stderr,
+                 "launch_volume_gemm_x_tiled: mma_shape %d is instantiated on "
+                 "the adopted tile only (Nq %d, tile %d)\n",
+                 mma_shape, Nq, tile);
+    return 1;
   }
   switch (Nq) {
   case 8:
@@ -1633,11 +1788,22 @@ extern "C" int launch_volume_gemm_z(double *deriv_z, const double *flux_z,
       return 1;
     }
   }
-  if (Nq == 8 && mma_shape == 0) {
-    return run_volume_gemm_z<P7MmaSet_884>(deriv_z, flux_z, D1D_tr, Nq, Ne);
+  //- Same for the plain z: the order's own tile at the selected shape.
+  if (Nq == 8) {
+    switch (mma_shape) {
+    case 0: return run_volume_gemm_z<P7MmaSet<0> >(deriv_z, flux_z, D1D_tr, Nq, Ne);
+    case 1: return run_volume_gemm_z<P7MmaSet<1> >(deriv_z, flux_z, D1D_tr, Nq, Ne);
+    case 2: return run_volume_gemm_z<P7MmaSet<2> >(deriv_z, flux_z, D1D_tr, Nq, Ne);
+    default: return bad_tiled_mma_shape(mma_shape, Nq);
+    }
   }
-  if (Nq == 16 && mma_shape == 0) {
-    return run_volume_gemm_z<P15MmaSet_884>(deriv_z, flux_z, D1D_tr, Nq, Ne);
+  if (Nq == 16) {
+    switch (mma_shape) {
+    case 0: return run_volume_gemm_z<P15MmaSet<0> >(deriv_z, flux_z, D1D_tr, Nq, Ne);
+    case 1: return run_volume_gemm_z<P15MmaSet<1> >(deriv_z, flux_z, D1D_tr, Nq, Ne);
+    case 2: return run_volume_gemm_z<P15MmaSet<2> >(deriv_z, flux_z, D1D_tr, Nq, Ne);
+    default: return bad_tiled_mma_shape(mma_shape, Nq);
+    }
   }
   switch (mma_shape) {
   case 0:
@@ -1718,11 +1884,25 @@ extern "C" int launch_volume_gemm_y(double *deriv_y, const double *flux_y,
   if (Nq <= 0 || Ne <= 0) {
     return 1;
   }
-  if (Nq == 8 && mma_shape == 0) {
-    return run_volume_gemm_y<P7MmaSet_884>(deriv_y, flux_y, D1D_tr, Nq, Ne);
+  //- The order-specialized y sets, now at the selected instruction shape too.
+  //- Before, a non-default shape fell through to the generic 64x64 tile here,
+  //- which changed the TILE as well as the instruction and so was not the
+  //- one-axis measurement the knob is for.
+  if (Nq == 8) {
+    switch (mma_shape) {
+    case 0: return run_volume_gemm_y<P7MmaSet<0> >(deriv_y, flux_y, D1D_tr, Nq, Ne);
+    case 1: return run_volume_gemm_y<P7MmaSet<1> >(deriv_y, flux_y, D1D_tr, Nq, Ne);
+    case 2: return run_volume_gemm_y<P7MmaSet<2> >(deriv_y, flux_y, D1D_tr, Nq, Ne);
+    default: return bad_tiled_mma_shape(mma_shape, Nq);
+    }
   }
-  if (Nq == 16 && mma_shape == 0) {
-    return run_volume_gemm_y<P15MmaSet_884>(deriv_y, flux_y, D1D_tr, Nq, Ne);
+  if (Nq == 16) {
+    switch (mma_shape) {
+    case 0: return run_volume_gemm_y<P15MmaSet<0> >(deriv_y, flux_y, D1D_tr, Nq, Ne);
+    case 1: return run_volume_gemm_y<P15MmaSet<1> >(deriv_y, flux_y, D1D_tr, Nq, Ne);
+    case 2: return run_volume_gemm_y<P15MmaSet<2> >(deriv_y, flux_y, D1D_tr, Nq, Ne);
+    default: return bad_tiled_mma_shape(mma_shape, Nq);
+    }
   }
   if (Nq == 32) {
     switch (mma_shape) {
@@ -1859,6 +2039,19 @@ extern "C" int launch_z_gemm_assembly(
   }
   if (pkg >= 0 && mma_shape == 0 && Nq == 64 && xy_weighted == 1) {
     DG_Z_ASM_PKG(MmaSet_884, true)
+  }
+  //- The same carrier at a non-default MMA shape.  Only the ADOPTED package of
+  //- Nq = 64 (zpkg 5: 16-byte epilogue and clamp aggregation, no 16-byte lift)
+  //- is instantiated; the eight-way package sweep stays an 8x8x4 measurement.
+  //- The mainloop is the generic set's z, which GEMM_CUTE runs at the same
+  //- shape through launch_volume_gemm_z, so the two paths still share it.
+  if (pkg == 5 && mma_shape != 0 && Nq == 64 && xy_weighted == 1) {
+    switch (mma_shape) {
+    case 1: return DG_Z_ASM_CALL(MmaSet_1684, true, true, true, false);
+    case 2: return DG_Z_ASM_CALL(MmaSet_1688, true, true, true, false);
+    case 3: return DG_Z_ASM_CALL(MmaSet_16816, true, true, true, false);
+    default: return bad_mma_shape(mma_shape);
+    }
   }
   if (pkg >= 0 && mma_shape == 0 && Nq == 16 && xy_weighted == 0) {
     DG_Z_ASM_PKG(P15MmaSet_884, false)
@@ -2214,8 +2407,46 @@ extern "C" int launch_x_gemm_assembly(
   if (Nq <= 0 || Ne <= 0) {
     return 1;
   }
+  //- The fused x carrier at a non-default MMA shape.  Instantiated for the
+  //- ADOPTED (tile, weight_mode, package) of the three orders that actually
+  //- carry on x -- Nq = 8 (tile 9, xpkg 5), 16 (tile 5, xpkg 4) and 32
+  //- (tile 7, xpkg 4), all with no Escale forwarded -- and for nothing else.
+  //- DG_X_ASM_CASE is a 4 x 8 sweep over weight_mode and package; building it
+  //- per shape as well would triple this file for combinations no order uses.
+  //- The tile is XAdopted*<shape>, the same type launch_volume_gemm_x_tiled
+  //- hands GEMM_CUTE at that shape, so the two paths keep one x mainloop --
+  //- which is the AGENTS.md requirement that made this instantiation
+  //- necessary rather than optional.
   if (mma_shape != 0) {
-    return bad_mma_shape(mma_shape);
+    if (mma_shape > kMaxTiledShape) {
+      return bad_tiled_mma_shape(mma_shape, Nq);
+    }
+    if ((weight_mode & 11) == 0) {
+      if (Nq == 8 && tile == 9 && pkg == 5) {
+        if (mma_shape == 1) {
+          return DG_X_ASM_CALL(XAdopted8<1>, false, false, true, false, true);
+        }
+        return DG_X_ASM_CALL(XAdopted8<2>, false, false, true, false, true);
+      }
+      if (Nq == 16 && tile == 5 && pkg == 4) {
+        if (mma_shape == 1) {
+          return DG_X_ASM_CALL(XAdopted16<1>, false, false, false, false, true);
+        }
+        return DG_X_ASM_CALL(XAdopted16<2>, false, false, false, false, true);
+      }
+      if (Nq == 32 && tile == 7 && pkg == 4) {
+        if (mma_shape == 1) {
+          return DG_X_ASM_CALL(XAdopted32<1>, false, false, false, false, true);
+        }
+        return DG_X_ASM_CALL(XAdopted32<2>, false, false, false, false, true);
+      }
+    }
+    std::fprintf(stderr,
+                 "launch_x_gemm_assembly: mma_shape %d is instantiated only on "
+                 "the adopted carrier of Nq = 8, 16 and 32 (got Nq %d tile %d "
+                 "weight_mode %d pkg %d)\n",
+                 mma_shape, Nq, tile, weight_mode, pkg);
+    return 1;
   }
   if ((weight_mode & 8) != 0 && !(Nq == 64 && tile == 3)) {
     std::fprintf(stderr,

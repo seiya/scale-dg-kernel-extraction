@@ -948,9 +948,10 @@ module mod_cuda_dg_kernels
     end function launch_volume_gemm_x
 
     function launch_volume_gemm_x_tiled(deriv_x, flux_x, D1D, escale, &
-      weighted, Nq, Ne, tile) bind(C, name="launch_volume_gemm_x_tiled")
+      weighted, Nq, Ne, tile, mma_shape) &
+      bind(C, name="launch_volume_gemm_x_tiled")
       import
-      integer(c_int), value :: weighted, Nq, Ne, tile
+      integer(c_int), value :: weighted, Nq, Ne, tile, mma_shape
       real(c_double), device :: deriv_x(*)
       real(c_double), device :: flux_x(*)
       real(c_double), device :: D1D(*)
@@ -2347,10 +2348,10 @@ contains
       istat = 0
     case (1)
       istat = launch_volume_gemm_x_tiled(deriv_x, flux_x, D1D, Escale, 0, &
-        Nq, Ne, plan%x_tile)
+        Nq, Ne, plan%x_tile, cutlass_mma_shape_id)
     case (2)
       istat = launch_volume_gemm_x_tiled(deriv_x, flux_x, D1D, Escale, 1, &
-        Nq, Ne, plan%x_tile)
+        Nq, Ne, plan%x_tile, cutlass_mma_shape_id)
     case default
       istat = cublas_dgemm_impl(0, 0, Nq, (Np/Nq)*Ne, Nq, 1.0_c_double, &
         D1D, Nq, flux_x, Nq, 0.0_c_double, deriv_x, Nq)
