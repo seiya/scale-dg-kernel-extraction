@@ -849,6 +849,41 @@ H100 では事情が違う。cuBLAS は **sm_90 専用の手書き xmma カー�
 **H100 の 1.20〜1.45 倍こそが本物のライブラリ軸の値**であり、
 GB200 の 1.00 は軸が存在しないことの表れである。
 
+#### ライブラリの中身を数えて確かめた: Blackwell 向けの FP64 GEMM が存在しない
+
+名前からの推測で終わらせないため、GB200 が実際にリンクしている
+`libcublasLt.so.13.2.1.1`（nvhpc 26.3 / CUDA 13.1、547 MB）の
+カーネル名を数えた。
+
+| カーネル族 | 本数 |
+|---|---:|
+| `sm90_xmma_gemm_f64...`（Hopper 専用の手書き FP64 GEMM） | **285** |
+| `sm80_xmma_gemm_f64...`（Ampere 専用） | 66 |
+| **`sm100_xmma_gemm_f64...`（Blackwell 専用）** | **0** |
+| `cutlass_80_tensorop_d884gemm...` | 32 |
+| `sm100_tensorop...`（他精度の Blackwell 専用カーネル） | 3279 |
+| `sm100_bstensorop...` | 1344 |
+| `sm100_simt...` | 56 |
+
+**同じライブラリが Blackwell 専用カーネルを何千本も持っているのに、
+FP64 GEMM の xmma 族だけ sm100 が 1 本も無い。**sm100 で FP64 GEMM に
+関係する名前は `cublasLt_fused_imma_dgemm_kernel_sm100_cga{1x1,1x2,2x1,2x2}`
+とその splitk 版の計 8 本だけで、これは **imma＝整数 MMA、すなわち
+FP64 エミュレーション**（本リポジトリが `CublasEmulation` として測っている
+経路、[`cublas_emulation_survey.md`](cublas_emulation_survey.md)）であって、
+native FP64 の mainloop ではない。
+
+つまり **NVIDIA は Blackwell 向けに FP64 GEMM を書き直しておらず、
+native FP64 は CUTLASS 生成の d884 カーネルに任せ、Blackwell 固有の
+手当ては整数エミュレーション側に置いている。**これが GB200 で
+「cuBLAS＝CUTLASS」になる理由である。
+
+（名前の `_80_` は CUTLASS の**構成の系統**（Ampere 期の d884 構成）であって
+SASS の対象アーキではない。このライブラリは sm_100 の cubin を 1022 本
+含んでおり、また sm_80 の cubin は sm_100 では実行できないので、
+GB200 で走っているのは**その構成を Blackwell 向けにビルドしたもの**である。
+どの cubin に入っているかまでは追っていない。）
+
 **この報告と論文への含意**: `AGENTS.md` は GEMM 系を「論文のライブラリ
 ベースライン」と位置づけている。**GB200 上ではそのベースラインは
 CUTLASS であって、独立したベースラインではない。**GB200 の
