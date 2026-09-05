@@ -91,7 +91,8 @@ cd "$ROOT" || exit 1
 echo "root=$ROOT"
 
 # The module names differ per machine (TSUBAME/RIKYU: nvhpc; Wisteria
-# Aquarius: nvidia/25.9 plus gcc/12.2.0).  Defaults keep TSUBAME and RIKYU
+# Aquarius: nvidia/<version>, which conflicts with the gcc/* modules and so
+# must be loaded alone).  Defaults keep TSUBAME and RIKYU
 # exactly as they were.
 readonly MODULES=${SCALE_DG_MODULES:-nvhpc}
 readonly MODULE_PURGE=${SCALE_DG_MODULE_PURGE:-1}

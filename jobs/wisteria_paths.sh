@@ -28,10 +28,12 @@
 #    guards that landed in 9853e28 (PDL and CutlassMmaShape); an older checkout
 #    will not compile cuda_dg_kernels_tc.cu for sm_80 at all.
 #
+#      module unload nvidia         # the site default (23.3) is loaded already
 #      module load nvidia/25.9      # closest available to RIKYU 26.3 / TSUBAME 26.1
-#      module load gcc/12.2.0       # NOT the default gcc/8.3.1 -- CUTLASS names
-#                                   # GCC 8.5 for known regressions (README.md:151)
 #      # do NOT load cuda/* : nvhpc brings its own and mixing breaks the build
+#      # do NOT load gcc/* either: the nvidia modulefile CONFLICTS with them
+#      #   ERROR: gcc/12.2.0 cannot be loaded due to a conflict.
+#      # nvcc uses whichever g++ is on PATH.  See "HOST COMPILER" below.
 #      make clean
 #      make CUDA=1 GPUFLAGS=-gpu=cc80 GPUNVCCFLAGS=-arch=sm_80
 #
@@ -40,6 +42,25 @@
 #    register allocation and priced it at 13-20% on the kernel that carried it.
 #    Dropping to 23.3 stacks ~2.5 years of codegen drift on top of the
 #    architecture difference this campaign exists to isolate.
+#
+# ---------------------------------------------------------------------------
+# HOST COMPILER
+# ---------------------------------------------------------------------------
+# The nvidia/* modulefile conflicts with the gcc/* modules, so there is no way
+# to load both; nvcc takes whatever g++ is on PATH.  Try that first and let the
+# build and the numerical validation decide -- CUTLASS's README names GCC
+# *8.5.0* for fold-expression regressions, and Aquarius's default is 8.3.1,
+# which is a different point release whose behaviour here is simply unknown.
+#
+# Only if CUTLASS fails to compile, point nvcc alone at a newer host compiler,
+# without loading a module that would conflict:
+#
+#   make CUDA=1 GPUFLAGS=-gpu=cc80 \
+#        GPUNVCCFLAGS='-arch=sm_80 -ccbin /opt/rh/gcc-toolset-10/root/usr/bin/g++'
+#
+# Prefer a gcc-toolset over a standalone gcc install: the toolset is built
+# against the system libstdc++, so it will not disagree with the C++ runtime
+# that `nvfortran -c++libs` pulls in at link time.
 #
 # 3. Submit FROM the checkout (the job writes its output tree into the working
 #    copy and finds it through PJM_O_WORKDIR):
@@ -116,7 +137,9 @@ export SCALE_DG_MACHINE=a100
 # Wisteria module names.  The shared body defaults to `nvhpc`, which does not
 # exist here.  module purge is skipped: the site's default environment carries
 # more than the compiler.
-export SCALE_DG_MODULES="nvidia/25.9 gcc/12.2.0"
+# nvidia/* conflicts with gcc/*; loading both fails.  Host compiler notes are
+# in the header.  The shared body defaults to `nvhpc`, which does not exist here.
+export SCALE_DG_MODULES="nvidia/25.9"
 export SCALE_DG_MODULE_PURGE=0
 
 # Roofs printed into metadata.txt so no report has to guess them later.

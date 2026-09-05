@@ -26,7 +26,8 @@
 # resubmit excluding it before touching the profiler command (AGENTS.md).
 set -u
 
-export SCALE_DG_MODULES="nvidia/25.9 gcc/12.2.0"
+# nvidia/* conflicts with gcc/*; do not add a gcc module here.
+export SCALE_DG_MODULES="nvidia/25.9"
 export SCALE_DG_MODULE_PURGE=0
 export OUTDIR="${OUTDIR:-a100_cublas_names_${PJM_JOBID:-manual}}"
 

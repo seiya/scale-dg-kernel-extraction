@@ -352,9 +352,10 @@ PDL 有の中央値は §8.1 の GB200 実測（p=31 `FUSED_TC` 1.3278、p=63
 ### 8.1 使うモジュール
 
 ```bash
+module unload nvidia          # サイト既定 (23.3) が load 済み
 module load nvidia/25.9
-module load gcc/12.2.0        # 既定の gcc/8.3.1 は使わない
 # cuda/* は load しない（nvhpc が自前の CUDA を持つ）
+# gcc/* も load しない（下記のとおり nvidia/* と conflict する）
 
 make clean
 make CUDA=1 GPUFLAGS=-gpu=cc80 GPUNVCCFLAGS=-arch=sm_80
@@ -369,10 +370,35 @@ make CUDA=1 GPUFLAGS=-gpu=cc80 GPUNVCCFLAGS=-arch=sm_80
   23.3 まで下げると、アーキテクチャ差の上に約 2 年半ぶんのコード生成差が
   重なり、測ろうとしている軸そのものが汚れる。
 
-**`gcc/12.2.0`**: `third_party/cutlass/README.md:151` が
-「GCC 8.5.0 has known regressions regarding fold expressions and overloaded
-operators. Using GCC 7.5.0 or (preferred) GCC >= 9 is recommended」と名指し
-している。**Wisteria の既定は `gcc/8.3.1`** で、この範囲に入る。
+**ホストコンパイラ（2026-09-06 訂正）**: 当初この節は `gcc/12.2.0` を併せて
+load すると書いていたが、**それはできない**。Aquarius の `nvidia/*`
+modulefile は `gcc/*` と conflict する:
+
+```
+ERROR: gcc/12.2.0 cannot be loaded due to a conflict.
+  HINT: Might try "module unload nvidia" first.
+```
+
+nvcc は PATH にある `g++` をホストコンパイラとして使う。**まずそれで通るか
+試すこと。** 併せて、当初の理由付けも正確ではなかった:
+`third_party/cutlass/README.md:151` が名指ししているのは **GCC 8.5.0**
+（fold expression と演算子オーバーロードの既知の regression）であり、
+Aquarius の既定は **8.3.1** という別のポイントリリースで、同じ問題があるか
+どうかは分かっていない。**判定は README の注記ではなく、ビルドが通ることと
+数値検証が通ることで行う**（`jobs/wisteria_paths.sh` は `VALIDATE=1` が既定で、
+点変化係数・owned `dqdt` 全点の照合を計測の前に走らせる）。
+
+CUTLASS のテンプレート展開で落ちた場合にだけ、**モジュールを load せず
+nvcc にだけ**新しいホストコンパイラを渡す:
+
+```bash
+make CUDA=1 GPUFLAGS=-gpu=cc80 \
+     GPUNVCCFLAGS='-arch=sm_80 -ccbin /opt/rh/gcc-toolset-10/root/usr/bin/g++'
+```
+
+`gcc-toolset` を独立インストールの `gcc/12.2.0` より優先するのは、toolset が
+システムの libstdc++ に対してビルドされており、リンク時に
+`nvfortran -c++libs` が持ち込む C++ ランタイムと ABI が食い違いにくいからである。
 
 **CUDA バージョンの下限**: CUTLASS 4.7.0 の要求は A100 (cc 8.0) に対して
 CUDA 11.4 以上（`README.md` の表）と緩く、**実質の下限は我々のコードが使う
