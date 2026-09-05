@@ -106,12 +106,14 @@ for p in $ORDERS; do
     prefix="$OUTDIR/nsys/${tag}"
     echo "nsys: $tag"
     # timeout from the known duration, not generously: on a bad node the
-    # profiler produces nothing rather than running slowly (AGENTS.md).
-    timeout 600 nsys profile --trace=cuda --sample=none --cpuctxsw=none \
+    # profiler produces nothing rather than running slowly, so a long bound
+    # only delays the retry (AGENTS.md).  nstep=10 traces a few hundred
+    # kernel launches; 5 minutes is already several times that.
+    timeout 300 nsys profile --trace=cuda --sample=none --cpuctxsw=none \
       --resolve-symbols=false --force-overwrite=true \
       --output="$prefix" "$EXE" "$conf" > "$OUTDIR/logs/${tag}.log" 2>&1
     echo "  profile rc=$?"
-    timeout 600 nsys stats --report=cuda_gpu_kern_sum --format=csv \
+    timeout 300 nsys stats --report=cuda_gpu_kern_sum --format=csv \
       --force-export=true --output="$prefix" "${prefix}.nsys-rep" \
       >> "$OUTDIR/logs/${tag}.log" 2>&1
     echo "  stats rc=$?"

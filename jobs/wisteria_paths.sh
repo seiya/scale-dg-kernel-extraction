@@ -1,8 +1,8 @@
 #!/bin/bash
 #PJM -N dg_a100_paths
-#PJM -L rscgrp=CHANGE_ME
+#PJM -L rscgrp=share-short
 #PJM -L gpu=1
-#PJM -L elapse=8:00:00
+#PJM -L elapse=2:00:00
 #PJM -g CHANGE_ME
 #PJM -j
 #PJM -S
@@ -21,11 +21,8 @@
 # ---------------------------------------------------------------------------
 # BEFORE SUBMITTING
 # ---------------------------------------------------------------------------
-# 1. Fill in the two CHANGE_ME above:
-#      -L rscgrp=   the Aquarius resource group.  List what you may use with
-#                   `pjshowrsc` or the centre's user guide; a debug/short group
-#                   is fine for a smoke test, but the full sweep needs ~8 h.
-#      -g           your project/group ID.
+# 1. Fill in -g CHANGE_ME above with your project/group ID.  rscgrp and elapse
+#    are already set; see "WALL CLOCK" below for where the 2 h comes from.
 #
 # 2. Build for A100.  cc80 is NOT the tree's default target and needs both
 #    guards that landed in 9853e28 (PDL and CutlassMmaShape); an older checkout
@@ -72,6 +69,36 @@
 #   p=63 FUSED_TC 2.98%, p=31 FUSED_TC 1.14%, p=63 FUSED_DFMA 1.69%,
 #   p=31 FUSED_DFMA 0 (a100_prediction.md 7.1.1).  p=127's PDL has no stage
 #   macro and could not be switched off, so its tax is unknown.
+#
+# ---------------------------------------------------------------------------
+# WALL CLOCK: why elapse=2:00:00
+# ---------------------------------------------------------------------------
+# Predicted cost at the A100 times of reports/a100_prediction.md section 3,
+# with per-run startup and the validation cost measured on RIKYU rather than
+# guessed (startup at nstep=1: 2.9-3.6 s for p<=255, 8.7 s at p=511, 11.3 s at
+# p=575; one validation entry = 6.6 s run-and-dump plus 11.4 s streaming
+# compare over all 16,777,216 points):
+#
+#   VALIDATE  6 orders x ~6 paths                      11.2 min
+#   PART_A    6 orders x ~7 paths x 6 rounds           17.2 min   (p=31's
+#                                                                  nstep=200
+#                                                                  dominates)
+#   PART_B    p=511  x 5 paths x 6 rounds               6.5 min
+#   PART_C    p=575  x 3 paths x 3 rounds               3.7 min
+#   TOTAL                                              38.5 min
+#
+# 2 h is 3.1x that.  The margin is for the things the prediction does not
+# cover and which would show up as time, not as a wrong answer:
+#   * the prediction itself being wrong -- the whole point of the run.  A 2x
+#     miss still fits.
+#   * validation writes ~400 MB of text per dump, ~14 GB over the phase; a
+#     slower filesystem than RIKYU's shows up here first.
+#   * cmp_dump is single-threaded Python on the Ice Lake host.
+#   * p=575 sits at 81% of the 40 GiB card and may thrash or OOM.
+# The body already bounds a single runaway run at `timeout 1800`, so a hang
+# costs one run, not the allocation.  If the job is killed at 2 h anyway, cut
+# the sweep rather than raising elapse: ORDERS_B= ORDERS_C= drops 10 min, and
+# ROUNDS=3 roughly halves PART_A.
 #
 # ---------------------------------------------------------------------------
 # KNOBS (all optional; export before pjsub, or use -x)
