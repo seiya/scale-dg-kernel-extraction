@@ -5,5 +5,15 @@ advect3d/advect3d
 
 .DS_Store
 .cc_src/
-/jobs/
+# jobs/ is local scratch, with one exception: the cross-machine measurement
+# harness is tracked, because a published ratio is only reproducible if the
+# script that produced every column of it is. See jobs/README.md.
+/jobs/*
+!/jobs/README.md
+!/jobs/tsubame_paths.sh
+!/jobs/tsubame_paths_summarize.py
+!/jobs/rikyu_paths.sh
+!/jobs/wisteria_paths.sh
+!/jobs/cublas_kernel_names_nsys.sh
+!/jobs/wisteria_cublas_nsys.sh
 /output/

@@ -225,7 +225,14 @@ performance win must never be treated as implicit permission to redefine it.
 - `namelists/`: committed sample and published-mesh Fortran namelists. Names are
   `{purpose}_p{order}_{kernel}[_{qualifiers}].conf`; see `namelists/README.md`.
   Do not add `_ncu` copies or one-off `Ne` / `nstep` variants.
-- `jobs/` is local (gitignored). Durable profiler commands go in `reports/`.
+- `jobs/` is local (gitignored) apart from an allowlist in `.gitignore`: the
+  cross-machine measurement harness is tracked, because a published
+  machine-to-machine ratio is only reproducible if every column's script is.
+  That is the shared body `tsubame_paths.sh`, its per-scheduler wrappers
+  (`rikyu_paths.sh` for Slurm, `wisteria_paths.sh` for Fujitsu TCS), the
+  summarizer, and the `cublas_kernel_names_nsys.sh` body with its wrapper.
+  Everything else in `jobs/` -- one-off ablations, sweeps, `ncu` probes --
+  stays local, and durable profiler commands still go in `reports/`.
 - `reports/`: committed performance and optimization reports. See
   `reports/README.md` for the index and the current fastest path per
   polynomial order.
@@ -243,6 +250,21 @@ module load nvhpc
 # or
 module load nvhpc-hpcx
 ```
+
+CUTLASS is a submodule (`third_party/cutlass`), so a fresh checkout needs
+
+```bash
+git submodule update --init --depth 1 third_party/cutlass
+```
+
+before any CUDA build; without it `cutlass/cutlass.h` is missing. A `git
+worktree` does not get submodules from the main checkout either -- run the
+same command in the worktree, or symlink `third_party` to the main one.
+
+Module names differ per machine. RIKYU and TSUBAME use `nvhpc`; on
+Wisteria/BDEC-01 Aquarius the module is `nvidia/<version>` and it conflicts
+with the `gcc/*` modules, so do not try to load both (see
+`reports/a100_prediction.md` section 8.1).
 
 The same module load is required inside Slurm profiling jobs before running
 NVIDIA profiling tools. Do not assume that a module loaded in the login shell
@@ -383,8 +405,12 @@ profiler output, and Slurm logs are not; see the commit rules below.
 ## Working Tree and Commits
 
 - Preserve unrelated user changes and untracked profiling artifacts.
-- Do not commit Slurm job scripts (`jobs/` is gitignored), `slurm-*.out`, Nsight reports, profiler text
-  or CSV output, or ad-hoc analysis Markdown unless the user explicitly asks.
+- Do not commit one-off job scripts, `slurm-*.out`, Nsight reports, profiler
+  text or CSV output, or ad-hoc analysis Markdown unless the user explicitly
+  asks. The `jobs/` allowlist above is the exception: a change to the shared
+  measurement body or to a scheduler wrapper is committed with the change
+  that motivated it, since those scripts are what makes the columns of a
+  cross-machine table one measurement.
   Reports under `reports/` are the exception: they are tracked, and updating
   them is part of the change that invalidates them.
 - Stage source and documentation files explicitly rather than using
