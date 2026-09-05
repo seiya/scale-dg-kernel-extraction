@@ -4,6 +4,45 @@
 
 #include "fused_kernel_geom.h"
 
+//- Programmatic Dependent Launch (PDL) is an sm_90 feature: both
+//- `griddepcontrol` and cudaLaunchAttributeProgrammaticStreamSerialization
+//- need .target sm_90 or higher, and ptxas rejects the asm outright on an
+//- older target (an sm_80 build of this file fails to compile without these
+//- guards).  Wrapping it keeps one source for every architecture: below
+//- sm_90 the hints vanish and the launches fall back to ordinary stream
+//- order, which enforces the same producer -> consumer dependency more
+//- conservatively.  Nothing changes for sm_90 and sm_100.
+#if defined(__CUDA_ARCH_LIST__)
+//- nvcc defines this in the host pass too, as a comma-separated list.
+inline bool dg_pdl_built(void)
+{
+  constexpr int kArchList[] = {__CUDA_ARCH_LIST__};
+  for (int arch : kArchList) {
+    if (arch >= 900) return true;
+  }
+  return false;
+}
+#else
+inline bool dg_pdl_built(void) { return true; }
+#endif
+
+//- Number of launch attributes to attach: 1 where PDL exists, 0 otherwise.
+inline unsigned dg_pdl_num_attrs(void) { return dg_pdl_built() ? 1u : 0u; }
+
+__device__ __forceinline__ void dg_pdl_launch_dependents(void)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+__device__ __forceinline__ void dg_pdl_wait(void)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+
 // FP64 Tensor Core GEMM helpers: mma.sync.aligned.m8n8k4.f64
 // Fragment map (SM80+):
 //   lane = thread % 32
@@ -2458,7 +2497,7 @@ tendency_fused_p31_xz_kernel(
   // The face phase above is this grid's only DRAM-latency block; let the y
   // grid start now.  Its mma does not read dqdt, and the wait sits in front of
   // the prefetch that does.
-  asm volatile("griddepcontrol.launch_dependents;");
+  dg_pdl_launch_dependents();
 #endif
 
   // Lift1D(Nq,6) varies in j for faces 1 and 3, in i for faces 2 and 4 and in
@@ -2730,7 +2769,7 @@ tendency_fused_p31_y_kernel(
 
 #if P31_PDL_STAGE >= 1
   // dqdt is what the xz grid writes, and this prefetch is the first read of it.
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  dg_pdl_wait();
 #endif
 #if !P31_ABL_YNOCPA
 #pragma unroll
@@ -2874,7 +2913,7 @@ void launch_tendency_fused_p31_impl(
     yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     yattr[0].val.programmaticStreamSerializationAllowed = 1;
     ycfg.attrs = yattr;
-    ycfg.numAttrs = 1;
+    ycfg.numAttrs = dg_pdl_num_attrs();
     cudaLaunchKernelEx(&ycfg, tendency_fused_p31_y_kernel<UseTc>, dqdt, D1D, q,
                        v, Escale, Ne);
   }
@@ -3075,7 +3114,7 @@ __global__ void pdl_elembnd_flux_kernel(
     const double *__restrict__ Fscale, int nface)
 {
   if (HintFirst) {
-    asm volatile("griddepcontrol.launch_dependents;");
+    dg_pdl_launch_dependents();
   }
   const int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
   if (idx < nface) {
@@ -3145,7 +3184,7 @@ __global__ __launch_bounds__(P63_THREADS_SEL, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFM
 #if P63_PDL_STAGE >= 3
   // Let the y grid start.  Its mma does not read dqdt; the wait is in front of
   // the only load that does, the epilogue's read-modify-write prefetch.
-  asm volatile("griddepcontrol.launch_dependents;");
+  dg_pdl_launch_dependents();
 #endif
 
   // sFU[k][l] = q*u at (l, jp, k).  l is fast in global, so sixteen lanes
@@ -3278,7 +3317,7 @@ __global__ __launch_bounds__(P63_THREADS_SEL, TCDFMA_BPSM(P63_BPSM, P63_BPSM_DFM
 #if P63_PDL_STAGE >= 1
   // The epilogue below is the first thing that reads flux_bnd, so this is the
   // latest point the face grid's stores have to be visible.
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  dg_pdl_wait();
 #endif
 
   // j is block uniform, so the faces 1 and 3 coefficients and the whole (i,j)
@@ -3382,7 +3421,7 @@ __global__ __launch_bounds__(P63Y_THREADS_SEL, TCDFMA_BPSM(P63Y_BPSM, P63Y_BPSM_
 #if P63_PDL_STAGE >= 3
   // dqdt is what the xz grid writes, and the prefetch below is this kernel's
   // only read of it, so this is the latest point the wait can sit.
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  dg_pdl_wait();
 #endif
 #pragma unroll
   for (int e8 = 0; e8 < P63Y_TM_SEL * P63Y_TN_SEL; ++e8) {
@@ -3484,7 +3523,7 @@ void launch_tendency_fused_p63_impl(
     fattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     fattr[0].val.programmaticStreamSerializationAllowed = 1;
     fcfg.attrs = fattr;
-    fcfg.numAttrs = 1;
+    fcfg.numAttrs = dg_pdl_num_attrs();
     cudaLaunchKernelEx(&fcfg, pdl_elembnd_flux_kernel<HINT_FIRST>, flux_bnd, q,
                        u, v, w, VMapM, VMapP, normal_fn, Fscale, nface);
   }
@@ -3498,7 +3537,7 @@ void launch_tendency_fused_p63_impl(
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
-    cfg.numAttrs = 1;
+    cfg.numAttrs = dg_pdl_num_attrs();
     cudaLaunchKernelEx(&cfg, tendency_fused_p63_xz_kernel<UseTc>, dqdt, D1D,
                        Lift1D, q, u, w, flux_bnd, Escale, Ne);
   }
@@ -3521,7 +3560,7 @@ void launch_tendency_fused_p63_impl(
     yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     yattr[0].val.programmaticStreamSerializationAllowed = 1;
     ycfg.attrs = yattr;
-    ycfg.numAttrs = 1;
+    ycfg.numAttrs = dg_pdl_num_attrs();
     cudaLaunchKernelEx(&ycfg, tendency_fused_p63_y_kernel<UseTc>, dqdt, D1D, q,
                        v, Escale, Ne);
   }
@@ -3787,7 +3826,7 @@ __global__ __launch_bounds__(P127_XZ_THREADS_SEL, TCDFMA_BPSM(P127_XZ_MINB, P127
   }
   // Let the y grid start: its mma does not read dqdt.  The wait is in the y
   // epilogue, after this grid's stores.
-  asm volatile("griddepcontrol.launch_dependents;");
+  dg_pdl_launch_dependents();
 
   // sFU[k][l] = q*u at (kk+l, jp, k), all 128 k.  l is fast in global.
   // sD[r][l] = D1D(r, kk+l), all 128 rows: m runs over the whole range and
@@ -3921,7 +3960,7 @@ __global__ __launch_bounds__(P127_XZ_THREADS_SEL, TCDFMA_BPSM(P127_XZ_MINB, P127
 #endif
 #undef P127_XZ_PFI
 
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  dg_pdl_wait();
 
   // The epilogue is nested b-outer / a-inner in the sense of section 4.4 of
   // p255_gap_study.md: half of what it reads depends on one tile index only.
@@ -4107,7 +4146,7 @@ __global__ __launch_bounds__(P127_Y_THREADS_SEL, TCDFMA_BPSM(P127_Y_BPSM, P127_Y
   }
 #undef P127_Y_STAGE_D
 
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  dg_pdl_wait();
 
 #pragma unroll
   for (int e8 = 0; e8 < TM * TN; ++e8) {
@@ -4160,7 +4199,7 @@ void launch_tendency_fused_p127_impl(
     fattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     fattr[0].val.programmaticStreamSerializationAllowed = 1;
     fcfg.attrs = fattr;
-    fcfg.numAttrs = 1;
+    fcfg.numAttrs = dg_pdl_num_attrs();
     cudaLaunchKernelEx(&fcfg, pdl_elembnd_flux_kernel<true>, flux_bnd, q, u, v, w,
                        VMapM, VMapP, normal_fn, Fscale, nface);
   }
@@ -4174,7 +4213,7 @@ void launch_tendency_fused_p127_impl(
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
-    cfg.numAttrs = 1;
+    cfg.numAttrs = dg_pdl_num_attrs();
     cudaLaunchKernelEx(&cfg, tendency_fused_p127_xz_kernel<UseTc>, dqdt, D1D,
                        Lift1D, q, u, w, flux_bnd, Escale, Ne);
   }
@@ -4188,7 +4227,7 @@ void launch_tendency_fused_p127_impl(
     yattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     yattr[0].val.programmaticStreamSerializationAllowed = 1;
     ycfg.attrs = yattr;
-    ycfg.numAttrs = 1;
+    ycfg.numAttrs = dg_pdl_num_attrs();
     cudaLaunchKernelEx(&ycfg, tendency_fused_p127_y_kernel<UseTc>, dqdt, D1D, q,
                        v, Escale, Ne);
   }

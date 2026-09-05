@@ -927,6 +927,14 @@ module mod_cuda_dg_kernels
       import
     end subroutine ozaki1_slice_stats_print
 
+    !- 1 when this build and this GPU both have the sm_90 f64 MMA
+    !  instructions that CutlassMmaShape 1-3 need, 0 otherwise.
+    function cuda_cutlass_has_sm90_f64_mma() &
+      bind(C, name="cuda_cutlass_has_sm90_f64_mma")
+      import
+      integer(c_int) :: cuda_cutlass_has_sm90_f64_mma
+    end function cuda_cutlass_has_sm90_f64_mma
+
     function launch_volume_gemm_xy(deriv_x, deriv_y, flux_x, flux_y, D1D, D1D_tr, &
       escale, Nq, Ne, mma_shape) bind(C, name="launch_volume_gemm_xy")
       import
@@ -2084,6 +2092,15 @@ contains
 
     if (shape_id < 0 .or. shape_id > 3) then
       write(*,*) "cuda_cutlass_set_mma_shape: unsupported shape id ", shape_id
+      error stop
+    end if
+    !- Shapes 1-3 are sm_90 instructions.  On an older target CUTLASS compiles
+    !  them into a device-side brkpt (CUTLASS_NOT_IMPLEMENTED), so refuse them
+    !  here rather than trapping inside the kernel.
+    if (shape_id > 0 .and. cuda_cutlass_has_sm90_f64_mma() == 0) then
+      write(*,*) "cuda_cutlass_set_mma_shape: shape id ", shape_id, &
+        " needs the sm_90 f64 MMA instructions, which this build/GPU"
+      write(*,*) "does not have. Use CutlassMmaShape = ""8x8x4""."
       error stop
     end if
     cutlass_mma_shape_id = int(shape_id, c_int)
