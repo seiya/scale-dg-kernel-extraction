@@ -339,13 +339,78 @@ PDL 有の中央値は §8.1 の GB200 実測（p=31 `FUSED_TC` 1.3278、p=63
 
 ---
 
-## 8. 環境（未確認、ジョブ投入前に埋める）
+## 8. 環境とコンパイラの選択
 
 | | |
 |---|---|
 | 機械 | Wisteria/BDEC-01 Aquarius（東京大学情報基盤センター） |
-| ノード | Xeon Platinum 8360Y (36c) x2 + A100 40 GiB x8、512 GiB、45 ノード |
+| ノード | Xeon Platinum 8360Y (36c) x2 + A100 **40 GiB** x8、512 GiB、45 ノード |
 | ホスト CPU | **Ice Lake**（GB200 は Grace、TSUBAME 4 は x86）——3 種類目のホスト |
 | スケジューラ | Fujitsu TCS（`pjsub`）。RIKYU の Slurm、TSUBAME の SGE に次ぐ 3 種目 |
-| ビルド | `make CUDA=1 GPUFLAGS=-gpu=cc80 GPUNVCCFLAGS=-arch=sm_80` |
-| リソースグループ / module 名 | **未確認** |
+| リソースグループ | **未確認**（ジョブ投入時に記録する） |
+
+### 8.1 使うモジュール
+
+```bash
+module load nvidia/25.9
+module load gcc/12.2.0        # 既定の gcc/8.3.1 は使わない
+# cuda/* は load しない（nvhpc が自前の CUDA を持つ）
+
+make clean
+make CUDA=1 GPUFLAGS=-gpu=cc80 GPUNVCCFLAGS=-arch=sm_80
+```
+
+**`nvidia/25.9`（既定の `23.3` ではなく）**:
+
+- 他の 2 台は RIKYU が **nvhpc 26.3**、TSUBAME が **26.1**。25.9 が最も近い。
+- コンパイラは**この測定では中立な変数ではない**。§8.7.3 は `SPLIT` の
+  GB200/H100 逆転の正体が nvfortran のレジスタ割り当てであることを示し、
+  占有率を揃えたアブレーションで当該カーネルの 13〜20% を説明した。既定の
+  23.3 まで下げると、アーキテクチャ差の上に約 2 年半ぶんのコード生成差が
+  重なり、測ろうとしている軸そのものが汚れる。
+
+**`gcc/12.2.0`**: `third_party/cutlass/README.md:151` が
+「GCC 8.5.0 has known regressions regarding fold expressions and overloaded
+operators. Using GCC 7.5.0 or (preferred) GCC >= 9 is recommended」と名指し
+している。**Wisteria の既定は `gcc/8.3.1`** で、この範囲に入る。
+
+**CUDA バージョンの下限**: CUTLASS 4.7.0 の要求は A100 (cc 8.0) に対して
+CUDA 11.4 以上（`README.md` の表）と緩く、**実質の下限は我々のコードが使う
+`cudaLaunchAttributeProgrammaticStreamSerialization`（CUDA 11.8+）と
+`__CUDA_ARCH_LIST__`（CUDA 11.5+）**の方である。
+
+確認（RIKYU の `cuda/12.9.2` を `nvidia/25.9` が抱える CUDA の代理として、
+`-arch=sm_80` でコンパイル。どちらも exit 0、警告ゼロ）:
+
+| ファイル | CUDA 12.9 / sm_80 | オブジェクト |
+|---|---|---:|
+| `cuda_cutlass_gemm_fused.cu` | 成功 | 22.0 MB |
+| `cuda_dg_kernels_tc.cu`（PDL ガード込み） | 成功 | 2.09 MB |
+
+RIKYU の CUDA 13.1 / 13.x での cc80 フルビルドも成功している（§7.3）。
+詰まったときの代替は `nvidia/24.11` → `nvidia/23.11` の順。
+
+### 8.2 残る非制御変数
+
+**3 台でコンパイラが揃わない**（26.3 / 26.1 / 25.9）。Wisteria に 26.x が
+無いので解消できない。上から抑えるには、**A100 上で p=63 だけ `nvidia/23.3`
+でも測って同一機械でのコンパイラ感度を取る**のが安い（1 ケース）。予測との
+ズレのうち何%がコンパイラかの上界になる。
+
+ホスト CPU も 3 種類（Grace / TSUBAME x86 / Ice Lake）で揃わないが、これは
+§5 が「低次だけ外れたら launch オーバーヘッドとホストの寄与」と予め書いた
+とおり、分離できる変数として扱う。
+
+### 8.3 測定時に記録すること
+
+- `nvfortran --version` / `nvcc --version` / `gcc --version` の実出力
+- リソースグループ名、ノード名、`nvidia-smi`（driver、GPU メモリ）
+- `Main per step` の中央値。経路をラウンドロビンで交互、6 ラウンド
+  （§8.1 と同じ測り方。**入力は `namelists/perf_p*_gemm.conf` から
+  `DqdtKernel_Type` だけを差し替えて生成**し、`Ne` / `dt` / `nstep` /
+  `UseCudaGraph` を構造的に同一にする）
+- 数値検証: `SCALE_DG_VARYING_COEFF=1`、owned `dqdt` 全点、p<=127 は
+  `CUDAFORTRAN_SPLIT`、p=255 は `CUDAFORTRAN_GEMM` 対照
+- **予測 3 のため、`nsys` で cuBLAS が出すカーネル名**
+  （`cutlass_80_tensorop_d884gemm` か否か）。`export DEBUGINFOD_URLS=` と
+  `--resolve-symbols=false` の両方が要る。`UseCudaGraph = .false.` で取る。
