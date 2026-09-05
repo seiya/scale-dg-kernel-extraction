@@ -799,7 +799,7 @@ FLOP/s ではなく**命令と発行スロット**であり、その代金は**�
 カーネル・この次数域では成り立たない。**§1 の結論 2 が現行ツリーで
 裏返っていた（§8.4）のは、この帰結でもある。
 
-### 8.7.2 未解明 B: CUTLASS が cuBLAS に負けるのは H100 だけ
+### 8.7.2 B: CUTLASS が cuBLAS に負けるのは H100 だけ（**原因判明**）
 
 `GEMM_CUTE ÷ GEMM`（ライブラリ／mainloop 軸。周辺カーネルもスケジュールも
 共有しているので一軸）:
@@ -812,11 +812,53 @@ FLOP/s ではなく**命令と発行スロット**であり、その代金は**�
 
 **GB200 では CUTLASS の mainloop は cuBLAS と同着（0.98〜1.01）なのに、
 H100 では最大 1.45 倍負ける。**命令形状を H100 向けの 16x8x4 にしても
-1.04〜1.13 が残る。これは §4.3 が p=255 で見た「1.27 倍」を 5 次数に広げた
-形で、当時の結論（タイル・warp 数・stage 数・命令まで揃えても sm90 の cuBLAS
-カーネルのほうが速い、`sm90_mma_shape_survey.md` §8.5）と整合する。
-**機構は当時も今も未測定。決め手**: 両機で volume GEMM 3 本の ncu を取り、
-cuBLAS が選ぶカーネルと CUTLASS のカーネルを同じ土俵で並べる。
+1.04〜1.13 が残る。
+
+#### 原因は「H100 の CUTLASS が弱い」ではなく「**GB200 の cuBLAS が CUTLASS そのもの**」
+
+`jobs/gemm_library_ncu.sh` を GB200 で走らせ（Slurm job `82208`、node `c393`）、**カーネル名でフィルタせずに** 1 tendency 分の全 launch を
+取った。cuBLAS が実際に起動したカーネルは:
+
+| 機械 | cuBLAS が起動する volume GEMM カーネル |
+|---|---|
+| **GB200 (sm_100)** | `cutlass_80_tensorop_d884gemm_64x128_16x3_nn_align1`<br>`cutlass_80_tensorop_d884gemm_64x64_16x4_nn_align1`<br>`cutlass_80_tensorop_d884gemm_64x32_16x4_nn_align1` |
+| **H100 (sm_90)** | `sm90_xmma_gemm_f64f64_f64f64_f64_nn_n_tilesize64x128x16_stage3_warpsize2x2x1_tensor16x8x8_execute_kernel__5x_cublas`<br>同 `tilesize128x64x16_stage3`<br>同 `tilesize64x64x16_stage4` |
+
+（GB200 側は p=255 と p=511 の両方で確認した。p=511 は 3 本とも
+`cutlass_80_tensorop_d884gemm_64x128_16x3_nn_align1` 1 種類になる。
+H100 側の名前は 2026-08-26 の nsys、job `8502531` / `8502578`、commit
+`f5794b7` の記録による。**現行コミットでの確認は
+`jobs/gemm_library_ncu.sh` を TSUBAME で走らせれば取れる。**
+なお、ここで言えるのはこのベンチマークが呼ぶ形（FP64、nn、align1、
+上の M/N/K）についてであって、cuBLAS 全体の話ではない。）
+
+**GB200 の cuBLAS は FP64 volume GEMM に CUTLASS 生成の sm_80 カーネル
+（`cutlass_80_tensorop_d884gemm`、すなわち DMMA 8x8x4）を出している。**
+タイルも 64x128 / 64x64 / 64x32、TileK 16、3〜4 段で、**`GEMM_CUTE` が
+組んでいるものと同じ族・同じタイル**である。x GEMM に至っては
+**レジスタ 212 本・grid 2048・block 128 が両者で一致する**（ncu、p=255）。
+
+つまり **GB200 では「cuBLAS 対 CUTLASS」という軸が縮退している。**
+測っている差は「CUTLASS 3.x 生成の sm_80 カーネル」対「我々が組んだ
+CUTLASS 2.x multistage」であって、ライブラリの実装差ではない。
+0.98〜1.01 という比は、**差が無いことの測定**である。
+
+H100 では事情が違う。cuBLAS は **sm_90 専用の手書き xmma カーネル**を
+持っており、しかも `tensor16x8x8` 命令（我々の既定 8x8x4 でも、H100 向けに
+選ぶ 16x8x4 でもない第三の形状）とタイル 64x128 / 128x64 / 64x64 を使う。
+**H100 の 1.20〜1.45 倍こそが本物のライブラリ軸の値**であり、
+GB200 の 1.00 は軸が存在しないことの表れである。
+
+**この報告と論文への含意**: `AGENTS.md` は GEMM 系を「論文のライブラリ
+ベースライン」と位置づけている。**GB200 上ではそのベースラインは
+CUTLASS であって、独立したベースラインではない。**GB200 の
+`GEMM` 対 `GEMM_CUTE` の比を「cuBLAS に勝った / 並んだ」と読むことは
+できない。H100 の数字だけがその主張を支えられる。
+
+**まだ測っていないこと**: H100 の xmma カーネルが速い理由（tile・stage・
+命令が違うので一軸ではない）。`sm90_mma_shape_survey.md` §8.5 は p=255 で
+タイル・warp 数・stage 数・命令まで揃えても cuBLAS が速いと結論しており、
+そこまで揃えた後に残る mainloop 実装差の中身は依然として未測定である。
 
 ### 8.7.3 未解明 C: `SPLIT` 逆転の残差
 

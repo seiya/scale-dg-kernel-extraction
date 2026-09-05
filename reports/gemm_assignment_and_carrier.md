@@ -3133,3 +3133,32 @@ SCALE_DG_VARYING_COEFF=1 SCALE_DG_CUTEPAR=0 SCALE_DG_DUMP_DQDT=cute0.txt \
 cmp ref.txt cute.txt
 cmp cute0.txt cute.txt
 ```
+
+---
+
+## 追記（2026-09-05）: GB200 上の「cuBLAS」は CUTLASS 生成カーネルである
+
+本稿の per-GEMM ライブラリ割り当ての測定（§ 各所の「cuBLAS x/y/z 対 CUTLASS
+x/y/z」）は、**GB200 上では「NVIDIA のライブラリ実装対我々の実装」ではない。**
+
+`reports/h100_report.md` §8.7.2（Slurm job `82208`、node `c393`、ncu で
+カーネル名をフィルタせずに採取）のとおり、**GB200 の cuBLAS はこの
+ベンチマークが呼ぶ FP64 volume GEMM に CUTLASS 生成の sm_80 カーネル
+`cutlass_80_tensorop_d884gemm_{64x128_16x3, 64x64_16x4, 64x32_16x4}_nn_align1`
+を出す**（p=255 で 3 種、p=511 は 64x128_16x3 の 1 種）。タイル族は
+`GEMM_CUTE` が組むものと同じで、x GEMM はレジスタ 212 本・grid 2048・
+block 128 まで一致する。
+
+**したがって本稿の測定の位置づけはこうなる。**
+
+- **有効なまま**: どのタイル・どの段数・どの命令形状が速いかという
+  **構成の比較**。cuBLAS 側は「CUTLASS 3.x が sm_80 向けに生成した構成」で、
+  我々の側は「CUTLASS 2.x multistage で組んだ構成」であり、両者の比較は
+  構成の比較として意味を持つ。採用した割り当てもそのまま有効である。
+- **読み替えが要る**: 「cuBLAS に勝った / 並んだ」という言い方。GB200 では
+  **相手もCUTLASS** なので、ライブラリ実装の優劣を示す証拠にはならない。
+  本物のライブラリ軸は H100 側にしかなく、そこでは cuBLAS は sm_90 専用の
+  手書き xmma（`tensor16x8x8`）で、`GEMM_CUTE` に 1.20〜1.45 倍勝つ。
+
+**本稿の測定値は 1 つも書き換えていない。**変わったのは、それが何の差を
+測っていたかである。
