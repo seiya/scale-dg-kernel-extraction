@@ -3734,6 +3734,19 @@ __device__ __forceinline__ int sw127(int idx)
 // because this kernel holds x and z at once.  See section 23 of
 // p127_gap_study.md for the sweep.
 template <bool UseTc>
+// Programmatic Dependent Launch stage for the p=127 fused path.  Same knob as
+// P31_PDL_STAGE / P63_PDL_STAGE, added 2026-09-06 so that the p=127 rung can be
+// ablated too:
+//   0  ordinary stream order, no griddepcontrol, plain <<<>>> launches (control)
+//   1  face -> xz PDL, and xz -> y PDL (the shipped schedule)
+// It exists because A100 has no PDL at all (sm_90 only), so the price of losing
+// it has to be measurable at every order that uses it.  Without this macro
+// reports/a100_prediction.md section 7.1.1 could price p=31 and p=63 but had to
+// record p=127's tax as unknown.
+#ifndef P127_PDL_STAGE
+#define P127_PDL_STAGE 1
+#endif
+
 __global__ __launch_bounds__(P127_XZ_THREADS_SEL, TCDFMA_BPSM(P127_XZ_MINB, P127_XZ_MINB_DFMA)) void tendency_fused_p127_xz_kernel(
     double *__restrict__ dqdt, const double *__restrict__ D1D,
     const double *__restrict__ Lift1D, const double *__restrict__ q,
@@ -3826,7 +3839,9 @@ __global__ __launch_bounds__(P127_XZ_THREADS_SEL, TCDFMA_BPSM(P127_XZ_MINB, P127
   }
   // Let the y grid start: its mma does not read dqdt.  The wait is in the y
   // epilogue, after this grid's stores.
+#if P127_PDL_STAGE >= 1
   dg_pdl_launch_dependents();
+#endif
 
   // sFU[k][l] = q*u at (kk+l, jp, k), all 128 k.  l is fast in global.
   // sD[r][l] = D1D(r, kk+l), all 128 rows: m runs over the whole range and
@@ -3960,7 +3975,9 @@ __global__ __launch_bounds__(P127_XZ_THREADS_SEL, TCDFMA_BPSM(P127_XZ_MINB, P127
 #endif
 #undef P127_XZ_PFI
 
+#if P127_PDL_STAGE >= 1
   dg_pdl_wait();
+#endif
 
   // The epilogue is nested b-outer / a-inner in the sense of section 4.4 of
   // p255_gap_study.md: half of what it reads depends on one tile index only.
@@ -4146,7 +4163,9 @@ __global__ __launch_bounds__(P127_Y_THREADS_SEL, TCDFMA_BPSM(P127_Y_BPSM, P127_Y
   }
 #undef P127_Y_STAGE_D
 
+#if P127_PDL_STAGE >= 1
   dg_pdl_wait();
+#endif
 
 #pragma unroll
   for (int e8 = 0; e8 < TM * TN; ++e8) {
@@ -4189,6 +4208,7 @@ void launch_tendency_fused_p127_impl(
                          (int)smem_y);
     opted_in = true;
   }
+#if P127_PDL_STAGE >= 1
   {
     cudaLaunchConfig_t fcfg = {};
     cudaLaunchAttribute fattr[1];
@@ -4231,6 +4251,20 @@ void launch_tendency_fused_p127_impl(
     cudaLaunchKernelEx(&ycfg, tendency_fused_p127_y_kernel<UseTc>, dqdt, D1D, q,
                        v, Escale, Ne);
   }
+#else
+  //- Control: ordinary stream order.  The producer-consumer dependency that
+  //- griddepcontrol expresses is then enforced by the stream itself, more
+  //- conservatively: y cannot start until xz has fully retired.
+  pdl_elembnd_flux_kernel<false>
+      <<<nblock_face, FACE_THREADS, 0, dg_cuda_stream>>>(
+          flux_bnd, q, u, v, w, VMapM, VMapP, normal_fn, Fscale, nface);
+  tendency_fused_p127_xz_kernel<UseTc>
+      <<<nblock, P127_XZ_THREADS_SEL, smem_xz, dg_cuda_stream>>>(
+          dqdt, D1D, Lift1D, q, u, w, flux_bnd, Escale, Ne);
+  tendency_fused_p127_y_kernel<UseTc>
+      <<<nblock_y, P127_Y_THREADS_SEL, smem_y, dg_cuda_stream>>>(
+          dqdt, D1D, q, v, Escale, Ne);
+#endif
   check_cuda("tendency_fused_p127 kernels");
 }
 
