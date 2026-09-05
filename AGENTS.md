@@ -361,6 +361,14 @@ that change.
   (40.1 TFLOP/s); the 2x advantage that Ampere and Hopper had is gone. Use the
   same denominator for CUDA-core and Tensor Core paths, and do not expect a
   Tensor Core rewrite to raise the arithmetic ceiling.
+  **That sentence is about GB200 and must not be carried to a machine where
+  the 2x still exists.** On A100 the two roofs are 9.7 and 19.5 TFLOP/s, and
+  the mma paths measurably exceed the CUDA-core roof -- 132.7% of it at p=511
+  `FUSED_TC` (`a100_report.md` section 3.2). Pick the denominator per path
+  from the instruction the path actually issues: the CUDA-core peak for a path
+  that issues none, the Tensor Core peak for one that issues `mma` or `DMMA`.
+  Reporting a path against the wrong roof is what made the A100 prediction
+  miss by up to 43%.
 - `--set basic` does not collect Memory Workload Analysis, so it cannot show
   shared-memory bank conflicts. Add `--set full` or the
   `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_*` metrics when a kernel
