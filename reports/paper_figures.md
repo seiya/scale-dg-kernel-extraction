@@ -8,7 +8,10 @@
 
 - **主軸は `Step loop per stage`**（`h100_report.md` §8.9.1）。`Main per step` は
   end-to-end の対照として補足に置く。**カーネル解析は `CUDA device` の
-  µs/stage**。3 つを混ぜない。
+  µs/stage**。3 つを混ぜない。**`Step loop` には tendency の外の RK 更新と
+  halo が入る**——p=767 では H100/GB200 比 1.109 のうち **8 ポイントがそこ**で、
+  tendency だけなら 1.026（`measured_dram_and_roofs.md` §7.2）。**F1 / F2 の
+  キャプションにこれを書く。**
 - **屋根の分母は経路が発行する命令で決める**（`AGENTS.md`、`h100_report.md`
   §8.9.2）。CUDA core 経路は CC ピーク、`mma` / `DMMA` を出す経路は TC ピーク。
   GB200 は両者が同じ 40.1 TF、H100 は 33.5 / 66.9 TF、A100 は 9.7 / 19.5 TF。
