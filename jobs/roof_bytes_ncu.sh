@@ -40,9 +40,11 @@
 #
 # TSUBAME:  qsub -g <GROUP> -v SHAPE=16x8x4 jobs/roof_bytes_ncu.sh
 # RIKYU:    sbatch jobs/rikyu_roof_bytes_ncu.sh
+# Wisteria: pjsub  jobs/wisteria_roof_bytes_ncu.sh
 #
 # Knobs: ORDERS, PATHS_<p> (per-order path list), SHAPE, CLOCK, NSTEP,
-#        SKIP_CALLS, COUNT, NCU_TIMEOUT, TIME_BUDGET, OUTDIR, SCALE_DG_ROOT
+#        SKIP_CALLS, COUNT, NCU_TIMEOUT, REPLAY, TIME_BUDGET, OUTDIR,
+#        SCALE_DG_ROOT, SCALE_DG_MODULES, SCALE_DG_MODULE_PURGE
 
 set -u
 
@@ -77,6 +79,14 @@ readonly COUNT=${COUNT:-24}
 # cost of the p=511 run rather than generously (AGENTS.md: on a bad node the
 # profiler emits nothing at all, so a long bound only delays the retry).
 readonly NCU_TIMEOUT=${NCU_TIMEOUT:-1200}
+# ncu's default kernel replay saves and restores whatever the kernel writes, so
+# it needs a device-side buffer on top of the payload.  That is free on GB200
+# (189 GiB) and H100 (94 GiB) at these orders, but p=575 already sits at 81% of
+# an A100's 40 GiB (jobs/wisteria_paths.sh), where the buffer can push it over.
+# REPLAY=application re-runs the whole application once per pass instead, which
+# costs time and not memory; with nstep=4 that trade is cheap.  Default kernel,
+# so the GB200 and H100 runs are unchanged.
+readonly REPLAY=${REPLAY:-kernel}
 readonly TIME_BUDGET=${TIME_BUDGET:-6000}
 readonly T_START=$(date +%s)
 readonly JOB_TAG=${JOB_ID:-${SLURM_JOB_ID:-${PJM_JOBID:-manual}}}
@@ -107,7 +117,7 @@ EXE="$(cd "$OUTDIR" && pwd)/scale-dg_extraction.frozen"
   echo "job=${JOB_TAG} host=$(hostname)"
   echo "commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "orders=$ORDERS shape=$SHAPE clock=$CLOCK nstep=$NSTEP"
-  echo "skip_calls=$SKIP_CALLS count=$COUNT ncu_timeout=$NCU_TIMEOUT"
+  echo "skip_calls=$SKIP_CALLS count=$COUNT ncu_timeout=$NCU_TIMEOUT replay=$REPLAY"
   nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total,clocks.max.sm --format=csv,noheader
   nvfortran --version 2>&1 | head -n 2
   ncu --version 2>&1 | head -n 4
@@ -143,6 +153,7 @@ for p in $ORDERS; do
     echo "ncu: $tag (skip=$skip count=$COUNT clock=$CLOCK)"
     timeout "$NCU_TIMEOUT" ncu --csv --clock-control "$CLOCK" --metrics "$METRICS" \
       --kernel-name-base demangled --rename-kernels 0 \
+      --replay-mode "$REPLAY" \
       -s "$skip" -c "$COUNT" \
       "$EXE" "$conf" > "$OUTDIR/ncu/${tag}.csv" 2> "$OUTDIR/logs/${tag}.err"
     echo "  rc=$? lines=$(wc -l < "$OUTDIR/ncu/${tag}.csv")"

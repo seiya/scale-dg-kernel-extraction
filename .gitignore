@@ -25,4 +25,5 @@ advect3d/advect3d
 !/jobs/roof_bytes_ncu.sh
 !/jobs/rikyu_roof_bytes_ncu.sh
 !/jobs/tsubame_roof_bytes_ncu.sh
+!/jobs/wisteria_roof_bytes_ncu.sh
 /output/
