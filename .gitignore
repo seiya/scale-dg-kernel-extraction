@@ -22,4 +22,7 @@ advect3d/advect3d
 !/jobs/rikyu_p511_reversal_ncu.sh
 !/jobs/wisteria_p511_reversal_ncu.sh
 !/jobs/wisteria_compiler_sens.sh
+!/jobs/roof_bytes_ncu.sh
+!/jobs/rikyu_roof_bytes_ncu.sh
+!/jobs/tsubame_roof_bytes_ncu.sh
 /output/
