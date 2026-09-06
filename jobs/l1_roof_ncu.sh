@@ -34,7 +34,15 @@
 # Knobs: ORDERS (default "15 63 255"), PATHS (default the three fused paths),
 #        NSTEP (default 4), NCU_TIMEOUT (default 300 s per invocation),
 #        REPEATS (default 1), CLOCKS (default "base"), TIME_BUDGET (default
-#        5400 s), SCALE_DG_MODULES, SCALE_DG_MODULE_PURGE, OUTDIR
+#        5400 s), KERNELS (default the fused-kernel regex), LAUNCH_SKIP /
+#        LAUNCH_COUNT (default 4 / 8), SCALE_DG_MODULES, SCALE_DG_MODULE_PURGE,
+#        OUTDIR
+#
+# KERNELS widens to the GEMM paths when the question involves them -- the
+# default regex matches only the hand-written fused kernels, so a CUTLASS or
+# cuBLAS volume GEMM would not be profiled at all.  LAUNCH_COUNT matters at
+# high order, where a single kernel runs for tens of milliseconds and ncu
+# replays it several times per pass.
 #
 # REPEATS and CLOCKS exist for the retake described in
 # reports/a100_report.md section 11.7.  ncu's default --clock-control base
@@ -97,7 +105,9 @@ readonly TIME_BUDGET=${TIME_BUDGET:-5400}
 readonly T_START=$(date +%s)
 readonly JOB_TAG=${JOB_ID:-${SLURM_JOB_ID:-${PJM_JOBID:-manual}}}
 readonly OUTDIR=${OUTDIR:-"l1_roof_ncu_${JOB_TAG}"}
-readonly KERNELS='regex:tendency_|pdl_elembnd'
+readonly KERNELS=${KERNELS:-'regex:tendency_|pdl_elembnd'}
+readonly LAUNCH_SKIP=${LAUNCH_SKIP:-4}
+readonly LAUNCH_COUNT=${LAUNCH_COUNT:-8}
 
 mkdir -p "$OUTDIR/config" "$OUTDIR/ncu" "$OUTDIR/logs" || exit 1
 if [ ! -x ./scale-dg_extraction ]; then
@@ -114,6 +124,7 @@ EXE="$(cd "$OUTDIR" && pwd)/scale-dg_extraction.frozen"
   echo "commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "orders=$ORDERS nstep=$NSTEP repeats=$REPEATS clocks=$CLOCKS"
   echo "ncu_timeout=$NCU_TIMEOUT time_budget=$TIME_BUDGET"
+  echo "kernels=$KERNELS launch_skip=$LAUNCH_SKIP launch_count=$LAUNCH_COUNT"
   echo "paths=$PATHS"
   nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total,clocks.max.sm --format=csv,noheader
   nvcc --version 2>&1 | tail -n 2
@@ -163,7 +174,7 @@ for r in $(seq 1 "$REPEATS"); do
           --clock-control "$clk" \
           --metrics "$METRICS" \
           --kernel-name-base demangled --rename-kernels 0 \
-          -k "$KERNELS" -s 4 -c 8 \
+          -k "$KERNELS" -s "$LAUNCH_SKIP" -c "$LAUNCH_COUNT" \
           "$EXE" "$OUTDIR/config/${tag}.conf" > "${out}.csv" 2> "${out}.err"
         echo "  rc=$? lines=$(wc -l < "${out}.csv")"
       done
