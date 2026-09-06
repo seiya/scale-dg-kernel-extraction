@@ -73,19 +73,53 @@ export ORDERS_B=""
 export ORDERS_C=""
 export VAL_ORDERS="${VAL_ORDERS:-63}"
 export ROUNDS="${ROUNDS:-6}"
+# The older half of the comparison.  nvidia/23.3 is Aquarius's default and the
+# widest gap available; fall back to a newer one only if 23.3 will not build.
+OLD_BUILD="${OLD_BUILD:-nv233}"
 
 ROOT="${SCALE_DG_ROOT:-${PJM_O_WORKDIR:-$PWD}}"
 cd "$ROOT" || exit 1
 
-for build in nv259 nv233; do
-  exe="$ROOT/scale-dg_extraction.$build"
-  if [ ! -x "$exe" ]; then
-    echo "ERROR: $exe missing; see the build recipe in this script's header." >&2
-    exit 1
-  fi
+missing=""
+for build in nv259 "$OLD_BUILD"; do
+  [ -x "$ROOT/scale-dg_extraction.$build" ] || missing="$missing $build"
 done
+if [ -n "$missing" ]; then
+  cat >&2 <<'RECIPE'
+ERROR: the frozen per-compiler executables are missing.
 
-for build in nv259 nv233; do
+They are built on the LOGIN NODE, not here: this job only measures.  From the
+checkout, one build per compiler, freezing each before the next make clean:
+
+  module unload nvidia
+  module load nvidia/25.9
+  make clean && make CUDA=1 GPUFLAGS=-gpu=cc80 GPUNVCCFLAGS=-arch=sm_80
+  cp scale-dg_extraction scale-dg_extraction.nv259
+
+  module unload nvidia
+  module load nvidia/23.3
+  make clean && make CUDA=1 GPUFLAGS=-gpu=cc80 GPUNVCCFLAGS=-arch=sm_80
+  cp scale-dg_extraction scale-dg_extraction.nv233
+
+  module unload nvidia
+  module load nvidia/25.9
+  make clean && make CUDA=1 GPUFLAGS=-gpu=cc80 GPUNVCCFLAGS=-arch=sm_80
+
+The last block leaves the tree in the state every other job expects.
+
+If the 23.3 build fails, it will fail in cuda_cutlass_gemm_fused.cu: CUTLASS
+4.7.0 wants a recent toolkit and 23.3 carries CUDA 12.0/12.1.  Nothing links
+without that object, so the answer is not to drop paths but to widen the gap
+as far as it will go -- try nvidia/23.11, then 24.11, and use the OLDEST that
+builds, naming the file after it (OLD_BUILD=nv2311 pjsub ...).  A narrower gap
+still gives an upper bound, just a weaker one; record which compiler was
+actually used.
+RECIPE
+  echo >&2 "missing:$missing"
+  exit 1
+fi
+
+for build in nv259 "$OLD_BUILD"; do
   echo
   echo "############ compiler build: $build ############"
   EXE="$ROOT/scale-dg_extraction.$build" \
