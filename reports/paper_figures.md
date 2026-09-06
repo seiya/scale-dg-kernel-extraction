@@ -27,7 +27,7 @@
 | T2 | 実装パスの定義 | `FUSED` / `FUSED_TC` / `FUSED_DFMA` / `GEMM` / `GEMM_CUTE` / `GEMM_FUSED` の役割と共有部分 | `AGENTS.md` Implementation Path Roles | **有** |
 | F1 | 経路 × 次数 × 機械 | p=7…767 の µs/stage、2 台（3 台目は次数が部分集合） | Slurm `81583` / SGE `8567869`（`h100_report.md` §8.9.1）、A100 は TCS `9520118` | **有**。p=31 は 10 ラウンド、p=511/575/767 は 8 ラウンドで取り直し済み（`h100_report.md` §8.10.2 / §8.10.3） |
 | F2 | H100/GB200 比 vs p | 3.10 → 1.11 の単調減少 | 同上（stage 基準で 3 桁一致） | **有** |
-| F3 | roofline（機械ごと） | 2 本の演算屋根（CC / TC）＋ HBM 屋根、各経路を `I_alg` と `I_meas` の 2 点で | GB200 Slurm `83141` + `83209`、H100 SGE `8585090`、A100 TCS `9525666`（`measured_dram_and_roofs.md` §2 / §5 / §6） | **有**（3 台） |
+| F3 | roofline（機械ごと） | 2 本の演算屋根（CC / TC）＋ HBM 屋根、各経路を `I_alg` と `I_meas` の 2 点で | GB200 Slurm `83141`/`83209`/`83214`、H100 SGE `8585090`/`8585547`、A100 TCS `9525666`/`9525913`（`measured_dram_and_roofs.md` §7.1） | **有**（3 台 × 全次数） |
 | T3 | どの屋根が binding か | カーネルごとの SM / L1 / L2 / DRAM 利用率（本番クロック） | GB200 §3、H100 §5.3、A100 §6.3。**律速資源は (カーネル, 機種) の組の性質** | **有**（3 台） |
 | F4 | mma 軸 | `FUSED_DFMA ÷ FUSED_TC`（iso-schedule）を 3 台 × 次数で | `h100_report.md` §8.7.1、`a100_report.md` §3.2 | **有** |
 | T4 | mma 軸の機構 | 命令数 2.3〜5 倍減、律速が命令発行 → 帯域へ移る（p=255 は L1 83.3% → SM 76.0%、p=7 は L1 85.0% → DRAM 80.9%） | ncu `81659` / `8577233` / `83141` | **有** |
