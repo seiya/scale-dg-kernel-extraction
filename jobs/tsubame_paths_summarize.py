@@ -3,6 +3,20 @@
 
 Usage:  python3 jobs/tsubame_paths_summarize.py <job stdout log> [--csv out.csv]
 
+The PRIMARY axis is "Step loop per stage".  Main per step is reported beside
+it as the end-to-end cross-check AGENTS.md asks for, but it is not the
+cross-order axis: Main's window contains the in-loop diagnostic (the q extrema
+reduction and its print), and output_interval differs by order, so the number
+of diagnostics inside the measured window is an order-dependent contaminant.
+Step loop brackets those out, from device sync to device sync.
+
+Measured, so that the change of axis is not a claim: on Slurm 81583 and SGE
+8567869 the two agree to within 0.17% everywhere and the cross-order H100/GB200
+ratio table is identical to three digits (reports/h100_report.md 8.9.1).  What
+the change does buy is robustness to interference -- at p=31 on H100 the two
+medians disagree by 6.0% on one cell, because the outlier landed in Main's
+median and not in stage's.
+
 Reports the MEDIAN over the interleaved rounds: the rounds exist to absorb
 clock and neighbour drift, and interleaving is what makes the median fair
 across paths.  Failed runs (rc != 0) are counted and listed, not silently
@@ -87,50 +101,78 @@ def main() -> int:
                 100.0 * (max(main_ms) - min(main_ms)) / statistics.median(main_ms)
                 if len(main_ms) > 1 else ""),
             "stage_us_median": statistics.median(stage_us) if stage_us else "",
+            "stage_us_min": min(stage_us) if stage_us else "",
+            "stage_us_max": max(stage_us) if stage_us else "",
+            "stage_median_over_min_pct": (
+                100.0 * (statistics.median(stage_us) / min(stage_us) - 1.0)
+                if stage_us else ""),
+            # Median absolute deviation, as a percentage of the median.  Unlike
+            # the spread it does not move when one round out of many is hit, so
+            # the pair (MAD, spread) separates "noisy" from "one bad round".
+            "stage_mad_pct": (
+                100.0 * statistics.median([abs(v - statistics.median(stage_us))
+                                           for v in stage_us])
+                / statistics.median(stage_us)
+                if stage_us else ""),
+            "stage_us_spread_pct": (
+                100.0 * (max(stage_us) - min(stage_us)) / statistics.median(stage_us)
+                if len(stage_us) > 1 else ""),
+            "stage_clean_runs": (
+                sum(1 for v in stage_us if v <= min(stage_us) * 1.005)
+                if stage_us else ""),
         })
 
     width = max(len(r["path"]) for r in rows)
-    print("%-5s %-*s %5s %5s %14s %10s %7s %7s %12s"
-          % ("p", width, "path", "runs", "fail", "main ms/step", "min", "med/min",
-             "clean", "stage us"))
+    print("PRIMARY AXIS: Step loop per stage (us).  main ms/step is the "
+          "end-to-end cross-check.")
+    print("%-5s %-*s %5s %5s %12s %10s %7s %7s %7s %14s"
+          % ("p", width, "path", "runs", "fail", "stage us", "min", "med/min",
+             "MAD", "clean", "main ms/step"))
     last_order = None
     for row in rows:
         if last_order is not None and row["poly_order"] != last_order:
             print()
         last_order = row["poly_order"]
-        flag = "*" if row["clean_runs"] != "" and row["clean_runs"] * 2 < row["runs"] else " "
-        print("%-5d %-*s %5d %5d %14s %10s %6s%%%s %6s %12s" % (
+        flag = ("*" if row["stage_clean_runs"] != ""
+                and row["stage_clean_runs"] * 2 < row["runs"] else " ")
+        def show(key, fmt="%.2f"):
+            return fmt % row[key] if row[key] != "" else "-"
+        print("%-5d %-*s %5d %5d %12s %10s %6s%%%s %6s%% %6s %14s" % (
             row["poly_order"], width, row["path"], row["runs"], row["failed"],
-            "%.4f" % row["main_ms_per_step_median"] if row["main_ms_per_step_median"] != "" else "-",
-            "%.4f" % row["main_ms_per_step_min"] if row["main_ms_per_step_min"] != "" else "-",
-            "%.2f" % row["median_over_min_pct"] if row["median_over_min_pct"] != "" else "-",
-            flag,
-            "%d/%d" % (row["clean_runs"], row["runs"]) if row["clean_runs"] != "" else "-",
-            "%.2f" % row["stage_us_median"] if row["stage_us_median"] != "" else "-"))
+            show("stage_us_median"), show("stage_us_min"),
+            show("stage_median_over_min_pct"), flag, show("stage_mad_pct"),
+            "%d/%d" % (row["stage_clean_runs"], row["runs"])
+            if row["stage_clean_runs"] != "" else "-",
+            show("main_ms_per_step_median", "%.4f")))
 
     # Fastest path per order, on the same axis the GB200 summary table is bold on.
     print()
-    print("fastest per order (median main ms/step):")
+    print("fastest per order (median Step loop per stage):")
     by_order: dict[int, list] = {}
     for row in rows:
-        if row["main_ms_per_step_median"] != "":
+        if row["stage_us_median"] != "":
             by_order.setdefault(row["poly_order"], []).append(row)
     for order in sorted(by_order):
-        best = min(by_order[order], key=lambda r: r["main_ms_per_step_median"])
-        print("  p=%-5d %-*s %.4f" % (order, width, best["path"],
-                                      best["main_ms_per_step_median"]))
+        best = min(by_order[order], key=lambda r: r["stage_us_median"])
+        alt = min(by_order[order], key=lambda r: r["main_ms_per_step_median"]
+                  if r["main_ms_per_step_median"] != "" else float("inf"))
+        note = "" if alt["path"] == best["path"] else (
+            "   (main would pick %s -- interference, see the docstring)" % alt["path"])
+        print("  p=%-5d %-*s %.2f us/stage%s" % (order, width, best["path"],
+                                                 best["stage_us_median"], note))
 
     starred = [r for r in rows
-               if r["clean_runs"] != "" and r["clean_runs"] * 2 < r["runs"]]
+               if r["stage_clean_runs"] != ""
+               and r["stage_clean_runs"] * 2 < r["runs"]]
     if starred:
         print()
-        print("* fewer than half the rounds are within 0.5%% of the min -- "
+        print("* fewer than half the rounds are within 0.5% of the min -- "
               "interference landed on this cell, quote the min:")
         for row in starred:
-            print("    p=%-5d %-*s median %.4f  min %.4f  (%+.2f%%)" % (
+            print("    p=%-5d %-*s median %.2f us  min %.2f us  (%+.2f%%)" % (
                 row["poly_order"], width, row["path"],
-                row["main_ms_per_step_median"], row["main_ms_per_step_min"],
-                row["median_over_min_pct"]))
+                row["stage_us_median"], row["stage_us_min"],
+                row["stage_median_over_min_pct"]))
 
     if failures:
         print()
