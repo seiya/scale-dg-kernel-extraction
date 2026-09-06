@@ -27,3 +27,8 @@ advect3d/advect3d
 !/jobs/tsubame_roof_bytes_ncu.sh
 !/jobs/wisteria_roof_bytes_ncu.sh
 /output/
+
+# Paper drafting notes (outline, abstract drafts, figure plan) stay local: the
+# figure plan was tracked as reports/paper_figures.md until 2026-09-06 and is
+# now here, out of the public tree.
+/paper_notes/
