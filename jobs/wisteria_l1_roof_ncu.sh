@@ -13,13 +13,23 @@
 #   pjsub jobs/wisteria_l1_roof_ncu.sh
 #
 # WALL CLOCK: share-short caps elapse at 02:00:00 (pjsub rejects more with
-# SIM4720), so the job has to bound itself well inside that.  It does: nine ncu
-# invocations at NCU_TIMEOUT=300 s each end at 45 minutes even if every one
-# hangs.  The expected cost is far below that -- GB200 (Slurm 82908) ran all
-# nine in one minute, about 7 s each -- and A100 replays more slowly but not by
-# forty times.  If an invocation does time out, check the node with pjstat and
-# resubmit excluding it before changing the profiler command (AGENTS.md).
+# SIM4720), so the job has to bound itself well inside that.  It does, but no
+# longer through the per-invocation timeout: this is the retake of
+# reports/a100_report.md 11.7, two clock-control modes x ten interleaved
+# repeats x nine configurations, so 180 invocations rather than nine.
+# TIME_BUDGET stops the sweep at 90 minutes whatever happens, leaving half an
+# hour of headroom inside the cap.  The expected cost is far below it: job
+# 9523261 ran nine invocations in 1 min 49 s, about 12 s each, so 180 is
+# roughly 36 minutes.
+#
+# Set REPEATS=1 CLOCKS=base to reproduce job 9523261 exactly.
+#
+# If an invocation times out, check the node with pjstat and resubmit
+# excluding it before changing the profiler command (AGENTS.md).
 set -u
+export REPEATS="${REPEATS:-10}"
+export CLOCKS="${CLOCKS:-base none}"
+export TIME_BUDGET="${TIME_BUDGET:-5400}"
 export SCALE_DG_MODULES="nvidia/25.9"
 export SCALE_DG_MODULE_PURGE=0
 export OUTDIR="${OUTDIR:-a100_l1_roof_ncu_${PJM_JOBID:-manual}}"

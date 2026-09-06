@@ -386,6 +386,16 @@ that change.
   to adopt a change on wall time, from an interleaved A/B on a GPU the job
   owns.** Comparisons across two `ncu` jobs are not reliable either; put the
   variants in one job.
+  **A `pct_of_peak_sustained_elapsed` figure taken at the locked clock cannot
+  be carried to boost by any simple rule, and the lock is a different fraction
+  of boost on each machine (0.53x on GB200, 0.77x on A100), so this bites
+  hardest when comparing machines.** `dram__throughput` scales with SM clock
+  only while DRAM is far from its roof, and the SM-side utilisations are not
+  clock-invariant either: elapsed includes stall time, so when raising the
+  clock lengthens DRAM waits, `l1tex__throughput` falls with it -- measured at
+  85.8% down to 66.7% on one kernel (`a100_report.md` section 12.2). When the
+  question is which roof binds in production, re-take with
+  `--clock-control none` rather than correcting on paper.
   Six measurements support this, five of them in one direction and one in the
   other, which is what pins the mechanism rather than a constant offset
   (`p63_gap_study.md` §19.10, §20.3, §20.6): a shared-conflict fix that `ncu`
