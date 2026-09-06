@@ -32,7 +32,8 @@
 #   Wisteria: pjsub  jobs/wisteria_l1_roof_ncu.sh
 #
 # Knobs: ORDERS (default "15 63 255"), PATHS (default the three fused paths),
-#        NSTEP (default 4), SCALE_DG_MODULES, SCALE_DG_MODULE_PURGE, OUTDIR
+#        NSTEP (default 4), NCU_TIMEOUT (default 300 s per invocation),
+#        SCALE_DG_MODULES, SCALE_DG_MODULE_PURGE, OUTDIR
 
 set -u
 
@@ -62,6 +63,13 @@ for m in $MODULES; do module load "$m"; done
 readonly ORDERS=${ORDERS:-"15 63 255"}
 readonly PATHS=${PATHS:-"CUDAFORTRAN_FUSED CUDAFORTRAN_FUSED_DFMA CUDAFORTRAN_FUSED_TC"}
 readonly NSTEP=${NSTEP:-4}
+# Measured, not guessed: on GB200 (Slurm 82908) all nine invocations finished
+# in one minute of wall clock, about 7 s each.  300 s is roughly forty times
+# that, which is a bound rather than a budget -- AGENTS.md is explicit that a
+# generous profiler timeout only delays the retry, because a bad node yields no
+# output at all rather than slow output.  It also makes the job self-limiting:
+# nine invocations at 300 s is 45 minutes, inside every short queue's cap.
+readonly NCU_TIMEOUT=${NCU_TIMEOUT:-300}
 readonly JOB_TAG=${JOB_ID:-${SLURM_JOB_ID:-${PJM_JOBID:-manual}}}
 readonly OUTDIR=${OUTDIR:-"l1_roof_ncu_${JOB_TAG}"}
 readonly KERNELS='regex:tendency_|pdl_elembnd'
@@ -105,7 +113,7 @@ for p in $ORDERS; do
     # -s 4 skips the first tendency call, whose caches are cold; -c 8 is enough
     # to cover one full call for every path (p=15 launches one kernel per stage,
     # p=63 and p=255 launch two or three plus the face kernel).
-    timeout 900 ncu --csv \
+    timeout "$NCU_TIMEOUT" ncu --csv \
       --metrics "$METRICS" \
       --kernel-name-base demangled --rename-kernels 0 \
       -k "$KERNELS" -s 4 -c 8 \

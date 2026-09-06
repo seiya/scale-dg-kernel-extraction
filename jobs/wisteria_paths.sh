@@ -2,7 +2,7 @@
 #PJM -N dg_a100_paths
 #PJM -L rscgrp=share-short
 #PJM -L gpu=1
-#PJM -L elapse=2:00:00
+#PJM -L elapse=02:00:00
 #PJM -g CHANGE_ME
 #PJM -j
 #PJM -S
@@ -108,7 +108,8 @@
 #   PART_C    p=575  x 3 paths x 3 rounds               3.7 min
 #   TOTAL                                              38.5 min
 #
-# 2 h is 3.1x that.  The margin is for the things the prediction does not
+# 2 h is 3.1x that, and it is also the cap: share-short rejects anything above
+# 02:00:00 (pjsub SIM4720).  The margin is for the things the prediction does not
 # cover and which would show up as time, not as a wrong answer:
 #   * the prediction itself being wrong -- the whole point of the run.  A 2x
 #     miss still fits.

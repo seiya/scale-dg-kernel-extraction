@@ -2,7 +2,7 @@
 #PJM -N dg_a100_l1_roof_ncu
 #PJM -L rscgrp=share-short
 #PJM -L gpu=1
-#PJM -L elapse=2:30:00
+#PJM -L elapse=02:00:00
 #PJM -g CHANGE_ME
 #PJM -j
 #PJM -S
@@ -12,11 +12,13 @@
 # jobs/wisteria_paths.sh, then submit FROM the checkout:
 #   pjsub jobs/wisteria_l1_roof_ncu.sh
 #
-# WALL CLOCK: 9 ncu invocations bounded at 900 s each, so even a total hang
-# ends at about 2.25 h, inside the 2.5 h asked for.  ncu on A100 is expected
-# to be slower per replay than on GB200; if an invocation times out, check
-# the node with pjstat and resubmit elsewhere before changing the command
-# (AGENTS.md).
+# WALL CLOCK: share-short caps elapse at 02:00:00 (pjsub rejects more with
+# SIM4720), so the job has to bound itself well inside that.  It does: nine ncu
+# invocations at NCU_TIMEOUT=300 s each end at 45 minutes even if every one
+# hangs.  The expected cost is far below that -- GB200 (Slurm 82908) ran all
+# nine in one minute, about 7 s each -- and A100 replays more slowly but not by
+# forty times.  If an invocation does time out, check the node with pjstat and
+# resubmit excluding it before changing the profiler command (AGENTS.md).
 set -u
 export SCALE_DG_MODULES="nvidia/25.9"
 export SCALE_DG_MODULE_PURGE=0
