@@ -661,37 +661,6 @@ cutlass::gemm::GemmCoord cap_batched_grid(cutlass::gemm::GemmCoord tiled,
                                    batched_grid_z(batch_count));
 }
 
-//- Shapes 1-3 (16x8x4 / 16x8x8 / 16x8x16) are sm_90 instructions.  CUTLASS
-//- still compiles them for an sm_80 target: cutlass/arch/mma_sm90.h keeps the
-//- asm behind __CUDA_ARCH__ >= 900 and otherwise expands
-//- CUTLASS_NOT_IMPLEMENTED(), which is a device-side brkpt / assert(0).
-//- Selecting one of them in a cc80 build would therefore trap inside the
-//- kernel instead of reporting a bad namelist entry, so let the Fortran side
-//- ask the build (and the device) whether they exist.  See
-//- reports/a100_prediction.md section 7.
-extern "C" int cuda_cutlass_has_sm90_f64_mma(void)
-{
-#if defined(__CUDA_ARCH_LIST__)
-  //- nvcc defines this in the host pass too, as a comma-separated list.
-  constexpr int kArchList[] = {__CUDA_ARCH_LIST__};
-  bool built = false;
-  for (int arch : kArchList) {
-    if (arch >= 900) built = true;
-  }
-  if (!built) return 0;
-#endif
-  //- A build that targets several architectures can still land on an older
-  //- GPU, where the instruction is absent no matter what was compiled.
-  int device = 0;
-  int major = 0;
-  if (cudaGetDevice(&device) != cudaSuccess) return 1;
-  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                             device) != cudaSuccess) {
-    return 1;
-  }
-  return major >= 9 ? 1 : 0;
-}
-
 int bad_mma_shape(int mma_shape)
 {
   std::fprintf(stderr, "cutlass volume gemm: unsupported mma_shape %d\n",
@@ -1559,6 +1528,44 @@ int run_x_gemm_assembly(double *dqdt, const double *flux_x, const double *D1D,
 }
 
 } // namespace
+
+//- Defined OUTSIDE the anonymous namespace above, deliberately.  An
+//- extern "C" function defined inside an unnamed namespace has internal
+//- linkage, and whether the symbol is nonetheless emitted is up to the
+//- toolchain: nvhpc 25.9 and 26.3 emit it, nvhpc 23.11 does not, and the
+//- Fortran side then fails to link with "undefined reference to
+//- cuda_cutlass_has_sm90_f64_mma".  Every other extern "C" entry point in
+//- this file is below this line for the same reason; keep this one here.
+//- Shapes 1-3 (16x8x4 / 16x8x8 / 16x8x16) are sm_90 instructions.  CUTLASS
+//- still compiles them for an sm_80 target: cutlass/arch/mma_sm90.h keeps the
+//- asm behind __CUDA_ARCH__ >= 900 and otherwise expands
+//- CUTLASS_NOT_IMPLEMENTED(), which is a device-side brkpt / assert(0).
+//- Selecting one of them in a cc80 build would therefore trap inside the
+//- kernel instead of reporting a bad namelist entry, so let the Fortran side
+//- ask the build (and the device) whether they exist.  See
+//- reports/a100_prediction.md section 7.
+extern "C" int cuda_cutlass_has_sm90_f64_mma(void)
+{
+#if defined(__CUDA_ARCH_LIST__)
+  //- nvcc defines this in the host pass too, as a comma-separated list.
+  constexpr int kArchList[] = {__CUDA_ARCH_LIST__};
+  bool built = false;
+  for (int arch : kArchList) {
+    if (arch >= 900) built = true;
+  }
+  if (!built) return 0;
+#endif
+  //- A build that targets several architectures can still land on an older
+  //- GPU, where the instruction is absent no matter what was compiled.
+  int device = 0;
+  int major = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) return 1;
+  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                             device) != cudaSuccess) {
+    return 1;
+  }
+  return major >= 9 ? 1 : 0;
+}
 
 extern "C" int launch_volume_gemm_x(double *deriv_x, const double *flux_x,
                                     const double *D1D, int Nq, int Ne,
