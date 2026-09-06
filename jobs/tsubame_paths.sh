@@ -96,7 +96,14 @@ echo "root=$ROOT"
 # exactly as they were.
 readonly MODULES=${SCALE_DG_MODULES:-nvhpc}
 readonly MODULE_PURGE=${SCALE_DG_MODULE_PURGE:-1}
+# Some sites load a compiler by default and its modulefile conflicts with the
+# one wanted here, so `module load` alone silently keeps the wrong runtime.
+# SCALE_DG_MODULE_UNLOAD names what to drop first; it matters whenever an
+# executable has to run under the toolchain it was BUILT with rather than
+# whatever the job inherited (jobs/wisteria_compiler_sens.sh).
+readonly MODULE_UNLOAD=${SCALE_DG_MODULE_UNLOAD:-}
 [ "$MODULE_PURGE" = 1 ] && module purge
+for m in $MODULE_UNLOAD; do module unload "$m" 2>/dev/null || true; done
 for m in $MODULES; do module load "$m"; done
 
 readonly ROUNDS=${ROUNDS:-6}
