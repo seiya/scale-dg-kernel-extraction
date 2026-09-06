@@ -57,10 +57,12 @@
   無効（−0.11%）**と確定した。**残りは p=511 / 575 / 767 の反復増**:
   ```
   qsub -g <GROUP> -v ORDERS_A=,ORDERS_B=511,ORDERS_C=,ROUNDS_HI=8,VALIDATE=0,\
-       SCALE_DG_PATHS_511="CUDAFORTRAN_GEMM CUDAFORTRAN_GEMM_CUTE@16x8x4 CUDAFORTRAN_GEMM_FUSED@16x8x4" \
+       SCALE_DG_PATHS_511=CUDAFORTRAN_GEMM:CUDAFORTRAN_GEMM_CUTE@16x8x4:CUDAFORTRAN_GEMM_FUSED@16x8x4 \
        jobs/tsubame_paths.sh
   ```
-  （575 / 767 は `ORDERS_C` と `ROUNDS_XHI=8` で同様。）
+  **区切りはコロン**——SGE の `-v` は値の中の空白（シェルが割る）もカンマ
+  （SGE 自身が割る）も運べないので、この形だけが投入できる（`2a5de1f`）。
+  575 / 767 は `ORDERS_C=575:767` と `ROUNDS_XHI=8` で同様。
   p=31 の結果からすると `stage` 軸では動かない見込みだが、**測っていない。**
 
 ## 4. 載せないと決めたもの
