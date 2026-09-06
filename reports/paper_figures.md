@@ -22,10 +22,10 @@
 |---:|---|---|---|---|
 | T1 | 機械の諸元 | GB200 / H100 / A100 の CC・TC ピーク、HBM、SM 数、driver、コンパイラ | `h100_report.md` §2、`a100_report.md` §2 | **有** |
 | T2 | 実装パスの定義 | `FUSED` / `FUSED_TC` / `FUSED_DFMA` / `GEMM` / `GEMM_CUTE` / `GEMM_FUSED` の役割と共有部分 | `AGENTS.md` Implementation Path Roles | **有** |
-| F1 | 経路 × 次数 × 機械 | p=7…767 の µs/stage、2 台（3 台目は次数が部分集合） | Slurm `81583` / SGE `8567869`（`h100_report.md` §8.9.1）、A100 は TCS `9520118` | **有**。ただし p=31 と p>=511 は反復増の取り直し待ち（§3 の M2） |
+| F1 | 経路 × 次数 × 機械 | p=7…767 の µs/stage、2 台（3 台目は次数が部分集合） | Slurm `81583` / SGE `8567869`（`h100_report.md` §8.9.1）、A100 は TCS `9520118` | **有**。p=31 は 10 ラウンドで取り直し済み（`h100_report.md` §8.10.2）。p>=511 の反復増だけ未実施 |
 | F2 | H100/GB200 比 vs p | 3.10 → 1.11 の単調減少 | 同上（stage 基準で 3 桁一致） | **有** |
-| F3 | roofline（機械ごと） | 2 本の演算屋根（CC / TC）＋ HBM 屋根、各経路を `I_alg` と `I_meas` の 2 点で | GB200: Slurm `83141`。H100: **未測定** | **半**（M1） |
-| T3 | どの屋根が binding か | カーネルごとの SM / L1 / L2 / DRAM 利用率（本番クロック） | GB200: `measured_dram_and_roofs.md` §3。H100: **未測定** | **半**（M1） |
+| F3 | roofline（機械ごと） | 2 本の演算屋根（CC / TC）＋ HBM 屋根、各経路を `I_alg` と `I_meas` の 2 点で | GB200: Slurm `83141`、H100: SGE `8585090`（`measured_dram_and_roofs.md` §2 / §5） | **有** |
+| T3 | どの屋根が binding か | カーネルごとの SM / L1 / L2 / DRAM 利用率（本番クロック） | GB200 `measured_dram_and_roofs.md` §3、H100 同 §5.3 | **有** |
 | F4 | mma 軸 | `FUSED_DFMA ÷ FUSED_TC`（iso-schedule）を 3 台 × 次数で | `h100_report.md` §8.7.1、`a100_report.md` §3.2 | **有** |
 | T4 | mma 軸の機構 | 命令数 2.3〜5 倍減、律速が命令発行 → 帯域へ移る（p=255 は L1 83.3% → SM 76.0%、p=7 は L1 85.0% → DRAM 80.9%） | ncu `81659` / `8577233` / `83141` | **有** |
 | F5 | ライブラリ軸 | `GEMM_CUTE ÷ GEMM` を 3 台 × 次数で。**H100 だけ軸が生きている**（GB200・A100 の cuBLAS は CUTLASS 生成の同一カーネル） | `h100_report.md` §8.7.2、`a100_report.md` §7 | **有** |
@@ -43,16 +43,25 @@
 | A3 | モデルの失敗 | 機械非依存の 2 係数モデルは原理的に成り立たない（律速資源は (カーネル, 機種) の性質） | **有**（`a100_report.md` §11.3、§13、§15.3） |
 | A4 | 測定手順 | 交互ラウンド、中央値、MAD、干渉の検出（`clean` 列）、`ncu` のクロック固定の扱い | **有** |
 
-## 3. 追加測定（この 2 つで図表の穴は埋まる）
+## 3. 追加測定（2026-09-06 に 1.5 件が済み、残りは 0.5 件）
 
-- **M1: H100 の `roof_bytes_ncu`**（F3・T3 の H100 列）。
-  `qsub -g <GROUP> jobs/tsubame_roof_bytes_ncu.sh`。GB200 側は 4 分 09 秒。
-  これが `h100_report.md` §8.9.2 の唯一の未解明——**H100 の p=767 が演算屋根の
-  46.8%、帯域屋根の 18.1% で、どちらにも当たっていない**——を閉じる。
-- **M2: H100 の反復増**（F1 の p=31 と p>=511）。
-  `SCALE_DG_PATHS_<p>` で経路を絞り、`ROUNDS=10` / `ROUNDS_HI=8` /
-  `ROUNDS_XHI=8`。p=31 は 6 ラウンド中 1 本が +9〜14% に飛ぶ実測があり、
-  p=575 / 767 は 3 ラウンドしかない。min / max / MAD は summarizer が出す。
+- **M1: H100 の `roof_bytes_ncu`**（F3・T3 の H100 列）——**完了**
+  （SGE `8585090`、14 起動とも `rc=0`）。`h100_report.md` §8.9.2 の唯一の
+  未解明を閉じた: **H100 の volume GEMM は自分の DMMA 屋根の 88.1% で、
+  絶対値では GB200 の 1.53 倍速い**。46.8% の正体は、演算をしない周辺
+  カーネルが tendency の 41.0% を占めること（`measured_dram_and_roofs.md` §5.2）。
+  **F3 / T3 は 2 台とも描ける。**
+- **M2: H100 の反復増**（F1）——**p=31 は完了**（SGE `8585093`、10 ラウンド、
+  9 経路とも 10/10 clean、MAD 0.01〜0.03%）。`stage` 軸は 6 ラウンドでも
+  ±0.03% で再現し、動いたのは `Main` だけ（5.59%）で、**`16x8x4` は p=31 では
+  無効（−0.11%）**と確定した。**残りは p=511 / 575 / 767 の反復増**:
+  ```
+  qsub -g <GROUP> -v ORDERS_A=,ORDERS_B=511,ORDERS_C=,ROUNDS_HI=8,VALIDATE=0,\
+       SCALE_DG_PATHS_511="CUDAFORTRAN_GEMM CUDAFORTRAN_GEMM_CUTE@16x8x4 CUDAFORTRAN_GEMM_FUSED@16x8x4" \
+       jobs/tsubame_paths.sh
+  ```
+  （575 / 767 は `ORDERS_C` と `ROUNDS_XHI=8` で同様。）
+  p=31 の結果からすると `stage` 軸では動かない見込みだが、**測っていない。**
 
 ## 4. 載せないと決めたもの
 
