@@ -44,6 +44,22 @@ SGE and TCS.
 Machine-independent as well; it decides `reports/a100_prediction.md`
 prediction 3 and prints the verdict.
 
+## Tracked: the L1 third term
+
+| file | role |
+|---|---|
+| `l1_roof_ncu.sh` | which roof binds each fused kernel: L1 throughput, FP64 pipe utilisation, shared wavefronts and bank conflicts, occupancy, issue rate |
+| `rikyu_l1_roof_ncu.sh` | Slurm wrapper |
+| `wisteria_l1_roof_ncu.sh` | Fujitsu TCS wrapper |
+
+Also machine-independent, and tracked for the same reason: the additive
+roofline needs a third term whose roof scales with SM count and clock rather
+than with FP64 FLOPs, and that can only be fitted with the same measurement
+taken on every machine (`reports/a100_report.md` section 10).
+
+`ncu` locks the clocks, so nothing these produce is a wall-time result. They
+identify which resource binds; adoption stays on interleaved wall-time A/B.
+
 ## Not tracked
 
 One-off ablations, sweeps and `ncu` probes (`ab_*`, `sweep_*`, `time_*`,

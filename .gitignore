@@ -16,4 +16,7 @@ advect3d/advect3d
 !/jobs/wisteria_paths.sh
 !/jobs/cublas_kernel_names_nsys.sh
 !/jobs/wisteria_cublas_nsys.sh
+!/jobs/l1_roof_ncu.sh
+!/jobs/rikyu_l1_roof_ncu.sh
+!/jobs/wisteria_l1_roof_ncu.sh
 /output/
