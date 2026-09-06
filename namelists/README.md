@@ -23,7 +23,7 @@ Nsight Compute needs a short `nstep` (typically 4). Do not keep a parallel
 
 | Field | Values |
 |---|---|
-| `purpose` | `demo` (tiny smoke), `perf` (timing mesh), `val` (point-varying coefficient check) |
+| `purpose` | `demo` (tiny smoke), `perf` (timing mesh), `val` (point-varying coefficient check), `acc` (time-integrated accuracy, `SCALE_DG_ACCURACY=1`) |
 | `order` | polynomial order (`7`, `15`, …, `1023`) |
 | `kernel` | `openacc_split`, `split`, `fused`, `fused_tc`, `gemm`, `gemm_cute`, `gemm_fused`, `gemm_ozaki1`, `gemm_ozaki2` |
 
@@ -55,6 +55,7 @@ Qualifiers only when they are not the default: `emu` (`CublasEmulation`), `ne{N}
 | `perf_p767_gemm_cute.conf` / `val_p767_gemm_cute.conf` | p=767 の未融合対照 `CUDAFORTRAN_GEMM_CUTE`（同一メッシュ・同一 `nstep`） |
 | `perf_p7_gemm_emu_n1.conf` | cuBLAS emulation timing (do not use `nstep=1000`) |
 | `val_p7_*` / `val_p7_split.conf` / `val_p15_fused.conf` / `val_p15_split.conf` / `val_p15_gemm_fused.conf` / `val_p31_split.conf` / `val_p31_gemm_fused.conf` / `val_p63_split.conf` / `val_p63_fused_tc.conf` / `val_p127_fused.conf` / `val_p127_split.conf` / `val_p255_*` | numerical checks (`SCALE_DG_VARYING_COEFF=1`) |
+| `acc_p{7,63,255}_gemm.conf` | 時間積分後の精度検証。定数速度・周期領域なので厳密解は初期条件の平行移動で、`SCALE_DG_ACCURACY=1` を付けると L2 / L∞ 誤差と質量ドリフトを出す。`DqdtKernel_Type` を差し替えて全経路を回す用途（`reports/accuracy_validation.md`）。`nstep` は t_end が p=7 / 63 で 0.01、p=255 で 0.001 になるよう選んである |
 | `perf_p511_gemm.conf` | p=511 published mesh, `CUDAFORTRAN_GEMM` (`Ne=1`, `nstep=20`) |
 | `perf_p511_gemm_fused.conf` | p=511 published mesh, `CUDAFORTRAN_GEMM_FUSED` (`Ne=1`, `nstep=20`) |
 | `val_p{511,575,767,1023}_gemm*.conf` | high-order GEMM / GEMM_FUSED / emu |

@@ -69,6 +69,13 @@ program main
 
   integer :: kelem, pnode
   real(RP) :: q_min, q_max
+
+  !> Advection velocity from the namelist.  Program scope rather than local to
+  !! init() because the accuracy diagnostic needs it to translate the initial
+  !! condition to the final time.
+  real(RP) :: vel_x = 1.0_RP
+  real(RP) :: vel_y = 1.0_RP
+  real(RP) :: vel_z = 1.0_RP
   real(RP) :: a_rk, b_rk
 
   type(Timer) :: timer_main
@@ -217,6 +224,7 @@ program main
   if (nstep > nwarmup) call Timer_stop(timer_step_loop)
 
   call dump_q_if_requested()
+  call report_accuracy_if_requested()
 
   !$acc wait(ACC_QUEUE)
 
@@ -241,9 +249,6 @@ contains
     integer :: NeY = 4
     integer :: NeZ = 4
     integer :: PolyOrder = 3
-    real(RP) :: vel_x = 1.0_RP
-    real(RP) :: vel_y = 1.0_RP
-    real(RP) :: vel_z = 1.0_RP
     character(len=8) :: DGOptrKernel_OptType = "OPT1" ! GENERAL or OPT1
     character(len=24) :: DqdtKernel_Type = "OPENACC_SPLIT"
     logical :: CublasEmulation = .false.
@@ -467,6 +472,90 @@ contains
 
     return
   end subroutine rk_update_stage
+
+  !> Accuracy of the time-integrated solution, against the analytic one.
+  !!
+  !! The full-field dqdt comparison that AGENTS.md requires validates one
+  !! tendency evaluation.  It says nothing about the solution after nstep
+  !! steps, which is what an application cares about, so this closes that gap:
+  !! with a constant velocity on a periodic box the exact solution of
+  !! dq/dt + div(q u) = 0 for q(x,0) = sin(2 pi x) sin(2 pi y) sin(2 pi z) is
+  !! the initial condition translated by u t, at any t.
+  !!
+  !! Off by default (SCALE_DG_ACCURACY=1 turns it on) so that no performance
+  !! run pays for it, and it runs after the timers have stopped in any case.
+  !! SCALE_DG_VARYING_COEFF makes the velocity point-varying, which has no
+  !! closed-form solution; that combination reports nothing rather than
+  !! reporting a wrong error.
+  subroutine report_accuracy_if_requested()
+    use mod_common, only: PI
+    use mod_mesh, only: w1D, ElemSize
+    implicit none
+    character(len=32) :: enabled, vary_coeff
+    integer :: ke, i, j, k, n
+    real(RP) :: t_end, jac, wgt
+    real(RP) :: qe, err
+    real(RP) :: l2num, l2den, linf, mass, mass0
+    !------------------------------------------------------------
+
+    enabled = '0'
+    call get_environment_variable('SCALE_DG_ACCURACY', enabled)
+    if (trim(enabled) /= '1') return
+
+    vary_coeff = '0'
+    call get_environment_variable('SCALE_DG_VARYING_COEFF', vary_coeff)
+    if (trim(vary_coeff) == '1') then
+      write(*,'(A)') 'Accuracy: skipped (SCALE_DG_VARYING_COEFF has no analytic solution)'
+      return
+    end if
+
+    !$acc wait(ACC_QUEUE)
+    !$acc update host(q)
+
+    t_end = real(nstep,RP) * dt
+    ! Reference cube [-1,1]^3 -> element of size ElemSize.
+    jac = 0.125_RP * ElemSize(1) * ElemSize(2) * ElemSize(3)
+
+    l2num = 0.0_RP
+    l2den = 0.0_RP
+    linf  = 0.0_RP
+    mass  = 0.0_RP
+    mass0 = 0.0_RP
+    !$omp parallel do private(i,j,k,n,wgt,qe,err) &
+    !$omp& reduction(+:l2num,l2den,mass,mass0) reduction(max:linf)
+    do ke = 1, Ne
+      do k = 1, Nq
+      do j = 1, Nq
+      do i = 1, Nq
+        n = i + (j-1)*Nq + (k-1)*Nq*Nq
+        wgt = jac * w1D(i) * w1D(j) * w1D(k)
+        qe = sin( 2.0_RP*PI*(pos_en(n,ke,1) - vel_x*t_end) ) &
+           * sin( 2.0_RP*PI*(pos_en(n,ke,2) - vel_y*t_end) ) &
+           * sin( 2.0_RP*PI*(pos_en(n,ke,3) - vel_z*t_end) )
+        err = q(n,ke) - qe
+        l2num = l2num + wgt*err*err
+        l2den = l2den + wgt*qe*qe
+        linf  = max(linf, abs(err))
+        mass  = mass  + wgt*q(n,ke)
+        mass0 = mass0 + wgt*sin( 2.0_RP*PI*pos_en(n,ke,1) ) &
+                          * sin( 2.0_RP*PI*pos_en(n,ke,2) ) &
+                          * sin( 2.0_RP*PI*pos_en(n,ke,3) )
+      end do
+      end do
+      end do
+    end do
+
+    write(*,'(A)')            'Accuracy (time-integrated solution vs analytic):'
+    write(*,'(A30,ES24.16)') 'final time:', t_end
+    write(*,'(A30,ES24.16)') 'L2 error (absolute):', sqrt(l2num)
+    write(*,'(A30,ES24.16)') 'L2 error (relative):', sqrt(l2num/max(l2den,tiny(1.0_RP)))
+    write(*,'(A30,ES24.16)') 'Linf error:', linf
+    write(*,'(A30,ES24.16)') 'mass (final):', mass
+    write(*,'(A30,ES24.16)') 'mass (initial):', mass0
+    write(*,'(A30,ES24.16)') 'mass drift:', mass - mass0
+
+    return
+  end subroutine report_accuracy_if_requested
 
   subroutine dump_q_if_requested()
     implicit none

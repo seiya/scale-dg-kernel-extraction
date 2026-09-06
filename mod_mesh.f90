@@ -39,12 +39,15 @@ module mod_mesh
 
   integer, public, allocatable :: Fmask(:,:)         !< Face node indices
   real(RP), public, allocatable :: x1D(:)            !< 1D coordinates in reference element
+  real(RP), public, allocatable :: w1D(:)            !< LGL quadrature weights of the same nodes
   real(RP), public, allocatable :: D1D(:,:)          !< 1D differentiation matrix
   real(RP), public, allocatable :: D1D_tr(:,:)       !< Transpose of 1D differentiation matrix
   real(RP), public, allocatable :: Lift_mat(:,:,:,:) !< Lift matrix
   real(RP), public, allocatable :: Lift1D(:,:)        !< Separable face lift coefficients
 
   !- Mesh
+
+  real(RP), public :: ElemSize(3)                   !< Element edge lengths (dx, dy, dz)
 
   integer, public :: Ne    !< Number of elements
   integer, public :: NeA   !< Number of elements including halo buffer
@@ -120,6 +123,7 @@ contains
     dx = domsize_x / real(NeX,RP)
     dy = domsize_y / real(NeY,RP)
     dz = domsize_z / real(NeZ,RP)
+    ElemSize = (/ dx, dy, dz /)
 
     !----------------------------------------------------------
     ! Geometry and VMapM / VMapP
@@ -260,6 +264,7 @@ contains
 
     logical :: have_file, dense_lift
     character(len=128) :: fname
+    real(RP) :: pn_i, pnm1_i
     !----------------------------------------------------------
 
     PolyOrder = p
@@ -315,6 +320,26 @@ contains
     end if
 
     D1D_tr = transpose(D1D)
+
+    !----------------------------------------------------------
+    ! Quadrature weights of the LGL node set.
+    !
+    ! The tendency never needs them: the collocation operators D1D and Lift1D
+    ! already carry the mass matrix.  The accuracy diagnostic in main.f90 does
+    ! -- an L2 norm and a total mass are integrals -- so compute them once
+    ! here.  w_i = 2 / (p (p+1) P_p(x_i)^2) holds for the Legendre-Gauss-
+    ! Lobatto nodes whichever way x1D arrived, from operator_data/p<p>.dat or
+    ! from generate_lgl_operators.
+    !----------------------------------------------------------
+    allocate(w1D(Nq))
+    if (p == 0) then
+      w1D(1) = 2.0_RP
+    else
+      do i = 1, Nq
+        call eval_legendre_pair(p, x1D(i), pn_i, pnm1_i)
+        w1D(i) = 2.0_RP / ( real(p,RP)*real(p+1,RP) * pn_i*pn_i )
+      end do
+    end if
 
     !----------------------------------------------------------
     ! Face node indices
