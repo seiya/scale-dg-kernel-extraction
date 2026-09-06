@@ -44,6 +44,7 @@
 #
 # Knobs (environment):
 #   ORDERS_A/B/C=.. orders each part sweeps (empty string skips the part)
+#   SCALE_DG_PATHS_<p>=".." replace the path list at one order (rerun knob)
 #   ROUNDS=6        interleaved rounds for p=7..255   (PART A)
 #   ROUNDS_HI=6     interleaved rounds for p=511      (PART B)
 #   ROUNDS_XHI=3    interleaved rounds for p=575/767  (PART C)
@@ -258,6 +259,14 @@ paths_for_order() { # echo the path specs that exist at this order
   # tree now refuses shapes 1-3 there with error stop rather than trapping
   # inside the kernel (reports/a100_prediction.md section 7.2), so sweeping
   # them would only produce failed runs.
+  # SCALE_DG_PATHS_<order> replaces the list for one order.  It exists for the
+  # repeat-count reruns: eight to twelve interleaved rounds at p=767 is hours
+  # if every path runs, and the question those reruns ask is only about the
+  # cells that decide the published ranking.  Unset everywhere else, so the
+  # default sweep is unchanged.
+  local override_var="SCALE_DG_PATHS_$1"
+  if [ -n "${!override_var:-}" ]; then echo "${!override_var}"; return; fi
+
   local shapes=${SCALE_DG_SHAPE_SPECS-" CUDAFORTRAN_GEMM_CUTE@16x8x4 CUDAFORTRAN_GEMM_FUSED@16x8x4"}
   case $1 in
     7|15|31|63|127)
