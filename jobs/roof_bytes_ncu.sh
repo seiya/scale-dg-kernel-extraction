@@ -68,7 +68,10 @@ readonly MODULES=${SCALE_DG_MODULES:-nvhpc}
 for m in $MODULES; do module load "$m"; done
 export DEBUGINFOD_URLS=
 
-readonly ORDERS=${ORDERS:-"7 63 255 767"}
+# Colon or comma separators are accepted as well as spaces, because neither
+# SGE's -v nor TCS's -x can carry a space inside one value (jobs/tsubame_paths.sh
+# learnt this the same way).
+readonly ORDERS=$(printf '%s' "${ORDERS:-7 63 255 767}" | tr ':,' '  ')
 readonly SHAPE=${SHAPE:-8x8x4}
 readonly CLOCK=${CLOCK:-none}
 readonly NSTEP=${NSTEP:-4}
@@ -99,7 +102,7 @@ readonly OUTDIR=${OUTDIR:-"roof_bytes_ncu_${JOB_TAG}"}
 paths_for() {
   local p=$1 var
   var="PATHS_$p"
-  if [ -n "${!var:-}" ]; then printf '%s' "${!var}"; return; fi
+  if [ -n "${!var:-}" ]; then printf '%s' "${!var}" | tr ':,' '  '; return; fi
   case "$p" in
     511|575|767|1023) echo "CUDAFORTRAN_GEMM CUDAFORTRAN_GEMM_FUSED" ;;
     *) echo "CUDAFORTRAN_FUSED CUDAFORTRAN_FUSED_TC CUDAFORTRAN_GEMM CUDAFORTRAN_GEMM_FUSED" ;;
