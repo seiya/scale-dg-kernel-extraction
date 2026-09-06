@@ -45,6 +45,13 @@
 # Knobs (environment):
 #   ORDERS_A/B/C=.. orders each part sweeps (empty string skips the part)
 #   SCALE_DG_PATHS_<p>=".." replace the path list at one order (rerun knob)
+#
+# Both of those accept ":" or "," as the separator as well as a space, because
+# SGE's -v can carry neither a space nor a comma inside one value.  From a
+# login shell either form works; from qsub, use colons:
+#   qsub -g <GROUP> -v ORDERS_A=,ORDERS_B=511,ORDERS_C=,ROUNDS_HI=8,VALIDATE=0,\
+#        SCALE_DG_PATHS_511=CUDAFORTRAN_GEMM:CUDAFORTRAN_GEMM_CUTE@16x8x4:CUDAFORTRAN_GEMM_FUSED@16x8x4 \
+#        jobs/tsubame_paths.sh
 #   ROUNDS=6        interleaved rounds for p=7..255   (PART A)
 #   ROUNDS_HI=6     interleaved rounds for p=511      (PART B)
 #   ROUNDS_XHI=3    interleaved rounds for p=575/767  (PART C)
@@ -113,9 +120,12 @@ readonly ROUNDS_XHI=${ROUNDS_XHI:-3}
 readonly VALIDATE=${VALIDATE:-1}
 readonly VAL_ORDERS=${VAL_ORDERS:-"7 15 31 63 127 255"}
 readonly TIMING=${TIMING:-1}
-readonly ORDERS_A=${ORDERS_A-"7 15 31 63 127 255"}
-readonly ORDERS_B=${ORDERS_B-"511"}
-readonly ORDERS_C=${ORDERS_C-"575 767"}
+# Colon or comma separators are accepted here too, for the same -v reason as
+# in paths_for_order: ORDERS_C=575:767 is submittable, ORDERS_C="575 767" is not.
+readonly ORDERS_A=$(printf '%s' "${ORDERS_A-7 15 31 63 127 255}" | tr ':,' '  ')
+readonly ORDERS_B=$(printf '%s' "${ORDERS_B-511}" | tr ':,' '  ')
+readonly ORDERS_C=$(printf '%s' "${ORDERS_C-575 767}" | tr ':,' '  ')
+readonly VAL_ORDERS_CLEAN=$(printf '%s' "$VAL_ORDERS" | tr ':,' '  ')
 # JOB_ID is SGE (TSUBAME), SLURM_JOB_ID is Slurm (RIKYU): the same script runs
 # on both, which is what makes the two columns of the table one measurement.
 # PJM_JOBID is Fujitsu TCS (Wisteria).
@@ -264,8 +274,16 @@ paths_for_order() { # echo the path specs that exist at this order
   # if every path runs, and the question those reruns ask is only about the
   # cells that decide the published ranking.  Unset everywhere else, so the
   # default sweep is unchanged.
+  # Colon-separated as well as space-separated, because SGE's -v cannot carry
+  # either separator it would otherwise want: it splits its own argument on
+  # commas and the shell splits it on spaces, so
+  #   -v SCALE_DG_PATHS_511=CUDAFORTRAN_GEMM:CUDAFORTRAN_GEMM_FUSED@16x8x4
+  # is the only form that survives the submission.
   local override_var="SCALE_DG_PATHS_$1"
-  if [ -n "${!override_var:-}" ]; then echo "${!override_var}"; return; fi
+  if [ -n "${!override_var:-}" ]; then
+    printf '%s\n' "${!override_var}" | tr ':,' '  '
+    return
+  fi
 
   local shapes=${SCALE_DG_SHAPE_SPECS-" CUDAFORTRAN_GEMM_CUTE@16x8x4 CUDAFORTRAN_GEMM_FUSED@16x8x4"}
   case $1 in
@@ -287,7 +305,7 @@ if [ "$VALIDATE" = 1 ]; then
   echo
   echo "===== VALIDATION (point-varying coefficients, full owned dqdt) ====="
   : > "$OUTDIR/validation.txt"
-  for p in $VAL_ORDERS; do
+  for p in $VAL_ORDERS_CLEAN; do
     if [ "$p" -le 127 ]; then ref_kernel=CUDAFORTRAN_SPLIT; else ref_kernel=CUDAFORTRAN_GEMM; fi
     ref_conf="$OUTDIR/config/val_p${p}_ref.conf"
     make_config "$ref_conf" "$p" "$ref_kernel" || continue
