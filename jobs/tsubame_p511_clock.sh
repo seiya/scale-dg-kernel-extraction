@@ -1,7 +1,7 @@
 #!/bin/bash
 #$ -cwd
 #$ -l gpu_1=1
-#$ -l h_rt=01:00:00
+#$ -l h_rt=02:00:00
 #$ -N dg_h100_p511clk
 #$ -j y
 #
@@ -22,7 +22,14 @@ O="$R/p511_clock_${JOB_ID:-manual}"
 mkdir -p "$O/config"; cd "$R" || exit 1
 echo "host=$(hostname) date=$(date -Is) commit=$(git rev-parse --short HEAD)"
 nvidia-smi --query-gpu=name,power.limit,clocks.max.sm --format=csv
-for k in FUSED_TC GEMM_FUSED; do
+# The five paths jobs/tsubame_paths.sh runs at p=511, in its order.  The
+# two-path version of this job (SGE 8595368) did NOT reproduce the signature
+# it was chasing -- FUSED_TC 0.67% against GEMM_FUSED 0.53%, where the harness
+# gives 0.103 against 0.005 -- so the protocol has to match the harness, not
+# just the namelist.  With five paths a given path returns to the GPU once a
+# minute instead of once every twenty seconds.
+PATHS="FUSED_TC FUSED_DFMA GEMM GEMM_CUTE GEMM_FUSED"
+for k in $PATHS; do
   sed "s/DqdtKernel_Type *= *\"[A-Z_]*\"/DqdtKernel_Type = \"CUDAFORTRAN_$k\"/" \
     "$R/namelists/perf_p511_gemm.conf" > "$O/config/$k.conf"
 done
@@ -38,7 +45,7 @@ nvidia-smi --query-gpu=$FIELDS \
 SMI=$!
 sleep 2
 for r in $(seq 1 20); do
-  for k in FUSED_TC GEMM_FUSED; do
+  for k in $PATHS; do
     echo "=== RUN r$r $k start=$(date +%s.%N)"
     ./scale-dg_extraction "$O/config/$k.conf"
     echo "=== RUN r$r $k end=$(date +%s.%N)"
