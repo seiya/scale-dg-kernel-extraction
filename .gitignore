@@ -31,6 +31,7 @@ advect3d/advect3d
 !/jobs/tsubame_acc.sh
 !/jobs/wisteria_acc.sh
 !/jobs/wisteria_p511_spread.sh
+!/jobs/rikyu_acc.sh
 /output/
 
 # Paper drafting notes (outline, abstract drafts, figure plan) stay local: the
