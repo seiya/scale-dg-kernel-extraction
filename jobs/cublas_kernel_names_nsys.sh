@@ -63,6 +63,14 @@ for m in $MODULES; do module load "$m"; done
 export DEBUGINFOD_URLS=
 
 readonly ORDERS=${ORDERS:-"63 255"}
+# Which variants to trace.  "GEMM" and "GEMM_CUTE" are the original library
+# axis (cuBLAS against our own CUTLASS).  "GEMM_EMU" is the same
+# DqdtKernel_Type as GEMM with CublasEmulation = .true., added 2026-09-08 so
+# that the emulated volume GEMM can be attributed by kernel name on each
+# machine: cublas_emulation_survey.md 10.2 found emulation winning at p >= 511
+# on GB200 and losing 2.18-3.17x on H100, with the native side only 10.7%
+# apart, and named the kernel breakdown as the way to close it.
+readonly KINDS=$(printf '%s' "${KINDS:-GEMM GEMM_CUTE}" | tr ':,' '  ')
 readonly NSTEP=${NSTEP:-10}
 readonly JOB_TAG=${JOB_ID:-${SLURM_JOB_ID:-${PJM_JOBID:-manual}}}
 readonly OUTDIR=${OUTDIR:-"cublas_names_nsys_${JOB_TAG}"}
@@ -89,11 +97,23 @@ EXE="$(cd "$OUTDIR" && pwd)/scale-dg_extraction.frozen"
 cat "$OUTDIR/metadata.txt"
 
 for p in $ORDERS; do
-  for kind in GEMM GEMM_CUTE; do
+  for kind in $KINDS; do
     tag="p${p}_${kind}"
     conf="$OUTDIR/config/${tag}.conf"
-    sed -e "s/DqdtKernel_Type *= *\"[A-Z0-9_]*\"/DqdtKernel_Type = \"CUDAFORTRAN_${kind}\"/" \
+    # GEMM_EMU is not a DqdtKernel_Type: it is CUDAFORTRAN_GEMM with the
+    # emulation knob on, which is what makes it a one-axis comparison against
+    # the GEMM tag traced in the same job.
+    case "$kind" in
+      GEMM_EMU) kernel=CUDAFORTRAN_GEMM; emu=.true. ;;
+      *)        kernel=CUDAFORTRAN_${kind}; emu=.false. ;;
+    esac
+    sed -e "s/DqdtKernel_Type *= *\"[A-Z0-9_]*\"/DqdtKernel_Type = \"${kernel}\"/" \
         "namelists/perf_p${p}_gemm.conf" > "$conf"
+    if grep -q "CublasEmulation" "$conf"; then
+      sed -i -e "s/CublasEmulation *= *\.\(true\|false\)\./CublasEmulation = $emu/" "$conf"
+    else
+      sed -i -e "s|^/|  CublasEmulation = $emu\n/|" "$conf"
+    fi
     sed -i -e "s/nstep *= *[0-9]*/nstep = $NSTEP/" \
            -e "s/output_interval *= *[0-9]*/output_interval = $NSTEP/" "$conf"
     # nsys cannot profile the CUDA graph path: it hangs and the report has no

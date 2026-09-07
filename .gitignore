@@ -39,6 +39,16 @@ advect3d/advect3d
 !/jobs/rikyu_p511_dir1_ncu.sh
 !/jobs/wisteria_p511_dir1_ncu.sh
 !/jobs/wisteria_p511_dir2_stalls.sh
+!/jobs/cublas_emulation_ab.sh
+!/jobs/rikyu_cublas_emu.sh
+!/jobs/tsubame_cublas_emu.sh
+!/jobs/wisteria_cublas_emu.sh
+!/jobs/wisteria_p511_ctamap_ncu.sh
+!/jobs/rikyu_cublas_emu_nsys.sh
+!/jobs/tsubame_cublas_emu_nsys.sh
+!/jobs/shmem_latency_probe.cu
+!/jobs/wisteria_shmem_probe.sh
+!/jobs/rikyu_shmem_probe.sh
 /output/
 
 # Paper drafting notes (outline, abstract drafts, figure plan) stay local: the
