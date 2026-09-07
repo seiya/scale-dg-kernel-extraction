@@ -289,3 +289,44 @@ g_ws.iB_bytes = static_cast<size_t>(mn) + kInt8Slack;
 
 手順は `jobs/tsubame_ozaki.sh` / `jobs/wisteria_ozaki.sh` を、
 この修正を含むツリーで**ビルドし直してから**投げ直すだけである。
+
+
+### 8.5 予測 O1 は外れた —— **パディングでは直らない**（2026-09-07、SGE `8594961` / TCS `9539267`）
+
+§8.3 の修正を含む commit **`3b66356`** で両機を走らせ直した。
+
+| 機械 | ジョブ | `rc=0` | 失敗 | 修正前（`a464048`） |
+|---|---|---:|---:|---|
+| H100 | SGE `8594961` | 93 | **51** | 93 / 51 |
+| A100 | TCS `9539267` | 87 | **48** | 87 / 48 |
+
+**成功数も失敗数も 1 つも変わらない。**症状も同一である:
+
+```
+ozaki2 workspace: Nq=8 Ne=32768 Np=512 s=7 residues=469.8 MB
+ ozaki2_dgemm x-deriv: an illegal memory access was encountered
+```
+
+**したがって §8.2 の仮説（cuBLAS の INT8 カーネルが `iB` の末尾を越えて読む）
+は否定された。** §8.3 のパディングは**残す** —— GB200 でビット一致であり
+害が無く、`iB` が論理サイズちょうどであったこと自体は事実だからだが、
+**これは原因ではなかった。**
+
+### 8.6 次に測ること —— **推測をやめて `compute-sanitizer` を当てる**
+
+**`ozaki2_dgemm x-deriv` は「エラーが気づかれた場所」であって
+「起きた場所」ではない。** CUDA のエラーは非同期で、`ozaki2_dgemm` は
+`launch_col_max` → `launch_pack_b` → `launch_row_max` → `launch_pack_a` →
+`cublasGemmEx` の順に**自前カーネル 4 本を先に投げてから** GEMM を呼ぶ。
+**違反はそのいずれで起きていてもおかしくない**（実際、致命エラー自体は
+さらに後の `update_halo` で出ている）。
+
+`compute-sanitizer --tool memcheck` は**カーネル名とアドレスを名指しする**。
+`jobs/tsubame_ozaki_sanitizer.sh` / `jobs/wisteria_ozaki_sanitizer.sh` を
+用意した。**p=7 を 2 つの規模で試す** —— memcheck は 10〜100 倍遅いので
+`val_p7_gemm.conf`（`Ne=2³`）を先に、再現しなければ
+`perf_p7_gemm.conf`（`Ne=32³`）を走らせる。**小さい構成を使うのは
+クラッシュの診断だからであって、性能比較では入力を変えない**という
+`AGENTS.md` の規則はここには掛からない。
+
+**本節は原因をまだ特定していない。**
