@@ -16,10 +16,29 @@
 #   make CUDA=1 GPUFLAGS=-gpu=cc80 GPUNVCCFLAGS=-arch=sm_80
 #   fill in -g above, then:  pjsub jobs/wisteria_ozaki_sanitizer.sh
 set -u
+# Job 9539840 exited 127 on both configurations: this script had no module
+# load, so nvcc was not on PATH, the fallback collapsed to
+# "./compute-sanitizer", and nothing ran.  Load the compiler the same way
+# jobs/wisteria_paths.sh does, then search rather than guess.
+module unload nvidia >/dev/null 2>&1 || true
+module load nvidia/25.9
 R="${PJM_O_WORKDIR:-$PWD}"
 O="$R/oz2_sanitizer_${PJM_JOBID:-manual}"
 mkdir -p "$O"; cd "$R" || exit 1
-SAN=$(command -v compute-sanitizer || echo "$(dirname "$(command -v nvcc)")/compute-sanitizer")
+SAN=$(command -v compute-sanitizer || true)
+if [ -z "$SAN" ] && command -v nvcc >/dev/null 2>&1; then
+  NVBIN=$(dirname "$(command -v nvcc)")
+  for c in "$NVBIN/compute-sanitizer" \
+           "$NVBIN/../compute-sanitizer/compute-sanitizer" \
+           "$NVBIN/../../cuda/bin/compute-sanitizer"; do
+    [ -x "$c" ] && SAN="$c" && break
+  done
+fi
+if [ -z "$SAN" ] || [ ! -x "$SAN" ]; then
+  echo "ERROR: compute-sanitizer not found. PATH=$PATH" >&2
+  echo "  try: find \$(dirname \$(command -v nvcc))/../.. -name compute-sanitizer -type f" >&2
+  exit 2
+fi
 echo "host=$(hostname) date=$(date -Is) commit=$(git rev-parse --short HEAD)"
 echo "sanitizer=$SAN"; "$SAN" --version 2>&1 | head -2
 mk() { sed -e 's/DqdtKernel_Type *= *"[A-Z_]*"/DqdtKernel_Type = "CUDAFORTRAN_GEMM_OZAKI2"/' \
