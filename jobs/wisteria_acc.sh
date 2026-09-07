@@ -16,7 +16,18 @@
 #   make ACC=1 GPUFLAGS=-gpu=cc80
 #   fill in -g, then:  pjsub -x EXE=$PWD/scale-dg_extraction <main>/jobs/wisteria_acc.sh
 set -u
-: "${EXE:?set EXE to the OpenACC executable, e.g. -x EXE=/path/scale-dg_extraction}"
+# EXE must be an ABSOLUTE path to the OpenACC executable.  Do not pass $PWD
+# through the scheduler: job 9539009 was submitted that way, the variable
+# arrived empty, EXE became "/scale-dg_extraction", and all 24 runs failed
+# with "No such file or directory".  Write the path out, and this checks it.
+if [ -z "${EXE:-}" ]; then
+  echo "ERROR: set EXE to the OpenACC executable (absolute path)." >&2
+  echo "   e.g.  pjsub -x EXE=/work/.../dg-acc/scale-dg_extraction ..." >&2
+  exit 2
+fi
+case "$EXE" in /*) ;; *) echo "ERROR: EXE must be absolute, got '$EXE'" >&2; exit 2;; esac
+[ -x "$EXE" ] || { echo "ERROR: EXE is not an executable file: '$EXE'" >&2; exit 2; }
+echo "EXE=$EXE"
 export EXE
 for p in 7 15; do export SCALE_DG_PATHS_$p="OPENACC_ASIS:OPENACC_SPLIT"; done
 export ORDERS_A="7 15" ORDERS_B="" ORDERS_C=""
