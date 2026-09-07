@@ -38,6 +38,7 @@ advect3d/advect3d
 !/jobs/tsubame_p511_clock.sh
 !/jobs/rikyu_p511_dir1_ncu.sh
 !/jobs/wisteria_p511_dir1_ncu.sh
+!/jobs/wisteria_p511_dir2_stalls.sh
 /output/
 
 # Paper drafting notes (outline, abstract drafts, figure plan) stay local: the
