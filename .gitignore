@@ -26,6 +26,11 @@ advect3d/advect3d
 !/jobs/rikyu_roof_bytes_ncu.sh
 !/jobs/tsubame_roof_bytes_ncu.sh
 !/jobs/wisteria_roof_bytes_ncu.sh
+!/jobs/tsubame_ozaki.sh
+!/jobs/wisteria_ozaki.sh
+!/jobs/tsubame_acc.sh
+!/jobs/wisteria_acc.sh
+!/jobs/wisteria_p511_spread.sh
 /output/
 
 # Paper drafting notes (outline, abstract drafts, figure plan) stay local: the
