@@ -2365,8 +2365,13 @@ Accelerator Fatal Error: ... error 700 (CUDA_ERROR_ILLEGAL_ADDRESS)
 **sm_100 では 9 次数 48 ラン全て通る。**
 
 **これは移植性の欠陥であって測定条件差ではない。**
-`cuda_ozaki2_gemm.cu` を sm_90 / sm_80 で見直す必要がある。
-**本節は原因を特定していない**（§21.5）。
+**2026-09-07 に診断と候補修正を
+[`ozaki2_implementation_report.md`](ozaki2_implementation_report.md) §8 に置いた**
+—— x 微分の `B` は `k·n = Np·Ne` バイトで、`iB` の確保 `mn = Np·Ne` と
+**バイト単位で完全一致しスラックがゼロ**。`cublasGemmEx` の INT8 カーネルが
+末尾を越えて読むなら sm_100 だけ助かる理由になる（**仮説であって測定ではない**）。
+INT8 バッファに 512 バイト足す修正を入れ、GB200 で `dqdt` がビット一致することを
+確認した。**H100 / A100 での再走が仮説の検定である**（§8.4 に予測を凍結）。
 
 ### 21.3 `OZAKI1` の列は取れた
 

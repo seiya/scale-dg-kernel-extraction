@@ -210,3 +210,82 @@ git clone https://github.com/RIKEN-RCCS/GEMMul8.git
 関連: [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md)、
 [`cublas_emulation_survey.md`](cublas_emulation_survey.md)、
 [`AGENTS.md`](../AGENTS.md)。
+
+
+---
+
+## 8. sm_90 / sm_80 で 1 次数も走らない —— 診断と候補修正（2026-09-07）
+
+`measurement_inventory.md` §21.2 が、**H100（sm_90）と A100（sm_80）では
+`CUDAFORTRAN_GEMM_OZAKI2` が全次数で落ちる**ことを測った
+（SGE `8592913` / TCS `9538052`、commit `a464048`）。**sm_100 では同じツリーで
+9 次数 48 ラン全て通る**（Slurm `83482`、§18.7）。症状は 2 台・全次数で同一:
+
+```
+Ozaki-II: FIXED 7 moduli (CRT product 55.7 bits, single A pack)
+ozaki2 workspace: Nq=128 Ne=8 Np=2097152 s=7 residues=469.8 MB
+ ozaki2_dgemm x-deriv: an illegal memory access was encountered
+Accelerator Fatal Error: ... error 700 (CUDA_ERROR_ILLEGAL_ADDRESS)
+```
+
+### 8.1 事実 —— `iB` は論理サイズちょうどで確保されている
+
+- x 微分の呼び出しは
+  `ozaki2_dgemm(0, 0, m=Nq, n=Nq²·Ne, k=Nq, D1D, lda=Nq, flux_x, ldb=Nq, ...)`
+  （`mod_cuda_dg_kernels.cuf`）。**B は `k·n = Nq·Nq²·Ne = Np·Ne` バイト**である。
+- 確保は `g_ws.iB_bytes = mn`、`mn = Np·Ne`（`cuda_ozaki2_gemm.cu`
+  `ozaki2_alloc_workspace`）。**バイト単位で完全一致し、スラックがゼロ。**
+- 対して `iA` は `k_rows·max_batch = Nq²·max(Nq·Ne, Ne)` で、x 微分が要る
+  `k·m = Nq²` を大きく上回る。**きつく確保されているのは `iB` だけである。**
+- ワークスペース確保自体は成功している（上のログの 469.8 MB が出ている）。
+  **メモリ不足ではない。**
+- `cuda_ozaki2_gemm.cu` には `__CUDA_ARCH__` もアーキ分岐も共有メモリも
+  cluster も無い（`grep` で 0 件）。**アーキで変わるのは、`cublasGemmEx` が
+  選ぶ INT8 カーネルだけである。**
+
+### 8.2 仮説（**測定ではない**）
+
+cuBLAS の INT8（IMMA）カーネルはタイルをベクトル化して読み、**論理的な
+末尾を越えて読んでからマスクする**実装が一般的である。sm_100 で選ばれる
+カーネルはその越境をしないか、越境幅が確保の外に出ない。sm_90 / sm_80 で
+選ばれるカーネルは出る —— `iB` の直後には何も無いので、そこで
+`CUDA_ERROR_ILLEGAL_ADDRESS` になる。
+
+**これは仮説である。** GB200 では再現しないので本レポートは確かめられない。
+確かめるのは §8.4 の再走である。
+
+### 8.3 候補修正 —— INT8 バッファに 512 バイトのスラック
+
+```c
+const size_t kInt8Slack = 512;
+g_ws.iA_bytes = static_cast<size_t>(k_rows * max_batch) + kInt8Slack;
+g_ws.iB_bytes = static_cast<size_t>(mn) + kInt8Slack;
+```
+
+**行列の定義は 1 つも変えていない** —— `m` / `n` / `k` / `lda` / `ldb` / `ldc`
+はそのままで、確保だけが伸びる。したがって**演算は不変**であるべきで、
+実際 GB200 で確かめた:
+
+| 検証 | 結果 |
+|---|---|
+| p=63 `OZAKI2`、`SCALE_DG_VARYING_COEFF=1`、owned `dqdt` 全 16 777 216 点、修正前バイナリと比較 | **ビット一致** |
+
+**GB200 での挙動は変わらない**（修正前も修正後も走る）。
+**スラック 512 は根拠のある値ではなく、越境幅の上限を知らないので
+安全側に取った定数である。**
+
+### 8.4 これを確かめる測定（**まだ走っていない**）
+
+**予測（この節を書いた時点で凍結）**:
+
+- **O1（決定的）**: 修正後の H100 と A100 で、`OZAKI2` が **全次数で
+  `rc=0`** になる。**ならなければ §8.2 の仮説は誤りで、
+  越境読み以外の原因を探すことになる。**
+- **O2**: GB200 の `OZAKI2` の時間は修正前と**測定誤差内**で一致する
+  （確保が 512 バイト増えるだけなので）。
+- **O3**: 修正後の H100 / A100 の `OZAKI2` の `dqdt` は、同じ機械の
+  `CUDAFORTRAN_GEMM` に対して §18.7 が GB200 で記録したのと同程度の
+  差に収まる。
+
+手順は `jobs/tsubame_ozaki.sh` / `jobs/wisteria_ozaki.sh` を、
+この修正を含むツリーで**ビルドし直してから**投げ直すだけである。

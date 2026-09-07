@@ -736,8 +736,20 @@ extern "C" int ozaki2_alloc_workspace(int Nq, int Ne, int Np)
   const int s = g_state.moduli_count;
   const int max_batch = g_ws.max_batch;
 
-  g_ws.iA_bytes = static_cast<size_t>(k_rows * max_batch);
-  g_ws.iB_bytes = static_cast<size_t>(mn);
+  // The INT8 operands are handed straight to cublasGemmEx, and its IMMA
+  // kernels load in vectorized chunks that can reach past the last logical
+  // element of a tile before masking it off.  iB is the operand that sits
+  // exactly at its logical size: the x derivative calls
+  // ozaki2_dgemm(m=Nq, n=Nq*Nq*Ne, k=Nq) with ldb=Nq, so B is k*n = Np*Ne
+  // bytes, which is mn to the byte.  On sm_100 that survives; on sm_90 and
+  // sm_80 every order died with CUDA_ERROR_ILLEGAL_ADDRESS inside
+  // ozaki2_dgemm (measurement_inventory.md 21.2).  Pad both INT8 buffers so
+  // the over-read lands inside the allocation.  The padding is never part of
+  // the matrix -- ldb and the dimensions are unchanged -- so the arithmetic
+  // is untouched.
+  const size_t kInt8Slack = 512;
+  g_ws.iA_bytes = static_cast<size_t>(k_rows * max_batch) + kInt8Slack;
+  g_ws.iB_bytes = static_cast<size_t>(mn) + kInt8Slack;
 
   const size_t scale_a_bytes =
       static_cast<size_t>(Nq) * static_cast<size_t>(max_batch) * sizeof(double);
