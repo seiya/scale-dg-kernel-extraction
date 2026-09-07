@@ -32,7 +32,14 @@ for k in FUSED_TC GEMM_FUSED; do
 done
 
 # background sampler: timestamp, SM clock, power, temperature, every 100 ms
-nvidia-smi --query-gpu=timestamp,clocks.sm,power.draw,temperature.gpu,clocks_throttle_reasons.active \
+# clocks_throttle_reasons.active does not exist on the A100 node's driver
+# (535.54.03): job 9540286 got two samples and an error.  Probe first, and
+# fall back to the four fields every driver here has.
+FIELDS=timestamp,clocks.sm,power.draw,temperature.gpu,clocks_throttle_reasons.active
+nvidia-smi --query-gpu=$FIELDS --format=csv,noheader -c 1 >/dev/null 2>&1 || \
+  FIELDS=timestamp,clocks.sm,power.draw,temperature.gpu
+echo "sampler fields: $FIELDS"
+nvidia-smi --query-gpu=$FIELDS \
            --format=csv,noheader --loop-ms=100 > "$O/smi.csv" 2>"$O/smi.err" &
 SMI=$!
 sleep 2
