@@ -400,3 +400,48 @@ NVLink-C2C でキャッシュコヒーレントなので、**カーネルから�
 **同種の欠陥が他のファイルに無いかは確認していない**（`cuda_ozaki1_gemm.cu`
 など）。**GB200 だけで開発すると、この種の誤りは検出されない**という
 一般的な含意がある。
+
+
+### 8.9 同種の欠陥の全数監査 —— **他には無い**（2026-09-07、静的、追加測定なし）
+
+§8.7 の欠陥は「**カーネルがデリファレンスするポインタがホストメモリを指す**」
+という型で、**GB200 のコヒーレンシがそれを隠す**。他に無いかを全ファイルで
+調べた。**追加測定は無い。**
+
+**対象: `.cu` 7 ファイルのカーネル起動 62 か所と、`.cuf` の 27 か所。**
+
+| ファイル | 起動 | 結果 |
+|---|---:|---|
+| **`cuda_ozaki2_gemm.cu`** | 13 | **3 か所で該当**（`launch_split_moduli` / `launch_crt` / `launch_crt_batched`）。§8.8 で修正済み |
+| `cuda_ozaki1_gemm.cu` | 11 | **該当なし** —— 11 起動とも引数は呼び出し元から来たデバイスポインタか `g_ws.res_a`（`cudaMalloc`）。`Ozaki1State` / `BDecompCache` / `Ozaki1SliceStats` は**配列メンバを持たず**、カーネルに渡してもいない |
+| `cuda_dg_kernels_tc.cu` | 18 | **該当なし** |
+| `cuda_dg_kernels_fused_highp.cu` | 10 | **該当なし** |
+| `cuda_cutlass_gemm_fused.cu` | 9 | **該当なし** |
+| `cuda_dg_kernels_fused.cu` | 1 | **該当なし** |
+| `cuda_cublas_gemm.cu` | 0 | 起動なし（cuBLAS 呼び出しのみ） |
+
+- **ファイルスコープのホスト配列をカーネルに渡している箇所は、修正した 3 つ
+  以外に無い。** 検索でヒットした「ファイルスコープ配列」は**すべて
+  `__global__` 関数内のローカル配列**（`double acc[2*TM*TN]` など）だった。
+- **`&ホスト変数` をカーネル引数にしている起動も無い。**
+- **`cudaLaunchKernelEx` の `cudaLaunchConfig_t` / `cudaLaunchAttribute` は
+  該当しない** —— これらはドライバがホスト側で読む起動設定であって、
+  カーネルがデリファレンスするものではない。
+- **CUDA Fortran 側（27 起動）はコンパイラが検出する。**
+  `attributes(global)` サブルーチンの実引数には `device` 属性が要求されるので、
+  ホスト配列を渡せばビルドが通らない。**チェックの効かない経路は C++ 側だけ
+  だった。**
+
+**GB200 のコヒーレンシが隠しうる隣接する型も見た**:
+
+| 型 | 結果 |
+|---|---|
+| `cudaMemcpy` の向き | **10 か所すべて明示**（D2H 8、H2D 2）。`cudaMemcpyDefault` は 0 |
+| managed / host-registered / mapped メモリ | **使用なし**（`cudaMallocManaged` / `cudaHostRegister` / `cudaHostAlloc` / `cudaMallocHost` とも 0） |
+
+**したがって、この型の欠陥は `cuda_ozaki2_gemm.cu` の 3 か所だけであり、
+修正済みである。**
+
+**ただしこれは静的監査であって、`compute-sanitizer` の再走ではない。**
+**予測 O3′（修正後にサニタイザからこのエラーが消える）が経験的な確認であり、
+そこで別のエラーが出れば、この監査が見ていない型があったということである。**
