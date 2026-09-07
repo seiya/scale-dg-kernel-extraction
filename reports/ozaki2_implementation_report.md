@@ -330,3 +330,73 @@ ozaki2 workspace: Nq=8 Ne=32768 Np=512 s=7 residues=469.8 MB
 `AGENTS.md` の規則はここには掛からない。
 
 **本節は原因をまだ特定していない。**
+
+
+### 8.7 原因 —— **CRT のテーブルをホストポインタのままカーネルに渡していた**（`compute-sanitizer`、SGE `8595140`、node `r18n4`）
+
+`compute-sanitizer --tool memcheck` が 1 回で名指しした。**cuBLAS ではない。**
+
+```
+========= Invalid __global__ read of size 4 bytes
+=========     at ozaki2_split_moduli_kernel(int *, const int *, const int *, int, long long)+0x270
+=========     by thread (32,0,0) in block (12,0,0)
+=========     Access to 0x11fb9a4 is out of bounds
+=========     and is 22,475,117,184,604 bytes before the nearest allocation
+=========         Host Frame: launch_split_moduli(long long)
+=========         Host Frame: ozaki2_dgemm
+=========         Host Frame: ... mod_cuda_dg_kernels.cuf:2496
+========= ERROR SUMMARY: 4100 errors
+```
+
+`Ne=2³` でも `Ne=32³` でも同じカーネル・同じアドレス（`0x11fb9a4`）で、
+**規模に依らない**。
+
+**アドレス `0x11fb9a4` は実行ファイルのデータ領域である。**
+`Ozaki2State g_state` は**ホスト側の static 構造体**で、
+`int moduli[kMaxModuli]` と `int64_t garner_inv[kMaxModuli]` は
+**その中のホスト配列**である。それを 3 か所でカーネル引数にそのまま渡していた:
+
+| 起動 | 渡していたホスト配列 |
+|---|---|
+| `launch_split_moduli` | `g_state.moduli` |
+| `launch_crt` | `g_state.moduli`, `g_state.garner_inv` |
+| `launch_crt_batched` | `g_state.moduli`, `g_state.garner_inv` |
+
+**なぜ GB200 でだけ動いていたか。** GB200 は Grace CPU と Blackwell GPU が
+NVLink-C2C でキャッシュコヒーレントなので、**カーネルからホストのアドレスを
+参照できてしまう**。TSUBAME（x86 ＋ H100）と Wisteria（x86 ＋ A100）では
+できないので faults する。**「sm_90 / sm_80 で動かない」ではなく、
+「GB200 でだけ、たまたま動いていた」が正しい。**
+
+**§8.2 の仮説（cuBLAS の INT8 カーネルの越境読み）が外れた理由も明確である**
+—— 落ちていたのは GEMM ではなく、その**前に投げられる自前カーネル**だった。
+`ozaki2_dgemm` が返すエラーは非同期に検出されたもので、
+**発生場所を示していなかった**（§8.6）。
+
+### 8.8 修正 —— テーブルをデバイスに置く
+
+`Ozaki2State` に `int *d_moduli` と `int64_t *d_garner_inv` を足し、
+`ozaki2_init` で `cudaMalloc` ＋ `cudaMemcpy`（`precompute_garner_inverses`
+の直後、値が確定してから）、`ozaki2_finalize` で解放。
+**3 か所の起動をデバイス側ポインタに差し替えた。**
+
+**値は同じで、置き場所だけが変わる。** GB200 で確認した:
+
+| 検証 | 結果 |
+|---|---|
+| p=63 `OZAKI2`、点変化係数、owned `dqdt` 全 16 777 216 点、修正前バイナリと比較 | **ビット一致** |
+
+**予測（凍結）**:
+
+- **O1′（決定的）**: 修正後の H100 と A100 で `OZAKI2` が**全次数 `rc=0`** に
+  なる。**ならなければ、この 3 か所以外にも同種の箇所が残っている**か、
+  別の原因がある。
+- **O2′**: GB200 の時間は修正前と測定誤差内で一致する（テーブルの読み出しが
+  ホストからデバイスに変わるだけで、`s` = 7 要素の参照である）。
+- **O3′**: `compute-sanitizer` を修正後に当てると
+  `ozaki2_split_moduli_kernel` のエラーが消える。**残るエラーがあれば
+  それが次の対象**である。
+
+**同種の欠陥が他のファイルに無いかは確認していない**（`cuda_ozaki1_gemm.cu`
+など）。**GB200 だけで開発すると、この種の誤りは検出されない**という
+一般的な含意がある。

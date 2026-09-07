@@ -49,6 +49,14 @@ struct Ozaki2State {
   int moduli_count = 0;
   int moduli[kMaxModuli] = {};
   int64_t garner_inv[kMaxModuli] = {};
+  // Device copies of the two tables above.  The kernels index them on the
+  // device, so they cannot be handed the host arrays: compute-sanitizer
+  // caught ozaki2_split_moduli_kernel reading g_state.moduli at a host
+  // address on H100 and A100 (ozaki2_implementation_report.md 8.7).  It only
+  // appeared to work on GB200, where Grace and Blackwell are cache-coherent
+  // over NVLink-C2C and a host pointer is addressable from a kernel.
+  int *d_moduli = nullptr;
+  int64_t *d_garner_inv = nullptr;
   int fixed = 1;
   int inited = 0;
 };
@@ -581,7 +589,7 @@ static int launch_split_moduli(long long n)
 {
   const int blocks = static_cast<int>((n + 255) / 256);
   ozaki2_split_moduli_kernel<<<blocks, 256, 0, dg_cuda_stream>>>(
-      g_ws.residues, g_ws.prod, g_state.moduli, g_state.moduli_count, n);
+      g_ws.residues, g_ws.prod, g_state.d_moduli, g_state.moduli_count, n);
   return check_cuda(cudaGetLastError(), "split_moduli");
 }
 
@@ -656,7 +664,7 @@ static int launch_crt_batched(double *C, const int *residues, int m, int n,
   const int64_t max_int =
       static_cast<int64_t>(k_dim) * 127LL * 127LL;
   ozaki2_crt_batched_kernel<<<blocks, 256, 0, dg_cuda_stream>>>(
-      C, residues, g_state.moduli, g_state.garner_inv, g_ws.scale_a,
+      C, residues, g_state.d_moduli, g_state.d_garner_inv, g_ws.scale_a,
       g_ws.scale_b, g_state.moduli_count, m, n, ldc, stride_c, batch, max_int,
       accumulate);
   return check_cuda(cudaGetLastError(), "crt_batched");
@@ -670,7 +678,7 @@ static int launch_crt(double *C, const int *residues, int m, int n, int ldc,
   const int64_t max_int =
       static_cast<int64_t>(k_dim) * 127LL * 127LL;
   ozaki2_crt_kernel<<<blocks, 256, 0, dg_cuda_stream>>>(
-      C, residues, g_state.moduli, g_state.garner_inv, g_ws.scale_a,
+      C, residues, g_state.d_moduli, g_state.d_garner_inv, g_ws.scale_a,
       g_ws.scale_b, g_state.moduli_count, m, n, ldc, max_int, accumulate);
   return check_cuda(cudaGetLastError(), "crt");
 }
@@ -689,6 +697,20 @@ extern "C" int ozaki2_init(int moduli_count, int fixed_mantissa)
     g_state.moduli[i] = kModuliPool[i];
   }
   precompute_garner_inverses(g_state);
+  if (g_state.d_moduli == nullptr) {
+    if (check_cuda(cudaMalloc(&g_state.d_moduli, sizeof(g_state.moduli)),
+                   "malloc d_moduli")) return -1;
+  }
+  if (g_state.d_garner_inv == nullptr) {
+    if (check_cuda(cudaMalloc(&g_state.d_garner_inv, sizeof(g_state.garner_inv)),
+                   "malloc d_garner_inv")) return -1;
+  }
+  if (check_cuda(cudaMemcpy(g_state.d_moduli, g_state.moduli,
+                            sizeof(g_state.moduli), cudaMemcpyHostToDevice),
+                 "memcpy d_moduli")) return -1;
+  if (check_cuda(cudaMemcpy(g_state.d_garner_inv, g_state.garner_inv,
+                            sizeof(g_state.garner_inv), cudaMemcpyHostToDevice),
+                 "memcpy d_garner_inv")) return -1;
   g_state.inited = 1;
   unsigned __int128 prod = 1;
   for (int i = 0; i < moduli_count; ++i) {
@@ -710,6 +732,8 @@ extern "C" int ozaki2_init(int moduli_count, int fixed_mantissa)
 extern "C" int ozaki2_finalize(void)
 {
   ozaki2_free_workspace();
+  if (g_state.d_moduli) cudaFree(g_state.d_moduli);
+  if (g_state.d_garner_inv) cudaFree(g_state.d_garner_inv);
   g_state = Ozaki2State{};
   return 0;
 }
