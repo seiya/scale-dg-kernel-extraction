@@ -46,7 +46,14 @@ mkdir -p "$O"; cd "$R" || exit 1
 echo "host=$(hostname) date=$(date -Is) commit=$(git rev-parse --short HEAD) arch=$ARCH"
 nvidia-smi --query-gpu=name,uuid,driver_version,compute_cap,clocks.max.sm --format=csv,noheader
 
-nvcc -O3 -arch="$ARCH" -o "$O/shmem_probe" "$R/jobs/shmem_latency_probe.cu" \
+PROBE="$R/jobs/shmem_latency_probe.cu"
+if [ ! -f "$PROBE" ]; then
+  echo "ERROR: $PROBE is missing on this machine." >&2
+  echo "  Copy jobs/shmem_latency_probe.cu here and resubmit (TCS 9547915" >&2
+  echo "  failed this way: nvcc reported only 'No such file or directory')." >&2
+  exit 1
+fi
+nvcc -O3 -arch="$ARCH" -o "$O/shmem_probe" "$PROBE" \
   > "$O/build.log" 2>&1
 echo "build rc=$?"
 [ -x "$O/shmem_probe" ] || { sed 's/^/  | /' "$O/build.log"; exit 1; }

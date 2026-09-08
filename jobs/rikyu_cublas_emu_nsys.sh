@@ -31,9 +31,22 @@
 # body, and the namelists it writes force UseCudaGraph = .false. because nsys
 # hangs on the graph path.
 set -u
+ROOT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+
+# The KINDS knob landed in the shared body on 2026-09-08.  A checkout that
+# predates it IGNORES this wrapper's KINDS and silently traces GEMM/GEMM_CUTE
+# instead of the emulated path -- SGE 8602137 did exactly that and produced a
+# clean-looking report answering the wrong question.  Fail loudly instead.
+BODY="$ROOT_DIR/jobs/cublas_kernel_names_nsys.sh"
+if ! grep -q 'readonly KINDS=' "$BODY"; then
+  echo "ERROR: $BODY predates the KINDS knob (2026-09-08)." >&2
+  echo "  Copy the current jobs/cublas_kernel_names_nsys.sh to this machine" >&2
+  echo "  and resubmit; without it this job traces the wrong variants." >&2
+  exit 1
+fi
 export SCALE_DG_MODULES="nvhpc-hpcx"
 export KINDS="GEMM GEMM_EMU"
 export ORDERS="${ORDERS:-255 511}"
 export NSTEP="${NSTEP:-10}"
 export OUTDIR="${OUTDIR:-cublas_emu_nsys_gb200_${SLURM_JOB_ID:-manual}}"
-exec bash "${SLURM_SUBMIT_DIR:-$PWD}/jobs/cublas_kernel_names_nsys.sh"
+exec bash "$BODY"

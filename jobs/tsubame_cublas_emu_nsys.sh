@@ -20,8 +20,21 @@
 # A100 is not in this comparison at all: its cuBLAS is 12.9.1 and cannot
 # express emulation (survey 10.3).
 set -u
+ROOT_DIR="${SGE_O_WORKDIR:-$PWD}"
+
+# The KINDS knob landed in the shared body on 2026-09-08.  A checkout that
+# predates it IGNORES this wrapper's KINDS and silently traces GEMM/GEMM_CUTE
+# instead of the emulated path -- SGE 8602137 did exactly that and produced a
+# clean-looking report answering the wrong question.  Fail loudly instead.
+BODY="$ROOT_DIR/jobs/cublas_kernel_names_nsys.sh"
+if ! grep -q 'readonly KINDS=' "$BODY"; then
+  echo "ERROR: $BODY predates the KINDS knob (2026-09-08)." >&2
+  echo "  Copy the current jobs/cublas_kernel_names_nsys.sh to this machine" >&2
+  echo "  and resubmit; without it this job traces the wrong variants." >&2
+  exit 1
+fi
 export KINDS="GEMM GEMM_EMU"
 export ORDERS="${ORDERS:-255 511}"
 export NSTEP="${NSTEP:-10}"
 export OUTDIR="${OUTDIR:-cublas_emu_nsys_h100_${JOB_ID:-manual}}"
-exec bash "${SGE_O_WORKDIR:-$PWD}/jobs/cublas_kernel_names_nsys.sh"
+exec bash "$BODY"
