@@ -1054,6 +1054,132 @@ p=511 も同じ形で、cuBLAS 8.521 ms 対 `GEMM_CUTE` @16x8x4 9.993 ms（1.17 
 `sm90_mma_shape_survey.md` §8.5 が「タイル・warp 数・stage 数・命令まで
 揃えても cuBLAS が速い」と結論した残差の中身も、依然として未測定である。
 
+#### 8.7.2.1 その 16.198 ms は「固定クロックの直列和」である —— 引き算を確定させた（SGE job `8602523`、node `r21n9`、commit `9d1dfd9`）
+
+上の 16.198 ms（および 9.993 / 8.521 ms）は **`ncu` 既定の `--clock-control base`
+で測った、直列化された 1 stage の和**である。同じツリーのキャンペーン
+（job `8567869`）の `CUTE volume GEMM only` は @8x8x4 13.516 ms/stage、
+@16x8x4 9.072 ms/stage なので、**周辺カーネルが一致しているのに CUTLASS 側だけ
+19.8% / 10.2% 大きい**という食い違いが残っていた（`volume_flux` は
+3.404 ms で 0.03% 一致）。この状態で到達率を出すと、引き算の仕方で
+**0.96 とも 1.12 とも**書けてしまう。1.12 は物理的にあり得ない値である。
+
+同じ向きに効く機構が 2 つあり、周辺カーネルの一致はどちらも否定できない:
+
+1. **`ncu` のクロック固定。** @8x8x4 は発行律速なので base/boost 比をそのまま
+   食らう。`volume_flux` は DRAM 律速（90.6%）でクロックにほぼ不感なので、
+   **周辺カーネルが 0.03% で一致することは GEMM について何も証明しない。**
+2. **`CUTE volume GEMM only` は sum ではなく span。**
+   `mod_advect3d_eq.f90` が読む `timer_volume_flux` は `dg_ev_harvest` の
+   `ms(2)`、すなわち `SCALE_DG_CUTEPAR` の fork/join をまたぐ主ストリーム上の
+   CUDA event 区間で、3 本重ねの重なりが入った elapsed である。`ncu` は
+   直列化して duration の和を返す。
+
+**そこで 2 項を別々に測った。**入力は `namelists/perf_p511_gemm.conf`
+（`nstep=20`、`WarmupStep=2` ＝ 18 step ＝ 54 stage）そのままで、
+PART A はプロファイラ無し・本番クロック、PART B は job `8577463` と同じ
+12 launch ウィンドウ（`-s 14 -c 12`、`nstep=4`）。
+
+##### PART A: 3 本重ねの得は p=511 では実質ゼロ（機構 2 は棄却）
+
+`SCALE_DG_CUTEPAR` 2（既定＝3 本重ね）対 0（直列）、4 ラウンド交互、
+volume GEMM span [µs/stage] の中央値:
+
+| 形状 | par=2（既定） | par=0（直列） | 重ねの得 | レンジ |
+|---|---:|---:|---:|---|
+| 8x8x4 | 13465.8 | 13478.7 | **0.10%** | 13411.8–13519.2 / 13439.1–13546.5（**重複＝差が無い**） |
+| 16x8x4 | 8940.5 | 8952.7 | **0.14%** | 8936.6–8943.1 / 8949.2–8954.1（非重複） |
+
+**19.8% を説明できる重なりは存在しない。**p=511 の 1 本は grid 32768 /
+65536 ブロックで 132 SM を単独で埋めるので、3 本を並べても時分割になるだけ
+である。GB200 の `gemm_assignment_and_carrier.md` §13.6 が p=511 で
+測った得（ms/step で −0.293%）と桁が揃う。**つまりキャンペーンの span は
+実質的に直列和であり、duration の和と直接比べてよい。**
+
+##### PART B: 差はクロックそのもの（機構 1 が全額）
+
+`--clock-control base` / `none` を交互に 2 反復。GEMM 3 本の 1 stage 合計、
+`sm__cycles_elapsed.avg.per_second` の実測クロック、`sm__throughput`:
+
+| 経路 | 形状 | clk | GEMM 3 本 [µs] | 実測クロック | 時間比 base/none | クロック比 | `sm__throughput` |
+|---|---|---|---:|---:|---:|---:|---|
+| `GEMM_CUTE` | 8x8x4 | base | 16216.6 | 1.602 GHz | **1.231** | **1.233** | 94.5 / 94.7 / 92.9% |
+| `GEMM_CUTE` | 8x8x4 | none | **13170.5** | 1.976 GHz | | | 94.7 / 94.7 / 92.7% |
+| `GEMM_CUTE` | 16x8x4 | base | 10033.2 | 1.598 GHz | **1.161** | **1.163** | 81.9 / 82.0 / 67.7% |
+| `GEMM_CUTE` | 16x8x4 | none | **8643.2** | 1.859 GHz | | | 81.7 / 81.7 / 67.1% |
+| cuBLAS | (16x8x8) | base | 8520.3 | 1.599 GHz | 1.168 | 1.221 | 90.9 / 87.9 / 92.2% |
+| cuBLAS | (16x8x8) | none | **7292.8** | 1.952 GHz | | | 90.9 / **80.7** / 90.1% |
+
+**CUTLASS の 2 形状では、時間比とクロック比が 0.2% 以内で一致する**
+（0.9982 / 0.9979）。すなわち **13〜20% はクロック固定が全額**であり、
+これらのカーネルは純粋に発行律速で、`sm__throughput` もクロック不変である
+（両クロックで 0.2 ポイント以内）。
+
+**cuBLAS だけは追随しない**（時間比 1.168 対クロック比 1.221 ＝ 0.957）。
+カーネル単位に割ると出どころは 1 本に絞れる: x（grid (8,8,512)）は
+1.184 対 1.184 で**ぴたり一致**、z（grid (4,4096,1)）は 1.204 対 1.231 で 2.2%
+外れ、**y（grid (4096,4)）だけが 1.123 対 1.223 で 8.2% 外れる**。その y は
+`none` にすると `dram__throughput` が 75.3 → 84.5% に上がり `sm__throughput` は
+87.9 → 80.7% に下がる。**`a100_report.md` §12.2 の「`elapsed` にストール時間が
+入るので SM 側の利用率はクロック不変ではない」がここでも出ている**わけで、
+同時に **「クロック不変」は DRAM 成分を持たないカーネルに限った性質**である
+ことを示す対照になっている。**`none` のクロック自体も構成で違う**
+（1.976 / 1.859 / 1.952 GHz）ので、公称 boost 1980 MHz を一律に当てることも
+できない。
+
+**残差**: `ncu`(`none`) は本番（PART A par=0）より **2.3% / 3.5% 速い**
+（0.977 / 0.965）。プロファイラは隣接カーネルも側ストリームも無い状態で
+1 本ずつ回すぶん、連続実行より有利になる（16x8x4 のほうが残差が大きく、
+`none` で維持できたクロックも低いことと向きが揃う）。**到達率は本番側の
+数字から出す。**
+
+##### 到達率（確定）
+
+volume GEMM の理論仕事量は 1 stage あたり 3·2·512⁴ = **412.32 GFLOP**。
+H100 の屋根は FP64 Tensor Core 66.9 TFLOP/s（この経路は DMMA を出すので
+`AGENTS.md` の機種別規則によりこちら）、FP64 CUDA core 33.5 TFLOP/s:
+
+| p=511 volume GEMM 3 本 | 直列時間 [ms/stage] | 有効 TFLOP/s | 対 TC 屋根 | 対 CC 屋根 | 発行屋根（`sm__throughput` @none） |
+|---|---:|---:|---:|---:|---|
+| `GEMM_CUTE` @8x8x4 | 13.479（PART A par=0） | 30.59 | **45.7%** | 91.3% | **94.7 / 94.7 / 92.7%** |
+| `GEMM_CUTE` @16x8x4 | 8.953（PART A par=0） | 46.06 | **68.8%** | 137.5% | 81.7 / 81.7 / 67.1% |
+| cuBLAS | 7.293（`ncu` `none` のみ） | 56.54 | **84.5%** | 168.8% | 90.9 / 80.7 / 90.1% |
+
+（cuBLAS 経路には GEMM だけの event タイマが無い——
+`mod_advect3d_eq.f90` は `CUDA device GEMM tendency` しか出さない——ので
+PART A の対応する行が無い。残差の向きからすると本番はこれより 2〜3% 遅い、
+すなわち 84.5% は上限として読む。）
+
+**@8x8x4 の到達率は 0.95（発行屋根）であって 1.12 ではない。**1.12 は、
+固定クロックの `elapsed` に対して定義された `sm__throughput` を、より短い
+本番時間へ手で引き伸ばして得た値である（0.947 × 1.198 ≒ 1.13）。
+`AGENTS.md` が「固定クロックの `pct_of_peak_sustained_elapsed` は簡単な規則で
+boost に持ち越せない」と書いているのはまさにこの操作のことで、正しい手続きは
+**`--clock-control none` で取り直してそのまま読む**である。0.96 という別の
+引き算も、値としては近いが理由が違う（重なりを差し引いたのではなく、
+`ncu` 固定クロックの時間をそのまま使ったにすぎない）。
+
+**§8.7.2 の表と 16.198 ms は記録として残す。**あれは固定クロック
+（1.602 GHz）での直列和であり、命令数の比較——この節の主題——には
+そのまま使える。使えないのは、本番クロックの時間や到達率としての引用である。
+
+**再現コマンド**（`jobs/h100_p511_gemm_subtraction.sh`、TSUBAME `qsub`）:
+
+```
+ncu --csv --clock-control {base|none} \
+    --metrics gpu__time_duration.sum,sm__cycles_elapsed.avg.per_second,\
+sm__inst_executed.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+l1tex__throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__throughput.avg.pct_of_peak_sustained_elapsed,\
+sm__warps_active.avg.pct_of_peak_sustained_active,launch__registers_per_thread,\
+launch__grid_size,launch__block_size,smsp__inst_executed.avg.per_cycle_active \
+    --kernel-name-base demangled --rename-kernels 0 -s 14 -c 12 \
+    ./scale-dg_extraction p511_{GEMM,GEMM_CUTE}_{8x8x4,16x8x4}_ncu.conf
+```
+
+PART A は同じ conf を `nstep=20` のまま `SCALE_DG_CUTEPAR=0` / 既定で実行する
+だけである。
+
 ### 8.7.3 C: `SPLIT` 逆転の残差（**解決。残差はアーキテクチャ差ではない**）
 
 §8.6.1.1 はレジスタ数で 58〜83% を説明し、残差 4.6 / 10.7 / 16.8%
