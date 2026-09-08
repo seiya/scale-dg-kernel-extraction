@@ -1180,18 +1180,28 @@ launch__grid_size,launch__block_size,smsp__inst_executed.avg.per_cycle_active \
 PART A は同じ conf を `nstep=20` のまま `SCALE_DG_CUTEPAR=0` / 既定で実行する
 だけである。
 
-**残る穴（本節は埋めていない）**: ここで確定したのは `GEMM_CUTE` の到達率
-である。`measured_dram_and_roofs.md` §6.4 が必要としているのは
-**`GEMM_FUSED`（分子）と `FUSED_TC`（分母）の既定形での到達率比**で、
-H100 の同節の行は `SHAPE=16x8x4` で採ったもの（1.556）しかない。本節の
-`GEMM_CUTE` から融合エピローグぶんを掛けて外挿すると @8x8x4 で
-15.4 ms/stage ＝ 屋根の 40.1%、比 1.02 になるが、**その係数は別ジョブ・別
-コミットをまたぐ**——2 ジョブ間で同一のはずの x / y mainloop が 7.8% / 18.5%
-ずれており、±10% の不確かさが乗る。**同一ジョブ・同一ノード・`none` で
-`GEMM_FUSED` と `FUSED_TC` を両形状ぶん採る**のが必要な測定で、
-`jobs/tsubame_p511_fusion_roof.sh`（`jobs/roof_bytes_ncu.sh` を
-`ORDERS=511`・`PATHS_511`・両 `SHAPE` で 2 回呼ぶだけなので、集計規則は §6.4 と
-同一）がそれである。**外挿値 1.02 は本文書の主張ではない。**
+**この 45.7% は `GEMM_FUSED` の mainloop の到達率でもある。**`AGENTS.md` は
+`GEMM_CUTE` と `GEMM_FUSED` に volume mainloop・タイル・段数・swizzle・
+バッチ分割・**GEMM ごとのライブラリ割り当て**を同一にすることを要求しており、
+p=511 では実際に両経路とも 3 本すべて CUTLASS で grid も
+(8,8,512)×2 ＋ (8,8192,1) で一致する。したがって既定形について
+**未測定なのはエピローグの取り分だけ**になった——融合担い手（z）が背負う
+重み付け＋surface lift と、`Nq>=64` で `xy_weighted` が x / y に前送りする
+ぶんである。
+
+**残る穴（本節は埋めていない）**: `measured_dram_and_roofs.md` §6.4 が
+必要としているのは **`GEMM_FUSED`（分子）と `FUSED_TC`（分母）の既定形での
+到達率比**で、H100 の同節の行は `SHAPE=16x8x4` で採ったもの（1.556）しかない。
+上のエピローグ係数を別ジョブから借りて外挿すると @8x8x4 で 15.4 ms/stage
+＝ 屋根の 40.1%、比 1.02 になるが、**その係数は別ジョブ・別コミットをまたぐ**
+——2 ジョブ間で同一のはずの x / y mainloop が 7.8% / 18.5% ずれており、
+±10% の不確かさが乗る。**外挿値 1.02 は本文書の主張ではない。**
+必要な測定は **同一ジョブ・同一ノード・`none` で `GEMM_FUSED`・`GEMM_CUTE`・
+`FUSED_TC` を両形状ぶん採ること**で、`jobs/tsubame_p511_fusion_roof.sh`
+（`jobs/roof_bytes_ncu.sh` を `ORDERS=511`・`PATHS_511`・両 `SHAPE` で 2 回
+呼ぶだけなので、集計規則は §6.4 と同一）がそれである。**`GEMM_CUTE` を
+同じジョブに入れてあるので、エピローグの取り分はジョブをまたがない差になり、
+本節の 13.17 ms（`ncu` `none`）の別ノードでの再現性も同時に見える。**
 
 ### 8.7.3 C: `SPLIT` 逆転の残差（**解決。残差はアーキテクチャ差ではない**）
 
