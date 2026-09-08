@@ -1180,6 +1180,19 @@ launch__grid_size,launch__block_size,smsp__inst_executed.avg.per_cycle_active \
 PART A は同じ conf を `nstep=20` のまま `SCALE_DG_CUTEPAR=0` / 既定で実行する
 だけである。
 
+**残る穴（本節は埋めていない）**: ここで確定したのは `GEMM_CUTE` の到達率
+である。`measured_dram_and_roofs.md` §6.4 が必要としているのは
+**`GEMM_FUSED`（分子）と `FUSED_TC`（分母）の既定形での到達率比**で、
+H100 の同節の行は `SHAPE=16x8x4` で採ったもの（1.556）しかない。本節の
+`GEMM_CUTE` から融合エピローグぶんを掛けて外挿すると @8x8x4 で
+15.4 ms/stage ＝ 屋根の 40.1%、比 1.02 になるが、**その係数は別ジョブ・別
+コミットをまたぐ**——2 ジョブ間で同一のはずの x / y mainloop が 7.8% / 18.5%
+ずれており、±10% の不確かさが乗る。**同一ジョブ・同一ノード・`none` で
+`GEMM_FUSED` と `FUSED_TC` を両形状ぶん採る**のが必要な測定で、
+`jobs/tsubame_p511_fusion_roof.sh`（`jobs/roof_bytes_ncu.sh` を
+`ORDERS=511`・`PATHS_511`・両 `SHAPE` で 2 回呼ぶだけなので、集計規則は §6.4 と
+同一）がそれである。**外挿値 1.02 は本文書の主張ではない。**
+
 ### 8.7.3 C: `SPLIT` 逆転の残差（**解決。残差はアーキテクチャ差ではない**）
 
 §8.6.1.1 はレジスタ数で 58〜83% を説明し、残差 4.6 / 10.7 / 16.8%
