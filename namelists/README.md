@@ -92,8 +92,28 @@ qualifier（`emu` = `CublasEmulation = .true.`、`ne{N}`、`n{N}`）。
 - p=575 と p=1023 には `fused*` 系が一切無い。GEMM 系のみの次数。
 - `gemm_ozaki{1,2}` は p=1023 のみ欠。
 - `perf_p767_fused_tc.conf` が無い（`val_p767_fused_tc.conf` と
-  `perf_p767_fused_dfma.conf` はある）。dfma 側だけ perf があり TC 側が欠ける。
-  **対応不明の欠落**であって、意図された穴とは確認できていない。
+  `perf_p767_fused_dfma.conf` はある）。**これは取りこぼしではなく、
+  p=767 の TC 側が計時されたことがないという事実の反映である。**
+  p=767 のタイル型融合カーネルを開いた `ba24055`（2026-09-04）の記録である
+  `reports/dfma_register_budget.md` §19 は、自分が追加した namelist を
+  `perf_p767_fused_dfma.conf` / `val_p767_fused_dfma.conf` /
+  `val_p767_fused_tc.conf` の 3 本と明示列挙している。同 §19 は
+  `FUSED_DFMA` の iso-schedule アブレーション（production 形 `4×4` が
+  151 107.88 µs/stage、9 形すべてが production に負ける）を測る節で、
+  `FUSED_TC` については数値検証だけを行った（`val_p767_fused_tc.conf` で
+  対 `CUDAFORTRAN_GEMM` max abs 3.552714e-15）。**計時していない経路の
+  perf conf は作られない**、という規則どおりの結果である。
+  実行ログからの復元は無意味でもあり不可能でもある。`main.f90` は
+  namelist をエコーしないので `slurm-*.out` からは次数すら復元できず、
+  ハーネスが `$OUTDIR/config/` に残す生成 conf にも p=767 の
+  `FUSED_TC` は 1 本も無い（走らせていないので当然である）。
+  内容自体は一意に決まる（`perf_p767_fused_dfma.conf` の
+  `DqdtKernel_Type` を差し替えるだけ。p=767 の `perf` 3 本は
+  `Ne=1` / `nstep=15` / `WarmupStep=4` / `dt=1e-8` が共通で、
+  `output_interval` だけ `gemm` が 15、`fused_dfma` が 1000）が、
+  **測っていないセルの conf を置くと、コミット済み `perf` の集合が
+  「published mesh で計時した実績」を表さなくなる**ので置いていない。
+  p=767 `FUSED_TC` を計時するときに、その測定と同じコミットで足すこと。
 - `val_p{15,31,63,127}_gemm_cute.conf` が無い（`val` の CUTE は p=255/767 のみ）。
 
 ### メッシュ（`purpose` ごとの `Ne`/`nstep`）

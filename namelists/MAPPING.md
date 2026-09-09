@@ -160,6 +160,27 @@ namelists/acc_p63_gemm.conf > /tmp/acc.conf` と生成の仕方ごと書いて�
 
 ## 3. 対応が確定できないもの
 
+### 3.0 実行ログからは復元できない（何が残っていて何が残っていないか）
+
+対応の確定に使える一次資料は git の履歴とハーネスの成果物だけで、
+**実行ログは使えない**。
+
+- **`slurm-*.out` / SGE / TCS のジョブログには namelist が出ない。**
+  `main.f90` が印字するのは `DEVICE_MEMORY_CONFIG`、ステップごとの
+  `q` の min/max、末尾の時間レポートだけで、`PolyOrder` も
+  `DqdtKernel_Type` も `NeX/NeY/NeZ` も `nstep` も出力されない。
+  ログ単独では**次数すら**復元できない。
+- **ハーネス経由の測定は、実際に使った conf が現物で残っている。**
+  `jobs/tsubame_paths.sh` の `make_config` は生成した conf を
+  `$OUTDIR/config/` に書き出すので、ローカルの成果物ツリーに数百本ある。
+  ただしこれらは**すべて現行命名の生成物**（`perf_p{order}_{PATH}.conf`）で、
+  本表が扱う旧名（`conf_perf_*` / `input_p*_val*`）は 1 本も無い。
+  ルート直下の手書き conf を使っていた時代の測定はハーネス経由ではないので、
+  §3.1 / §3.2 の穴はこれでは埋まらない。
+- したがって、下の 2 表の「実体」欄は git の履歴（`9dfea48^` と、
+  HEAD の祖先でない `6466dc0`）にあるものだけである。そこに無いものは
+  **どこにも無い**。
+
 ### 3.1 ncu 用の短 `nstep` コピー（現行に対応ファイルは存在しない）
 
 `namelists/README.md` は「`_ncu` コピーや一回限りの `Ne`/`nstep` 変種を
