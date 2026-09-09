@@ -289,6 +289,17 @@ p=767 では Scheme I が native を上回ったが、p=1023 では Ozaki worksp
 入力は `input_p1023_val_gemm_emu.conf`。
 [`cublas_emulation_survey.md`](cublas_emulation_survey.md) §4 参照。
 
+> **訂正（2026-09-09）**: 上表の **1.74×** と 3 run 目の OOM は、
+> **当時の既定が ADP（DYNAMIC 仮数ビット選択）だった**ときの値である。
+> `fd091fc` で `CublasEmulation = .true.` の既定は **FIXED 55 bit** になり、
+> 現行既定では p=1023 でも **OOM せず**、native の **0.691×**（135.936 ms/stage、
+> native 196.658）——すなわち **emulation の方が速い**
+> （[`cublas_emulation_survey.md`](cublas_emulation_survey.md) §10.5、
+> Slurm `86678`）。同 §10.5 の ADP は 3 本中 2 本が OOM で、残る 1 本が 1.245× と、
+> 上表の負けの側に整合する。**ただし OOM が消えたのは定数係数のベンチマークでの話で、
+> 点変化係数の場（`SCALE_DG_VARYING_COEFF=1`）では FIXED 55 / ADP とも
+> 今も同じ 8 GiB workspace の確保で OOM する**（同 §14.5、Slurm `88634`）。
+
 ## 10. なぜ emulation は p=1023 でも native GEMM より遅いか（2026-08-29）
 
 孤立 GEMM ベンチ（`bench_ozaki2/p1023_emu_why.cu`、GB200、176 GiB の場は無し）で
@@ -309,6 +320,16 @@ p=767 では Scheme I が native を上回ったが、p=1023 では Ozaki worksp
 - INT8 1 本の x 形状は 2464 TOP/s（native の 64 倍）なので、Scheme II なら
   算術下限で勝つ。cuBLAS 13.1 は Scheme I。`OZAKI2` は workspace が payload に
   乗って OOM（§8）。
+
+> **訂正（2026-09-09）**: 本節の見出しの主張（「emulation は p=1023 でも native
+> より遅い」）は **ADP 既定時の §9 の 1.74× を分解したもの**であり、現行既定には
+> もう当てはまらない。本節自身が 2 番目の項目で「FIXED 55 にすれば x は 0.495×」と
+> 書き、`fd091fc` でその FIXED 55 が既定になった。場つきの実測でも
+> p=1023 emulation は native の **0.691×** で、負けではなく勝ちである
+> （[`cublas_emulation_survey.md`](cublas_emulation_survey.md) §10.5、
+> Slurm `86678`）。**y が FIXED 55 でも 1.41× 遅いという分解は取り消さない**
+> ——それでも x/z の勝ちが上回った、というのが §10.5 の測定である。
+> 点変化係数の場では今も 8 GiB workspace が確保できず OOM する（同 §14.5）。
 
 ## 11. 2026-08-29 の経路横断について
 
@@ -422,6 +443,13 @@ device 時間は graph では非計測。既定 conf は off のまま（`nsys` 
 | z `launch_bounds` で占有率 | p=63 は +90%（spill）。254 レジスタ | 実装せず |
 | RK を z epilogue に融合 | `dqdt` を実体化しない | 範囲外 |
 | Ozaki / emulation | §8–§10 | OOM または 1.74× |
+
+> **訂正（2026-09-09）**: 上表最終行の emulation 側の判定は **ADP 既定時**のもの。
+> 現行既定 FIXED 55 では p=1023 の emulation は OOM せず native の **0.691×**
+> （[`cublas_emulation_survey.md`](cublas_emulation_survey.md) §10.5、
+> Slurm `86678`）で、**「測って閉じた」は誤り——ここは開いた候補である**。
+> ただし点変化係数の場では同 §14.5 のとおり今も OOM し、数値検証が取れない。
+> Ozaki 側（§8 の OOM）はこの訂正の対象ではない。
 
 ### 12.7 結論
 

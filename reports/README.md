@@ -1945,6 +1945,20 @@ SM 2062 MHz 固定、900 W / 上限 1200 W、56 °C、throttle 0x0）。
   本体の FIXED 55 vs native（3 run 中央値）は §8: p=511 / p=767 は勝ち
   （0.95× / 0.91×）、p=575 は 1.31×、p=7 は 305×。p=1023 native は
   193.1 ms/stage、FIXED 55 は 8 GiB workspace 先行確保で場コピー時 OOM。
+  **（追記 2026-09-09、[`cublas_emulation_survey.md`](cublas_emulation_survey.md)
+  §10.5（2026-09-08、Slurm `86678`）と §14.5（2026-09-09、Slurm `88634`））
+  直前の行の p=1023 の「OOM」は当時の記録である。
+  現行ツリーの既定 FIXED 55 では OOM せずに動き、native より速い**:
+  定数係数の `namelists/perf_p1023_gemm.conf` で native 196.658 ms/stage に対し
+  **135.936 ms/stage ＝ native の 0.691×**（3 本の中央値、130.0–190.0 と荒れる。
+  native は 0.02% に収まるので荒れは emulated 側の性質。原因は未測定）。
+  勝ち幅は次数とともに広がる（0.947 → 0.914 → **0.691**）。ADP は同次数で
+  3 本中 2 本が OOM し、通った 1 本は 1.245×。
+  ここまでは下の 2026-09-08 の追記（§10）と同じ測定である。
+  **ただし点変化係数の場では今も OOM する**（§14.5）—— `SCALE_DG_VARYING_COEFF=1`
+  では 8 GiB 永続 workspace の確保で落ち（`cuMemAlloc` error 2、
+  8 589 934 592 B）、同次数の native 参照は通る。つまり p=1023 の emulated
+  経路は**この機械では数値検証できない**（ADP も同じく OOM）。
 
 - **p=7, `Ne=32^3`**: `CUDAFORTRAN_FUSED_TC` が最速（commit `e22dda1` 以降）。
   現時点の device 時間は 0.806 秒 / Main 1.066 秒（下の ±x 面の項目）。

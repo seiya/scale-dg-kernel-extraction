@@ -13,6 +13,16 @@
 比較で整理する。性能最適化の主目的ではない（調査結論どおり p=255 では native より遅い）が、
 **計測可能な正しい経路**として `DqdtKernel_Type = "CUDAFORTRAN_GEMM_OZAKI2"` を追加した。
 
+**注記（2026-09-09、Slurm `88634`）: ここでいう「正しい」は経路役割の意味に限る
+—— `AGENTS.md` の未融合 GEMM ドライバ上で volume GEMM 3 本だけを差し替える、という
+経路定義を満たすという意味であって、数値精度の合格を意味しない。`OZAKI2` は
+`gemm_assignment_and_carrier.md` §14.3 で 3 次数・4 設定（FIXED / ADP × 7 / 14 moduli）
+すべて✘の数値不合格である**（FIXED での max abs は p=7 で 2.97e-01、p=255 で
+1.235e+02、p=511 で 2.118e+02。対照は p=7 が `CUDAFORTRAN_SPLIT`（§9.8.5）、
+p=255 / 511 が同一次数の `CUDAFORTRAN_GEMM`（§14.2）。moduli を 7 から 14 に
+増やしても値は同一で、律速は moduli 数ではなく A 側の int8 表現）。**本経路の測定値は「数値が合わない設定の
+速度」として読むこと。**
+
 ---
 
 ## 1. 実装概要
@@ -22,7 +32,7 @@
 | 新カーネル種別 | `CUDAFORTRAN_GEMM_OZAKI2`（`DQDT_KERNEL_CUDAFORTRAN_GEMM_OZAKI2 = 9`） |
 | CUDA コア | `cuda_ozaki2_gemm.cu` — 対角スケール、INT8 `cublasGemmEx`、Garner CRT、A 行列マルチスライス |
 | 統合 | `cuda_cal_dqdt_gemm_ozaki2`（`mod_cuda_dg_kernels.cuf`）— 既存 `cuda_cal_dqdt_gemm` と同段構成 |
-| namelist | `OzakiModuliCount`（2–20、既定 14）、`CublasEmulation` とは独立 |
+| namelist | `OzakiModuliCount`（2–20、**既定 7**。本レポート作業時の既定は 14 で、`fd091fc` で 7 に変更された）、`CublasEmulation` とは独立 |
 | 検証 conf | `input_p255_val_gemm_ozaki2.conf`、`input_p7_val_gemm_ozaki2.conf` |
 | 単体テスト | `bench_ozaki2/ozaki2_crt_test.cu`（合成行列、tol `2e-2`） |
 
@@ -206,6 +216,23 @@ git clone https://github.com/RIKEN-RCCS/GEMMul8.git
   成立条件 p ≳ 500–650 は変わらない。
 - **本経路の価値**: 論文手法の **再現可能な計測対象**、将来ハード（浅い K で INT8
   天井が上がる場合）への接続、cuBLAS 内蔵 emulation（`CublasEmulation`）との対比。
+
+**注記（2026-09-09）: 上の「成立条件 p ≳ 500–650」は交叉していない。** 本レポート
+§8.13 の 3 台測り直し（commit `302c681`）では GB200 の対 `GEMM` 比が p=255 で 2.9×、
+p=511 で 1.7×、**p=767 でも 1.3× で 1 を割らない**（H100 は 2.3〜3.1×、A100 は
+1.9〜3.1× で下げ止まり —— 最小は H100 が p=511 の 2.3×、A100 が p=511 / 575 の
+1.9×）。
+[`README.md`](README.md) の公表列（job `78846`、現行既定 FIXED 55 / 7 moduli）でも
+GB200 p=255 は **3.03×**（3 190.9 / 1 052.0）で、p=767 の **1.30×**
+（82 149.1 / 63 286.1）が全 9 次数の下限である。すなわち
+**測れた範囲（p≤767）では、どの機械でも native `GEMM` を下回る次数は現れていない**。
+
+**注記（2026-09-09、Slurm `88634`）: 上の「計測可能な経路」としての価値は、
+経路役割の意味に限る。** `OZAKI2` は `gemm_assignment_and_carrier.md` §14.3 で
+p=7 / 255 / 511 の 3 次数、FIXED / ADP × 7 / 14 moduli の 4 設定すべてが✘の
+**数値不合格**である（FIXED で p=7 2.97e-01、p=255 1.235e+02、p=511 2.118e+02。
+対照は p=7 が `CUDAFORTRAN_SPLIT`、p=255 / 511 が同一次数の `CUDAFORTRAN_GEMM`）。
+本節の性能値は数値が合わない設定の速度であり、合格経路との性能比較には使えない。
 
 関連: [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md)、
 [`cublas_emulation_survey.md`](cublas_emulation_survey.md)、

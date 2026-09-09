@@ -28,6 +28,14 @@ Scheme II（`CUDAFORTRAN_GEMM_OZAKI2`）と並ぶ **比較・計測用経路**�
 | 検証 conf | `input_p7_val_gemm_ozaki1.conf`、`input_p255_val_gemm_ozaki1.conf`、長時間 `input_p7_val_gemm_ozaki1_1000.conf` |
 | 単体テスト | `bench_ozaki2/ozaki1_crt_test.cu`（合成行列、tol `2e-2`） |
 
+> **注記（2026-09-09）: 表の「既定 8」は本レポート作成時（`74f09bc`、2026-08-28）の
+> 既定である。** 翌日の `fd091fc`（*Default FP64 emulation to FIXED 55 bits*）で
+> `OzakiSliceCount` の既定は **7** になった（`main.f90:258`、
+> `cuda_ozaki1_gemm.cu` の `kDefaultSlices = 7`。7 枚は
+> `mantissaBitCount = 8×7 − 1 = 55` で cuBLAS の FIXED 55 に対応する）。
+> 同 commit で `OzakiModuliCount` の既定も 14 → **7** になっている。
+> **以降の本文で `s=8` と書かれた測定は、当時の既定での測定条件として読むこと。**
+
 ### 1.1 Scheme I と Scheme II の違い
 
 | 観点 | Scheme I（本実装） | Scheme II（OZAKI2） |
@@ -74,6 +82,18 @@ Ozaki Scheme I の「本家」参照は **2 系統**ある。GEMMul8 リポジ�
 | ワークスペース | `ozaki1::workSize`（1024/128 pad + 8 GiB 定数） | handle 内動的再割当 | setup 時 `ozaki1_alloc_workspace(Nq,Ne,Np)` 固定 |
 | 比較用既存経路 | `CublasEmulation`（本 repo、130× 遅） | なし | **`CUDAFORTRAN_GEMM_OZAKI1`**（3× 程度、計測可能） |
 
+> **注記（2026-09-09）: 表最下行と §2.3 の「`CublasEmulation` は 130× 遅」は、
+> `cublas_emulation_survey.md` §4 の EAGER・ADP 時代の値**（p=7 で 130.6 倍遅、
+> `input_p7_perf_gemm_emu.conf`）**である。`fd091fc` で emulation の既定は
+> FIXED 55 bit になり、物差しが変わった。** 現行既定を GB200 で測り直すと
+> p=7 は native の **300.1×**（`cublas_emulation_survey.md` §10.1）で
+> むしろ遅い側に大きく、一方 **p≥511 では emulation が native を下回る**
+> —— p=511 **0.947×**、p=767 **0.914×**、p=1023 **0.691×**（同 §10.1 / §10.5、
+> Slurm `86678`）。**「emulation は常に桁違いに遅い」という読みは次数依存で
+> 成立しない**ので、「130× 遅」は p=7・当時の既定に限った値として読むこと。
+> 同じ行の `CUDAFORTRAN_GEMM_OZAKI1`「3× 程度」も当時の物差し（早期打ち切り有効）の
+> 値で、現行既定では p=7 で **76.4×**、p=255 で **23.4×** である（§7 の注記）。
+
 ### 2.2 取り込んだ点
 
 #### ゼロ行スケールと pack 除算（§4.2、本 repo 独自修正）
@@ -118,6 +138,15 @@ namelist コメントとして整合を取った。
 | **DG 専用 workspace・NN/TN のみ** | Ne, Nq 既知。**余計な pad / 8 GiB cuBLAS workspace 不要**。 | GEMMul8 `workSize` の 1024 整列・8 GiB 定数は **任意 M,N,K BLAS** 向け。 |
 | **B キャッシュはポインタ同一性のみ** | メッシュ固定で **D1D / D1D_tr は不変**。実装が単純。 | 係数が時間変化する一般 BLAS では **内容ハッシュ invalidation** が必要。 |
 | **ADP / mantissa loss 自動選択なし** | 性能最適化目的ではなく **Scheme I 経路のモデル化**が目的。 | ozIMMU `auto_mode_select` は **mantissa loss 閾値**で s を最小化。 |
+
+> **注記（2026-09-09）: 表中および §3 の「K = Nq ≤ 256」は、本レポート作成時点で
+> 既に狭すぎる。** LGL 演算子生成は `bd2d962`（2026-08-27、本レポートより前）で
+> 任意次数化されており、本リポジトリの上限は **p=1023、すなわち K = Nq = 1024**
+> である（`OZAKI1` 自体の測定実績は p=767 / Nq=768 まで。p=1023 は OOM で
+> セルが存在しない —— `reports/README.md` の Ozaki 表、job `78846`）。
+> **INT32 飽和の結論は変わらない**: K=1024 でも
+> |Σ| ≤ 1024 × 127² ≈ 1.65×10⁷ で、INT32 上限 2.1×10⁹ に対してなお 2 桁の余裕がある。
+> 「既定 `OzakiSliceCount`」欄の 8 についても §1 の注記を参照。
 
 ### 2.4 本リポジトリ内ベンチとの関係
 
@@ -199,6 +228,18 @@ login ノード、`nstep=1`、定数速度（`SCALE_DG_VARYING_COEFF` 未設定�
 **Ozaki 経路全体の精度特性**（volume GEMM 量子化）を示す。定数速度ベンチだけでは
 見えない外れ値は、変動係数テストで捕捉する（`AGENTS.md`）。
 
+> **注記（2026-09-09）: 上表と本段落の 10¹ オーダーの差は、当時の既定＝
+> 早期打ち切り常時有効（現行の ADP / `EmulationMantissaControl="DYNAMIC"` に相当）に
+> 固有のものである。** `fd091fc` 以降の既定 FIXED では全 slice が走り、
+> 点変化係数（`SCALE_DG_VARYING_COEFF=1`）の owned `dqdt` 全点で
+> 対 `CUDAFORTRAN_SPLIT` **3.55e-15**（p=7、7 枚でも 8 枚でも同値。
+> `gemm_assignment_and_carrier.md` §9.8.5）。同じ実行ファイルを ADP に戻すと
+> **3.04e-01** で、上表と同じ側に落ちる。
+> **ただし既定 7 枚が roundoff 水準なのは p=7 まで**で、同 §14.3 / §14.5
+> （Slurm `88634`、対照は同次数の `CUDAFORTRAN_GEMM`）では p=255 で **3.551e-12**
+> （相対 4.15e-13）、p=511 で **1.516e-11**（同 1.77e-12）と、8 枚
+> （7.905e-14 / 1.625e-13）の **44.9 倍 / 93.3 倍**になる。
+
 ### 6.2 変動係数・1000 step 長時間 run（p=7, Ne=32³）
 
 login ノード、`SCALE_DG_VARYING_COEFF=1`、`dt=10⁻⁵`、`nstep=1000`、`WarmupStep=1`
@@ -218,6 +259,9 @@ login ノード、`SCALE_DG_VARYING_COEFF=1`、`dt=10⁻⁵`、`nstep=1000`、`W
 （§7.2）。旧 `dt=10⁻³` run の mean pairs_sum=78.7 は **発散に伴う flux 拡大**の
 アーティファクトと見なす。
 
+> **注記（2026-09-09）: 本節の pairs_sum は早期打ち切りが有効だった `74f09bc` の値で、
+> 現行既定では成立しない**（`fd091fc` 以降、早期打ち切りは DYNAMIC 専用。§7.2 の注記）。
+
 ---
 
 ## 7. 性能（参考、login ノード・nstep=1）
@@ -236,6 +280,17 @@ OZAKI1 が native より速く見えたが、スライスが早期打ち切り�
 本番最速経路としては採用しない。実効 s_a/s_b は
 `SCALE_DG_OZAKI1_SLICE_STATS=1` で run 終了時に min/max/mean と step あたり
 `s_a*s_b` 合計（INT8 GEMM 本数の proxy）が出力される。
+
+> **注記（2026-09-09）: §7 / §7.2 の性能値は commit `74f09bc`・早期打ち切り有効
+> （現行の ADP 相当）・login ノード・`nstep=1`（§7.2 は 999 step）での値である。**
+> 現行既定（`EmulationMantissaControl="FIXED"` / 55 bit / **7 slices**）で
+> 占有 GPU 交互に測り直した値は `measurement_inventory.md` §10 と
+> `reports/README.md` の Ozaki 表（2026-09-03 追記、job `78846`、node `c186`）にあり、
+> native `GEMM` 比は **p=7 で 76.4×**（1 613.2 → 123 257.7 µs/stage）、
+> **p=255 で 23.4×**（1 052.0 → 24 596.6 µs/stage）である。
+> **本節の「p=255 Ne=1 では OZAKI1 が native より速く見えた」は、早期打ち切りで
+> pairs_sum が 15 まで落ちたときの値であって、現行既定では成立しない**
+> （現行既定では p=255 でも 23.4 倍遅い）。
 
 ### 7.2 変動係数・1000 step（§6.2 同一 run、`dt=10⁻⁵`）
 
@@ -266,6 +321,15 @@ OZAKI1 が native より速く見えたが、スライスが早期打ち切り�
 が全 step で固定。§7 の p=255「15 ms」は pairs_sum=15 の best case。
 旧 `dt=10⁻³` run（mean 78.7、max 304）は積分発散時の flux 拡大を反映しており、
 本番性能見積もりには使わない。
+
+> **注記（2026-09-09）: 上の実効スライス統計は、早期打ち切りが無条件に有効だった
+> `74f09bc` 時点のものである。** `fd091fc` で早期打ち切りは **DYNAMIC 専用**になり
+> （`cuda_ozaki1_gemm.cu:456` / `:497` の
+> `if (!g_state.fixed && !scales_need_next_slice(...)) break;`）、
+> **既定 FIXED では break が効かず、常に `OzakiSliceCount` 枚すべてが走る。**
+> したがって現行既定（7 枚）では s_a = s_b = **7** に固定され、
+> **49 pairs / 呼び出し**、本節と同じ 9 呼び出し/step 換算で **441 pairs / step**
+> —— 上表の 36 の **12.25 倍**である。§7 / §7.2 の性能値はこの物差しの差を含む。
 
 ---
 
@@ -358,8 +422,21 @@ export SCALE_DG_DUMP_DQDT=dqdt_ozaki1.txt
   （`dt=10⁻⁵`・安定積分）では pairs_sum=36 により **約 12 倍**（§7.2）。
   `dt=10⁻³` 発散 run の ≈17 倍は flux 飽和のアーティファクト。p=255 1 step の
   「native より速い」は pairs_sum=15 の外れ値（§7）。
+
+  > **注記（2026-09-09）: 上の「約 3 倍」「約 12 倍」、および p=255 の「native より速い」は、
+  > `74f09bc`・早期打ち切り有効（ADP 相当）・login ノードの物差しでの値である。**
+  > 現行既定（FIXED / 7 slices）では native `GEMM` 比が **p=7 で 76.4×**、
+  > **p=255 で 23.4×**（job `78846`、node `c186`）で、桁が違う。§7 の注記を参照。
 - **今後**: ozIMMU 式 **mantissa bit split** の ablation、変動係数 p=255 全点比較、
   B キャッシュ効果の nsys 計測は任意。
+
+> **注記（2026-09-09）: 上の「変動係数 p=255 全点比較」は実施済みで、任意ではない。**
+> `gemm_assignment_and_carrier.md` §14（Slurm `88634`、node `c181`、
+> `SCALE_DG_VARYING_COEFF=1`、`nstep=1`、owned `dqdt` 全点、対照は同次数の
+> `CUDAFORTRAN_GEMM`）が p=255 と p=511 で取っており、既定 FIXED 7 枚の `OZAKI1` は
+> p=255 で **3.551e-12**、p=511 で **1.516e-11**（合否は ✔ だが、8 枚に対して
+> 44.9 倍 / 93.3 倍で roundoff 水準ではない）。同節は `OZAKI2` が 3 次数・4 設定
+> すべてで数値不合格（p=255 1.235e+02 / p=511 2.118e+02）であることも示している。
 
 関連: [`ozaki2_implementation_report.md`](ozaki2_implementation_report.md)、
 [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md)、

@@ -250,6 +250,23 @@ Scheme I は native GEMM と **実質互角**（1.04×）。最速は `GEMM_FUSE
 入力は `input_p575_val_gemm_emu.conf`。
 [`cublas_emulation_survey.md`](cublas_emulation_survey.md) §4 参照。
 
+> **（訂正 2026-09-09）** 上表は commit `a1cdb57` の測定で、そのツリーには
+> mantissa 幅のノブがまだ無く、`cublasSetEmulationStrategy(EAGER)` の下で
+> cuBLAS 既定の **ADP（DYNAMIC）** が走っていた
+> （`a1cdb57:cuda_cublas_gemm.cu:27`）。`EmulationMantissaControl` /
+> `EmulationMantissaBits` は `fd091fc`（2026-08-29、"Default FP64 emulation to
+> FIXED 55 bits, with a namelist switch back to ADP."）で追加され、既定は
+> **FIXED 55 bit** になった（現行ツリーの `main.f90:255-256`）ので、
+> **上表の 2.10× は当時の ADP 既定での比である。**
+> 現行既定 FIXED 55 で取り直すと p=575 の emulation は native の
+> **1.31×**（[`cublas_emulation_survey.md`](cublas_emulation_survey.md) §8、
+> 2026-08-29、login GPU 1）、**1.333×**（同 §9.1、Slurm `84461`、node `c191`）、
+> **1.346×**（同 §10.1、Slurm `86678`）で、3 回の再測定を通して **1.31–1.35×** に
+> 収まる。emulation が負けるという結論は変わらないが、負け幅は 2.10× ではない。
+> なお FIXED 55 が native に勝つのは p=511（0.95×）と p=767（0.91×）で、
+> p=575 だけが負けとして残る（同 §8）。
+> **本表は当時の ADP 既定での測定として書き換えずに残す。**
+
 ## 10. 2026-08-29 の経路横断について
 
 p=7…255 は同一実行ファイルで再測定したが、**p=575 は再実行していない**。
