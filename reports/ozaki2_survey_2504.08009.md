@@ -64,9 +64,11 @@ Ne = 1 として
 | y | `256x256x256` batched × 256 | 242.9 | 35.37 | 88.2% |
 | z | `<64,32,16>`（assembly + lift epilogue 込み） | 338.6 | 26.23 | 65.4% |
 
-（`overall_summary_report.md` §12 の値。x+y で 493 µs、tendency 988 µs/call の
-ちょうど半分。z は epilogue を融合済みでライブラリ GEMM に戻せないので、
-エミュレーションの対象になり得るのは x と y だけである。）
+（`overall_summary_report.md` §7 の値。x+y で 493 µs、tendency 988 µs/call の
+ちょうど半分（この 2 つは同レポート §8.7 の値で、x 249.7 + y 243.5 µs。上表の
+§7 の x/y は別ジョブの 254.2 + 242.9 = 497.1 µs）。z は epilogue を融合済みで
+ライブラリ GEMM に戻せないので、エミュレーションの対象になり得るのは x と y
+だけである。）
 
 x/y は既に FP64 ピークの 84-88% に達しており、native 側に伸びしろは無い。
 本リポジトリで唯一 compute bound な場所なので、候補としては正しい。
@@ -267,7 +269,8 @@ s=14 本ぶん払って勝つには FP64 比 14× 以上、さらに再構成ト
 
 `combined.cu` による実測。まず**何が構造的に可能か**が先に決まる。
 
-`dqdt_assembly_kernel`（`mod_cuda_dg_kernels.cuf:1874-1878`）は
+`dqdt_assembly_kernel`（`mod_cuda_dg_kernels.cuf:4078-4095`、式は
+`:4089-4093`。本文執筆時の `c66bfca` では `:1874-1878` だった）は
 
 ```fortran
 dqdt = -( Escale_x*deriv_x + Escale_y*deriv_y + Escale_z*deriv_z + lift )

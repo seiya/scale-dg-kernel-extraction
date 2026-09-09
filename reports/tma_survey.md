@@ -92,6 +92,13 @@ occupancy を 2 ブロック/SM に落とした私のベースラインの作り
 **ベースラインの取り方ひとつで TMA の見かけの効果が 7 倍変わる**ので、
 以降はこの罠を避けている。
 
+（2026-09-09 追記: provenance の補足。上の 20 回平均は login node での実行なので
+Slurm job ID は無く、**マイクロベンチのソース・ビルド commit・`nvcc` フラグは
+記録されていない**。バイナリも（後段の job が使った `tma_bw.bench` を含めて）
+ツリーに残っていない。したがってこの表は本文中の形状記述からの再実装でしか
+再現できない。ncu を当てた §1.5 側の起動形だけは `jobs/ncu_tma_b0.sh` /
+`jobs/ncu_tma_b0b.sh` に残っている（§6）。）
+
 ### 1.5 帯域以外では、TMA は確かに効く
 
 同じ 2 カーネル（同一バイト・同一 shared レイアウト・違いは copy の
@@ -114,6 +121,11 @@ occupancy を 2 ブロック/SM に落とした私のベースラインの作り
 | global load sectors | 20,971,520 | **0** | 0 |
 | 発行命令数 | 23,183,360 | **1,277,960** | 0.055 |
 | レジスタ/スレッド | 30 | 16 | 0.53 |
+
+（2026-09-09 追記: この 2 表の全行を採れる metric 一式を持つのは
+`jobs/ncu_tma_b0b.sh`（`launch__registers_per_thread` を含むのはこちらだけ）で、
+`jobs/ncu_tma_b0.sh` の part 1 にはレジスタ列が無い。実行ファイルは
+`./tma_bw.bench`、ビルド commit は §1.4 と同じく未記録。）
 
 **TMA は「速い転送」ではなく「L1/TEX とレジスタと発行スロットを使わない転送」である。**
 したがって効くのは L1・レジスタ・命令発行のいずれかが律速のカーネルに限られる。
@@ -325,6 +337,14 @@ warp の 62% が L1TEX 待ちで止まっており、§1.5 の通り TMA はそ�
 `e22dda1` 以前の値で、**現行では余地がある**（この訂正は
 `overall_summary_report.md` §12.9 に追記済み）。
 
+（2026-09-09 追記: provenance の補足。この占有率プローブも login node 実行で、
+**Slurm job ID・ビルド commit・`nvcc` フラグは記録されておらず**、ソースも
+ツリーに無い。ただし前提の `sharedMemPerMultiprocessor` = 233,472 B は
+2026-09-09 に RIKYU ログインノードで `cudaGetDeviceProperties` を叩き直して
+再確認した（GB200、cc 10.0、`multiProcessorCount` = 152、`regsPerSM` = 65,536）。
+表そのものは `cudaOccupancyMaxActiveBlocksPerMultiprocessor` の
+決定的な計算結果なので、同じ smem/レジスタ値からいつでも再構成できる。）
+
 ### 3.2 判定: 不採用（swizzle が表現できない）
 
 予算は足りる。落ちたのは**レイアウト**である。
@@ -354,8 +374,9 @@ GF(2) 一次独立）を、**TMA が 8 B 要素で符号化できるレイアウ
 
 （`§1.2` の受理条件から、8 B 要素で符号化できる swizzle 付きレイアウトは
 最内 box 次元 4 / 8 / 16 の 3 通りに限られ、swizzle 無しを足して**この 4 行で全部**である。
-表は判定器が linear 行を恒等写像として再現し、コミット版 2 行が §10.2 の
-記述どおり 4/4 になることで検証されている。）
+表は判定器が linear 行を恒等写像として再現し、コミット版 2 行が
+`tc_paper_survey_2407.09621.md` §10.2 の記述どおり 4/4 になることで
+検証されている。）
 
 原因は 1 行で言える。**TMA の swizzle は行ビットを必ず最下位のチャンクビットから
 順に当てる**ので、ノード bit4 はアドレス **bit1** に落ちる。ところが bit1 には
@@ -363,8 +384,8 @@ GF(2) 一次独立）を、**TMA が 8 B 要素で符号化できるレイアウ
 `sw_xy` が必要とするのは bit4 → **bit2** で、この対応を TMA は表現できない。
 
 収支を見積もると符号は変わらない。TMA で `q,u,v` を smem に落とし、
-`q` 倍を mma のオペランドロードに畳み込む版（`tc_paper_survey` §9 版 B と
-同じ形で、face gather は global に残す）は 1 スレッドあたり
+`q` 倍を mma のオペランドロードに畳み込む版（`tc_paper_survey_2407.09621.md`
+§9 の版 B と同じ形で、face gather は global に残す）は 1 スレッドあたり
 
 - global load 8 → 2（−6）、shared store 6 → 2（−4）: 素直に数えて **−20 wavefront/warp**
 - x/y 収縮のオペランド読み 4 → 8、かつ**全レイアウトで 2-way**: **+24 wavefront/warp**
@@ -440,11 +461,77 @@ Phase 0 の 5 本のマイクロベンチはリポジトリに入れていない
 再現に要る情報はすべて本文中にある。実機測定は以下で採った。
 
 ```bash
-sbatch job_ncu_tma_a0.sh    # A-0  --set full, z GEMM 融合版と CUTE 版
-sbatch job_ncu_tma_a0b.sh   # A-0  stall 内訳
-sbatch job_ncu_tma_b0.sh    # B-0  --set full, p=7 FUSED_TC
-sbatch job_ncu_tma_b0b.sh   # B-0  マイクロベンチの L1 計測
+sbatch jobs/ncu_tma_a0.sh    # A-0  --set full, z GEMM 融合版と CUTE 版
+sbatch jobs/ncu_tma_a0b.sh   # A-0  stall 内訳
+sbatch jobs/ncu_tma_b0.sh    # B-0  --set full, p=7 FUSED_TC
+sbatch jobs/ncu_tma_b0b.sh   # B-0  マイクロベンチの L1 計測
 ```
+
+（2026-09-09 追記: スクリプト名を実体に合わせた。作成時に `job_ncu_tma_*.sh` と
+書いていたが、ツリーにあるのは `jobs/` 直下の `ncu_tma_a0.sh` / `ncu_tma_a0b.sh` /
+`ncu_tma_b0.sh` / `ncu_tma_b0b.sh` である。4 本とも `jobs/` の allowlist 外で
+**未追跡**である。凍結実行ファイル `scale-dg_extraction.tma0` とマイクロベンチの
+バイナリ `tma_bw.bench` はツリーに無く、`output/` ディレクトリ自体は残っているが
+本調査の生データ（`tma_a0_*`, `tma_a0b_*`, `tma_b0_*`）はもう入っていない。散逸に備えて、その 4 本が実際に発行した ncu のコマンドラインを
+以下に転記する。）
+
+```bash
+# jobs/ncu_tma_a0.sh — 融合版と CUTE 版（p=255, Ne=1, dt=1.0D-7, nstep=3,
+#                      OPT1, CublasEmulation=.false., UseCudaGraph=.false.）
+timeout 1500 ncu --set full --kernel-name-base demangled --rename-kernels 0 \
+    -k "regex:DqdtAssembly" -s 3 -c 1 $EXE <conf: CUDAFORTRAN_GEMM_FUSED>
+timeout 1500 ncu --set full --kernel-name-base demangled --rename-kernels 0 \
+    -k "regex:GemmBatched"  -s 3 -c 1 $EXE <conf: CUDAFORTRAN_GEMM_CUTE>
+
+# jobs/ncu_tma_a0b.sh — stall 内訳（同じ 2 conf、--csv --metrics）
+timeout 900 ncu --csv --metrics "$METRICS" \
+    --kernel-name-base demangled --rename-kernels 0 \
+    -k "$RE" -s 3 -c 1 $EXE tmp_a0b.conf
+#   METRICS = smsp__warp_issue_stalled_{long_scoreboard,short_scoreboard,wait,
+#             math_pipe_throttle,mio_throttle,barrier,not_selected}_per_warp_active.pct,
+#             smsp__inst_executed.sum,
+#             smsp__sass_thread_inst_executed_op_integer_pred_on.sum,
+#             dram__bytes.sum, gpu__time_duration.sum
+
+# jobs/ncu_tma_b0.sh — マイクロベンチ（part 1）と実カーネル（part 2）
+#   $BW は login node のスクラッチに置いたマイクロベンチ（現存しない）
+timeout 900  ncu --csv --metrics "$METRICS" \
+    -k "regex:b_plain|b_tma|a_regs|a_tma" $BW
+#   METRICS = l1tex__throughput.avg.pct_of_peak_sustained_elapsed,
+#             l1tex__data_pipe_lsu_wavefronts.sum,
+#             l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,
+#             l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum,
+#             l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,
+#             smsp__inst_executed.sum,
+#             sm__throughput.avg.pct_of_peak_sustained_elapsed,
+#             dram__throughput.avg.pct_of_peak_sustained_elapsed,
+#             dram__bytes.sum, gpu__time_duration.sum
+#   （b0b との差: shared load 側のコンフリクトを持つ代わりに
+#     long_scoreboard と launch__registers_per_thread が無い）
+timeout 1500 ncu --set full \
+    -k "regex:tendency_fused_p7_tc_kernel" -s 5 -c 1 $EXE tmp_tma_b0.conf
+#   conf: p=7, NeX=NeY=NeZ=32, dt=1.0D-5, nstep=5, OPT1,
+#         DqdtKernel_Type="CUDAFORTRAN_FUSED_TC", UseCudaGraph=.false.
+
+# jobs/ncu_tma_b0b.sh — マイクロベンチの再実行（計算ノードから login の
+#   スクラッチが見えないため、バイナリを ./tma_bw.bench としてリポジトリに置いた）
+timeout 1200 ncu --csv --metrics "$METRICS" \
+    -k "regex:b_plain|b_tma|a_regs|a_tma" ./tma_bw.bench
+#   METRICS = l1tex__throughput.avg.pct_of_peak_sustained_elapsed,
+#             l1tex__data_pipe_lsu_wavefronts.sum,
+#             l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,
+#             l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum,
+#             smsp__inst_executed.sum,
+#             smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct,
+#             sm__throughput.avg.pct_of_peak_sustained_elapsed,
+#             dram__throughput.avg.pct_of_peak_sustained_elapsed,
+#             dram__bytes.sum, launch__registers_per_thread, gpu__time_duration.sum
+```
+
+なお A-0 / B-0 の conf は namelist ファイルとしてではなくジョブスクリプト内の
+here-document で生成しており（`tmp_tma_a0_fused.conf` / `tmp_tma_a0_cute.conf` /
+`tmp_a0b.conf` / `tmp_tma_b0.conf`、いずれも実行後に削除）、`namelists/` に
+対応するファイルは無い。上のコメントに転記した設定がその全内容である。
 
 ジョブスクリプトは AGENTS.md の規約に従って `module load nvhpc-hpcx`、
 `export DEBUGINFOD_URLS=`、`timeout` 付き、凍結実行ファイル

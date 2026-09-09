@@ -33,7 +33,7 @@ p=255 / 511 が同一次数の `CUDAFORTRAN_GEMM`（§14.2）。moduli を 7 か
 | CUDA コア | `cuda_ozaki2_gemm.cu` — 対角スケール、INT8 `cublasGemmEx`、Garner CRT、A 行列マルチスライス |
 | 統合 | `cuda_cal_dqdt_gemm_ozaki2`（`mod_cuda_dg_kernels.cuf`）— 既存 `cuda_cal_dqdt_gemm` と同段構成 |
 | namelist | `OzakiModuliCount`（2–20、**既定 7**。本レポート作業時の既定は 14 で、`fd091fc` で 7 に変更された）、`CublasEmulation` とは独立 |
-| 検証 conf | `input_p255_val_gemm_ozaki2.conf`、`input_p7_val_gemm_ozaki2.conf` |
+| 検証 conf | `input_p255_val_gemm_ozaki2.conf`、`input_p7_val_gemm_ozaki2.conf`（本レポート作業時の名前。現行の `namelists/` には無く、§6 の再現コマンドが使う `val_p255_gemm_ozaki2.conf` / `val_p7_gemm_ozaki2_ne32.conf` が後継。ただし後者は Ne=32³ で、§3.1 の p=7 行の Ne=8 とは構成が違う） |
 | 単体テスト | `bench_ozaki2/ozaki2_crt_test.cu`（合成行列、tol `2e-2`） |
 
 パイプライン（volume 部分）:
@@ -46,6 +46,18 @@ volume_flux_kernel
 
 `AGENTS.md` の数値契約: `flux_*` と `D1D` は点ごと配列のまま。`Escale` の重み付けは
 既存 assembly と同順序で CRT 後に適用する（`bench_ozaki2/combined.cu` の分析と一致）。
+
+**注記（2026-09-09）: 上の「統合」行とパイプライン図は本レポート作業時
+（`cb23b98`、現行履歴では同内容の `4475f9a`）の形である。** 現行の
+`cuda_cal_dqdt_gemm_ozaki2` は共有ドライバ
+`cuda_cal_dqdt_gemm_unfused( GEMM_VOL_OZAKI2, … )` を呼ぶだけの薄いラッパで
+（`2dadc41`、`mod_cuda_dg_kernels.cuf:2707-2733`）、`GEMM` / `OZAKI1` / `OZAKI2` は
+この 1 本のドライバを通る。前段の flux も `3d4045c` 以降は `launch_flux_all`
+（`:3633`）に融合されうる —— `SCALE_DG_FLUXFUSE` 既定 1、未融合ドライバの
+`use_side = dg_side_enabled .and. (Nq >= 64)`（`:2565`）なので、Nq<64 では
+`volume_flux_kernel` と `elembnd_flux_kernel` が 1 launch に融合され、Nq>=64 では
+従来どおり 2 本に分かれる。**GEMM 3 本と `separable_lift_assembly_kernel` の並びは
+変わらない**ので、上の図の volume 部分の意味は変わらない。
 
 ---
 
@@ -117,6 +129,15 @@ SYRK 等、INT8 / FP8 バックエンド、CUDA / HIP）。本実装は **SCALE-
 ## 3. 数値検証
 
 同一 login ノード、`nstep=1`、`WarmupStep` 既定。`SCALE_DG_DUMP_DQDT` で `dqdt` 全要素比較。
+
+**注記（2026-09-09、provenance）: §3 の測定については、ノード名・実行時刻・実行ファイルの
+commit が記録されていない。** 分かるのはヘッダの情報だけで、ブランチ `feature/ozaki` /
+HEAD `cb23b98` の上に moduli テーブル整合の**未コミット差分**を載せたビルドである
+（login 実行なので Slurm job ID は元々存在しない）。`cb23b98` はオブジェクトとしては残るが
+現行のどのブランチからも到達不能で（`git branch -a --contains cb23b98` が空）、現行履歴で
+対応するのは `4475f9a`（`cuda_ozaki2_gemm.cu` は両者で同一）。入力 conf は §1 表の旧名で、
+現行で設定まで一致するのは p=255 の `namelists/val_p255_gemm_ozaki2.conf`
+（Ne=1、`OzakiModuliCount=14`）だけである。**この分だけ §3 はそのままでは再現できない。**
 
 ### 3.1 moduli 整合後（GEMMul8 テーブル、s=14）
 
@@ -301,6 +322,11 @@ g_ws.iB_bytes = static_cast<size_t>(mn) + kInt8Slack;
 **スラック 512 は根拠のある値ではなく、越境幅の上限を知らないので
 安全側に取った定数である。**
 
+**注記（2026-09-09、provenance）: 上のビット一致検証について、比較した「修正前バイナリ」の
+commit、使った conf、実行ノードはどこにも記録されていない。** 突き合わせられるのは、この候補
+修正が landed した commit が `3b66356`（親 `2f618ce`）であることだけである。GB200 の login
+実行なので job ID は元々無い。
+
 ### 8.4 これを確かめる測定（**まだ走っていない**）
 
 **予測（この節を書いた時点で凍結）**:
@@ -412,6 +438,10 @@ NVLink-C2C でキャッシュコヒーレントなので、**カーネルから�
 | 検証 | 結果 |
 |---|---|
 | p=63 `OZAKI2`、点変化係数、owned `dqdt` 全 16 777 216 点、修正前バイナリと比較 | **ビット一致** |
+
+**注記（2026-09-09、provenance）: §8.3 と同じく、この検証の「修正前バイナリ」の commit・
+conf・実行ノードは記録されていない。** 突き合わせられるのは、この修正が landed した commit が
+`98b5f34`（親 `d949d90`）であることだけである。
 
 **予測（凍結）**:
 
@@ -612,3 +642,22 @@ H100 は p=767 の `OZAKI1`（94 GB）、A100 は p=575 の `OZAKI1`（40 GB）�
 **§8.10 との整合**: この列は修正後のビルドで測ったが、§8.10 が
 テーブル配置の代金を **−0.18%〜+0.15%** と測っているので、
 **§18.7 の GB200 公表値（修正前）とも比較可能**である。
+
+**注記（2026-09-09、provenance / 訂正）: GB200 列は Slurm `83482`、node `c164`、
+2026-09-06 の測定で、`98b5f34` の修正を含まないホストポインタ版のビルドである。**
+ローカル成果物 `recheck_ozaki_83482/`（`jobs/rikyu_recheck_ozaki.sh` の
+`OUTDIR=recheck_ozaki_${SLURM_JOB_ID}` によりディレクトリ名が job ID。`metadata.txt` 自体は
+`job_id=unknown` で、記録しているのは `host=c164`、
+`commit=7a95be3`、凍結コピー `scale-dg_extraction.gb200`、
+`rounds=6 / rounds_hi=6 / rounds_xhi=3`、`date=2026-09-06T19:31:04+09:00`）の
+`run_logs` から `Step loop per stage` の中央値を取り直すと、9 次数すべてが上の GB200 列と
+一致する（5 198 / 5 074 / 3 557 / 3 340 / 3 399 / 3 212 / 23 361 / 34 100 / 81 109 µs、
+対 `GEMM` 比も 3.11 / 5.63 / 5.11 / 4.87 / 4.26 / 2.86 / 1.71 / 1.59 / 1.28）。
+**したがって直前の「この列は修正後のビルドで測った」は誤りで、正しくは修正前のビルドである。**
+比較可能だという結論は変わらない —— §8.10 が代金を −0.18%〜+0.15% と測ったうえで
+「§18.7 の GB200 公表値（job `83482`、修正前）は影響を受けない」と結論しているのと、
+同じ列だからである。H100 / A100 列（SGE `8595165` / TCS `9539837`、commit `302c681`）は
+本文どおり修正後である。なお §8.10 はこの列の commit を `e113535` と書いているが、成果物の
+`metadata.txt` が記録しているのは `7a95be3` である（`measurement_inventory.md` §18 は
+「ツリー: `e113535`（ソースは `7a95be3` と同一）」と両方を併記している。実際、両 commit の差は
+`reports/` のみで実行ファイルは同一）。

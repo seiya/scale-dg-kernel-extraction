@@ -59,6 +59,23 @@ make -j4 CUDA=1 GPUFLAGS=-gpu=cc100 GPUNVCCFLAGS=-arch=sm_100 \
   CUTLASS_HOME=/data1/rkp00015/rku00044/scale-dg-kernel-extraction/third_party/cutlass
 ```
 
+**注記（2026-09-09）: 上の commit 表記は rebase 前のもので、現行履歴では解決できない。**
+baseline の `1107de3489…` は commit オブジェクトとしては残っているが、どのブランチからも
+到達不能である（`git branch -a --contains 1107de3` が空）。ブランチ `feature/p511` も
+現存しない（現行で最も近い名前は `feature/p511-gemm-fused`）。また本レポートの 2 変更が
+実際に入った commit が本文に書かれていない。それは `eb46c9c`
+「Make high-order indexing boundaries 64-bit safe」（2026-08-28、
+`cuda_cutlass_gemm_fused.cu` / `mod_mesh.f90` と本レポート・`reports/README.md`）である。
+したがって現行履歴で candidate に当たるのは `eb46c9c`、baseline に当たるのはその親
+`0980bdc` になる。**ただし `0980bdc` は `1107de3` と同じ subject「Add p=511 GEMM paths」
+でありながら同一ツリーではない**: 両者の差は木全体で 30 ファイル・8261 挿入 / 444 削除
+（`git diff --shortstat 1107de3 0980bdc`）、レポートや conf を除いたソース
+（`*.cu` / `*.cuf` / `*.f90` / `*.h`）だけでも 15 ファイル・5134 挿入 / 424 削除であり、
+`0980bdc` 側には Ozaki 実装（`cuda_ozaki1_gemm.cu` など）を含む後続 19 commit 分の内容が
+畳み込まれている。`0980bdc` は「現行履歴での対応位置」であって §4 / §5 の測定を取った
+ツリーそのものではないので、測定の厳密な再現には rebase 前の `1107de3` を直接
+checkout する必要がある。
+
 ## 4. 性能結果
 
 入力は同一体積 DOF の p=7 `Ne=32^3`、p=15 `Ne=16^3` と、p=511
@@ -66,6 +83,18 @@ make -j4 CUDA=1 GPUFLAGS=-gpu=cc100 GPUNVCCFLAGS=-arch=sm_100 \
 `CUDAFORTRAN_GEMM_FUSED` である。p=7 / p=15 は `nstep=1000`,
 `WarmupStep=20`（2940 measured RK stages）、p=511 は `nstep=50`,
 `WarmupStep=5`（135 measured RK stages）。表は反復測定の中央値である。
+
+**注記（2026-09-09）: §4 と §6 は namelist ファイル名を記録しておらず、§6 のとおり当時の
+設定ファイルは削除済みなので、入力は本文のパラメータから再構成するしかない。**
+現行 `namelists/` で格子と経路が一致するのは `perf_p7_fused_tc.conf`（`NeX=NeY=NeZ=32`、
+`CUDAFORTRAN_FUSED_TC`）、`perf_p15_fused_tc.conf`（16^3、同経路）、
+`perf_p511_gemm_fused.conf`（1^3、`CUDAFORTRAN_GEMM_FUSED`）の 3 本で、いずれも
+`UseCudaGraph = .false.` は本文の条件と一致する。**ステップ数だけは一致しない**:
+3 本とも `nstep = 20` で、`WarmupStep` は p=511 が 2、p=7 / p=15 は未指定（既定 1、
+`main.f90:47`）である。本文の `nstep=1000` / `WarmupStep=20`（p=7 / p=15）と
+`nstep=50` / `WarmupStep=5`（p=511）は上書きが要る。§6 で使った環境変数
+`SCALE_DG_DUMP_DQDT` と `SCALE_DG_VARYING_COEFF` は現行の `main.f90`（それぞれ :590 と
+:340 / :506）にも残っているので、検証手順そのものはそのまま再実行できる。
 
 | order / path | baseline device | candidate device | 差 | baseline Main | candidate Main | 差 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -106,6 +135,8 @@ p=7 は baseline 5回 / candidate 3回、p=15 と p=511 は各3回測定した�
 この比較は各次数で同じ path の baseline と candidate を比較するものなので、縮約順の
 差はなく完全一致が期待値であり、結果もその通りだった。検証 dump、設定ファイル、
 frozen executable は確認後に削除した。
+
+**注記（2026-09-09）: 削除した設定ファイルの再構成については §4 の注記を参照。**
 
 ## 7. Build validation
 

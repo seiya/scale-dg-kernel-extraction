@@ -380,6 +380,14 @@ unique DRAM 68971 MB では 0.371 TB/s（7.9 の 4.7%）。
 
 ### 12.2 nsys（job `71135`、c178）
 
+> **provenance 補足（2026-09-09）**: `sacct -j 71135,73612,73617
+> --format=JobID,NodeList,JobName` でノードを確認した——`71135` は **`c178`**
+> （JobName `nsys_p1023gf`）、§12.3 の `73612` / `73617` は **`c179`**
+> （`ncu_p1023gf` / `ncu_p1023gf2`）で、どれも本文の記載と一致する。
+> 一方**この 3 本の nsys / ncu コマンドライン本体はツリーに残っていない**
+> （当時のジョブスクリプトは `jobs/` の追跡対象外で、現存しない）。
+> 本レポートで完全な起動形が記録されているのは §14（job `79016`）だけである。
+
 `nstep=4`、12 RK stage。カーネル中央値:
 
 | カーネル | med [ms] | 孤立 cuBLAS（§10） | 差 |
@@ -478,6 +486,13 @@ lift 全消しの 0.71% と flux 屋根の 0.39% で、どちらも実装でき�
 （`Ne=1`、`nstep=15`、`WarmupStep=3`、graph off、`CutlassMmaShape = "8x8x4"`）。
 commit は本節を追加したもの（親 `acdbd8a`）。
 
+> **provenance 訂正（2026-09-09）**: 「親 `acdbd8a`」は**リベース前の並び**である。
+> 現行履歴で §13 を追加したのは `0c300dd`（"Account for every millisecond of the
+> p=1023 GEMM_FUSED stage"）で、その親は **`20cc80b`**（"Pin every timer's bias to
+> a whole number of stages"）。`acdbd8a`（"Optimize p=31 GEMM_FUSED within the
+> CUTLASS contract"）は今も履歴にあるが 8 コミット前の祖先で、直接の親ではない
+> （`git log --oneline acdbd8a..0c300dd` が 8 本）。
+
 > **基準について（2026-09-01 追記）**: 本節の測定はすべて `nstep=15` 当時の
 > conf（12 measured step = 36 stage）で、per-stage は
 > `CUDA device GEMM fused ÷ 36`。その後 `feature/cuda` で conf が `nstep=10` に
@@ -503,6 +518,12 @@ repad が入ったのは `run_gemm_batched_nn_capped`（`GEMM_CUTE` の y/z と
 `Nq<64` 融合 y）であり、`Nq>=64` の融合 y は別ローンチャだからである。
 
 ### 13.2 stage の全内訳（nsys job `74738`、c183、`nstep=4`）
+
+> **provenance 補足（2026-09-09）**: job `74738` のノードは `sacct` で **`c183`**
+> （JobName `nsys_p1023_gap`）と確認でき、本文と一致する。ただし**この測定の
+> nsys コマンドライン本体は記録されていない**。本レポートで完全に残っている
+> 起動形は §14（job `79016`）の
+> `nsys profile --trace=cuda --sample=none --resolve-symbols=false` だけである。
 
 §12.2 はカーネル中央値だけを並べ、stage 合計 185.6 と 3 GEMM の和 171.9 の差
 13.7 ms を説明していなかった。GPU trace の開始・終了時刻から stage 1 周期
@@ -559,6 +580,13 @@ repad が入ったのは `run_gemm_batched_nn_capped`（`GEMM_CUTE` の y/z と
 ピークの 93.2% で、しかも既定の 64x32 / warp 32x32 は **2 warp（64 スレッド）
 /CTA** しか使わない（x は 64x128、y は 64x64 で 4 warp）。`Nq>64` 用の
 order-specialized set を `GEMM_CUTE` と `GEMM_FUSED` の両方に入れて掃いた。
+
+> **注（2026-09-09）**: 本文の「x は 64x128」は測定当時の形で、**現行ツリーでは
+> 古い**。`Nq >= 512` の x は §13.8 が測ったリベース分（`b344c6d` / `04172b0`）
+> 以降 batched な y のタイルを借りており、`GemmYScaleShallow` = **64x64 /
+> warp 32x32 / 3 段**である（`cuda_cutlass_gemm_fused.cu` の
+> `run_volume_gemm_x_scale` にある `if (Nq >= 512)` 分岐）。
+> 本節が掃いたのは z のタイルだけなので、**表と判定は影響を受けない**。
 
 | z tile / warp / stage | device [s / 36 stage] | 基準比 |
 |---|---:|---:|
@@ -640,7 +668,19 @@ K が深いほど epilogue の比率が下がるので、効果は Nq ととも�
 `p767_gap_study.md` §12 が x と合わせて測った −0.487%（job `74821`）の内訳に
 あたる。
 
+> **注（2026-09-09）**: 上の p=127 `FUSED_TC` **621.5 µs/stage は当時値**である。
+> その後 [`p127_gap_study.md`](p127_gap_study.md) §23.8（job `75895`）が xz の
+> mma タイル拡大とチャンクループ二重バッファで **590.8 µs/stage** にしている。
+> 「p=127 の最速は `FUSED_TC`」も「本節の repad は `GEMM_FUSED` 側だけを動かす」も
+> 変わらない。**表は書き換えない。**
+
 ### 13.8 リベース後の現在地（占有 GPU job `75692`、c-node、12 回交互）
+
+> **provenance 補足（2026-09-09）**: 見出しの「c-node」は
+> `sacct -j 75692 --format=JobID,NodeList,JobName` で **`c065`**
+> （JobName `ab_rebase_p1023`）と確定した。本節を追加したのは現行履歴では
+> `21cfaeb`（親 `0c300dd`）だが、**比較した「リベース前 / リベース後」2 本の
+> 実行ファイルの commit は本文にも残っておらず、復元できない**。
 
 §13 の測定後に `feature/cuda` が 7 コミット進み、うち `fc272e9`（融合 x/y
 epilogue の repad）、`b344c6d` / `04172b0`（`Nq>=512` の batched x と x/y の
@@ -673,6 +713,12 @@ p=767 §15 と未整合のままである。
 測定した唯一の正の効果（p=1023 **−0.019%**、p=127 −0.31%）だが、実装は
 `p767_gap_study.md` §12 が x と一緒に入れた `fc272e9` に置き換わった。
 p=1023 `GEMM_FUSED` は旧基準で **185.56 ms/stage**（占有 GPU 換算 185.12）。
+
+> **注（2026-09-09）**: この **185.56** は §13.1 の再測中央値と合わない。
+> §13.1 の `6.68149 s ÷ 36 = 185.597 ms/stage` が login 再測の値で、
+> `README.md`（L1772）が引くのもこちらである。括弧内の 185.12 のほうは
+> §13.5 の repad 中央値 `6.664345 s ÷ 36 = 185.121` と一致するので、
+> **ずれているのは前者だけ**。**表は書き換えない。**
 
 §12 が机上または部分的に閉じていた候補を、天井の実測で閉じ直した:
 
@@ -724,7 +770,7 @@ stage 周期 186.06 ms のうち **92.8%（172.68 ms）は FP64 ピークの 95.
 
 ---
 
-## 14. 追記（2026-09-07）—— p=1023 の `device [ms/stage]` は 1 ステージぶん上振れしている
+## 15. 追記（2026-09-07）—— p=1023 の `device [ms/stage]` は 1 ステージぶん上振れしている
 
 **この報告書の表は書き換えない。**以下は読み方の注記である。
 
@@ -761,3 +807,11 @@ p=1023 はステージ数が最も少ない（本節は 36、`recheck_all_83460`
   持つため）ので、§6.2 の 3.32% や §11–§13 の採否判断は変わらない。
 - `Step loop` / `Main` は影響を受けない。論文が p=1023 で使うのは `Step loop`
   だけである（`paper_notes/draft_appendix_a3.md` §5.1）。
+
+> **注（2026-09-09）**: 参照先の節番号は **§A.3.2**（"Delayed CUDA-event
+> harvesting at p = 1023"）で、`§5.1` は当該ファイルに存在しない。
+> `paper_notes/` は git 追跡外なので、この参照はリポジトリの外を指す。
+> なお A.3.2 の記述は「Table A3a の p=1023 の device 値は**測定どおり残し、
+> 上限として読む**」であって、device 値を落とすわけではない。
+> 「stage 時間を使う Fig. 2 と §5 / §6 はこの問題の影響を受けない」が
+> 正確な言い方である。

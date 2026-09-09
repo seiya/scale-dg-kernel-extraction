@@ -6,6 +6,15 @@
 - 入力: `namelists/acc_p{7,63,255}_gemm.conf`（`DqdtKernel_Type` のみ差し替え）
 - 実行: `SCALE_DG_ACCURACY=1 ./scale-dg_extraction namelists/acc_p7_gemm.conf`
 
+> **（2026-09-09 追記、provenance の訂正）**: 上の「commit `48eb7da` + 本コミット」
+> は 1 コミットずれている。本レポートを追加したのは `90bef60`
+> （"Validate the solution after nstep steps, not only one tendency"、2026-09-06）
+> で、その親は **`a7b9e04`**（"A per-order path override, so a repeat-count rerun
+> is affordable"）である。`48eb7da` はその 1 つ手前。ただし `a7b9e04` の変更は
+> `jobs/tsubame_paths.sh` の 9 行だけ（`git show --stat a7b9e04`）でソースを
+> 触っていないので、**測定に使ったバイナリは `48eb7da` 相当のままで、表の値には
+> 影響しない**。正確な記法は「commit `a7b9e04` + 本コミット（`90bef60`）」。
+
 ## 0. 何を埋める検証か
 
 `AGENTS.md` の数値契約が要求するのは、**点変化係数での owned `dqdt` 全点比較**、
@@ -40,12 +49,19 @@ LGL 重み `w1D` で積分すれば L2 誤差も総質量も出る。
 すなわちベンチマークの dt では**空間離散化誤差も時間離散化誤差も丸め誤差以下**
 であり、次節が比べているのは実装どうしの一致である。
 
-## 2. 全経路が、厳密解に対しても互いに対しても一致する
+## 2. 表の 7 経路が、厳密解に対しても互いに対しても一致する
 
 `t_end` は p=7 / 63 で 0.01、p=255 で 0.001（`namelists/acc_p*_gemm.conf` の
 `dt` × `nstep`）。厳密解に対する相対 L2、L∞ 絶対誤差、質量ドリフト。
-質量の厳密値は 0（`sin` の 1 周期積分）なので、ドリフト欄はそのまま
-「0 からのずれ」である。
+質量の厳密値は 0（`sin` の 1 周期積分）である。ただし**ドリフト欄が引いて
+いるのは厳密値 0 ではなく、同じ LGL 重みで積分した離散初期質量
+`mass (initial)`** である（`main.f90` の `report_accuracy_if_requested` が
+出す `mass drift:` は `mass - mass0`、`main.f90:555`）。離散初期質量自体も
+丸め誤差の水準なので値の桁は変わらない——`sin(2πx)` は領域中心について
+反対称、LGL 節点と重みは要素中心について対称で、`acc_*` の 3 設定は
+どれも要素数が偶数か `Ne=1`（p=255）なので、`mass0` は厳密演算なら
+節点ごとに打ち消し合って 0 になり、残るのは丸めだけである。
+それでも欄の定義は「0 からのずれ」ではなく「離散初期質量からのずれ」である。
 
 | p | 経路 | 相対 L2 | L∞ | 質量ドリフト |
 |---:|---|---:|---:|---:|
@@ -101,6 +117,13 @@ p=3、`Ne=4³`、dt=1e-5、`nstep=100`、t=0.001）:
 （この実行は CPU / OpenMP ビルドで、`AGENTS.md` が要求する
 非 CUDA ビルドの確認も兼ねている。）
 
+> **（2026-09-09 追記、provenance）**: 本節の実行に使った**入力ファイル名と
+> ビルドコマンドは記録されていない**。p=3 / `Ne=4³` の namelist は
+> `namelists/` に無く（`acc_*` は p=7 / 63 / 255 の 3 本のみ）、ローカルの
+> 成果物ディレクトリにもこの実行のログは残っていない。上に書かれた
+> パラメータ（`OPENACC_SPLIT`、p=3、`Ne=4³`、dt=1e-5、`nstep=100`、t=0.001）
+> からの再構成はできるが、当時のファイルそのものは復元できない。
+
 ## 3. 制約と、やっていないこと
 
 - **定数速度でしか動かない。**点変化係数（`SCALE_DG_VARYING_COEFF=1`）には
@@ -113,6 +136,18 @@ p=3、`Ne=4³`、dt=1e-5、`nstep=100`、t=0.001）:
   **厳密解を任意の t で評価する**ことで代えている（数学的には同じ検証で、
   1 周期に特別な意味は無い）。p=7 の 1 周期（`nstep=100000`、t=1.0）だけは
   実際に走らせた: §4。
+
+> **（2026-09-09 追記）**: §2 の表は**現行 11 経路のうち 7 経路**であり、
+> 見出しの「全経路」は言い過ぎだったので「表の 7 経路」に直した。対象外は
+> `OPENACC_ASIS` / `OPENACC_SPLIT` の 2 経路（`make CUDA=1` の `FFLAGS` にも
+> `-acc=gpu` が入るので CUDA ビルドでも選べる。単に未測定で、§2.1 が粗い格子・
+> 非 CUDA ビルドで `OPENACC_SPLIT` を走らせているのが唯一の点）と、
+> `CUDAFORTRAN_GEMM_OZAKI1` / `CUDAFORTRAN_GEMM_OZAKI2` の 2 経路である。
+> 後者のうち **`OZAKI2` は実行ファイルの既定設定で数値不合格**
+> （[`measurement_inventory.md`](measurement_inventory.md) §10.1: FIXED / ADP ×
+> 7 / 14 moduli の 4 通りとも p=7 owned `dqdt` の max abs が 1.86e-01〜2.97e-01）
+> なので、この表に載せても一致しないことが先に分かっている。`OZAKI1` は
+> FIXED / 7 slices なら 3.55e-15 だが、この積分検証は未実施である。
 
 ## 4. 1 周期（p=7、`FUSED_TC`、`nstep=100000`、t = 1.0）
 
@@ -142,10 +177,19 @@ for path in CUDAFORTRAN_SPLIT CUDAFORTRAN_FUSED CUDAFORTRAN_FUSED_TC \
             CUDAFORTRAN_GEMM_FUSED; do
   sed "s/DqdtKernel_Type = \"CUDAFORTRAN_GEMM\"/DqdtKernel_Type = \"$path\"/" \
       namelists/acc_p63_gemm.conf > /tmp/acc.conf
-  SCALE_DG_ACCURACY=1 ./scale-dg_extraction /tmp/acc.conf | grep -A6 '^Accuracy'
+  SCALE_DG_ACCURACY=1 ./scale-dg_extraction /tmp/acc.conf | grep -A7 '^Accuracy'
 done
 ```
 
 §1 の dt 収束は `namelists/acc_p7_gemm.conf` の `dt` と `nstep` を
 （1.0e-4, 100）/（5.0e-5, 200）/（2.5e-5, 400）/（1.0e-5, 1000）に替えたもの。
-§4 は同じファイルで `nstep = 100000`。
+§4 は同じファイルで `nstep = 100000`。**どちらも `DqdtKernel_Type` を
+`CUDAFORTRAN_FUSED_TC` に差し替えて走らせている**（`acc_p7_gemm.conf` の
+既定は `CUDAFORTRAN_GEMM`。§1 / §4 の見出しが `FUSED_TC` なのはこのため）。
+
+> **（2026-09-09 追記、再現手順の訂正）**: 上の `grep` は当初 `-A6` だったが、
+> それでは最終行の `mass drift:` が切れる。`report_accuracy_if_requested`
+> （`main.f90`）は見出し `Accuracy (time-integrated solution vs analytic):`
+> の下に **7 行**（`final time` / `L2 error (absolute)` / `L2 error (relative)`
+> / `Linf error` / `mass (final)` / `mass (initial)` / `mass drift`）を出すので、
+> **`-A7`** が要る。上のブロックは `-A7` に直してある。

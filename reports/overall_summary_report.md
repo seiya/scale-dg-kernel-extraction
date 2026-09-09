@@ -219,6 +219,15 @@ cuBLAS **3.881 s** / CUTE **3.914 s** / **z-epilogue FUSED 3.603 s**
 FUSED_TC 1.13×、GEMM **3.50×**。融合 epilogue の詳細は
 [`p255_gap_study.md`](p255_gap_study.md) §0。
 
+（2026-09-09 追記: provenance の補足。上の表は §4.1 と同じ一括測定で、commit
+`299a868` / Slurm job `41348` / host `c162` である。これに対し「同条件の別セッション
+実測」の 3 値（cuBLAS 3.881 / CUTE 3.914 / z-epilogue FUSED 3.603 s）は、
+**測定時の commit も job ID も host も記録されていない。** 初出は `e971ba5` が
+`reports/` を作ったときに取り込んだ `p255_gemm_fusion_session_report.md`
+（`508c0d0` で本レポート等へ統合・削除）だが、そちらにも記載が無く、復元できない。
+この 3 値は絶対値ではなく当時の相対比（CUTE 比 −8%、cuBLAS 比 −7%）としてのみ
+読むこと。）
+
 ---
 
 ## 5. nsys によるカーネル内訳（`nstep=10`, job 43219）
@@ -576,6 +585,11 @@ tendency 以外になった。** RK 更新は既に 5.06 TB/s（HBM3e 実効と�
 1.5473 → 1.4520 s、p=255 `GEMM_FUSED` で 4.1889 → 4.0968 s
 （`nstep=1000`, 各 3 回平均、login node）。`Cal_tend` と `CUDA device` は不変。
 
+（2026-09-09 追記: provenance の補足。login node 実行なので job ID は無い。
+実行体の commit も本文に無いが、この §8.1 の追記と `main.f90` の融合は同一コミット
+`44814b7`（"Fuse the SSP-RK q0 save into the first-stage update"）で入っているので、
+「融合後」は `44814b7`、「融合前」はその親 `44814b7^` のツリーである。）
+
 数値検証: `SCALE_DG_VARYING_COEFF=1`、`Ne=8^3`, `nstep=7`,
 `CUDAFORTRAN_FUSED_TC` で最終 `q(:,1:Ne)` 262,144 点が融合前と**ビット一致**。
 `nstep=1000` の min/max も p=7 の 2 パス、p=255 `GEMM_FUSED`、非 CUDA の
@@ -718,6 +732,12 @@ lift 側の DRAM は 670 → 134 MB になる。加算順は GEMM と同じ `(x+
 `nstep=1000`、`UseCudaGraph = .false.`、login node。
 **§5.1 と §6 の lift 行は変更前の値である。**
 
+（2026-09-09 追記: provenance の補足。login node 実行なので job ID は無い。
+「変更前」の commit は表に `514853f` と書かれているが「変更後」の commit は本文に
+無い。この §8.4 の追記と `separable_lift_kernel`（`mod_cuda_dg_kernels.cuf`）は
+同一コミット `a8a44d9`（"Write the p=255 lift once instead of accumulating it
+through three GEMMs"）で入っているので、「変更後」は `a8a44d9` のツリーである。）
+
 残っているのは z-epilogue が `lift_out` を読む 134 MB で、これは lift を
 epilogue 内で面から直接評価すれば消える（§12-6）。
 
@@ -751,6 +771,14 @@ epilogue に足した整数演算がそのまま効く。
 1089 → 1027 µs/call。`514853f` からの通算 Main **−12.8%**。
 旧実装と**ビット一致**。p=255 `Ne=2` の `GEMM_FUSED` vs `FUSED_TC` も
 3.553e-15。非 CUDA ビルドも通る。
+
+（2026-09-09 追記: provenance の補足。login node 実行なので job ID は無い。
+最終行「lift を epilogue へ（column 不変量を hoist）」の実行体 commit は本文に
+無いが、この §8.5 の追記と `cutlass_z_gemm_assembly.h` の epilogue 改修は同一
+コミット `d7b1853`（"Build the p=255 lift inside the z epilogue instead of reading
+it back"）で入っているので、その版は `d7b1853` のツリーである。表の中間 2 行
+（`separable_lift_kernel` 版、除算そのまま版）は `a8a44d9` と、その上に積んだ
+未コミットの中間版であり、後者の commit は記録されていない。）
 
 **§5.1 と §6 の lift 行・z GEMM 行はいずれも変更前の値である。**
 z GEMM のレジスタ 242 本と SM throughput 79.8% は epilogue を厚くした分
@@ -1098,6 +1126,27 @@ z の結果から見て、どちらも時間では報われない公算が大き
   nsys カーネル総和（1.25 ms/call）より大きい値（1.90 ms/call）を示す。
   `nstep=1000` では 1.29 ms/call に収束する。**定常値は nsys 側を使うこと。**
 - p=7 FUSED は両者が一致する（app 384.8 µs、nsys 379.5 µs、nstep=1000 で 383.4 µs）。
+- （2026-09-09 追記: **本レポートが引用する入力ファイル名とジョブスクリプト名は
+  すべて測定当時のもので、現行ツリーにはその名前では存在しない。** 本文の旧名は
+  書き換えず、対応は `e13d802` で追加した `namelists/MAPPING.md` と
+  `jobs/MAPPING.md` で引くこと。本レポートに関係する行は
+  `conf_perf_p7.conf` → `namelists/perf_p7_fused_tc.conf`、
+  `conf_perf_p15.conf` → `namelists/perf_p15_fused.conf`、
+  `conf_perf_p31_fused.conf` → `namelists/perf_p31_fused.conf`、
+  `conf_perf_p63_fused.conf` → `namelists/perf_p63_fused.conf`、
+  `conf_perf_p127_fused.conf` → `namelists/perf_p127_fused.conf`、
+  `conf_perf_p255.conf` → `namelists/perf_p255_gemm_fused.conf`、
+  `conf_perf_p255_tc.conf` → `namelists/perf_p255_fused_tc.conf`、
+  `job_all.sh` → `jobs/sweep_p7_p255_all_paths.sh`（現ツリーに実在するが未追跡）、
+  `gen_ncu_cmds.sh` → `jobs/gen_ncu_cmds.sh`（同じく未追跡）。
+  §8.9 が引く `bench_runs/p255_gemm_fused.conf` は両 MAPPING のどちらにも項目が
+  無く、`bench_runs/` 自体が現ツリーに存在しない。**この 1 本だけは対応先が
+  記録されていない。**）
+- （2026-09-09 追記: 上表の「152 SM」は `cudaGetDeviceProperties` の
+  `multiProcessorCount` を RIKYU ログインノードで実測して確認した（GPU 4 基とも
+  152、CC 10.0、SM clock 上限 2062 MHz）。§7 の 40.12 TFLOP/s
+  ＝ 2 FLOP × 64 FMA/clk/SM × **152** × 2.062 GHz もこの値による。他レポートに
+  148 を使っている箇所があるが、SM 数としては 148 が誤りである。）
 
 ### 11.1 測定バッチの補完と注意点
 
@@ -1380,6 +1429,13 @@ TMA はコピーエンジンであって MMA とは直交しているので、
 | `cuda_cublas_gemm.cu` / `cuda_cutlass_gemm_fused.cu` | cuBLAS / CUTLASS GEMM 経路 |
 | `cutlass_z_gemm_assembly.h` | z batched GEMM の TensorOp mainloop + assembly epilogue |
 | `mod_mesh.f90` | mesh・マッピング・halo・p=255 演算子生成 |
+
+（2026-09-09 追記: 上表のうち `bench_runs/` は現行ツリーに存在しない。`output/`
+は存在するが中身は入れ替わっており、job `43219` のレポートはもう残っていない。
+`job_all.sh` / `gen_ncu_cmds.sh` はこの名前では存在しない（実体は
+`jobs/sweep_p7_p255_all_paths.sh` と `jobs/gen_ncu_cmds.sh`、いずれも未追跡）。
+入力ファイル名を含む対応は §11 の補足と `namelists/MAPPING.md` /
+`jobs/MAPPING.md` で引くこと。）
 
 ---
 

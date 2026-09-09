@@ -21,6 +21,41 @@ ncu は Slurm job `62367`（改修前）、`62642`（二重バッファ導入時
 `CUDA_VISIBLE_DEVICES=1` に固定し、3〜5 回の中央値を採っている。
 これを固定せずに採った測定は一度捨てている。
 
+**（追記 2026-09-09）物差しは §15.12 で切り替わっている。** 上の「すべて
+`CUDA_VISIBLE_DEVICES=1` の 3〜5 回中央値」が当てはまるのは §1–§15.11 と、
+§15.12 以降でも本文が「login」と書いている値だけである。**§15.12
+（job `67470`、本レポートで最初の交互 A/B）以降の採否は、Slurm で占有した
+GPU 上で変種を交互に 12 ラウンド走らせた中央値とレンジで判定している**
+（§21 以降・§26–§29 も同じ）。login の 3〜5 回中央値は掃引と一次選抜に
+しか使っていない。ヘッダの記述は当時のまま残す。**例外は §16–§20 で、この 5 節は
+login node GPU 1 上の交互 A/B と 4〜5 回中央値である**（§16 の「同一 GPU で交互」も
+login の意味）。そちらの断りは §20 末尾に置いた。
+
+**（追記 2026-09-09）ヘッダの入力ファイル名は当時のもの。** `9dfea48`
+（2026-08-30「Keep only sample and published-mesh namelists under
+namelists/.」）で namelists が `{purpose}_p{order}_{kernel}.conf` に整理された。
+現行の対応は次のとおりで、**4 本とも中身はバイト単位で同一**（`NeX/NeY/NeZ`・
+`PolyOrder`・`dt`・`nstep` は変わっていない）:
+
+| 本文の名前 | 現行 | `DqdtKernel_Type` |
+|---|---|---|
+| `conf_perf_p255_tc.conf` | `namelists/perf_p255_fused_tc.conf` | `CUDAFORTRAN_FUSED_TC` |
+| `conf_perf_p255.conf` | `namelists/perf_p255_gemm_fused.conf` | `CUDAFORTRAN_GEMM_FUSED` |
+| `input_p255_val_tc.conf` | `namelists/val_p255_fused_tc.conf` | `CUDAFORTRAN_FUSED_TC` |
+| `input_p255_val_gemm.conf` | `namelists/val_p255_gemm.conf` | `CUDAFORTRAN_GEMM` |
+
+旧名のファイル自体は現行ツリーに無い（履歴では `conf_perf_*` が `6466dc0`、
+`input_p255_val_*` が `9dfea48^` に残り、上の 4 本はその版と `diff` でバイト単位一致）。
+`conf_perf_p255_tc_ncu.conf` に対応するコミット済みファイルは無い:
+`namelists/README.md` の方針どおり `_ncu` コピーは追跡せず、
+`perf_p255_fused_tc.conf` の `nstep` を 4 に落としたコピーを使う。
+この対応は本文中の同名参照（§0 の `conf_perf_p255*.conf`、§9 の
+`conf_perf_p255.conf` / `conf_perf_p255_tc.conf` と `conf_perf_p255_ncu.conf`、
+§11–§15 の `conf_perf_p255_tc.conf`）にもそのまま当てはまる。§14–§15 が使っている
+`output/conf_perf_p255_fused_ncu.conf` は現在ローカルの
+`output/perf_p255_fused_ncu.conf`（§26 以降は `jobs/perf_p255_fused{,_tc}_ncu.conf`）で、
+`_ncu` 系はいずれも追跡していない。
+
 ## 0. 前史: volume GEMM 融合と Tensor Core タイル化
 
 旧 `p255_gemm_fusion_session_report.md`（2026-08-25 の GEMM / z-epilogue
@@ -801,6 +836,16 @@ ncu job `64240`: z は SM 79.6%（73.4 から）、命令 117.6 M（136.4 M か�
 - **カーネル間の隙間 14 µs**（nsys 実測、`volume_flux`→x 4.2、x→y 2.9、y→z 6.5 µs）。
   カーネルを減らす方向は §10.4 の x batched 化で負けている。
 
+**（追記 2026-09-09）この 84 / 86 / 84% と §10.8 結論の「合計 808 µs に対し
+mma 下限 643 µs」（= 79.6%）は分母が違う。** 84 / 86 / 84% は **mainloop だけ**の
+分母で、z については assembly epilogue を除いた時間に対する比である
+（上の表の「epilogue 全部」−4.5% ＝ 1021.3 の 46.0 µs を §10.5 の z 299.6 µs から
+引くと 253.6 µs、mma 下限 214.2 µs に対し 84.5%）。一方 §10.8 の 808 µs は
+§10.5 の nsys job `64240` の**カーネル全体**（x 258.0 + y 249.8 + z 299.6）で、
+epilogue 込みである。同じカーネル全体の分母では z は 214.2 / 299.6 = **71.5%**
+であり、**79.6% は 84 / 86 / 84 の平均ではない**。表の数値はどちらも
+書き換えない。
+
 ### 10.7 検証
 
 `SCALE_DG_VARYING_COEFF=1` で `SCALE_DG_DUMP_DQDT` により `dqdt(:,1:Ne)` を
@@ -889,6 +934,10 @@ shared を 36 KB に落とせば 5 ブロックぶんの余地はできるが、
 85% はライブラリ水準の実効天井であり、ここを越えるのは CUTLASS 3.x / CuTe で
 TMA と warp specialization を使う FP64 カーネルを書く作業になる。
 **p=255 で `FUSED_TC` との差 6.2 µs（0.6%）を埋める安い手はもう無い。**
+
+**（追記 2026-09-09）** ここの 643/808 = 79.6% は**カーネル全体**（epilogue 込み）
+の分母で、直前の「x 84%、y 86%、z 84%」は **mainloop だけ**の分母である。
+z をカーネル全体で見ると 71.5% になる。導出は §10.6 の追記。
 
 **（追記 2026-08-28、`p127_gap_study.md` §13）この「もう無い」は半分だけ正しかった。**
 p=127 で z の epilogue を追いかけたところ、mainloop 以外にまだ 3 つ残っていて、
@@ -2432,6 +2481,23 @@ y/z の 2-outer×4-inner は §15.99 と同一仮説。`__ldcs` / `__ldca` は �
 
 これ以上、契約を保ったまま測れるノブは残っていない。
 
+**（追記 2026-09-09）この「測り尽くした」は覆った。** 契約内のノブが 2 つ残っていた。
+
+- **出力タイル (A) × レジスタ予算 (B) の第 2 段**（§26.6–§26.7）: **−18.63%**
+  （1874.26 → 1525.00 µs/stage、job `78165`、node c186、12 ラウンド交互、
+  レンジ非重複）。
+- **ブロック形状 `(BDX, 128/BDX)`**（§28.3–§28.4）: **−5.60%**
+  （1525.50 → 1440.04 µs/stage、job `78391`、node c186、12 ラウンド交互）。
+
+本節が「TC / FUSED = 2.04×」と書いている主比（向きは §26.9 の主比 B と同じ
+`FUSED` / `FUSED_TC` で、上の `918.9 / 1868.6` は分子分母が逆。割り直すと
+1868.6 / 918.9 = **2.03×** で、表の 2 値はそのまま）も、
+**1440.04 / 883.55 = 1.630×**（§28.10）に縮んだ。覆った理由は §28.9 が書いているとおり「当時の候補集合に、後から
+他次数（`p63_gap_study.md` §53–§54、`p127_gap_study.md` §24–§25）を経由して
+来た軸が入っていなかった」ためで、上の不採用表と残天井の一覧はそのまま
+証拠として残す。`FUSED`（CC、p=255）の探索終了宣言は、候補集合を明示した形で
+§28.9 が改めて出している。
+
 ## 16. p=255 `FUSED_TC` の残り天井（2026-08-30）
 
 commit `265ef15`、login node GPU 1、`make CUDA=1 GPUFLAGS=-gpu=cc100`、
@@ -2557,6 +2623,18 @@ Lift / flux の前に 16 対まとめて発行するとその待ちが他のエ�
 採用後: Main **2.871 ms/step**、device **883.2 µs/stage**（4-run 中央値
 5.0345×10⁻² s / 57）。y/z を最終 MMA に載せた §19 の +15% とは違い、
 mma が終わったあとのエピローグ内ハイストである。
+
+**（追記 2026-09-09、§17–§20 の物差しについて）** この 4 節の採否はすべて
+**login node GPU 1 の 4-run 中央値**で決めており、§15.12 以降の CC 側が使っている
+占有 GPU の交互 A/B（レンジ非重複を要求する）を通していない。1 変更あたりの
+採用幅は −0.27%（§18）から −0.99%（§20）で、いずれも 1% 未満である
+（節単位で足すと §17 が −1.17%、§20 が −1.33% で 1% を超える）。
+**累積（§16 の 912.6 → §20 の 883.2 µs/stage）は後から占有 GPU で追認されている**:
+§26.1 の job `78165`（node c186、12 ラウンド交互）が `FUSED_TC` を **883.55
+µs/stage**（レンジ 882.75–883.96）、§29.2 の job `78530`（node c187）が
+**880.5 µs/stage**（レンジ 879.2–881.2）を出しており、どちらも §20 の 883.2 と
+0.4% 以内で一致する。**追認されているのは累積だけで、個々の 1% 未満の採否が
+占有 GPU で再現するかは測っていない。** 上の表は当時の login 測定として残す。
 
 ## 21. P 側 gather を x Escale より先に発行する（2026-08-30、占有 GPU で不採用）
 
@@ -2899,6 +2977,35 @@ DFMA を同じジョブに入れて確かめる（`TODO.md` §6 の
   **ncu の時間は採否に使っていない**（クロック固定バイアス）。
 - ptxas は `nvcc -O3 -std=c++17 -arch=sm_100 -Ithird_party/cutlass/include
   --expt-relaxed-constexpr -Xptxas -v`
+
+**（追記 2026-09-09）`jobs/ncu_p255_regbudget.sh` は未追跡（`jobs/` の
+allowlist 外）なので、`ncu` の起動形を本文に転記しておく。** ジョブは
+`#SBATCH --gpus=1` と `module load nvhpc` のうえで、凍結実行ファイル
+`scale-dg_extraction.{p255_v0,p255_final,p255_zdg}`（CC 側）と
+`scale-dg_extraction.{p255_v0,p255_tm2,p255_bk32m2}`（TC 側）に対して次を回す:
+
+```bash
+timeout 400 ncu --target-processes all -k regex:"tendency_[xyz]_p255_cc_kernel" \
+  -c 3 --metrics $M --csv scale-dg_extraction.$v jobs/perf_p255_fused_ncu.conf
+timeout 400 ncu --target-processes all -k regex:"tendency_p255_kernel" \
+  -c 3 --metrics $M --csv scale-dg_extraction.$v jobs/perf_p255_fused_tc_ncu.conf
+```
+
+`$M` は 18 メトリクス:
+`sm__throughput.avg.pct_of_peak_sustained_elapsed`,
+`gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed`,
+`l1tex__throughput.avg.pct_of_peak_sustained_elapsed`,
+`sm__warps_active.avg.pct_of_peak_sustained_active`,
+`smsp__inst_executed.sum`,
+`l1tex__data_pipe_lsu_wavefronts_mem_shared.sum`,
+`l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum`,
+`l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum`,
+`dram__bytes_read.sum`, `dram__bytes_write.sum`,
+`smsp__average_warp_latency_issue_stalled_{long_scoreboard,mio_throttle,barrier,lg_throttle,math_pipe_throttle,wait}.ratio`,
+`launch__registers_per_thread`, `launch__occupancy_limit_registers`。
+`--set` は使っていないので Memory Workload Analysis は入っておらず、
+shared のバンクコンフリクトはこの CSV からは見えない
+（見ているのは `l1tex__data_pipe_lsu_wavefronts_mem_shared.sum` の増減だけ）。
 
 同一ジョブのベースライン（12 ラウンド中央値、`µs/stage`）:
 
@@ -3773,6 +3880,12 @@ p=255 に `CUDAFORTRAN_SPLIT` は無いので参照は `GEMM`（§25 / §26.8 �
   `nsys profile --resolve-symbols=false -t cuda -f true`、`DEBUGINFOD_URLS=` 空、
   `timeout 600`。集計は `nsys stats --report cuda_gpu_kern_sum --format csv` の
   **Med (ns)**（12 インスタンス = 4 step × 3 stage）。
+- **（追記 2026-09-09）** ジョブスクリプト `jobs/nsys_p255_roof_unexp3.sh` は
+  未追跡（`jobs/` の allowlist 外）だが、**上の `nsys profile` と `nsys stats`
+  の 2 行が起動形の本体**である。補足すると、`-o` は
+  `valdump/nsys_p255_{fused_tc,gemm_fused}`、PART B の入力は
+  `namelists/perf_p255_fused_tc.conf` と `jobs/perf_p255_gemm_fused.conf` を
+  `sed 's/nstep = 20/nstep = 4/'` で落とした複製である。
 
 ### 29.2 実時間（PART A、12 ラウンド交互、µs/stage）
 

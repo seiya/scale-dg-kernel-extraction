@@ -130,6 +130,27 @@ write/read回数は変わらないため、§5の測定表は当時の結果と�
 - `input_p575_val_gemm.conf`
 - `input_p575_val_gemm_fused.conf`
 
+> **（参照名の注記 2026-09-09）** 本レポートが名指す入力ファイル名は当時のもので、
+> **現行ツリーには存在しない**。現行の対応は次のとおり（`namelists/README.md` の
+> 命名規則 `{purpose}_p{order}_{kernel}.conf`）。
+>
+> | 本文の名前 | 現行 |
+> |---|---|
+> | `input_p575_val_gemm.conf`（本節） | `namelists/val_p575_gemm.conf` |
+> | `input_p575_val_gemm_fused.conf`（本節） | `namelists/val_p575_gemm_fused.conf` |
+> | `/tmp/conf_perf_p575_gemm.conf`（§5.1） | `namelists/perf_p575_gemm.conf` |
+> | `/tmp/conf_perf_p575_gemm_fused.conf`（§5.1） | `namelists/perf_p575_gemm_fused.conf` |
+> | `input_p575_val_gemm_emu.conf`（§9） | `namelists/val_p575_gemm_emu_n50.conf` |
+>
+> **パラメータは一致している。** `perf_` の 2 本は §5.1 が並べた設定
+> （`NeX=NeY=NeZ=1`、`PolyOrder=575`、`dt=1.0D-8`、`nstep=50`、`WarmupStep=5`、
+> `UseCudaGraph=.false.`、`MeasureKernelTime=.true.`、`CublasEmulation=.false.`、
+> `CutlassMmaShape="8x8x4"`）と同一で、`DqdtKernel_Type` だけが違う。
+> `val_` の 2 本は同じメッシュの `nstep=1` / `output_interval=1` 版
+> （計時用の `WarmupStep` / `MeasureKernelTime` / `CutlassMmaShape` は持たない）、
+> `val_p575_gemm_emu_n50.conf` は `CublasEmulation=.true.` の `nstep=50` 版である。
+> **本文のファイル名は当時の記録として書き換えずに残す。**
+
 ## 4. 数値検証
 
 ### 4.1 方法
@@ -409,6 +430,21 @@ uncapped が +36%、148 ブロックが +13% で、下に凸だが底が現行�
 flux 側が長くなって y GEMM の開始を遅らせ、grid を広げると x GEMM から SM を
 奪う**という両側から挟まれた形で、間に得をする窓が無い。コードは戻した。
 
+> **（注記 2026-09-09）** 上の掃引のブロック上限は **SM 数を 148 と置いて**
+> 決めている（888 = 6×148、1776 = 12×148、3552 = 24×148、login 掃引の
+> 「148 ブロック」= 1 SM 1 ブロック）。**GB200 の SM 数は 152 である**:
+> `cudaGetDeviceProperties` の `multiProcessorCount` を RIKYU ログインノードで
+> 実測すると 4 基とも **152**（cc 10.0、SM clock 上限 2062 MHz）で、
+> [`p511_gap_study.md`](p511_gap_study.md) §14.1 の実測とも一致する。
+> 本レポート内部にも裏付けがある: §11.8 が ncu から数えたスケジューラ数
+> 「約 605」は 152 SM × 4 = **608** とほぼ一致し、148 SM が含意する 592 とは
+> 合わない。
+> したがって上の 3 点は 1 SM あたり 5.84 / 11.68 / 23.37 ブロックで、
+> **「整数波」の点にはなっていない**（「148 ブロック」も 1 波ではなく 0.974 波）。
+> **採否は変わらない**——3 点とも赤字でレンジは全部非重複、かつ login の粗い掃引で
+> 底が現行より上にあるという読みはこの点の取り方に依存しない。
+> **測定値と上表は書き換えずに残す。**
+
 ### 11.8 重ねの天井（job `74816`、c368）と 3 本の GEMM の律速（ncu job `74815`、c190）
 
 **天井。** §11.1 / §11.7 が測ったのは「重ねる機構」の値段なので、賞金の方も
@@ -676,6 +712,43 @@ x / y のタイル軸は M/N（§11.2）・段数（§11.13）・K（§11.14）�
 「DRAM 律速のフルグリッドカーネルを、FP64 パイプ 95% の GEMM の裏に
 入れる手段が無い」という形で閉じている。新しい機構（GEMM の CTA の中で
 flux を分担して計算する等）を思いつけば再開する価値がある。
+
+> **（撤回注記 2026-09-09）** 「**契約内で残っている実装ノブは無い**」は
+> 成り立たなかった。本節の後に
+> [`p767_gap_study.md`](p767_gap_study.md) §14.1 が契約内のノブを 1 つ見つけている:
+> **`Nq>=512` の batched x にも accumulator repad を戻す**
+> （`run_gemm_batched_nn_scaled_capped` の `RepadEpilogue<..., 8>`。p=767 で
+> **−0.075%**、shared store conflict 30.70 M → 2.54 M、発行命令は不変）。
+> §11.2 で x を batched に替えたときに `run_gemm_nn_scaled_repad` の pad が
+> 外れていた、という取りこぼしであり、**§11 の掃引 4 軸（M/N・段数・K・warp）の
+> どれでもない 5 本目の軸**である。ゲートは `Nq >= 512` なので
+> **p=575（Nq=576）の x にもそのまま載っている**（現行ツリー
+> `cuda_cutlass_gemm_fused.cu:1009-1013` の分岐が呼ぶ
+> `run_gemm_batched_nn_scaled` は同 `:903-913` で `_capped` に転送される別名で、
+> repad 付き）。**p=575 単独での取り分は測っていない。**
+> 現行ツリー（`e113535`）の p=575 `GEMM_FUSED` は **19305.3 µs/stage**
+> （[`measurement_inventory.md`](measurement_inventory.md) §18.3、Slurm `83460`、
+> node `c286`、`--exclusive`、3 ラウンド交互）。本節の 19347 µs/stage との差
+> −0.22% は**ツリーも測定条件も違うので repad の取り分として読んではならない**。
+> **上の 2 表は本節時点の測定として書き換えずに残す。**
+
+> **（provenance 注記 2026-09-09）** 「終了根拠」の内訳
+> **x 5867 + y 5734 + z 6137 + flux 1477 µs** の 4 値は、**どのジョブ・どの
+> 実行ファイルで採ったかがこのレポートに記録されていない**。本文に出所が残る
+> 最も近い内訳は §11.8 の nsys job `74701`（c399）の x 5890 / y 5758 / z 6118 µs
+> と、§11 冒頭の nsys job `71124`（c178、baseline、`nstep=4`）の
+> `volume_flux` 1478 µs で、上の 4 値はそのどちらとも一致しない。
+> **この 4 値の job / commit は記録されていないので、再現には §11.8 の値を使うこと。**
+> **§11 全体について、nsys / ncu の完全なコマンドラインも記録されていない**
+> （当時のジョブスクリプトは残っていない。`jobs/` に現存する p=575 を含む
+> profiler スクリプト —— ncu の `jobs/roof_bytes_ncu.sh`、nsys の
+> `jobs/nsys_invnq_mid.sh` —— はいずれも後年の別作業のもので、§11 の
+> job `71124` / `74701` / `74815` / `74816` のものではない）。
+> 本文に残っているのは ncu 側の
+> `--set full` / `nstep=4` / `-s 9 -c 9`（§11.8）だけである。
+> AGENTS.md の規則では `nsys` はジョブ内の `export DEBUGINFOD_URLS=` と
+> コマンドラインの `--resolve-symbols=false` を必須とするが、
+> **当時それをどう与えたかは残っていない**ので、ここに書き起こすことはしない。
 
 ### 11.18 `feature/cuda` への rebase による訂正（2026-09-01）
 

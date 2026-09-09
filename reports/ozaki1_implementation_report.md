@@ -11,6 +11,17 @@
 対象 GPU: NVIDIA GB200（RIKYU login ノード）、`make CUDA=1 GPUFLAGS=-gpu=cc100`
 ビルド: NVIDIA HPC SDK 26.3、cuBLAS 13.2.1
 
+> **注記（2026-09-09、provenance）: 上のヘッダが指すブランチ `feature/ozaki` と
+> worktree `scale-dg-kernel-extraction-ozaki` は現存しない。**
+> `git branch -a` に `ozaki` を含む枝は無く、`git worktree list` にも当該 worktree は無い。
+> commit `74f09bc` 自体は現在の `feature/cuda` の祖先として残っている
+> （`git merge-base --is-ancestor 74f09bc HEAD` が真）ので、§1–§5 の実装記述は
+> その commit で追える。**ただし §6.2 / §7.2 の slice 統計は「`74f09bc` の上の
+> 未コミット差分」での測定であり、その差分はどのコミットにも残っていないので
+> 実行ファイルは再構成できない。**
+> 本レポートの測定はすべて login ノードでの直接実行で、**Slurm job ID は記録されていない**
+> （sbatch を経ていないので job ID が無いこと自体は欠落ではない）。
+
 本レポートは **volume 導関数 GEMM を Ozaki Scheme I で置換する経路**を本体に統合した記録である。
 Scheme II（`CUDAFORTRAN_GEMM_OZAKI2`）と並ぶ **比較・計測用経路**であり、性能最適化の主目的ではない。
 `CublasEmulation`（cuBLAS 内蔵 fixed-point）とは独立した経路である。
@@ -35,6 +46,26 @@ Scheme II（`CUDAFORTRAN_GEMM_OZAKI2`）と並ぶ **比較・計測用経路**�
 > `mantissaBitCount = 8×7 − 1 = 55` で cuBLAS の FIXED 55 に対応する）。
 > 同 commit で `OzakiModuliCount` の既定も 14 → **7** になっている。
 > **以降の本文で `s=8` と書かれた測定は、当時の既定での測定条件として読むこと。**
+
+> **注記（2026-09-09）: 表の「既存 `cuda_cal_dqdt_gemm` と同段構成」は
+> `2dadc41`（*Share fused and GEMM drivers so control paths stay aligned.*、2026-08-29）
+> より前の構成である。** 現行では `cuda_cal_dqdt_gemm_ozaki1`
+> （`mod_cuda_dg_kernels.cuf:2816`）も `cuda_cal_dqdt_gemm`（同 `:2640`）も、
+> 共有ドライバ `cuda_cal_dqdt_gemm_unfused(backend, …)`（同 `:2511`）を backend 定数
+> （`GEMM_VOL_OZAKI1` / `GEMM_VOL_CUBLAS` / `GEMM_VOL_OZAKI2`）だけ替えて呼ぶ薄い
+> ラッパで、「同段構成」ではなく**同一ドライバ**である。前段の 2 つの flux カーネルも
+> `3d4045c` 以降は共有ヘルパ `launch_flux_all`（同 `:3633`、呼び出しは `:2575`）に
+> 1 本化されている。
+
+> **注記（2026-09-09）: 表と本文の conf 名 `input_p*_val_gemm_ozaki1*.conf` は当時の
+> ファイル名で、現行ツリーには存在しない**（本文は当時の名前のまま残すという
+> `reports/README.md` の方針に従う）。現行の対応ファイルは
+> `namelists/val_p7_gemm_ozaki1_ne32.conf`、`namelists/val_p255_gemm_ozaki1.conf`、
+> `namelists/val_p7_gemm_ozaki1_ne32_n1000.conf` で、§10 の再現コマンドは既に現行名で
+> 書かれている。同じく §2.1 の注記が「130× 遅」の出典として挙げる
+> `input_p7_perf_gemm_emu.conf` も現存せず、現行の対応ファイルは
+> `namelists/perf_p7_gemm_emu_n1.conf`（p=7、`Ne=32³`、`CUDAFORTRAN_GEMM` ＋
+> `CublasEmulation=.true.`、`nstep=1`）である。
 
 ### 1.1 Scheme I と Scheme II の違い
 
@@ -156,6 +187,14 @@ namelist コメントとして整合を取った。
 | `bench_ozaki2/ozaki1_crt_test.cu` | 合成データで native DGEMM 比較 | 本番 `ozaki1_dgemm*` API の **回帰テスト**。 |
 | `bench_ozaki2/mini_ozaki2_all.cu`（Ozaki I API 差替） | 単体 GEMM 誤差比較 | OZAKI1/2 で **同一 INT8 核**のとき誤差一致を確認済み。 |
 
+> **注記（2026-09-09）: 表 3 行目の `bench_ozaki2/mini_ozaki2_all.cu` は現行ツリーにも
+> git 履歴にも存在しない**（`git log --all -- '*mini_ozaki2*'` が空。`bench_ozaki2/` で
+> 追跡されているのは `.gitignore` / `balance.py` / `combined.cu` / `int8_peak.cu` /
+> `ozaki1_crt_test.cu` / `ozaki2_crt_test.cu` / `ozaki2_floor.cu` / `p1023_emu_why.cu` /
+> `pscan.cu` の 9 本）。**したがってこの行と §5 の「OZAKI1/2 が同一誤差」を裏づける
+> 測定は再現できない。** 追跡されている `ozaki1_crt_test.cu` / `ozaki2_crt_test.cu` で
+> 取り直すまで、再現不能な記録として扱うこと。
+
 ---
 
 ## 3. アルゴリズム（`cuda_ozaki1_gemm.cu`）
@@ -211,9 +250,16 @@ OZAKI2 は slice あたり scale を上書き再利用するため顕在化し�
 単体 GEMM テスト（`bench_ozaki2/mini_ozaki2_all.cu` を Ozaki I API に差し替え）では
 OZAKI1/2 が **同一誤差** —— 差は **B 側マルチスライス本数**と **CRT vs FP64 加算**に出る。
 
+> **注記（2026-09-09）: この段落と上表の p=7 単体 GEMM 行が依拠する
+> `bench_ozaki2/mini_ozaki2_all.cu` はツリーにも git 履歴にも存在せず、再現できない
+> （§2.4 の注記）。** 表の p=7 全体 `dqdt` の 2 行（21.5 / 23.7）は §6 の測定なので
+> この制約は掛からないが、それらは当時の ADP 既定の値である（§6 の注記）。
+
 ---
 
 ## 6. 数値検証
+
+### 6.1 定数速度・`nstep=1` の全点比較（p=7 / p=255）
 
 login ノード、`nstep=1`、定数速度（`SCALE_DG_VARYING_COEFF` 未設定）。
 `SCALE_DG_DUMP_DQDT` で owned `dqdt(:,1:Ne)` 全点比較、参照は `CUDAFORTRAN_GEMM`。
@@ -266,6 +312,8 @@ login ノード、`SCALE_DG_VARYING_COEFF=1`、`dt=10⁻⁵`、`nstep=1000`、`W
 
 ## 7. 性能（参考、login ノード・nstep=1）
 
+### 7.1 定数速度・`nstep=1` の device イベント
+
 device イベント行（`CUDA device Ozaki-I GEMM` / `GEMM tendency`）を 1 step 分として記録。
 **login ノード共有 GPU のためばらつきあり**。傾向比較用。
 
@@ -291,6 +339,16 @@ OZAKI1 が native より速く見えたが、スライスが早期打ち切り�
 > **本節の「p=255 Ne=1 では OZAKI1 が native より速く見えた」は、早期打ち切りで
 > pairs_sum が 15 まで落ちたときの値であって、現行既定では成立しない**
 > （現行既定では p=255 でも 23.4 倍遅い）。
+
+> **注記（2026-09-09、物差し）: 上表は `nstep=1` の 1 step 分の device イベントで、
+> 1 step ＝ SSP-RK3 の 3 stage（`RK_nstage`、`main.f90:15` と `:404`）である。**
+> µs/stage に直すと p=7 の `CUDAFORTRAN_GEMM` 39.6 ms は **13.2 ms/stage** で、
+> 同じ経路の現行値 1 613.2 µs/stage（job `78846`、上の注記）の **約 8.2 倍**にあたる。
+> `nstep=1` では初回の GEMM 呼び出しに乗る cuBLAS の 1 回限りの初期化
+> （`reports/README.md` の p=63 の項で **19.1 ms** と実測。`nstep=20` の Main の 42% を
+> 占める）が償却されず、device イベントにどれだけ載っているかも切り分けていない。
+> **したがって本節の絶対値は定常状態の µs/stage と比較できない。**
+> 経路間の比だけを傾向として読むこと。
 
 ### 7.2 変動係数・1000 step（§6.2 同一 run、`dt=10⁻⁵`）
 

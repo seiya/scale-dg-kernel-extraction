@@ -197,8 +197,10 @@ cat "$OUTDIR/metadata.txt"
 # is touched, which is what keeps the comparison one-axis.
 #-----------------------------------------------------------------------------
 # path spec: <kernel_type>[@<mma_shape>]
-make_config() { # $1 out  $2 order  $3 spec  [$4 nstep override]
-  local out=$1 order=$2 spec=$3 nstep_override=${4:-}
+# nstep is NOT touched here: the validation caller sheds it to 1 with its own
+# sed, so the timing configs keep the template's published nstep untouched.
+make_config() { # $1 out  $2 order  $3 spec
+  local out=$1 order=$2 spec=$3
   local kernel=${spec%%@*} shape=""
   case "$spec" in *@*) shape=${spec#*@} ;; esac
   local template="$N/perf_p${order}_gemm.conf"

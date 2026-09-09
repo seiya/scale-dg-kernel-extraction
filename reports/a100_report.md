@@ -196,7 +196,7 @@ core ピークと同じなので同じ分母を使う」を、**2 倍が現存�
 
 ---
 
-## 4. 予測 2 は当たった —— そして §8.7.1 は機種条件付きになる
+## 4. 予測 2 は当たった —— そして `h100_report.md` §8.7.1 は機種条件付きになる
 
 ### 4.1 `FUSED_TC ÷ FUSED`
 
@@ -228,7 +228,7 @@ p=63 の 0.932 は、PDL 欠落の税を織り込んだ調整値 **0.947**（`a1
 
 高次で **A100 の mma 利得が 3 台で最大**になる（p=511 で 2.59、GB200 2.25、
 H100 2.17）。低次では最小（p=7 で 1.01）で、**HBM 律速の領域では mma は何も
-買わない**という §8.7.1 の描像がそのまま出ている。
+買わない**という `h100_report.md` §8.7.1 の描像がそのまま出ている。
 
 ### 4.3 `h100_report.md` §8.7.1 への注記
 
@@ -386,9 +386,10 @@ Loading gcc/12.2.0
 | 127 | `FUSED_TC` | 2.0385 | 2.1038 | **+3.20%** | 0.45% | 0.33% |
 | 127 | `FUSED_DFMA` | 4.6291 | 4.7881 | **+3.43%** | 0.15% | 0.07% |
 
-レンジは 2 経路とも非重複。PDL 有の中央値は §8.1 の GB200 実測（`FUSED_TC`
-2.0345、`FUSED_DFMA` 4.6225）と 0.2% 以内で一致し、**マクロの追加は既定の
-挙動を変えていない**。数値も p=127 で `SPLIT` 対照に対し相対 4.156e-16。
+レンジは 2 経路とも非重複。PDL 有の中央値は `h100_report.md` §8.1 の
+GB200 実測（`FUSED_TC` 2.0345、`FUSED_DFMA` 4.6225）と 0.2% 以内で一致し、
+**マクロの追加は既定の挙動を変えていない**。数値も p=127 で `SPLIT` 対照に
+対し相対 4.156e-16。
 
 ### 8.1 3 次数そろった PDL の税
 
@@ -918,6 +919,16 @@ job `9523261` の実測 1 分 49 秒から 180 起動は約 36 分、`share-shor
 | 掃引 | `CLOCKS="base none"` × `REPEATS=10` × 9 構成 = **180 起動、全て `rc=0`** |
 | クロック | `none` で **1.39 GHz**（A100 boost 1410 MHz）。GB200 は 2.04 GHz（boost 2062） |
 
+> **2026-09-09 追記（provenance）**: 本節は node と commit を書いていなかった。
+> ローカルの成果物 `wisteria/a100_l1_roof_ncu_9523596/metadata.txt` に
+> **node `wa34`**、**commit `15462f4`**、`orders=15 63 255`、`nstep=4`、
+> `repeats=10`、`clocks=base none`、`ncu_timeout=300` が残っている
+> （A100-SXM4-40GB、driver 535.54.03、nvcc 12.9、`ncu` 2025.2.1.0）。
+> `ncu` 本体は共有ボディ `jobs/l1_roof_ncu.sh`（`--csv --clock-control <clk>
+> --metrics <METRICS> --kernel-name-base demangled --rename-kernels 0
+> -k <KERNELS> -s <LAUNCH_SKIP> -c <LAUNCH_COUNT>`）で、投入は
+> `jobs/wisteria_l1_roof_ncu.sh`。
+
 ### 13.1 本番クロックでの律速（両機）
 
 | tag | カーネル | GB200 `sm/l1/l2/dram/fp64` | 律速 | A100 `sm/l1/l2/dram/fp64` | 律速 | 一致 |
@@ -1118,6 +1129,12 @@ A100 でも数分）。**この予測も測定前にコミットしてある。*
 
 ### 15.1 H2 は外れた（A100、TCS `9523829`、1 分 34 秒）
 
+> **2026-09-09 追記（provenance）**: node と commit を書いていなかった。
+> `wisteria/a100_p511_reversal_ncu_9523829/metadata.txt` に **node `wa35`**、
+> **commit `ea03a6e`**、`orders=511 nstep=4 repeats=2 clocks=none`、
+> `-k regex:tendency_|pdl_elembnd|cutlass|gemm|Kernel`、`-s 4 -c 4` が残る。
+> 投入は `jobs/wisteria_p511_reversal_ncu.sh`（本体は `jobs/l1_roof_ncu.sh`）。
+
 §14.4 の予測は「A100 では `FUSED_TC` の `sm%` が `GEMM_FUSED` 以上になる」。
 
 | | GB200 | A100 |
@@ -1130,6 +1147,17 @@ A100 でも数分）。**この予測も測定前にコミットしてある。*
 優位を保ったまま wall time で負ける。
 
 ### 15.2 見ていなかったカーネルがあった（GB200、Slurm `83053`、1 分 41 秒）
+
+> **2026-09-09 追記（provenance）**: 本節は結論（§15.3 の逆転再現）を担うのに
+> commit と `ncu` のコマンドが本文に無かった。ローカルの成果物
+> `p511_surround_ncu_manual/metadata.txt` に **job `83053`**、**node `c310`**、
+> **commit `e241570`**、`orders=511 nstep=4 repeats=2 clocks=none`、
+> `-k regex:tendency_|elembnd|volume_flux|separable_lift|cutlass|gemm|Kernel`、
+> **`-s 4 -c 12`**、`ncu_timeout=900` が残っている（GB200、driver 580.173.02、
+> nvcc 13.1、`ncu` 2025.4.1.0、`nvhpc/26.3`）。`ncu` 本体は共有ボディ
+> `jobs/l1_roof_ncu.sh`。**この run を投入したラッパは追跡されていない**
+> （`-k` を広げた環境変数だけが上の `metadata.txt` の記録）。生 CSV は
+> `p511_surround_ncu_manual/ncu/*.csv`。
 
 H1 も H2 も、**プロファイルの窓に入っていたカーネルだけ**で考えていた。
 `-k` の正規表現に `volume_flux` と `separable_lift` が入っておらず、
@@ -1316,6 +1344,16 @@ Slurm `83462`）が、**A100 側は測っていなかった**。取った。
 | 実行環境 | **両方とも `nvidia/25.9`** |
 | 入力 | p=63、`ROUNDS=6`、検証込み |
 
+> **2026-09-09 追記（provenance）**: 上表は node と commit を書いていなかった。
+> `wisteria/a100_compiler_nv233_9524314/metadata.txt` と
+> `wisteria/a100_compiler_nv259_9524314/metadata.txt` に **node `wa34`**、
+> **両ビルドとも commit `e52d595`** が残る（§16.3 の 1 つめの修正が入った
+> ツリー）。実行ファイルは `scale-dg_extraction.nv233` / `.nv259`、投入は
+> `jobs/wisteria_compiler_sens.sh`。§16.1.1（`9524414`）は **node `wa35`**、
+> commit `e52d595`、§16.1.2（`9524473`）は **node `wa35`**、
+> commit `3f4fbae`（本文の記載どおり）。TCS の `.stats` には job ID が
+> 入らないので `metadata.txt` 側は `job_id=unknown` である。
+
 `nvidia/23.3` のビルドには `GPUFLAGS='-gpu=cc80,cuda12.0'` が要る（§16.3）。
 
 ### 16.1 結果
@@ -1443,6 +1481,13 @@ cudart / cuBLAS の違いは**測定にかからない。**
 | 経路 | `CUDAFORTRAN_GEMM` / `CUDAFORTRAN_FUSED_TC` / `CUDAFORTRAN_GEMM_FUSED`、8 ラウンド交互 |
 | 結果 | **24 ラン全て `rc=0`**、`Measured steps` は全ラン 18 |
 
+> **2026-09-09 追記（provenance）**: 上の 3 本のうち **`jobs/wisteria_a6_gemm.sh`
+> だけがリポジトリに追跡されていない**（`jobs/wisteria_paths.sh` と
+> `jobs/tsubame_paths.sh` は allowlist 済み）。本節の 1.1668 は公表した
+> 機械間比を支える測定なので、ラッパも `jobs/` の allowlist に入れるのが筋。
+> 現状の再現手段は上の「設定」行の環境変数を `jobs/wisteria_paths.sh` に
+> 与えることである。
+
 **`pjsub -x` は使えないのでラッパにした。**TCS は `-x` に空の値を受け付けず
 （`SIM4008`）、`:` で代用すると投入は通るがジョブが起動前に ERROR になり
 `.stats` すら残らない。同時刻に投げた素の probe ジョブは走ったので、
@@ -1517,10 +1562,23 @@ A6 が支持するのは狭いほうの主張だけ」—— を強めも弱め�
 2 つの再現検定に通っているので採用するが、A100 の `FUSED_TC` を
 分母にする比に 3 桁目の精度を主張してはならない。**
 
+> **2026-09-09 追記**: 「原因は追っていない」は本節の時点の話で、その後
+> `measurement_inventory.md` §21.1（20 ラウンドで再現、`FUSED_TC` だけが散る）、
+> §21.13（ばらつきは device 時間の中にあり、3 launch のうち `DIR1` 1 本だけが
+> 動く）、§22（CTA 割り当て・ECC は否定）、§23（カーベアウトも否定。増えた分は
+> 仕事ではなく待ち）で追い切っている。**残っている未解明は
+> `short_scoreboard` / MIO 側の待ちへ移る理由だけ**で、`ncu` が数えられる量は
+> 尽きている（同 §23.6）。カウンタの外に出た次の 1 手（共有メモリ遅延プローブ）
+> も同 §24 にあるが、**GB200 対照が平坦だったところまでで、A100 本番は未実施**
+> である。**本節の採否の判断（比の中央値は採る、3 桁目の精度は
+> 主張しない）は変わらない。**
+
 ### 17.7 測っていないこと
 
 - **p=511 以外。**A6 が要るのは p=511 の 3 比だけなので、そこで止めた。
-- **`FUSED_TC` のばらつきの原因**（§17.6）。
+- **`FUSED_TC` のばらつきの原因**（§17.6）。**その後追った** ——
+  `measurement_inventory.md` §21〜§23 で `tendency_p255_kernel` の `DIR1`
+  1 本の待ちまで絞り、`ncu` で数えられる量は尽きている（§17.6 の追記）。
 - **同一ノードでの §15.6 との A/B。**`wa35` は指定できないので、
   1.0658 対 1.0680 はノードをまたぐ比較である（**同一ジョブ内の比なので
   結論は成立するが、0.20% を「差」として読んではならない**）。

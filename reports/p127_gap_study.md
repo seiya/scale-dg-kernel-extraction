@@ -62,7 +62,11 @@ p = 15, 31, 63, 127 の 2 冪だけで（`p15_gap_study.md` §1）、p=127 は `
 > `FUSED_TC` を p=127 に開いており、上の 3 行はそのときに失効した
 > （`FUSED_DFMA` という名前が付いたのは翌 2026-08-29 の `5b6bd82`）。
 > 現行の `mod_advect3d_eq.f90` の許可条件を読み直すと
-> （行番号は当時のもので現在は一致しないため、条件そのもので指す）:
+> （行番号は当時のもので現在は一致しないため、条件そのもので指す。
+> 2026-09-09 時点の実体は、許可リストのガードが `mod_advect3d_eq.f90:195-199`
+> （`FUSED`）/ `:207-213`（`FUSED_DFMA`）/ `:221-227`（`FUSED_TC`）、
+> Nq ごとの分岐が `:1028-1062`（`FUSED`）/ `:1090-1124`（`FUSED_DFMA`）/
+> `:1152-1186`（`FUSED_TC`））:
 > `CUDAFORTRAN_FUSED` は `PolyOrder=7, 15, 31, 63, 127, 255`、
 > `CUDAFORTRAN_FUSED_TC` / `FUSED_DFMA` は `PolyOrder=7, 15, 31, 63, 127, 255, 511, 767`
 > を通す。GEMM 系（`GEMM` / `GEMM_FUSED` / `GEMM_CUTE` / `OZAKI1` / `OZAKI2`）には
@@ -1266,6 +1270,19 @@ mainloop 床まで残り 50 µs。**どれも「資源をもっと使う」方�
 
 もう 1 つ挙げていた「lift を y GEMM の epilogue へ移す」は §13.10 で実装して
 測り、**棄却した**。
+
+> **追記（2026-09-09）: 「残る筋は tcgen05 だけ」は本レポート §21（2026-09-01）と
+> その直後の追記（同日）で覆った。** 契約内のノブが 2 つ残っていた —— (1) x（`run_gemm_nn_scaled`）と
+> y（`run_volume_gemm_y_scaleadd`）の accumulator staging タイルの repad
+> （§21、`fc272e9`、占有 GPU job `74821`、10 回交互、レンジ非重複、**−0.487%**）、
+> (2) volume GEMM の y のパイプライン段数 4 → 3（§21 直後の追記、`04172b0`、
+> `GEMM_FUSED` で **−0.762%**、`GEMM_CUTE` で −0.598%）。**どちらも tcgen05 を
+> 必要とせず、本節が「仕事を減らす余地は無い」と読んだ 4 本のうち x と y に載った。**
+> 上表の内訳（直列合計 626.3）と ncu の値は当時の測定としてそのまま残す。
+> p=127 `GEMM_FUSED` の公表値は本レポート §15 の 674.0 から、
+> [`measurement_inventory.md`](measurement_inventory.md) §7.2 の 641.5
+> （job `78678`、tree `232dd27`）を経て、同 §18.3 の 637.1（job `83460`、
+> tree `e113535`）まで下がっている。
 
 ### 13.10 棄却: lift を y GEMM の epilogue へ移す（+15.0 µs）
 

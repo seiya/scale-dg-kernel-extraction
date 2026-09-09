@@ -308,7 +308,7 @@ cuBLAS の列はタイルが違う（自分で選んだもの、grid 形状か�
 32x32x16）、accumulator だけでスレッドあたり 64 本を占める。そこへ kK を
 8 にすると operand fragment が倍（A が 4→8、B が 8→16 doubles）になり、
 `MmaMultistage` はそれを二重化して持つ。**レジスタ圧が第一容疑**だが、
-これは ncu で確かめること（§9）。
+これは ncu で確かめた（§8.6）。
 
 `GEMM_FUSED` の z（融合 assembly）は epilogue 律速で、命令形状はほとんど効かない
 （702.4 → 695.9、16x8x8 では 774.7 に悪化）。`GEMM_FUSED` の改善率が
@@ -393,6 +393,16 @@ cuBLAS のプロファイル実行に `CutlassMmaShape = "cublas"` という不�
   −24%、Main −7.2%）、GB200 で同着である以上、既定を `16x8x4` にする案がある。
   `arch::Sm90` タグが既定になるので、sm_80 以前で組む可能性を考えるなら
   ビルド時の分岐が要る。
+  **注記（2026-09-09）**: このビルド時分岐は不要になった。`9853e28`
+  (2026-09-05) が `cuda_cutlass_has_sm90_f64_mma()`
+  (`cuda_cutlass_gemm_fused.cu:1547`) を追加し、ビルドが sm_90 以降を
+  含むか (`__CUDA_ARCH_LIST__`) と実機の CC の両方を実行時に見る。
+  形状 1〜3 は sm_80 でもコンパイル自体は通るが CUTLASS が
+  `CUTLASS_NOT_IMPLEMENTED()`（デバイス側 brkpt）に展開するため、
+  `cuda_cutlass_set_mma_shape` (`mod_cuda_dg_kernels.cuf:2100`) が
+  カーネル内でトラップする代わりに起動時に `error stop` する。
+  経緯は `reports/a100_prediction.md` §7.2。既定値を `16x8x4` にするか
+  どうかは、これとは独立の未決事項として残る。
 - **16x8x8 を x で使う道は残っている**が、価値は低い。spill を止めるには
   x の warp タイルを 32x32x16 に落とす（64x128 タイルを 8 warp で持つ）
   必要があり、それは命令形状ではなくタイルの実験になる。現状 16x8x4 が

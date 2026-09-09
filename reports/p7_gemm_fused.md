@@ -297,6 +297,15 @@ DRAM 屋根 ~148 µs に対し体積はまだ約 **50 µs**。
 job `72946`、c396、12 組 interleaved A/B。入力は
 `namelists/perf_p7_gemm_fused.conf`。µs/stage は 19 step × 3 RK = 57 で割った。
 
+> **（2026-09-09 追記、provenance）**: 本節（§10 全体）の**実行ファイルの commit は
+> 記録されていない**。本文にあるのは node（c396 ほか）と job 番号だけで、job
+> `72555`--`72572` / `72921`--`72947` の成果物ディレクトリもローカルには残っていない。
+> 参考として、本節の変更（y `32x64` s3 / z `16x32` s3 と役割準拠への復帰）が landed
+> したのは `755538e`「Optimize p=7 GEMM_FUSED and restore p=15 path roles」
+> （2026-08-31、親 `e220c85`）で、本節はそのコミットで追加された。冒頭が挙げる
+> 親 commit `40fff1a` は `e220c85` より 2 コミット前なので、本節の実行ファイルを
+> 指してはいない。
+
 | 構成 | device s / 57 stage | µs/stage | Main ms/step | 対基準 |
 |---|---:|---:|---:|---:|
 | 旧準拠構成（y 64x32 s3、z 64x32 s4） | 0.144376 | 2532.9 | 7.731 | — |
@@ -385,6 +394,12 @@ p=15 の [`p15_gap_study.md`](p15_gap_study.md) §25.3 で入れた次数非依�
 Slurm job `74632`（c178）、§10 と同じ `namelists/perf_p7_gemm_fused.conf` を
 12 回交互 A/B した中央値:
 
+> **（2026-09-09 追記、provenance）**: 実行ファイルの commit は記録されていない
+> （job `74632` の成果物ディレクトリもローカルに残っていない）。参考として、本節の
+> 変更（`run_gemm_batched_nn_capped` による単一 launch）が landed したのは
+> `2e48571`「Fit the volume-GEMM tiles to Nq=16 and launch big batches once」
+> （2026-09-01、親 `b0572f9`）で、本節はそのコミットで追加された。
+
 | 構成 | Main [ms/step] | device [ms/57 stage] | µs/stage | 対 §10 |
 |---|---:|---:|---:|---:|
 | §10 の最終形（5 launch） | 6.04200 | 111.682 | 1959.3 | — |
@@ -408,6 +423,12 @@ unique **0.832 TB/s**（10.5%）、path **2.16 TB/s**（27.3%）。
 `GEMM_CUTE` と `GEMM_FUSED` の両方に同じものが入る。
 
 job `74636`（c178、12 回交互 A/B）:
+
+> **（2026-09-09 追記、provenance）**: 実行ファイルの commit は記録されていない
+> （job `74636` の成果物ディレクトリもローカルに残っていない）。参考として、本節の
+> 変更（batched launcher への `RepadEpilogue<..., 8>`）が landed したのは
+> `09cb3b3`「Repad the batched volume-GEMM epilogue and measure the streaming floor」
+> （2026-09-01、親 `2e48571` = §11 のコミット）で、本節はそのコミットで追加された。
 
 | 構成 | Main [ms/step] | device [ms/57 stage] | µs/stage | 対 §11 |
 |---|---:|---:|---:|---:|
@@ -548,7 +569,19 @@ p=255 §10 の一般則が、**同じ epilogue でも「どのカーネルに置
 同じ 4 ビットを p=31 の z assembly（`MmaSet_884` の 64×32 タイル）に当てた。
 入力は `namelists/perf_p31_gemm_fused.conf`。bit 3 は y に `GemmY32` の
 重み付き双子が要る（= `GEMM_CUTE` と mainloop を共有しなくなる）ので実装せず、
-§23 の +2.3% を引き継ぐ。
+[`p31_gap_study.md`](p31_gap_study.md) §21.3 の +2.3% を引き継ぐ。
+
+> **（2026-09-09 追記、参照先の訂正）**: 原文は無印の「§23 の +2.3%」だったが、
+> 本レポートに §23 は無く、[`p31_gap_study.md`](p31_gap_study.md) §23（p=31 の
+> 経路役割訂正）にも +2.3% は出てこない。bit 3 と同じ内容（`Escale` と `deriv_x`
+> を y epilogue へ前送りする折り込み）の p=31 での既知値 **+2.3%（login）** は
+> 同レポート §21.3 の表「`Ey*acc+Ex*Dx` 折り込み」の行にある。
+> [`p15_gap_study.md`](p15_gap_study.md) §25.8 の「xy_weighted の fold を `Nq=16`
+> に開く **+3.8%**」の行も、この値を「p=31 の +2.3% と同符号」として引いている。
+> 参照先を §21.3 に直した。数値は不変。なお
+> [`p31_gap_study.md`](p31_gap_study.md) §18.3 の「xz エピローグの `Escale` を
+> mma の前へ出す **+2.3%**」は数値が同じだが**別経路・別機構**（`FUSED_TC` の
+> xz 融合カーネル内での前出し）であり、bit 3 の引き継ぎ元ではない。
 
 > **（2026-09-09 追記、訂正）**: 下の表の µs/stage は分母を **÷57** で計算して
 > いるが、正しい分母は **597** である。`namelists/perf_p31_gemm_fused.conf` は
