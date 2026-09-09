@@ -151,10 +151,16 @@ or
 DqdtKernel_Type = "CUDAFORTRAN_FUSED_TC"
 ```
 
-They share one C++ source. `CUDAFORTRAN_FUSED_TC` uses FP64 Tensor Core
-`mma.sync.aligned.m8n8k4.f64`. `CUDAFORTRAN_FUSED` is the same kernel with
-that MMA replaced by DFMA on the same fragment layout; it exists to measure
-the Tensor Core effect, not as a separately tuned CUDA-core path. Geometry
+`CUDAFORTRAN_FUSED_TC` uses FP64 Tensor Core
+`mma.sync.aligned.m8n8k4.f64` and lives in `cuda_dg_kernels_tc.cu`.
+`CUDAFORTRAN_FUSED` is a separately optimized CUDA-core path with its own
+source (`cuda_dg_kernels_fused.cu`, `cuda_dg_kernels_fused_highp.cu`):
+natural-order shared panels and length-`Nq` inner products, not the MMA
+fragment layout. The iso-schedule ablation -- the same kernel as
+`CUDAFORTRAN_FUSED_TC` with the MMA replaced by DFMA on the same fragment
+layout -- is the third path, `CUDAFORTRAN_FUSED_DFMA`; it exists to measure
+the Tensor Core instruction alone and is not a separately tuned path.
+Geometry
 constants are in `fused_kernel_geom.h`. Volume fluxes remain pointwise
 `q*u`, `q*v`, and `q*w`, and all six faces are evaluated. On GB200, compile
 the C++ kernels with `NVCCFLAGS=-O3 -std=c++17 -arch=sm_100` together with
@@ -227,12 +233,16 @@ The p=255 Legendre-Gauss-Lobatto nodes and operators are generated at startup;
 no large `operator_data/p255.dat` file is needed. Its separable lifting
 operator is stored as `Lift1D(256,6)` instead of a dense
 `Lift_mat(256,256,256,6)`. The p=255 path currently requires
-`CUDAFORTRAN_FUSED`, `CUDAFORTRAN_FUSED_TC`, `CUDAFORTRAN_GEMM`,
-`CUDAFORTRAN_GEMM_FUSED`, or `CUDAFORTRAN_GEMM_CUTE`.
+`CUDAFORTRAN_FUSED`, `CUDAFORTRAN_FUSED_TC`, `CUDAFORTRAN_FUSED_DFMA`,
+`CUDAFORTRAN_GEMM`, `CUDAFORTRAN_GEMM_FUSED`, `CUDAFORTRAN_GEMM_CUTE`,
+`CUDAFORTRAN_GEMM_OZAKI1`, or `CUDAFORTRAN_GEMM_OZAKI2`.
 
 The p=511 path likewise generates its operators at startup and keeps only
-`Lift1D(512,6)`. It currently supports `CUDAFORTRAN_GEMM` and
-`CUDAFORTRAN_GEMM_FUSED`, with `Ne=1` in the supplied validation inputs. Halo
+`Lift1D(512,6)`. It currently supports the six GEMM paths above plus
+`CUDAFORTRAN_FUSED_TC` and `CUDAFORTRAN_FUSED_DFMA`, with `Ne=1` in the
+supplied validation inputs. p=767 has the same set; p=575 and p=1023 are
+GEMM-only, the latter because `3*Np` overflows the tile kernel's 32-bit node
+index. `mod_advect3d_eq.f90` holds the allow lists. Halo
 face points are packed into the minimum number of `Np`-sized field columns, so
 the six periodic faces do not reserve six otherwise-unused 512^3-point halo
 elements.

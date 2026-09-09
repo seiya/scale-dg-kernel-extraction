@@ -132,7 +132,12 @@ implementation is fastest.
   definition: the epilogue reads the other two derivatives elementwise at the
   same node index, so x, y or z can each carry it by running last, and each
   offers a different face-point pair for tile-level reuse and a different
-  register budget. z is the current carrier and the only one measured. The
+  register budget. Two of the three have been measured and both are in
+  production: x carries at `Nq` = 8, 16 and 32 and z carries at `Nq >= 64`
+  (`2238965` and `84b44c6`, 2026-09-02; the per-order table at the top of
+  `mod_cuda_dg_kernels.cuf` is authoritative, and
+  `gemm_assignment_and_carrier.md` §3 records the measurements). y has been
+  measured and lost at `Nq` = 32. The
   carrier cannot be cuBLAS, which has no epilogue. That is the only fixed
   point of the library assignment: which library runs each of the other two
   volume GEMMs is a measurement, and the assignment must be identical in
@@ -143,9 +148,11 @@ implementation is fastest.
   another belong to the fusion package as well: they are consequences of
   fusing, not mainloop differences, so `GEMM_FUSED`
   may carry them where `GEMM_CUTE` cannot, and which of them to carry at a
-  given order is a measurement, not a rule stated here. With z as the carrier
-  they are gated by `xy_weighted` (Escale into x/y, `deriv_x` into y); the
-  orders where that measured faster are in the gap studies.
+  given order is a measurement, not a rule stated here. They are gated by
+  `xy_weighted`, whose value depends on the carrier: with z carrying it folds
+  Escale into x/y and `deriv_x` into y, and with x carrying it forwards
+  Escale_x only. The orders where each measured faster are in the gap studies,
+  and the gate itself is in `cuda_cal_dqdt_gemm_cutlass`.
   CUTLASS tile types live in `VolumeGemmSet` (or an explicitly shared
   order-specialized set) in `cuda_cutlass_gemm_fused.cu`.
   **`GEMM_FUSED` does not share the three-way volume-GEMM schedule, and that
@@ -239,6 +246,8 @@ performance win must never be treated as implicit permission to redefine it.
 - `.claude/skills/dg-optimize/` and `.cursor/skills/dg-optimize/`: the
   kernel-optimization procedure for Claude Code and Cursor. Same tree
   (Cursor path is a symlink). It follows this file and does not add rules.
+  Only the `.claude/` copy is tracked; a fresh checkout that wants the Cursor
+  path has to recreate the symlink.
 
 ## Builds
 
@@ -313,7 +322,12 @@ Leave the working executable in the build mode relevant to the current task.
 - For p=255, test both the intended `Ne=1` case and an `Ne>1` smoke case when
   memory permits. The p=255 path currently requires `CUDAFORTRAN_FUSED`,
   `CUDAFORTRAN_FUSED_TC`, `CUDAFORTRAN_FUSED_DFMA`, `CUDAFORTRAN_GEMM`,
-  `CUDAFORTRAN_GEMM_FUSED`, or `CUDAFORTRAN_GEMM_CUTE`.
+  `CUDAFORTRAN_GEMM_FUSED`, `CUDAFORTRAN_GEMM_CUTE`,
+  `CUDAFORTRAN_GEMM_OZAKI1`, or `CUDAFORTRAN_GEMM_OZAKI2`.
+- p=511 and p=767 require one of those GEMM paths (including both Ozaki ones)
+  or `CUDAFORTRAN_FUSED_TC` / `CUDAFORTRAN_FUSED_DFMA`; p=575 and p=1023 are
+  GEMM-only. `mod_advect3d_eq.f90` holds the allow lists and the reason each
+  order has the set it has.
 - After interface changes, verify both a CUDA build and a non-CUDA build so the
   stub remains synchronized.
 - Run `git diff --check` before committing.
