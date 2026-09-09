@@ -797,6 +797,18 @@ elembnd 込み）。§14 の 374.8 µs は当時の計測で、表は残す。
 方が高い）という §6 / §14 の結論は変わらない。
 > **（訂正 2026-08-30、§21）** 融合 z を捨てて cuBLAS y/z + lift に戻すと
 > device 611.2 µs になり、`GEMM`（625.7）より短い。上表の 940.6 は当時の値。
+
+> **訂正（2026-09-03、`51d56a8` / `84b44c6` / `2238965` 後）:** 「この次数だけ
+> `GEMM_FUSED` が素の `GEMM` より遅い」は**逆転した**。担い手が z から x に移り
+> （`dg_gemm_defaults` の Nq=32 は `carrier=2`・x CUTLASS tile 7・z cuBLAS・
+> `xpkg=4`）、tree `232dd27`（job `78678`、node `c186`、占有 GPU、12 ラウンド交互）
+> では **`GEMM_FUSED` 545.1 < `GEMM_CUTE` 605.1 < `GEMM` 610.7** µs/stage で
+> `GEMM_FUSED` が GEMM 系の最速である
+> （[`measurement_inventory.md`](measurement_inventory.md) §7.2、
+> 担い手は [`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §3、
+> x の CUTLASS 化は同 §1）。
+> 上表の 940.6 / 808.6 / 625.7 は当時の測定として残す。
+
 FLOP/s と DRAM は README のまとめ表。
 この節の `CUDAFORTRAN_FUSED` は iso-schedule DFMA の測定である（経路名は
 `CUDAFORTRAN_FUSED_DFMA`）。

@@ -280,6 +280,18 @@ DRAM 屋根 ~148 µs に対し体積はまだ約 **50 µs**。
 `TB=16x32x16 / warp=16x16x16 / stages=3`。すべて FP64 TensorOp
 `mma.sync.m8n8k4` である。
 
+> **（2026-09-09 追記、変更は `51d56a8` / `84b44c6` / `2238965`）**: 上の箇条書きの
+> 1 番目と 4 番目は現行ツリーでは成立しない。`Nq<=64` の cuBLAS-x 分岐は
+> **全次数で廃止**され、x は次数専用の CUTLASS タイルになった
+> （`dg_gemm_defaults`、`mod_cuda_dg_kernels.cuf`）。p=7（Nq=8）では
+> **x が CUTLASS tile 9 かつ融合 epilogue の担い手**（`carrier=2`）で、
+> **y が cuBLAS**（`y_lib=1`）、z が CUTLASS である。したがって 2 番目の
+> 「y/z は同じ CUTLASS tile」も y については当たらない。別 stream で重ねる
+> 独立ペアも x/y ではなく **y と z**（`ysched=1` → `overlap_xy`。担い手 x は
+> 両者の結果を読むので最後に走る）である。本節の測定値は当時のもので、
+> 現行の値は [`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md)
+> と [`README.md`](README.md) を参照。
+
 ### 10.1 採用値
 
 job `72946`、c396、12 組 interleaved A/B。入力は
@@ -568,6 +580,15 @@ Nq = 8 / 16 / 32 / 64 / ≥128 の全点で測り終わった。
   = 1724--1726 µs/stage、改修前 0.098472 と一致し、点変化係数の owned `dqdt`
   は `CUDAFORTRAN_SPLIT` と**最大絶対差 0**。mainloop が動いていないことの
   確認になっている。
+
+> **（2026-09-09 追記、変更は `51d56a8` / `84b44c6` / `2238965`）**: 上の 3 番目と
+> 4 番目は現行ツリーでは成立しない。`Nq<=64` の cuBLAS-x 分岐は**無い**。
+> p=7 では x が CUTLASS tile 9 かつ融合 epilogue の担い手（`carrier=2`）で、
+> y が cuBLAS である（`dg_gemm_defaults`）。担い手が z から x に移り、かつ
+> `xpkg=5`（bit 1 = 16 B lift が 0）なので `pair_nq2 = 0` となり、
+> `elembnd_flux_kernel` の**面平面インターリーブは p=7 でも無効**になった
+> （`mod_cuda_dg_kernels.cuf` の `pair_nq2` ゲート）。§13 冒頭の追記にあるとおり、
+> 本節が採用した 16 B lift 自体が担い手の移動で成立しなくなっている。
 
 ### 13.5 数値検証
 

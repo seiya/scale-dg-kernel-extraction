@@ -418,6 +418,16 @@ p=31 `GEMM_FUSED` は §23 で fused-z epilogue に復帰したため、path は
 165.0 B/nodeを使う。§21--22 の cuBLAS-z + lift hybridだけが181.0 B/nodeで、
 production表には使わない。
 
+> **追記（2026-09-09、対象コミット `51d56a8` / `84b44c6` / `2238965`、いずれも
+> 2026-09-02）**: p=31 の融合エピローグの担い手は z ではなく **x** に移り
+> （`dg_gemm_defaults` の Nq=32 は `carrier=2`）、z は cuBLAS（`z_lib=1`）に
+> なった。B/node の数え方（18V = 中間を 1 本畳んだ体積テンソル本数）は x/y/z の
+> どれが担い手でも変わらないので上表の 165.0 はそのままだが、「§23 で fused-z
+> epilogue に復帰したため」という理由づけは現行ツリーには当たらない。
+> なお現行の cuBLAS-z は §21--22 の「cuBLAS-z + lift hybrid」(181.0 B/node) では
+> ない。エピローグは x の GEMM が融合して担うので `separable_lift_assembly` は
+> 走らず、B/node は 165.0 のままである。
+
 ### 経路 × 次数
 
 ピーク比の分母は 40.1 TFLOP/s と 7.9 TB/s。
