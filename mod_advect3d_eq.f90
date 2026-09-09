@@ -334,8 +334,12 @@ contains
     !  grid and chunk count, and 768 divides both BM255/BN255 = 64 and
     !  BK255 = 16.  p=767 was opened in section 19 of
     !  reports/dfma_register_budget.md; p=575 has no instance and p=1023
-    !  cannot have one, because 3*Np = 3.22e9 overflows the kernel's 32-bit
-    !  node index (p1023_gap_study.md section 1).
+    !  cannot have one, because the kernel's node index is 32-bit and its
+    !  Escale reference reaches Escale + node + 2*npoint: at Nq = 1024 the
+    !  2*npoint term alone is 2*Np = 2^31, so the index is already out of
+    !  range before the node offset (p1023_gap_study.md section 3.2, which
+    !  is where the same boundary was fixed for the plain-GEMM assembly
+    !  kernel by passing the three Escale base pointers separately).
     if ((Np == 512**3 .or. Np == 576**3 .or. Np == 768**3 .or. &
          Np == 1024**3) .and. &
         dqdt_kernel_typeid /= DQDT_KERNEL_CUDAFORTRAN_GEMM .and. &

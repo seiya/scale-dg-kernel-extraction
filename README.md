@@ -241,8 +241,9 @@ The p=511 path likewise generates its operators at startup and keeps only
 `Lift1D(512,6)`. It currently supports the six GEMM paths above plus
 `CUDAFORTRAN_FUSED_TC` and `CUDAFORTRAN_FUSED_DFMA`, with `Ne=1` in the
 supplied validation inputs. p=767 has the same set; p=575 and p=1023 are
-GEMM-only, the latter because `3*Np` overflows the tile kernel's 32-bit node
-index. `mod_advect3d_eq.f90` holds the allow lists. Halo
+GEMM-only, the latter because the tile kernel's 32-bit node index is already
+out of range at `2*Np = 2^31` for `Nq=1024`. `mod_advect3d_eq.f90` holds the
+allow lists. Halo
 face points are packed into the minimum number of `Np`-sized field columns, so
 the six periodic faces do not reserve six otherwise-unused 512^3-point halo
 elements.

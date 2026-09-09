@@ -205,9 +205,22 @@ p=15 §18–24、p=31 §16–23、p=63 §22–25、p=127 §15–20、p=255 §12�
 
 太字は次数ごとの最速（Main ms/step）。空欄はその次数では経路が無い
 （`GEMM_FUSED` / `GEMM_CUTE` は p=7/15 も `grid.z` チャンクで起動できる、
-**p=511 は `GEMM` / `GEMM_CUTE` / `GEMM_FUSED` / `FUSED_TC` / `FUSED_DFMA`、
-p=575 / 767 / 1023 は `GEMM` / `GEMM_CUTE` / `GEMM_FUSED` のみ** ——
-下の訂正注記を見よ）。**p≥511 に融合経路が無い理由は
+**p=511 と p=767 は `GEMM` / `GEMM_CUTE` / `GEMM_FUSED` / `OZAKI1` /
+`OZAKI2` / `FUSED_TC` / `FUSED_DFMA`、p=575 と p=1023 は GEMM 系 5 経路
+（`GEMM` / `GEMM_CUTE` / `GEMM_FUSED` / `OZAKI1` / `OZAKI2`）のみ** ——
+下の訂正注記を見よ。**p=767 の `FUSED_TC` / `FUSED_DFMA` は 2026-09-04 の
+`ba24055` でインスタンスを足して開通した**（測定は
+[`dfma_register_budget.md`](dfma_register_budget.md) §19、p=767 `FUSED_DFMA`
+の production 形は 151 107.88 µs/stage。下の §19 追記と同じ値）。
+**p=575 に融合経路が無いのは `nq == 576` のインスタンスが無いからで、
+p=1023 は資源ではなくタイルカーネルの 32-bit ノードインデックスが
+`Escale + node + 2*npoint` に達するため**——`Nq=1024` では `2*npoint` の項だけで
+`2*Np = 2^31` になり、ノードオフセットを足す前に `int`（2.15e9）を越える。
+数え上げは [`dfma_register_budget.md`](dfma_register_budget.md) §19.6
+（`Nq=768` の `3*Np = 1.36e9` は収まる）、GEMM 側で同じ境界を越えた記録は
+[`p1023_gap_study.md`](p1023_gap_study.md) §3.2。
+現行の許可条件は `mod_advect3d_eq.f90` のゲートを正とする）。
+**p≥511 に融合経路が無い理由は
 [`p511_gap_study.md`](p511_gap_study.md) §14（2026-09-03）に数え上げで書いた**:
 要素常駐型は Nq=256 の時点で 1 平面が shared 上限の 2.26 倍・Nq=512 で 9.02 倍に
 なり不可能、タイル型（p=255 の `tendency_p255_kernel`）は 1 ブロックあたりの

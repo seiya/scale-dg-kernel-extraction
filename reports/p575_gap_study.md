@@ -32,6 +32,27 @@ Wisteria/BDEC-01 の **40 GiB** と Tsubame の **94 GiB** の 2 つで、
 p=575 / p=767 だけが 2 冪でないのは、この容量基準で選ばれたためである。
 p=767 の選定理由は [`p767_gap_study.md`](p767_gap_study.md) §1.1 を見よ。
 
+### 1.2 dispatch guard は現在 5 経路を許す（2026-09-09 追記）
+
+§1 の「対応済みの2経路だけに制限する dispatch guard」は本レポートの
+base commit `70ed842` 時点の記述であり、そのまま残す。現行 tree の
+`mod_advect3d_eq.f90` のゲート（`Np == 576**3` を含む分岐）は、p=575 に対して
+`CUDAFORTRAN_GEMM`、`CUDAFORTRAN_GEMM_FUSED`、`CUDAFORTRAN_GEMM_CUTE`、
+`CUDAFORTRAN_GEMM_OZAKI1`、`CUDAFORTRAN_GEMM_OZAKI2` の **GEMM 系 5 経路**を
+許している。本レポート自身の §8（Ozaki Scheme I / II）が Ozaki 2 経路を
+p=575 で測っているので、「2経路だけ」は §8 以降の tree には当てはまらない。
+
+同じゲートは p=511 と p=767 に限り `CUDAFORTRAN_FUSED_TC` /
+`CUDAFORTRAN_FUSED_DFMA` も許す（p=767 は commit `ba24055`、2026-09-04 で開通、
+測定は [`dfma_register_budget.md`](dfma_register_budget.md) §19）。
+**p=575 には tile カーネルのインスタンスが無く、この 2 経路は依然として不可**
+である。p=1023 も不可で、理由は tile カーネルが `const int npoint = NP*Ne`
+という 32-bit 添字で `Escale + node + 2*npoint` を引くこと（`cuda_dg_kernels_tc.cu`）
+による。`Nq=1024` では `2*Np = 2^31` の時点で符号付き 32-bit を越え、
+添字は最大 `3*Np = 3.22e9` に達する。境界の値は
+[`p1023_gap_study.md`](p1023_gap_study.md) §3.2 にあるが、同節が直したのは
+通常 GEMM の assembly カーネルであって tile カーネルではない。
+
 ## 2. 測定条件
 
 - 日付: 2026-08-28（Asia/Tokyo）
