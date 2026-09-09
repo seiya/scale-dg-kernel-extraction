@@ -2903,7 +2903,8 @@ contains
         dg_env_int("SCALE_DG_XYW", xyw_env, -1) == 0) xy_weighted = 0
     ! The whole volume-GEMM assignment for this order and path, resolved once:
     ! x library / tile / weighting, y library, which GEMM carries the fused
-    ! assembly epilogue (0 = z, 1 = y), z library and the y-carrier schedule.
+    ! assembly epilogue (0 = z, 1 = y, 2 = x), z library and the y-carrier
+    ! schedule.
     ! See the table at the top of the module.
     call dg_gemm_plan(Nq, fuse_epilogue, plan)
     carrier = plan%carrier
