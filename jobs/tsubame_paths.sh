@@ -130,8 +130,10 @@ readonly VAL_ORDERS_CLEAN=$(printf '%s' "$VAL_ORDERS" | tr ':,' '  ')
 # on both, which is what makes the two columns of the table one measurement.
 # PJM_JOBID is Fujitsu TCS (Wisteria).
 readonly JOB_TAG=${JOB_ID:-${SLURM_JOB_ID:-${PJM_JOBID:-manual}}}
-# Short machine tag: names the frozen executable and, by default, the output
-# tree.  h100 keeps the existing TSUBAME/RIKYU names unchanged.
+# Short machine tag: names the frozen executable and goes into metadata.txt.
+# The default is h100 because TSUBAME ran this first; every other wrapper has
+# to override it, and rikyu_paths.sh did not until 2026-09-09, so GB200 runs
+# before that carry machine=h100 and the H100 roofs below.
 readonly MACHINE=${SCALE_DG_MACHINE:-h100}
 readonly OUTDIR=${OUTDIR:-"tsubame_paths_${JOB_TAG}"}
 # Hardware roofs printed into metadata.txt, so a report never has to guess
