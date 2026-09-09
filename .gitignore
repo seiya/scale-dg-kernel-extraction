@@ -10,6 +10,7 @@ advect3d/advect3d
 # script that produced every column of it is. See jobs/README.md.
 /jobs/*
 !/jobs/README.md
+!/jobs/MAPPING.md
 !/jobs/tsubame_paths.sh
 !/jobs/tsubame_paths_summarize.py
 !/jobs/rikyu_paths.sh
