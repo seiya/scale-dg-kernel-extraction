@@ -87,6 +87,19 @@ CUTLASS はそれを `grid.z` に載せるので **65535 が上限**である。
 カーネル起動側の両方に置いた。cuBLAS の strided-batched にはこの上限が無いので、
 上の 2 点は従来どおり `CUDAFORTRAN_GEMM` を使う。
 
+> **（2026-08-30 / 08-31 追記、`f7788bb` / `755538e`）** 上の表の p=7 / p=15「**不可**」は
+> 現行ツリーでは解消している。`f7788bb` が CUTLASS の batched swizzle
+> （batch を `% 65536` で `grid.z` に載せるため 65536 が `grid.z = 0` になる）を避けて
+> **`grid.z` を 65535 でキャップし、`kernel::GemmBatched` 側が
+> `batch_idx += gridDim.z` で歩く**形に組み替えたので、`Nq*Ne` がいくつでも
+> 起動できるようになった（`cuda_cutlass_gemm_fused.cu` の
+> `batched_grid_z` / `cap_batched_grid` / `run_gemm_batched_nn_capped`）。
+> 同コミットで `mod_advect3d_eq.f90` の `Nq*Ne <= 65535` の error stop も
+> `GEMM_FUSED` / `GEMM_CUTE` の両方から外れている。p=7 `Ne=32³`（262144）は
+> `755538e`（2026-08-31）までに開通し、現在は 10 次数横断の再測定
+> （`measurement_inventory.md` §18.3）に p=7 / p=15 の `GEMM_CUTE` /
+> `GEMM_FUSED` セルが載っている。上の表と本文は当時（2026-08-26）の記録として残す。
+
 ## 3. 検証
 
 すべて `SCALE_DG_VARYING_COEFF=1`（点ごとに変動する `u,v,w,Escale,normal_fn,Fscale`）で、
@@ -885,6 +898,13 @@ ncu は `60580` / `60595` / `60635` / `60655`。時間はすべて `sbatch` で�
 **p=63 の最速経路は `CUDAFORTRAN_GEMM_FUSED` から `CUDAFORTRAN_FUSED_TC` に替わる。**
 同一 DOF 5 点の最速はこれで p=7/15/31/63 が `FUSED_TC`、p=127/255 が `GEMM_FUSED` になり、
 **融合が勝つ上限は p=31 ではなく p=63 に上がった**（§13.1 の「上限は p=31」は無効）。
+
+> **（2026-08-31 追記）** この交差点はその後さらに動いた。`e220c85`（2026-08-31）で
+> p=127 が、`ba53906`（2026-08-28）で p=255 が `GEMM_FUSED` から `FUSED_TC` に替わり、
+> **融合が勝つ上限は p=63 ではなく p=255 と p=511 の間にある**
+> （p=7…255 が `FUSED_TC`、p=511 以上が `GEMM_FUSED`）。裏取りは
+> [`README.md`](README.md) の「最新結果のまとめ」と
+> [`measurement_inventory.md`](measurement_inventory.md) §18.3。上の表は当時値として残す。
 
 変更はすべて `cuda_dg_kernels_tc.cu` の中だけで、ホスト側も数値も動かない。
 `Ne=2³/3³/4³` で `OPENACC_SPLIT` に対し 3.12e-16 / 4.16e-16 / 4.16e-16、

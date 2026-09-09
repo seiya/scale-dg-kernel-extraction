@@ -56,6 +56,23 @@ p = 15, 31, 63, 127 の 2 冪だけで（`p15_gap_study.md` §1）、p=127 は `
 `OPENACC_SPLIT` の 5 つ。`CUDAFORTRAN_FUSED` と `FUSED_TC` は p=7/15/255 専用のままである
 （`mod_advect3d_eq.f90:142,:153`）。
 
+> **追記（2026-08-28、`0679cab`）: 「使えるのは 5 経路」は本節の執筆時点の話で、
+> 現行ツリーでは p=127 に経路の穴は無い。** 本レポート §11 自身が同日に
+> `0679cab`（Open the fused kernels at p=127）で `CUDAFORTRAN_FUSED` /
+> `FUSED_TC` を p=127 に開いており、上の 3 行はそのときに失効した
+> （`FUSED_DFMA` という名前が付いたのは翌 2026-08-29 の `5b6bd82`）。
+> 現行の `mod_advect3d_eq.f90` の許可条件を読み直すと
+> （行番号は当時のもので現在は一致しないため、条件そのもので指す）:
+> `CUDAFORTRAN_FUSED` は `PolyOrder=7, 15, 31, 63, 127, 255`、
+> `CUDAFORTRAN_FUSED_TC` / `FUSED_DFMA` は `PolyOrder=7, 15, 31, 63, 127, 255, 511, 767`
+> を通す。GEMM 系（`GEMM` / `GEMM_FUSED` / `GEMM_CUTE` / `OZAKI1` / `OZAKI2`）には
+> 次数ガードが無く、`Np == 256**3` と `Np == 512**3 / 576**3 / 768**3 / 1024**3` の
+> 2 つの許可リストも Nq=128 には掛からない。**したがって `DqdtKernel_Type` の 11 経路が
+> すべて p=127 で走る**（`CUDAFORTRAN_SPLIT` / `OPENACC_SPLIT` / `OPENACC_ASIS` を
+> 含む。`OZAKI1` / `OZAKI2` の p=127 実測は本レポート §14 の表にある）。うち 7 経路の
+> 現行値は [`measurement_inventory.md`](measurement_inventory.md) §18.3 の p=127 の
+> 7 行にある。
+
 メモリは 1 フィールド 134 MB、work を含めて約 1.6 GB。
 
 ## 3. 検証
@@ -593,11 +610,36 @@ FP64 ピーク 40.1 TFLOP/s で割った値。）
 注: p=15 は `Nq*Ne = 16*4096 = 65536` で CUTLASS の batch 上限 65535 を 1 だけ
 超えるため `GEMM_FUSED` / `GEMM_CUTE` が使えない（`mod_advect3d_eq.f90` のガード）。
 
+> **追記（2026-08-30、`f7788bb`）: この「不可」は解消済みで、上表の p=15 の
+> 「——（注）」は当時の制約である。** `f7788bb` が CUTLASS の `grid.z` を上限で
+> キャップする形に変えたので、p=15 でも `GEMM_FUSED` / `GEMM_CUTE` が走る。
+> 現行値は [`measurement_inventory.md`](measurement_inventory.md) §18.3 で
+> p=15 `GEMM_FUSED` 598.2、`GEMM_CUTE` 644.5 µs/stage（tree `e113535`、job `83460`）。
+> **開通しても p=15 の最速が `FUSED_TC` であることは変わらない**（272.0 µs/stage）ので、
+> 本節の交差点の議論そのものは影響を受けない。上表の p>=511 側が空いているのも
+> 当時の制約で、`bd2d962`（2026-08-27、任意次数の LGL 演算子生成）を前提に
+> `0980bdc`（p=511）/ `1018b70`（p=575）/ `9402f72`（p=767）/ `4c2b65a`（p=1023、
+> 64 bit 添字を含む）がそれぞれ GEMM 系を開き、`FUSED_TC` / `FUSED_DFMA` の
+> p=511 / 767 は `b494a42` / `ba24055` による。
+
 **交差は p=127 と p=255 の間へ動いた。** 融合が勝つ最大の次数は少なくとも
 **p=127** で、上側の境界はふたたび開いている（p=255 は `FUSED_TC` 1487.4 対
 `GEMM_FUSED` 955 で GEMM 側）。`p63_gap_study.md` §16 の「p=63 以上」という
 下限表現は正しく、本節の初稿が §11.4 で「p=63 で確定」と書いたのは
 §11.11 より前の測定に基づく誤りだった。
+
+> **追記（2026-08-28 / 2026-08-31、`ba53906` / `e220c85`）: 交差点はさらに動き、
+> 現在は p=255 と p=511 の間にある。上表と本節の数値は当時の測定として残す。**
+> 括弧内の「p=255 は `FUSED_TC` 1487.4 対 `GEMM_FUSED` 955 で GEMM 側」は、
+> `ba53906`（p=255 タイル GEMM の二重バッファ化ほか、`p255_gap_study.md` §1 以降）で
+> 逆転した。p=127 の側も `e220c85` で `FUSED_TC` を組み替えている。
+> 現行ツリーの最速は **p=7…255 が `CUDAFORTRAN_FUSED_TC`、p=511 / 575 / 767 / 1023 が
+> `CUDAFORTRAN_GEMM_FUSED`** で、p=255 は `FUSED_TC` 883.7 対 `GEMM_FUSED` 943.3、
+> p=127 は `FUSED_TC` 592.6 対 `GEMM_FUSED` 637.1 µs/stage
+> （[`measurement_inventory.md`](measurement_inventory.md) §18.3、tree `e113535`、
+> job `83460`。索引と最新のまとめは [`README.md`](README.md)）。
+> **したがって「融合が勝つ上限は p=127」も上限ではなく、現時点では少なくとも p=255。**
+> 本節の見出しに残る「p=63」は初稿時のラベルである。
 
 published 値との照合: p=31 `FUSED_TC` 374.8 → 378.9、p=63 `GEMM_FUSED` 593.8 → 590.6 は
 いずれも 1% 以内で、過去の表はそのまま有効である。**p=63 の `FUSED_TC` だけは

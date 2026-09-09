@@ -32,6 +32,17 @@ Tensor Core 版は演算器が 22% しか回らず、L1 / shared パイプで律
 Memory Workload Analysis（バンクコンフリクト指標）が未収集だった。
 → **§5 で測定済み（Slurm job 43554, 2026-08-25）**。
 
+> **用語対応表（追記 2026-09-09）**: 本メモ全体のカーネル名は当時の名前である。
+> `5b6bd82`（2026-08-29）で CUDA core 版が C++ に移って改名され、
+> `tendency_fused_p7_kernel` という名前は **TC 側**に移った。
+> **上の表と以降の表は当時の記録として 1 文字も書き換えない。**
+>
+> | 本メモの表記 | 現行ツリー |
+> |---|---|
+> | `tendency_fused_p7_kernel`（CUDA core） | `tendency_fused_p7_cc_kernel`（`cuda_dg_kernels_fused.cu`、C++。CUDA Fortran 版は §17 の C++ 復活で消えた） |
+> | `tendency_fused_p7_tc_kernel`（Tensor Core） | `tendency_fused_p7_tile_kernel<UseTc>`（`cuda_dg_kernels_tc.cu`。§23 の `P7_TC_KP=2` 形。NVTX 範囲名は今も `tendency_fused_p7_tc_kernel`） |
+> | （当時は無い） | `tendency_fused_p7_kernel<UseTc>`（`cuda_dg_kernels_tc.cu`。**TC/DFMA 側**の `KP=1` 版であって CUDA core 版ではない） |
+
 ---
 
 ## 1. 論文側の主張の要点
@@ -58,6 +69,9 @@ Memory Workload Analysis（バンクコンフリクト指標）が未収集だ�
 ---
 
 ## 2. 取り込み候補（優先度順）
+
+> **但し書き（追記 2026-09-09）**: 本節は `299a868`（2026-08-25）時点の候補評価である。
+> 以降の実測で覆った判断があるので、A-2 末尾の追記を併せて読むこと。
 
 ### A-1. shared memory のコンフリクトフリー化【最優先】
 
@@ -111,6 +125,25 @@ TC 版が tiled FUSED 比 1.13× しか出ない理由はこれで説明でき�
 （`overall_summary_report.md` §1）、これは論文の手書きカーネルより成熟した
 multistage mainloop である。**手書き TC の p=255 パスに投資する価値は低い。**
 廃止候補として明記し、投資は A-1（p=7）と C 系に回すのが妥当。
+
+> **訂正注記（追記 2026-09-09）**: 上の 2 段落は 2 点とも現行ツリーでは成り立たない。
+> 本文は当時の評価として残す。
+>
+> **(a) カーネルの記述が現行と違う。** p=255 の手書き TC は
+> `tendency_p255_kernel<DIR, NQ, UseTc, FuseFace24>`（`cuda_dg_kernels_tc.cu`）に
+> 置き換わっており、`BM255 = BN255 = 64` の **64×64 タイル**を
+> `TH255_SEL = 128` スレッド（4 ワープ、`TM255 = TN255 = 4` ＝ 1 ワープが
+> 4×4 枚の 8×8 mma タイル）で回し、
+> `BK255 = 16` の縮約チャンクを **二重バッファの shared パネル**
+> （`P255_SMEM_BYTES` = 32 KB）に載せる。`MINB255 = 3`。
+> したがって「shared memory を一切使わず」「1 ブロック = 1 warp」は
+> どちらも現行の実装には当たらない（`fused_kernel_geom.h` の `BM255`/`BK255`/`TH255`/`MINB255`）。
+>
+> **(b) 「投資価値は低い / 廃止候補」という判断は覆った。** `ba53906`（2026-08-28）以降、
+> p=255 の最速は `CUDAFORTRAN_FUSED_TC` であり、**手書き TC が CUTLASS / cuBLAS 経路に
+> 負けるという前提そのものが失効している**（`reports/README.md`「最速経路だけ横断」、
+> `p255_gap_study.md` §1 以降、`measurement_inventory.md` §18.3）。
+> p=255 の手書き TC は現在 production の最速経路である。
 
 ### A-3. shared memory ルーフラインの導入【解析手法】
 
@@ -188,6 +221,20 @@ GB200 の BF16 TC スループットを考えると、**p=255 の巨大 GEMM に
 ただし 2 項では足りず 6〜9 項必要で演算量が一桁増えるため、実装前に
 「必要項数 × 実効 BF16 TFLOP/s vs 現行 FP64 GEMM」の見積もりを先に行うこと。
 
+> **追記（2026-09-09）**: この「先に行うこと」とされた見積もりは
+> [`ozaki2_survey_2504.08009.md`](ozaki2_survey_2504.08009.md) で実施済みで
+> （§3 の下限実測、§6 の交点モデル）、さらに `CUDAFORTRAN_GEMM_OZAKI1` /
+> `CUDAFORTRAN_GEMM_OZAKI2` として**実装され測定済み**である。
+> 結果は否定的で、**精度を揃えると Ozaki は 9 次数すべて native に負け、
+> 交叉は起きていない**（`reports/README.md` の 2026-09-03 追記、job `78846`、
+> `measurement_inventory.md` §10.3）。**数値が合う唯一の設定である `OZAKI1`
+> FIXED 7 slices** は p=255 で **23.4×**、比が最小の p=767 でも **9.78×** 遅い。
+> `OZAKI2` の 3.03×（p=255）/ 1.30×（p=767）は速いほうの値だが、
+> **その設定は数値検証を通らない**ので達成可能な速度ではない
+> （`gemm_assignment_and_carrier.md` §14.3、`OZAKI2` は 3 次数とも max abs
+> 1e+2 オーダー）。
+> したがって本項の「理屈上は有望」は、**実測では p=767 まで成立していない**。
+
 ### C-2. WMMA API
 
 論文の結論どおり劣位。本リポジトリは既に MMA 直書きのため、
@@ -221,6 +268,9 @@ GB200 の BF16 TC スループットを考えると、**p=255 の巨大 GEMM に
 `output/FUSED_TC_p7_bank_full.ncu-rep{,.txt}`, および `FUSED_p7_*` の同名一式。
 
 ### 5.1 測定値
+
+> **注記（2026-09-09）**: 以下の 2 つのカーネル名は当時の名前。現行名は §0 の
+> 用語対応表を見ること（CUDA core 版 = `tendency_fused_p7_cc_kernel`）。
 
 | metric | `tendency_fused_p7_tc_kernel` (TC) | `tendency_fused_p7_kernel` (CUDA core) |
 |---|---:|---:|
@@ -324,6 +374,10 @@ ncu の見積りを単純合成すると 1.3〜1.5× 程度で、
 5. **`sDz` に XOR 置換** `sw_dz(idx) = idx ^ (((idx>>6)&1)<<3)`。
 
 ### 6.2 測定結果
+
+> **注記（2026-09-09）**: 「CUDA core 版」列は当時の CUDA Fortran
+> `tendency_fused_p7_kernel`。現行では C++ の `tendency_fused_p7_cc_kernel` で、
+> `tendency_fused_p7_kernel` という名前は TC 側に移っている（§0 の用語対応表）。
 
 | | 実装前 | 実装後 | CUDA core 版 |
 |---|---:|---:|---:|
@@ -563,6 +617,11 @@ ncu 単発カーネル（`-s 5 -c 1`、`--set full`）:
 `tendency_fused_p7_kernel`（CUDA core 版、`mod_cuda_dg_kernels.cuf`）にも
 そのまま効く。測定は Slurm job `44039` と login node の `nstep=1000` 実測、
 条件は §5 と同一。
+
+> **注記（2026-09-09）**: 本節の `tendency_fused_p7_kernel` は当時の CUDA Fortran
+> カーネル。§17 の C++ 復活と `5b6bd82` の改名により、現行の CUDA core 版は
+> `cuda_dg_kernels_fused.cu` の `tendency_fused_p7_cc_kernel` であり、
+> `mod_cuda_dg_kernels.cuf` にこの名前のカーネルはもう無い（§0 の用語対応表）。
 
 ### 8.1 適用可否
 
@@ -1666,6 +1725,11 @@ max abs **1.776357e-15**（相対 2.860e-16）—— §18 と同値。
 実測でも `Ne=2³` の owned `dqdt` が TC / DFMA でビット一致する。
 **内積以外の乖離は無い。**
 
+> **注記（2026-09-09）**: ソース上は 2 か所だが、`mma_m16n8k8_f64` は
+> `P7_TC_M16N8K8=1`（既定 0）のときしか `mma_k8_8x8` から呼ばれないため、
+> **既定ビルドで実体化されるのは 1 か所**である。§23.4 の「1 か所」はその意味で、
+> 両者は矛盾しない。
+
 ### 19.9 副産物: iso-schedule の代金を `FUSED_DFMA` が払っている（未解決）
 
 上の 3 版を `DqdtKernel_Type = CUDAFORTRAN_FUSED_DFMA` で回すと、
@@ -2209,6 +2273,13 @@ shared 充填が `if (tid < 64) … else if (tid < 112)` と書かれていて�
 （`AGENTS.md`）。iso-schedule は保たれている: `UseTc` を見る分岐は
 `mma_m8n8k4_f64` の 1 か所だけで、`P7_TC_KP` はそこを見ない。
 
+> **限定注記（2026-09-09）**: この「1 か所」は §19.8 の「2 か所」と字面が矛盾するが、
+> どちらも誤りではない。現行ソースの `UseTc` 分岐は `mma_m8n8k4_f64` と
+> `mma_m16n8k8_f64` の **2 か所**にあり、後者は `P7_TC_M16N8K8`
+> （既定 0、`fused_kernel_geom.h`）が 1 のときだけ `mma_k8_8x8` から呼ばれる
+> 役割外アブレーションである。すなわち**既定ビルドで実体化されるのは 1 か所**で、
+> 本項の iso-schedule の議論はそのまま成り立つ。
+
 DFMA が TC より大きく（−21.2% 対 −7.2%）動くのは、DFMA 側が `KP=1` の
 32 レジスタ予算で **84 B の spill** を出していた（§26.2 が p=255 で見つけた
 のと同じ現象）ためで、`KP=2`/80 レジスタでは spill 0 になる。
@@ -2634,6 +2705,26 @@ p=31 の 128-bit は**同族**であり、共通項は幅ではなく
   **`scripts/build_p7tc_variant.sh`**（`cuda_dg_kernels_tc.cu` だけ再コンパイル
   して凍結実行ファイルを作る）。`jobs/job_p7_shwf.sh` は gitignore なので、
   ncu コマンドは本節冒頭に転記した。
+
+> **訂正注記（2026-09-09）**: 上の 2 項目に、それぞれ 1 点ずつ訂正がある。
+> 「カーネル変更ゼロ・§23.6 の数値検証は有効・p=7 行は動かない」という**結論は
+> そのまま**である。
+>
+> - **`reports/README.md` の p=7 行が採っているのは 254.15 ではなく 253.76
+>   µs/stage**（`FUSED_TC`、§23.7、job `78271`、node `c177`、3 経路同居）。
+>   254.15 は §23.4 の 2 経路 A/B（job `78266`）の値で、README はそちらではなく
+>   3 経路を同一ジョブに入れた §23.7 の値を、**「追記（2026-09-02）」の現行
+>   `FUSED_TC` 表**（p=7 行 253.8、出所欄が job `78271`）と主比 B / 機構比 A に
+>   使っている。凍結された「最速経路だけ横断」表の p=7 行は当時値 274.9 のままで、
+>   方針どおり書き換えられていない。
+>   索引行（README の本レポート行と `p7_gap_study.md` 行）には §23.4 の 254.15 が
+>   経緯として残っており、そちらは当時の記録である。
+> - **`scripts/micro_shared_wavefront.cu` と `scripts/build_p7tc_variant.sh` は
+>   ツリーに存在しない。** `scripts/` 自体が未追跡（gitignore 対象）で、
+>   両ファイルとも現在は残っていない。したがって **§24 の機構同定
+>   （マイクロベンチ 11 パターンと実カーネル 4 版）は、現状そのままでは再現できない**。
+>   §24.2 / §24.3 の測定値と ncu コマンドは記録として有効だが、再取得するには
+>   マイクロベンチとビルドスクリプトを書き直す必要がある。
 - §20.5 の未解明は**機構つきで閉じた**。§20.2 の要求数 80 / 144 と
   wf/要求 2.82 / 2.85 は**訂正される**（72 / 136、3.03 / 3.16）。
   §20 の結論そのもの（増分は率ではなく要求数、天井は負）は**変わらない**。

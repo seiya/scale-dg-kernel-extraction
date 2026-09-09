@@ -22,9 +22,20 @@
    入れ替わっている。項目 4 と §7 の現行列を参照。）
 2. **p=255（Ne=1）では GEMM 化が最速**。`CUDAFORTRAN_GEMM_FUSED` は
    tiled FUSED 比 **4.30×**、`CUDAFORTRAN_GEMM` 比 **1.08×**。
+   （2026-09-09 追記: この順位は `ba53906`（2026-08-28）以降
+   `CUDAFORTRAN_FUSED_TC` に入れ替わっている。`README.md` の
+   「最新結果のまとめ」、[`p255_gap_study.md`](p255_gap_study.md) §5.1
+   （`FUSED_TC` 1014.2 対 `GEMM_FUSED` 1050.5 µs/stage）を参照。
+   現行値は `measurement_inventory.md` §18.3 で 883.7 対 943.3 µs/stage。）
 3. **同じ体積 DOF 数（256³）でも、最適戦略は p=7 と p=255 で逆転する。**
    p=7 は「小行列 × 大量要素」、p=255 は「巨大 dense contraction」で、
    GEMM 化は p=7 では **7.4× 遅く**、p=255 では **4.3× 速い**。
+   （2026-09-09 追記: 項目 2 の順位交代に伴い、後半の符号も反転した。
+   `measurement_inventory.md` §18.3 の現行値では p=7 が `GEMM_FUSED` 1482.0 対
+   `FUSED_TC` 253.8 で GEMM 化は **5.84× 遅く**、p=255 は 943.3 対 883.7 で
+   GEMM 化は速いどころか **1.07× 遅い**。「最適戦略が p=7 と p=255 で逆転する」
+   という前半の命題自体が、現行ツリーでは成り立たない —— どちらの端でも
+   融合カーネルが勝つ。上の 7.4× / 4.3× は `299a868` 時点の測定として残す。）
 4. **FP64 Tensor Core（`m8n8k4` 直書き）の勝敗は shared memory レイアウトで決まる。**
    本レポート時点（`299a868`）では p=7 で 1.28× 遅く、p=255 でも 1.13× しか
    速くならなかったが、p=7 の原因は MMA 命令そのものではなく shared memory の
@@ -35,6 +46,10 @@
    詳細は `tc_paper_survey_2407.09621.md` §5-6。
    なお p=255 の手書き TC 経路は依然として CUTLASS/cuBLAS の multistage
    mainloop に大きく負けており、この結論は変わらない。
+   （2026-09-09 追記: `ba53906`（2026-08-28）以降 p=255 の最速は
+   `CUDAFORTRAN_FUSED_TC` で、手書き TC が CUTLASS に負けるというこの結論は
+   覆った。`README.md` の「最新結果のまとめ」、
+   [`p255_gap_study.md`](p255_gap_study.md) §5.1。）
 5. **カーネル削減は「消せる DRAM トラフィック」の範囲でのみ得。** p=255 で
    assembly（DRAM 92% で帯域律速）を z-GEMM epilogue に融合すると **−8.3%** だが、
    `q*vel` を GEMM mainloop に融合すると +66% と大きく悪化する。
@@ -98,6 +113,30 @@ adv_z = Escale(1,1,3) * w(1,1)
 | `CUDAFORTRAN_GEMM` | volume flux と数値流束はカーネル、微分と `Lift1D` を cuBLAS Dgemm | ✓ | ✓ |
 | `CUDAFORTRAN_GEMM_CUTE` | volume 3 GEMM のみ CUTLASS d884 に置換 | — | ✓ |
 | `CUDAFORTRAN_GEMM_FUSED` | 上に加え z GEMM の epilogue で dqdt assembly を融合 | — | ✓ |
+
+**追記（2026-09-09）: 上の表は 2026-08-25 時点の経路一覧である。表は書き換えない。
+現行の経路定義は `AGENTS.md` の Implementation Path Roles を正典とすること。**
+当時からの変更点は次の 4 点:
+
+- **経路が 3 本増えている**: `CUDAFORTRAN_FUSED_DFMA`（`FUSED_TC` と同一ソース・
+  `UseTc=false` の iso-schedule アブレーション）、`CUDAFORTRAN_GEMM_OZAKI1` /
+  `CUDAFORTRAN_GEMM_OZAKI2`（`GEMM` と同一の unfused ドライバで volume 3 GEMM だけ
+  差し替え）。
+- **p=7 の `GEMM_CUTE` / `GEMM_FUSED` の「—」は失効**。`f7788bb`（2026-08-30）の
+  CUTLASS `grid.z` キャップで batch 上限 65535 の制約が外れ、p=7 / p=15 でも起動する
+  （`measurement_inventory.md` §18.3 に両経路の p=7 セルがある）。
+- **`GEMM_FUSED` の「z GEMM の epilogue」は現行の実装ですらない**。
+  どの volume GEMM が融合エピローグを担うかは測定事項で、担い手が cuBLAS で
+  ないことだけが固定である（`AGENTS.md`）。現行ツリーの担い手は
+  **`Nq<=32` で x、`Nq>=64` で z**（`51d56a8` / `84b44c6` / `2238965`、
+  いずれも 2026-09-02。`gemm_assignment_and_carrier.md` §3）。
+- **`CUDAFORTRAN_FUSED` の p=255 は「16×16 tile」ではない**。CUDA-core 融合は
+  次数ごとの自然順カーネル（`cuda_dg_kernels_fused.cu` /
+  `cuda_dg_kernels_fused_highp.cu`）として書き直されており（§15）、対応次数も
+  Nq=8, 16, 32, 64, 128, 256（`mod_advect3d_eq.f90` の
+  `"CUDAFORTRAN_FUSED requires Nq=8, 16, 32, 64, 128 or 256"`）、`FUSED_TC` /
+  `FUSED_DFMA` は `bd2d962` の任意次数 LGL 演算子生成と合わせて Nq=512 / 768 まで
+  伸びている。
 
 OpenACC の resident 配列は `host_data use_device` で CUDA Fortran に渡し、
 time-stepping 中に host 経由の field copy は行わない。
@@ -240,6 +279,10 @@ z GEMM 339.1 / x GEMM 249.7 / y GEMM 243.5 / `volume_flux` 125.9 /
 
 - **CUTE と cuBLAS はほぼ同じ**（1259.8 vs 1249.7 µs、+0.8%）。
   volume GEMM を自前 CUTLASS d884 に置き換えること自体には性能上の意味がない。
+  （2026-09-09 追記: **この観察は p=255 限定である。** 低次では差が付く。
+  `measurement_inventory.md` §18.3 の現行値では Nq=16（p=15）で
+  `GEMM_CUTE` 644.5 対 `GEMM` 828.1 µs/stage ＝ **0.778**、CUTLASS が 22% 速い。
+  「置換自体に意味がない」を次数によらない一般則として引かないこと。）
 - **CUTE → FUSED の差は z GEMM と assembly の交換に完全に帰着する。**
   z GEMM が 255.2 → 306.4 µs（**+51.2**）、assembly カーネルが 153.3 → 0（**−153.3**）で、
   差し引き **−105.2 µs（−8.3%）**。x/y GEMM・lift・flux は 1 µs 以下の差しかない。
@@ -818,6 +861,14 @@ device 時間（`CUDA device GEMM fused`、3000 call）は 3.0058 → 2.9646 秒
 graph on が +0.6% になる。elembnd は `VMapM`/`VMapP` で `q` を gather するので、
 volume flux が `q,u,v,w` を L2 に流す前のほうが安い。
 
+（2026-09-09 追記: **この「graph 捕捉時は 1 本に戻す」は `c5788c7`（2026-08-30）で
+撤回されている。** 現行の `main.f90` は `UseCudaGraph` のとき
+`cuda_dg_set_side_stream(.false.)` を呼ばない（`use` 節に名前が残っているだけで、
+呼び出しは無い）。y エピローグ畳み込み後は再生でも elembnd が cuBLAS x の裏に
+収まり、p=63 `GEMM_FUSED` で side stream を残した方が Main **−0.58%**
+（直接ローンチ比 −1.97%）である。`p63_gap_study.md` §44、`README.md`
+「現時点の結論」。上の +5 µs/call は当時の測定として残す。）
+
 p=7 の `CUDAFORTRAN_GEMM` でも無効にしている。そこでは elembnd が 181 µs で
 volume GEMM は 8×8 の 24 launch なので、隠す先の窓より隠すものが大きく、
 重ねると +3.1% になる。
@@ -1062,6 +1113,10 @@ z の結果から見て、どちらも時間では報われない公算が大き
   （`Kernel<cutlass..gemm..kernel..Gemm<` のように `::` を `..` で表記）としている。
 - `CUDAFORTRAN_GEMM_FUSED` p=7 と `CUDAFORTRAN_SPLIT` p=255 は
   実装上サポート外のため `ERROR STOP`（想定どおり）。
+  （2026-09-09 追記: **`CUDAFORTRAN_GEMM_FUSED` p=7 のこの制約は失効した。**
+  `f7788bb`（2026-08-30）が CUTLASS の `grid.z` をキャップして batch 上限 65535 を
+  外したので、p=7 / p=15 でも起動する。現行値は `measurement_inventory.md` §18.3。
+  `CUDAFORTRAN_SPLIT` p=255 は現在も対象外。）
 - `CUDAFORTRAN_GEMM_CUTE` は job 43219 の `job_all.sh` の対象に含まれていなかった。
   **→ job 43244（run + nsys）と job 43246（ncu）で取得済み**。
   CUTE は volume GEMM の 2 本が同じ `GemmBatched` テンプレートで、
@@ -1132,6 +1187,13 @@ z の結果から見て、どちらも時間では報われない公算が大き
    あわせて、ncu 単発 launch と実運用 launch では最適化の優劣が逆転しうる
    ことが分かった（同 §10.5、§11.5）。ncu で絞った候補は
    必ず `nstep=1000` の end-to-end で確認すること。
+   （2026-09-09 追記: **「打ち止めに近い」は撤回する。** その後 `265ef15`
+   （M 側面の staging と spill 削減）、`51b1abf`（出力タイル、−3.4%）、
+   `5a2a99a`（TC でさらに −7.15%）で p=7 は下がり続け、現行は
+   `FUSED_TC` **253.8** / `FUSED`（CC）**292.8** µs/stage である
+   （`tc_paper_survey_2407.09621.md` §23 / §23.7、job `78271`。
+   `measurement_inventory.md` §18.3 の再測は 253.8 / 292.5）。
+   本項の 434.6 → 405.5 µs は当時の値として残す。）
 3. ~~**`q0 ← q` の改善。**~~ → **完了（2026-08-25、§8.1）**。stage 1 の RK
    更新に融合してカーネルごと削除した。非 tendency は約 422 → 320 µs/step。
    次に残るのは min/max reduction（1.16 TB/s）と halo 更新だが、
@@ -1145,6 +1207,15 @@ z の結果から見て、どちらも時間では報われない公算が大き
    「要素並列カーネル vs GEMM 化」の比較にはならず、汎用パス同士の比較にしか
    ならない。損益分岐を知りたいなら、まず中間次数の専用カーネルを書く
    必要がある。それは測定ではなく実装の作業であり、現時点で優先度は低い。
+   （2026-09-09 追記: **取り下げの理由は失効した。取り消し線の記述は当時の
+   ツリーの状態として残す。** 中間次数の専用カーネルはその後書かれ、現行の
+   error stop は `CUDAFORTRAN_FUSED` が
+   `"CUDAFORTRAN_FUSED requires Nq=8, 16, 32, 64, 128 or 256"`、
+   `FUSED_DFMA` / `FUSED_TC` が `Nq=8, 16, 32, 64, 128, 256, 512 or 768` を許す
+   （`mod_advect3d_eq.f90` の `cuda_cal_dqdt_fused*` ディスパッチ。引用行番号
+   605/613/622/652/660 は当時のもので現行ツリーには対応しない）。
+   crossover 自体もすでに実測済みで、`README.md` の「最新結果のまとめ」と
+   `measurement_inventory.md` §18.3 が p=7…1023 の 10 次数 × 全経路を横断している。）
 5. ~~**1 step あたりの launch 回数の削減（CUDA Graph）。**~~ → **完了
    （2026-08-25、§8.3）**。1 step を捕捉して再生するようにし、p=7 `FUSED_TC` の
    Main は 1.2038 → 1.1716 秒（−32 µs/step）、p=255 `GEMM_FUSED` は
@@ -1287,7 +1358,11 @@ TMA はコピーエンジンであって MMA とは直交しているので、
 
 ---
 
-## 13. 関連ファイル
+## 関連ファイル
+
+（2026-09-09: 節番号を外した。本文中に `## 13.` の見出しが 2 つあり、
+外部から参照されている §13 は下の「律速の棚卸し」の方であるため。
+参照されているのは §13.1 / §13.3 で、その番号は変えていない。）
 
 | ファイル | 内容 |
 |---|---|
