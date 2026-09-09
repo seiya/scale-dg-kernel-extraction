@@ -179,6 +179,7 @@ OZAKI 列の p≥511 は本作業では起動確認をしていない（時間�
 | `p1023_gap_study.md` §13.8 の 188.78 ms/stage | `device GEMM fused` ÷21（未補正） | 同レポート自身が「trace 実測 **186.06 ms/stage**（§13.2、job `74738`）を優先せよ」と書いている。**README 最速経路表の p=1023 = 187617 µs/stage はこのどちらとも一致しない**（`Cal_tend` 系の当時値） |
 | `p15_gap_study.md` §17 / `p31_gap_study.md` §15 の Ozaki 値 | 「device 合計 ÷ 99 step」など stage で割っていない換算 | §単位が他と揃っていない。`gemm_assignment_and_carrier.md` §9.5 の native 比が現行の一次ソース |
 | `README.md`「今回埋めた欠測」節 | p=15 `GEMM` の 2508 µs/stage が「RK 3 stage で割っていなかった」誤りとして訂正済み（→848 µs） | **stage 数の取り違えは実際に 1 度起きている**。同種の誤りが p=1023 に残っている疑い（上記） |
+| `p31_gap_study.md` §28 と `p7_gemm_fused.md` §13.3（同内容の双子節）の µs/stage | p=7 conf（`nstep=20` → 57 stage）の分母を p=31 の表（`nstep=200` → 597 stage）に持ち込んだ。base 7400.1 は実際には **706.5 µs/stage** | **stage 数の取り違えの 2 例目。**絶対値が 10.47 倍大きく出ている。**同じ表の中では分母が共通なので比（+0.94%）と採用ゼロは不変**。両節に訂正注記あり（2026-09-09）。同一経路・同一 conf の正しい絶対値は `p31_gap_study.md` §23.2 の 709.17 |
 
 **`WarmupStep` より前（`760e96e` 以前、2026-08-27 より前）の値**は
 warmup 込みである。README の「経路 × 次数」表の一次ソースは 2026-08-29 なので
