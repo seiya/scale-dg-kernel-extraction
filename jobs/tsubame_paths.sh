@@ -227,9 +227,11 @@ label_of() { # tsubame-safe file/label token for a path spec
 #-----------------------------------------------------------------------------
 cmp_dump() { # $1 ref  $2 run   -- streams, so a 3 GB dump does not need 3 GB of RAM
   python3 - "$1" "$2" <<'PY'
-import sys
+import sys, math
 worst = 0.0
 ref = 0.0
+sd2 = 0.0
+sx2 = 0.0
 n = 0
 with open(sys.argv[1]) as a, open(sys.argv[2]) as b:
     for la, lb in zip(a, b):
@@ -237,9 +239,16 @@ with open(sys.argv[1]) as a, open(sys.argv[2]) as b:
         d = abs(x - y)
         if d > worst: worst = d
         if abs(x) > ref: ref = abs(x)
+        sd2 += d * d
+        sx2 += x * x
         n += 1
 rel = worst / ref if ref else 0.0
-print("n=%d max|diff|=%.3e ref_max=%.3e rel=%.3e" % (n, worst, ref, rel))
+# Relative L2 as well as the max norm: the max norm is set by one point and
+# says nothing about how many points moved, which is the question a reader
+# asks of a reduction-order change.  Both are reported so neither has to be
+# inferred from the other.
+l2 = math.sqrt(sd2) / math.sqrt(sx2) if sx2 else 0.0
+print("n=%d max|diff|=%.3e ref_max=%.3e rel=%.3e relL2=%.3e" % (n, worst, ref, rel, l2))
 PY
 }
 

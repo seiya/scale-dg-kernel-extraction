@@ -213,19 +213,26 @@ cmp_dump() { # $1 ref  $2 run
   python3 - "$1" "$2" <<'PY'
 import sys, math
 worst = ref = 0.0
+sd2 = sx2 = 0.0
 n = bad = 0
 with open(sys.argv[1]) as a, open(sys.argv[2]) as b:
     for la, lb in zip(a, b):
         x = float(la); y = float(lb)
         n += 1
+        sx2 += x * x
         if math.isinf(y) or math.isnan(y):
             bad += 1
             continue
         d = abs(x - y)
         if d > worst: worst = d
         if abs(x) > ref: ref = abs(x)
-print("n=%d max|diff|=%.3e ref_max=%.3e rel=%.3e inf_or_nan=%d"
-      % (n, worst, ref, worst / ref if ref else 0.0, bad))
+        sd2 += d * d
+# Relative L2 beside the max norm, for the same reason as in
+# jobs/tsubame_paths.sh: an emulated mantissa moves many points a little,
+# which the max norm cannot distinguish from one point moving a lot.
+print("n=%d max|diff|=%.3e ref_max=%.3e rel=%.3e relL2=%.3e inf_or_nan=%d"
+      % (n, worst, ref, worst / ref if ref else 0.0,
+         math.sqrt(sd2) / math.sqrt(sx2) if sx2 else 0.0, bad))
 PY
 }
 
