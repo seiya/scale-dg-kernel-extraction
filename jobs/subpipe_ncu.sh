@@ -88,6 +88,22 @@
 
 set -u
 
+# Freeze this script before running it.  bash reads a script incrementally, so
+# editing it while a job is executing it shifts every later byte offset and the
+# job dies with a syntax error in the middle of the sweep -- which is exactly
+# what happened to Slurm 94875 (reports/subpipe_transfer_model.md 5S.4), after
+# its 24 cells had finished.  AGENTS.md already requires profiling a frozen copy
+# of the executable for the same class of reason; the job script needs it too.
+if [ -z "${SCALE_DG_FROZEN_SCRIPT:-}" ] && [ -r "$0" ]; then
+  frozen_self=$(mktemp "${TMPDIR:-/tmp}/subpipe_ncu.XXXXXX") || exit 1
+  cat "$0" > "$frozen_self" || exit 1
+  export SCALE_DG_FROZEN_SCRIPT="$frozen_self"
+  bash "$frozen_self" "$@"
+  rc=$?
+  rm -f "$frozen_self"
+  exit $rc
+fi
+
 # Not from $0: SGE and TCS both run a spool copy.  See jobs/tsubame_paths.sh.
 ROOT=""
 for candidate in "${SCALE_DG_ROOT:-}" "${SGE_O_WORKDIR:-}" "${PJM_O_WORKDIR:-}" "$PWD" \
