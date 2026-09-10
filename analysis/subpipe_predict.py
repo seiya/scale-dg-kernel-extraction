@@ -75,6 +75,10 @@ CAP_FMA = 4.0          # FMA pipe instructions
 CAP_ALU = 2.0          # ALU pipe instructions
 CAP_L2_B = 64.0        # L2 bytes per SM-clock (calibrated below, see --audit)
 
+STALLS = ["long_scoreboard", "short_scoreboard", "math_pipe_throttle",
+          "mio_throttle", "lg_throttle", "tex_throttle", "barrier", "membar",
+          "wait", "drain", "no_instruction", "not_selected"]
+
 METRICS = {
     "dur": "gpu__time_duration.sum",
     "freq": "sm__cycles_elapsed.avg.per_second",
@@ -86,7 +90,13 @@ METRICS = {
     "lsu_wf": "l1tex__data_pipe_lsu_wavefronts.sum",
     "dram_B": "dram__bytes.sum",
     "l2_B": "lts__t_bytes.sum",
+    "warps_pct": "sm__warps_active.avg.pct_of_peak_sustained_active",
+    "dram_pct": "dram__throughput.avg.pct_of_peak_sustained_elapsed",
 }
+# Group B of the sweep: the issue-stall breakdown, which is what the second
+# equation (latency-bound kernels, section 5H) transfers.
+METRICS.update({"st_" + s_: "smsp__average_warps_issue_stalled_%s"
+                            "_per_issue_active.ratio" % s_ for s_ in STALLS})
 
 
 def role_of(name):
@@ -215,11 +225,17 @@ def load_case_raw(machine, order, path_name):
     d = os.path.join(ROOT, SWEEPS[machine])
     files = sorted(glob.glob(os.path.join(d, "p%d_%s_8x8x4_none_r*_a.csv"
                                           % (order, path_name))))
+    # The stall metrics are collected in a second ncu pass (suffix _b), a
+    # different set of launches of the same kernels; merged per role below.
+    files += sorted(glob.glob(os.path.join(d, "p%d_%s_8x8x4_none_r*_b.csv"
+                                           % (order, path_name))))
     per_role = defaultdict(list)
+    stall_role = defaultdict(list)
     for f in files:
+        b_pass = f.endswith("_b.csv")
         for _, (role, mets) in read_csv(f).items():
             if role and "dur" in mets:
-                per_role[role].append(mets)
+                (stall_role if b_pass else per_role)[role].append(mets)
     if not per_role:
         return {}
     # One tendency call launches every role at least once, so the rarest role
@@ -234,7 +250,8 @@ def load_case_raw(machine, order, path_name):
                "dmma_flop": statistics.median([dmma_flop_of(x["_name"])
                                                for x in lst])}
         for k in METRICS:
-            vals = [x[k] for x in lst if k in x]
+            src_lst = stall_role.get(role, []) if k.startswith("st_") else lst
+            vals = [x[k] for x in src_lst if k in x]
             agg[k] = statistics.median(vals) if vals else 0.0
         out[role] = agg
     return out
@@ -290,6 +307,52 @@ def eta_of(agg, machine):
 
 
 ETA_RULE = ["closest"]
+def stall_cycles(agg, src, tgt):
+    """Second equation (section 5H): T = N_inst (1 + sum S) / (4 W) SM cycles.
+
+    An identity on the machine it is measured on; transferring it means
+    transferring each stall class.  Measured laws (section 5M):
+
+      long_scoreboard  a DRAM queue -> scales with DRAM bytes per SM-clock,
+                       with a 6-8% unloaded-latency share that scales with
+                       clock instead (measured 2.36 / 2.60 against 2.47 / 2.75
+                       for the pure queue law)
+      math_pipe        shared fp64+tensor pipe -> its demand ratio
+      mio / short / lg / drain
+                       L1 and shared queues -> aggregate SM-cycle rate ratio
+      wait, barrier, not_selected, no_instruction
+                       fixed latencies and scheduling -> machine-invariant
+                       (measured 1.06 / 1.00 for wait)
+
+    N_inst and W are kernel properties and carry (measured 0.92-1.02 and
+    1.02-1.06 across the three machines).
+    """
+    W = agg["warps_pct"] / 100.0 * 16.0          # warps per scheduler
+    if W <= 0:
+        return float("inf")
+    bw = MACHINES[src]["dram_B"] / MACHINES[tgt]["dram_B"]
+    fr = MACHINES[tgt]["ghz"] / MACHINES[src]["ghz"]
+    rate = ((MACHINES[src]["sm"] * MACHINES[src]["ghz"])
+            / (MACHINES[tgt]["sm"] * MACHINES[tgt]["ghz"]))
+    sh_s = demands(agg, src)["shared"]
+    sh_t = demands(agg, tgt)["shared"]
+    law = {"long_scoreboard": UNLOADED_SHARE * fr + (1 - UNLOADED_SHARE) * bw,
+           "math_pipe_throttle": sh_t / sh_s if sh_s > 0 else 1.0,
+           "mio_throttle": rate, "short_scoreboard": rate,
+           "lg_throttle": rate, "drain": rate}
+    tot = 1.0 + sum(agg.get("st_" + c, 0.0) * law.get(c, 1.0) for c in STALLS)
+    return agg["inst"] / MACHINES[tgt]["sm"] * tot / (4.0 * W)
+
+
+# Share of the exposed long-scoreboard wait that is unloaded latency rather
+# than queueing, on the calibration machine.  Two machines give the same value
+# to within 2 points (0.061 from A100, 0.083 from H100), which is one degree
+# of freedom of validation, not none -- but it is the one fitted number in the
+# model and section 5M says so.
+UNLOADED_SHARE = 0.07
+
+ETA_RULE = ["closest"]
+MODEL = ["roof"]
 PATHS = ["FUSED_TC", "GEMM_FUSED", "GEMM", "FUSED"]
 ORDERS = [7, 15, 31, 63, 127, 255, 511, 575]
 
@@ -334,6 +397,9 @@ def predict_case(srcs, tgt, order, path_name, verbose=False):
         d = demands(agg, tgt, dmma_flop_tgt=o_name)
         roof = max(d, key=d.get)
         cyc = eta * d[roof]
+        if MODEL[0] != "roof" and agg.get("warps_pct"):
+            st_cyc = stall_cycles(agg, src, tgt)
+            cyc = st_cyc if MODEL[0] == "stall" else max(d[roof], st_cyc)
         ns = cyc / (MACHINES[tgt]["ghz"] * 1e9) * 1e9 * agg["mult"]
         pred_ns += ns
         o = obs.get(role)
@@ -361,6 +427,10 @@ def main():
                     help="rebuild analysis/subpipe_inputs.csv from the raw ncu CSVs")
     ap.add_argument("--from-table", action="store_true",
                     help="ignore the raw ncu CSVs and use the committed table")
+    ap.add_argument("--model", default="roof", choices=["roof", "stall", "max"],
+                    help="roof: eta * max demand (section 4).  stall: the "
+                         "second equation (section 5H/5M).  max: the larger of "
+                         "the unscaled roof and the second equation")
     ap.add_argument("--eta-rule", default="closest",
                     choices=["closest", "mean", "min", "max"],
                     help="with two calibration machines, how to combine eta")
@@ -368,6 +438,7 @@ def main():
     a = ap.parse_args()
     USE_TABLE[0] = a.from_table
     ETA_RULE[0] = a.eta_rule
+    MODEL[0] = a.model
 
     if a.distill:
         with open(TABLE, "w", newline="") as fh:
@@ -468,6 +539,18 @@ def main():
             print("  %-5d %10.3f %10.3f   %10.3f %10.3f  %s"
                   % (p, rat("GEMM_FUSED", 0), rat("GEMM_FUSED", 1),
                      rat("GEMM", 0), rat("GEMM", 1), marks))
+        rerr = []
+        for p in sorted(ratios):
+            r = ratios[p]
+            if "FUSED_TC" in r and "GEMM_FUSED" in r:
+                rerr.append(abs((r["GEMM_FUSED"][0] / r["FUSED_TC"][0])
+                                / (r["GEMM_FUSED"][1] / r["FUSED_TC"][1]) - 1))
+        if rerr:
+            lo = [e for p, e in zip(sorted(ratios), rerr) if p <= 127]
+            print("  |err| of that ratio: median %.1f%% over %d orders"
+                  " (p<=127: %.1f%%)"
+                  % (100 * statistics.median(rerr), len(rerr),
+                     100 * statistics.median(lo) if lo else float("nan")))
         print("  which path wins (sign of ratio-1): "
               + ", ".join("%s %d/%d" % (k, v[0], v[1]) for k, v in sorted(sign.items())))
 
