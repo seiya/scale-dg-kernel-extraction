@@ -70,7 +70,7 @@ SWEEPS = {
               "subpipe_paths_94875/ncu"],
     "A100":  ["wisteria/a100_subpipe_orders_9569112/ncu",
               "wisteria/a100_subpipe_paths_*/ncu"],
-    "H100":  ["tsubame/h100_subpipe_orders_8621935/ncu",
+    "H100":  ["tsubame/h100_subpipe_orders_*/ncu",
               "tsubame/h100_subpipe_paths_*/ncu"],
 }
 
