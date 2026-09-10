@@ -313,16 +313,22 @@ def stall_cycles(agg, src, tgt):
     An identity on the machine it is measured on; transferring it means
     transferring each stall class.  Measured laws (section 5M):
 
-      long_scoreboard  a DRAM queue -> scales with DRAM bytes per SM-clock,
-                       with a 6-8% unloaded-latency share that scales with
-                       clock instead (measured 2.36 / 2.60 against 2.47 / 2.75
-                       for the pure queue law)
-      math_pipe        shared fp64+tensor pipe -> its demand ratio
-      mio / short / lg / drain
-                       L1 and shared queues -> aggregate SM-cycle rate ratio
-      wait, barrier, not_selected, no_instruction
-                       fixed latencies and scheduling -> machine-invariant
-                       (measured 1.06 / 1.00 for wait)
+      long_scoreboard  a DRAM queue -> scales with DRAM bytes per SM-clock
+                       (57.4% of the weighted stall; measured 2.40 / 2.61
+                       against 2.47 / 2.75, section 5O)
+      math_pipe        machine-invariant (13.1%; measured 1.15 / 0.84).  NOT
+                       the shared-pipe demand ratio, which is 2.01 on A100 and
+                       would double-count what the roof term already carries
+      wait             fixed instruction latencies, invariant in CYCLES
+                       (10.9%; measured 0.97 / 0.95)
+      short_scoreboard, not_selected
+                       shared-memory latency, fixed in NANOSECONDS, so it
+                       scales with the clock (measured 0.57 / 0.97 and
+                       0.73 / 0.97 against 0.68 / 0.96)
+      mio / lg_throttle / barrier / drain
+                       no law found; 12.9% of the weighted stall and the
+                       largest remaining hole in the second equation
+                       (section 5O.2)
 
     N_inst and W are kernel properties and carry (measured 0.92-1.02 and
     1.02-1.06 across the three machines).
@@ -341,9 +347,9 @@ def stall_cycles(agg, src, tgt):
     else:
         long_law = UNLOADED_SHARE * fr + (1 - UNLOADED_SHARE) * bw
     law = {"long_scoreboard": long_law,
-           "math_pipe_throttle": sh_t / sh_s if sh_s > 0 else 1.0,
-           "mio_throttle": rate, "short_scoreboard": rate,
-           "lg_throttle": rate, "drain": rate}
+           "math_pipe_throttle": 1.0,
+           "short_scoreboard": fr, "not_selected": fr,
+           "mio_throttle": rate, "lg_throttle": rate, "drain": rate}
     tot = 1.0 + sum(agg.get("st_" + c, 0.0) * law.get(c, 1.0) for c in STALLS)
     return agg["inst"] / MACHINES[tgt]["sm"] * tot / (4.0 * W)
 
@@ -367,6 +373,11 @@ UNLOADED_SHARE = 0.07
 # latency half.
 PROBE_L0 = {"GB200": 916.0, "A100": 672.6, "H100": 726.0}
 QUEUE_K = 1.20
+
+# Where the roof model stops applying, on the calibration machine's own eta.
+# Section 5E.3 measured the error bands at this boundary; it is not fitted to
+# any hold-out.
+AUTO_ETA = 1.2
 
 ETA_RULE = ["closest"]
 MODEL = ["roof"]
@@ -417,7 +428,12 @@ def predict_case(srcs, tgt, order, path_name, verbose=False):
         cyc = eta * d[roof]
         if MODEL[0] != "roof" and agg.get("warps_pct"):
             st_cyc = stall_cycles(agg, src, tgt)
-            cyc = st_cyc if MODEL[0] == "stall" else max(d[roof], st_cyc)
+            if MODEL[0] == "stall":
+                cyc = st_cyc
+            elif MODEL[0] == "max":
+                cyc = max(d[roof], st_cyc)
+            else:                                    # auto
+                cyc = cyc if eta <= AUTO_ETA else max(d[roof], st_cyc)
         ns = cyc / (MACHINES[tgt]["ghz"] * 1e9) * 1e9 * agg["mult"]
         pred_ns += ns
         o = obs.get(role)
@@ -445,10 +461,13 @@ def main():
                     help="rebuild analysis/subpipe_inputs.csv from the raw ncu CSVs")
     ap.add_argument("--from-table", action="store_true",
                     help="ignore the raw ncu CSVs and use the committed table")
-    ap.add_argument("--model", default="roof", choices=["roof", "stall", "max"],
+    ap.add_argument("--model", default="roof", choices=["roof", "stall", "max", "auto"],
                     help="roof: eta * max demand (section 4).  stall: the "
                          "second equation (section 5H/5M).  max: the larger of "
-                         "the unscaled roof and the second equation")
+                         "the unscaled roof and the second equation.  auto: "
+                         "roof where the calibration machine says the kernel is "
+                         "near a roof (eta <= AUTO_ETA), the second equation "
+                         "where it is not -- decidable from calibration data")
     ap.add_argument("--l0-probe", action="store_true",
                     help="use the measured unloaded latency (jobs/"
                          "global_latency_probe.cu) in the long-scoreboard law "
