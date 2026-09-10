@@ -336,7 +336,11 @@ def stall_cycles(agg, src, tgt):
             / (MACHINES[tgt]["sm"] * MACHINES[tgt]["ghz"]))
     sh_s = demands(agg, src)["shared"]
     sh_t = demands(agg, tgt)["shared"]
-    law = {"long_scoreboard": UNLOADED_SHARE * fr + (1 - UNLOADED_SHARE) * bw,
+    if USE_PROBE[0]:
+        long_law = (PROBE_L0[tgt] / PROBE_L0[src]) * QUEUE_K * bw
+    else:
+        long_law = UNLOADED_SHARE * fr + (1 - UNLOADED_SHARE) * bw
+    law = {"long_scoreboard": long_law,
            "math_pipe_throttle": sh_t / sh_s if sh_s > 0 else 1.0,
            "mio_throttle": rate, "short_scoreboard": rate,
            "lg_throttle": rate, "drain": rate}
@@ -351,8 +355,22 @@ def stall_cycles(agg, src, tgt):
 # model and section 5M says so.
 UNLOADED_SHARE = 0.07
 
+# Unloaded global-memory latency, SM cycles, from jobs/global_latency_probe.cu
+# (section 5N.4, 5N.8, 5N.10).  Two minutes per machine, and it is NOT a
+# constant: 444 / 477 / 367 ns across these three, a 30% spread, and in SM
+# cycles the order changes again.  With it the long-scoreboard law splits into
+# the two halves that were measured separately:
+#     S_long ratio = (L0 ratio in SM cycles) x QUEUE_K x (DRAM B/SM-clk ratio)
+# QUEUE_K is the one number fitted here, on two points that agree to 5%
+# (1.17 from A100, 1.23 from H100).  This form reproduces both measured
+# S_long ratios to 1%, using a probe measurement rather than a fit for the
+# latency half.
+PROBE_L0 = {"GB200": 916.0, "A100": 672.6, "H100": 726.0}
+QUEUE_K = 1.20
+
 ETA_RULE = ["closest"]
 MODEL = ["roof"]
+USE_PROBE = [False]
 PATHS = ["FUSED_TC", "GEMM_FUSED", "GEMM", "FUSED"]
 ORDERS = [7, 15, 31, 63, 127, 255, 511, 575]
 
@@ -431,6 +449,11 @@ def main():
                     help="roof: eta * max demand (section 4).  stall: the "
                          "second equation (section 5H/5M).  max: the larger of "
                          "the unscaled roof and the second equation")
+    ap.add_argument("--l0-probe", action="store_true",
+                    help="use the measured unloaded latency (jobs/"
+                         "global_latency_probe.cu) in the long-scoreboard law "
+                         "instead of the two-point fit; costs a two-minute run "
+                         "on the target machine")
     ap.add_argument("--eta-rule", default="closest",
                     choices=["closest", "mean", "min", "max"],
                     help="with two calibration machines, how to combine eta")
@@ -439,6 +462,7 @@ def main():
     USE_TABLE[0] = a.from_table
     ETA_RULE[0] = a.eta_rule
     MODEL[0] = a.model
+    USE_PROBE[0] = a.l0_probe
 
     if a.distill:
         with open(TABLE, "w", newline="") as fh:
