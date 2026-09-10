@@ -69,15 +69,20 @@ SWEEPS = {
     "GB200": ["subpipe_orders_92904/ncu", "subpipe_hi_94874/ncu",
               "subpipe_paths_94875/ncu"],
     "A100":  ["wisteria/a100_subpipe_orders_9569112/ncu",
-              "wisteria/a100_subpipe_paths"],
+              "wisteria/a100_subpipe_paths_*/ncu"],
     "H100":  ["tsubame/h100_subpipe_orders_8621935/ncu",
-              "tsubame/h100_subpipe_paths"],
+              "tsubame/h100_subpipe_paths_*/ncu"],
 }
 
 
 def sweep_dirs(machine):
-    return [os.path.join(ROOT, d) for d in SWEEPS[machine]
-            if os.path.isdir(os.path.join(ROOT, d))]
+    """Entries may be globs, so a sweep that comes back from another machine is
+    picked up by dropping the directory in place, without editing this file."""
+    out = []
+    for d in SWEEPS[machine]:
+        out += sorted(x for x in glob.glob(os.path.join(ROOT, d))
+                      if os.path.isdir(x))
+    return out
 
 # Machine-invariant capacities, per SM per SM-clock (section 4).
 CAP_ISSUE = 4.0        # issue slots
@@ -416,6 +421,9 @@ CLAMP_Q = [False]
 PATHS = ["FUSED_TC", "GEMM_FUSED", "GEMM", "FUSED", "FUSED_DFMA", "GEMM_CUTE",
          "GEMM_OZAKI1"]
 ORDERS = [7, 15, 31, 63, 127, 255, 511, 575, 767, 1023]
+RATIOS = [("GEMM_FUSED", "FUSED_TC"), ("GEMM", "FUSED_TC"),
+          ("FUSED_DFMA", "FUSED_TC"), ("GEMM_CUTE", "GEMM_FUSED"),
+          ("FUSED", "FUSED_TC")]
 
 
 def predict_case(srcs, tgt, order, path_name, verbose=False):
@@ -601,40 +609,30 @@ def main():
         # The ranking question the paper asks.
         print("  %-5s %10s %10s   %10s %10s" % ("p", "GF/TC pred", "GF/TC meas",
                                                 "G/TC pred", "G/TC meas"))
+        # The pairs the model is asked to rank.  GEMM_FUSED/FUSED_TC is the
+        # one the paper opens with; FUSED_DFMA/FUSED_TC is the mma instruction
+        # on an iso-schedule, GEMM_CUTE/GEMM_FUSED the epilogue fusion.
         sign = defaultdict(lambda: [0, 0])
-        for p in sorted(ratios):
-            r = ratios[p]
-            if "FUSED_TC" not in r:
+        for num, den in RATIOS:
+            rows_ = [(p, r) for p, r in sorted(ratios.items())
+                     if num in r and den in r]
+            if not rows_:
                 continue
-
-            def rat(k, i):
-                return r[k][i] / r["FUSED_TC"][i] if k in r else float("nan")
-            marks = ""
-            for k, tag in (("GEMM_FUSED", "GF"), ("GEMM", "G")):
-                if k not in r:
-                    continue
-                ok = (rat(k, 0) > 1) == (rat(k, 1) > 1)
-                key = tag + (" p>=63" if p >= 63 else " p<63")
-                sign[key][0] += ok
-                sign[key][1] += 1
-                marks += " %s%s" % (tag, "o" if ok else "X")
-            print("  %-5d %10.3f %10.3f   %10.3f %10.3f  %s"
-                  % (p, rat("GEMM_FUSED", 0), rat("GEMM_FUSED", 1),
-                     rat("GEMM", 0), rat("GEMM", 1), marks))
-        rerr = []
-        for p in sorted(ratios):
-            r = ratios[p]
-            if "FUSED_TC" in r and "GEMM_FUSED" in r:
-                rerr.append(abs((r["GEMM_FUSED"][0] / r["FUSED_TC"][0])
-                                / (r["GEMM_FUSED"][1] / r["FUSED_TC"][1]) - 1))
-        if rerr:
-            lo = [e for p, e in zip(sorted(ratios), rerr) if p <= 127]
-            print("  |err| of that ratio: median %.1f%% over %d orders"
-                  " (p<=127: %.1f%%)"
-                  % (100 * statistics.median(rerr), len(rerr),
-                     100 * statistics.median(lo) if lo else float("nan")))
-        print("  which path wins (sign of ratio-1): "
-              + ", ".join("%s %d/%d" % (k, v[0], v[1]) for k, v in sorted(sign.items())))
+            print("  %-24s %10s %10s" % (num + " / " + den, "pred", "meas"))
+            errs_ = []
+            for p, r in rows_:
+                pr = r[num][0] / r[den][0]
+                me = r[num][1] / r[den][1]
+                ok = (pr > 1) == (me > 1)
+                sign[num + "/" + den][0] += ok
+                sign[num + "/" + den][1] += 1
+                errs_.append(abs(pr / me - 1))
+                print("    p=%-6d %10.3f %10.3f   %s" % (p, pr, me,
+                                                         "o" if ok else "X"))
+            print("    |err| median %.1f%%" % (100 * statistics.median(errs_)))
+        print("  sign of ratio-1: "
+              + ", ".join("%s %d/%d" % (k, v[0], v[1])
+                          for k, v in sorted(sign.items())))
 
 
 if __name__ == "__main__":
