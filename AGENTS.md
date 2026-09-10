@@ -240,6 +240,14 @@ performance win must never be treated as implicit permission to redefine it.
   summarizer, and the `cublas_kernel_names_nsys.sh` body with its wrapper.
   Everything else in `jobs/` -- one-off ablations, sweeps, `ncu` probes --
   stays local, and durable profiler commands still go in `reports/`.
+- `analysis/`: tracked analysis code and its distilled inputs, for results a
+  reader has to be able to re-derive. Today that is the sub-pipe transfer
+  model's predictor (`subpipe_predict.py`) and the table it reads
+  (`subpipe_inputs.csv`, distilled from the three machines' `ncu` sweeps,
+  which are 102 MB and stay local). Same reasoning as the `jobs/` allowlist: a
+  published cross-machine prediction is only reproducible if the code that
+  made it is. Ad-hoc analysis still does not go here -- only what a report
+  cites.
 - `reports/`: committed performance and optimization reports. See
   `reports/README.md` for the index and the current fastest path per
   polynomial order.
