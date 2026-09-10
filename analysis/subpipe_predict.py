@@ -61,12 +61,23 @@ MACHINES = {
                   dram_TBs=2.396, dmma_shapes={"8x8x4", "16x8x8", "16x8x16"}),
 }
 
-# All-order sub-pipe sweeps, one per machine, all at CutlassMmaShape 8x8x4.
+# Sub-pipe sweeps, all at CutlassMmaShape 8x8x4.  More than one directory per
+# machine: the original all-order sweep, then the extensions (p >= 767, and the
+# paths the first sweep did not cover).  Searched in order; the first directory
+# that has the file wins.
 SWEEPS = {
-    "GB200": "subpipe_orders_92904/ncu",
-    "A100":  "wisteria/a100_subpipe_orders_9569112/ncu",
-    "H100":  "tsubame/h100_subpipe_orders_8621935/ncu",
+    "GB200": ["subpipe_orders_92904/ncu", "subpipe_hi_94874/ncu",
+              "subpipe_paths_94875/ncu"],
+    "A100":  ["wisteria/a100_subpipe_orders_9569112/ncu",
+              "wisteria/a100_subpipe_paths"],
+    "H100":  ["tsubame/h100_subpipe_orders_8621935/ncu",
+              "tsubame/h100_subpipe_paths"],
 }
+
+
+def sweep_dirs(machine):
+    return [os.path.join(ROOT, d) for d in SWEEPS[machine]
+            if os.path.isdir(os.path.join(ROOT, d))]
 
 # Machine-invariant capacities, per SM per SM-clock (section 4).
 CAP_ISSUE = 4.0        # issue slots
@@ -212,7 +223,7 @@ def load_table():
 
 
 def load_case(machine, order, path_name):
-    if USE_TABLE[0] or not os.path.isdir(os.path.join(ROOT, SWEEPS[machine])):
+    if USE_TABLE[0] or not sweep_dirs(machine):
         return load_table().get((machine, order, path_name), {})
     return load_case_raw(machine, order, path_name)
 
@@ -222,13 +233,17 @@ def load_case_raw(machine, order, path_name):
 
     Returns {role: {"n": launches, "mult": launches per tendency call, metrics...}}
     """
-    d = os.path.join(ROOT, SWEEPS[machine])
-    files = sorted(glob.glob(os.path.join(d, "p%d_%s_8x8x4_none_r*_a.csv"
+    files = []
+    for d in sweep_dirs(machine):
+        f = sorted(glob.glob(os.path.join(d, "p%d_%s_8x8x4_none_r*_a.csv"
                                           % (order, path_name))))
-    # The stall metrics are collected in a second ncu pass (suffix _b), a
-    # different set of launches of the same kernels; merged per role below.
-    files += sorted(glob.glob(os.path.join(d, "p%d_%s_8x8x4_none_r*_b.csv"
+        # The stall metrics are collected in a second ncu pass (suffix _b), a
+        # different set of launches of the same kernels; merged per role below.
+        f += sorted(glob.glob(os.path.join(d, "p%d_%s_8x8x4_none_r*_b.csv"
                                            % (order, path_name))))
+        if f:
+            files = f
+            break
     per_role = defaultdict(list)
     stall_role = defaultdict(list)
     for f in files:
@@ -397,8 +412,10 @@ ETA_RULE = ["closest"]
 MODEL = ["roof"]
 USE_PROBE = [False]
 CLAMP_Q = [False]
-PATHS = ["FUSED_TC", "GEMM_FUSED", "GEMM", "FUSED"]
-ORDERS = [7, 15, 31, 63, 127, 255, 511, 575]
+# FUSED_TC first: it is the denominator of the ranking ratios below.
+PATHS = ["FUSED_TC", "GEMM_FUSED", "GEMM", "FUSED", "FUSED_DFMA", "GEMM_CUTE",
+         "GEMM_OZAKI1"]
+ORDERS = [7, 15, 31, 63, 127, 255, 511, 575, 767, 1023]
 
 
 def predict_case(srcs, tgt, order, path_name, verbose=False):
@@ -518,11 +535,14 @@ def main():
 
     if a.audit:
         print("inputs (target contributes spec sheet only):")
-        for m, d in SWEEPS.items():
-            md = os.path.join(ROOT, os.path.dirname(d), "metadata.txt")
-            tags = [l.strip() for l in open(md) if l.startswith(("job=", "commit=",
-                                                                "orders=", "kernels="))]
-            print("  %-6s %-46s %s" % (m, d, " ".join(tags[:2])))
+        for m in SWEEPS:
+            for d in sweep_dirs(m):
+                md = os.path.join(os.path.dirname(d), "metadata.txt")
+                tags = ([l.strip() for l in open(md)
+                         if l.startswith(("job=", "commit="))]
+                        if os.path.exists(md) else ["(no metadata)"])
+                print("  %-6s %-44s %s"
+                      % (m, os.path.relpath(d, ROOT), " ".join(tags[:2])))
         print("  spec sheet:")
         for m, s in MACHINES.items():
             print("    %-6s SM=%3d f=%.3fGHz tc=%.1f cc=%.1f dramB=%.2f"
