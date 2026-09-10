@@ -346,6 +346,16 @@ def stall_cycles(agg, src, tgt):
         long_law = (PROBE_L0[tgt] / PROBE_L0[src]) * QUEUE_K * bw
     else:
         long_law = UNLOADED_SHARE * fr + (1 - UNLOADED_SHARE) * bw
+    if CLAMP_Q[0]:
+        # REJECTED, kept because the reason is instructive (section 5P.2).
+        # The queue inflation Q has a floor of 1, so it is tempting to floor
+        # the transfer RATIO at the clock ratio.  That is wrong and measures
+        # worse (the GB200 hold-out goes 41% -> 105% at p <= 31): the floor is
+        # on each machine's absolute Q, not on the ratio, and a ratio below 1
+        # is exactly right when the source machine is the queued one and the
+        # target is not.  Separating them needs Q on the calibration machine,
+        # which the two-clock sweep measures and nothing else does.
+        long_law = max(long_law, fr)
     law = {"long_scoreboard": long_law,
            "math_pipe_throttle": 1.0,
            "short_scoreboard": fr, "not_selected": fr,
@@ -382,6 +392,7 @@ AUTO_ETA = 1.2
 ETA_RULE = ["closest"]
 MODEL = ["roof"]
 USE_PROBE = [False]
+CLAMP_Q = [False]
 PATHS = ["FUSED_TC", "GEMM_FUSED", "GEMM", "FUSED"]
 ORDERS = [7, 15, 31, 63, 127, 255, 511, 575]
 
@@ -468,6 +479,9 @@ def main():
                          "roof where the calibration machine says the kernel is "
                          "near a roof (eta <= AUTO_ETA), the second equation "
                          "where it is not -- decidable from calibration data")
+    ap.add_argument("--clamp-q", action="store_true",
+                    help="floor the transfer ratio at the clock ratio; measured"
+                         " worse, kept as a rejected variant (section 5P.2)")
     ap.add_argument("--l0-probe", action="store_true",
                     help="use the measured unloaded latency (jobs/"
                          "global_latency_probe.cu) in the long-scoreboard law "
@@ -482,6 +496,7 @@ def main():
     ETA_RULE[0] = a.eta_rule
     MODEL[0] = a.model
     USE_PROBE[0] = a.l0_probe
+    CLAMP_Q[0] = a.clamp_q
 
     if a.distill:
         with open(TABLE, "w", newline="") as fh:
