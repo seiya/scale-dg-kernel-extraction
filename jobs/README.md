@@ -62,6 +62,39 @@ taken on every machine (`reports/a100_report.md` section 10).
 `ncu` locks the clocks, so nothing these produce is a wall-time result. They
 identify which resource binds; adoption stays on interleaved wall-time A/B.
 
+## Tracked: the SM sub-pipe transfer model
+
+| file | role |
+|---|---|
+| `subpipe_ncu.sh` | the shared body. Per-kernel SM sub-pipe cycles (`shared` = fp64+tensor, alu, fma, fp64), the per-pipe instruction mix, L1TEX wavefronts / sectors / requests, the L2 hit-miss split, DRAM bytes, occupancy and the twelve issue-stall reasons. Knobs: `ORDERS`, `PATHS`, `SHAPES`, `NSTEP`, `REPEATS`, `CLOCKS`, `LAUNCH_SKIP` / `LAUNCH_COUNT`, `NCU_TIMEOUT`, `TIME_BUDGET`, `OUTDIR`. |
+| `rikyu_subpipe_ncu.sh` | Slurm wrapper, p=63/255/511 (GB200 job `92507`) |
+| `rikyu_subpipe_shape.sh` | Slurm, `CutlassMmaShape` control at p=511 (job `92628`) |
+| `rikyu_subpipe_orders.sh` | Slurm, every order p=7..575 (job `92904`) |
+| `rikyu_subpipe_latency.sh` | Slurm, the latency-term counters (job `93312`) |
+| `wisteria_subpipe_ncu.sh` | Fujitsu TCS wrapper (TCS `9568133`) |
+| `wisteria_subpipe_orders.sh` | Fujitsu TCS, every order (TCS `9569112`) |
+| `tsubame_subpipe_ncu.sh` | SGE wrapper (SGE `8621140`) |
+| `tsubame_subpipe_shape.sh` | SGE, shape control at p=511 (SGE `8621412`) |
+| `tsubame_subpipe_orders.sh` | SGE, every order (SGE `8621935` at 8x8x4, `8621936` at 16x8x4) |
+
+Tracked for the same reason as the two harnesses above, and more sharply:
+`reports/subpipe_transfer_model.md` predicts one machine's kernel times, roof
+identification and ranking crossovers from another machine's counters, so every
+number in it is a ratio between two runs of this body. One shared body on all
+three schedulers is what makes that a measurement rather than three
+conventions.
+
+`SHAPES` is specific to this harness. On sm_100 and sm_80 every f64 MMA shape
+lowers to `DMMA.8x8x4`, so sweeping it is a control that must show nothing; on
+sm_90 the wide shapes are single instructions and it must halve the DMMA count
+(`reports/sm90_mma_shape_survey.md` section 6, confirmed by counter in
+`subpipe_transfer_model.md` sections 2.2 and 5J.1).
+
+`--clock-control none` is the default here, unlike `l1_roof_ncu.sh`: the model
+reads utilisations at production clock, and `reports/a100_report.md` section
+12.2 shows a locked-clock percentage cannot be lifted to boost. Nothing these
+produce is a wall-time result either.
+
 ## 追跡スクリプト全一覧（索引漏れの補完）
 
 上の 3 つの表は harness の最初の 3 群しか載せていない。`.gitignore` の

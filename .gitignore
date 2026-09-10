@@ -50,6 +50,16 @@ advect3d/advect3d
 !/jobs/shmem_latency_probe.cu
 !/jobs/wisteria_shmem_probe.sh
 !/jobs/rikyu_shmem_probe.sh
+!/jobs/subpipe_ncu.sh
+!/jobs/rikyu_subpipe_ncu.sh
+!/jobs/rikyu_subpipe_shape.sh
+!/jobs/rikyu_subpipe_orders.sh
+!/jobs/rikyu_subpipe_latency.sh
+!/jobs/wisteria_subpipe_ncu.sh
+!/jobs/wisteria_subpipe_orders.sh
+!/jobs/tsubame_subpipe_ncu.sh
+!/jobs/tsubame_subpipe_shape.sh
+!/jobs/tsubame_subpipe_orders.sh
 /output/
 
 # Paper drafting notes (outline, abstract drafts, figure plan) stay local: the
