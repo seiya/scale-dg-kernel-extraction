@@ -40,6 +40,10 @@ advect3d/advect3d
 !/jobs/global_latency_probe.sh
 !/jobs/tsubame_global_latency.sh
 !/jobs/wisteria_global_latency.sh
+!/jobs/contended_latency_probe.cu
+!/jobs/contended_latency_probe.sh
+!/jobs/tsubame_contended_latency.sh
+!/jobs/wisteria_contended_latency.sh
 !/jobs/tsubame_p511_clock.sh
 !/jobs/rikyu_p511_dir1_ncu.sh
 !/jobs/wisteria_p511_dir1_ncu.sh
