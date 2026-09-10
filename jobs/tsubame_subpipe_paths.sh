@@ -17,6 +17,9 @@
 #
 #   qsub -g <GROUP> jobs/tsubame_subpipe_paths.sh
 #
+# SGE does not export the submitting shell, and -v cannot carry a space, so
+# overrides go in as -v ORDERS=7:15:31 (colons; jobs/subpipe_ncu.sh splits).
+#
 # REQUIRES the current jobs/subpipe_ncu.sh (SHAPES knob + L1 / latency
 # counters).  SHAPES is 8x8x4 to stay iso-shape with the calibration machines;
 # add SHAPES="8x8x4 16x8x4" to get the production H100 configuration too.

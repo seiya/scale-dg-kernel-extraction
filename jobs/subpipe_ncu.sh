@@ -111,8 +111,18 @@ readonly MODULE_PURGE=${SCALE_DG_MODULE_PURGE:-1}
 [ "$MODULE_PURGE" = 1 ] && module purge
 for m in $MODULES; do module load "$m"; done
 
-readonly ORDERS=${ORDERS:-"63 255 511"}
-readonly PATHS=${PATHS:-"CUDAFORTRAN_FUSED_TC CUDAFORTRAN_GEMM_FUSED CUDAFORTRAN_GEMM CUDAFORTRAN_FUSED"}
+# Colon- and comma-separated lists are accepted as well as space-separated
+# ones, because neither SGE's -v nor TCS's -x can carry a value with a space in
+# it, and neither scheduler exports the submitting shell's environment by
+# default.  jobs/roof_bytes_ncu.sh has done this since it was written; this
+# script had not, so
+#     ORDERS="767" qsub -g <GROUP> jobs/tsubame_subpipe_orders.sh
+# silently ran the default order list.  The working forms are
+#     qsub -g <GROUP> -v ORDERS=767 jobs/tsubame_subpipe_orders.sh
+#     pjsub -x ORDERS=7:15:31    jobs/wisteria_subpipe_orders.sh
+#     ORDERS="7 15" sbatch jobs/rikyu_subpipe_orders.sh      (Slurm does export)
+readonly ORDERS=$(printf '%s' "${ORDERS:-63 255 511}" | tr ':,' '  ')
+readonly PATHS=$(printf '%s' "${PATHS:-CUDAFORTRAN_FUSED_TC CUDAFORTRAN_GEMM_FUSED CUDAFORTRAN_GEMM CUDAFORTRAN_FUSED}" | tr ':,' '  ')
 readonly NSTEP=${NSTEP:-4}
 # Measured, not guessed: on GB200 (Slurm 82908) all nine invocations finished
 # in one minute of wall clock, about 7 s each.  300 s is roughly forty times
@@ -138,7 +148,7 @@ readonly LAUNCH_COUNT=${LAUNCH_COUNT:-24}
 # them for 16x8x4 / 16x8x8 / 16x8x16) while sm_90 issues each as one
 # instruction -- reports/sm90_mma_shape_survey.md 6.  Sweeping it on GB200
 # is therefore a control: the shared-pipe cycle count must NOT move.
-readonly SHAPES=${SHAPES:-"8x8x4"}
+readonly SHAPES=$(printf '%s' "${SHAPES:-8x8x4}" | tr ':,' '  ')
 
 mkdir -p "$OUTDIR/config" "$OUTDIR/ncu" "$OUTDIR/logs" || exit 1
 if [ ! -x ./scale-dg_extraction ]; then

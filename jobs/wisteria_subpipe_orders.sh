@@ -20,6 +20,10 @@
 # Fill in -g, build for cc80 as in jobs/wisteria_paths.sh, then submit FROM the
 # checkout:
 #   pjsub jobs/wisteria_subpipe_orders.sh
+#   pjsub -x ORDERS=7:15:31 jobs/wisteria_subpipe_orders.sh   (override)
+#
+# TCS does not export the submitting shell either, and -x cannot carry a
+# space, so lists go in colon-separated.
 #
 # REQUIRES the current jobs/subpipe_ncu.sh.  The copy that ran TCS 9568133
 # predates both the SHAPES knob and the L1 / latency counters.

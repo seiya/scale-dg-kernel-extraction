@@ -11,6 +11,11 @@
 # validity range, NOT for choosing anything in the model.
 #
 #   qsub -g <GROUP> jobs/tsubame_subpipe_orders.sh
+#   qsub -g <GROUP> -v ORDERS=767 jobs/tsubame_subpipe_orders.sh   (one order)
+#
+# SGE does not export the submitting shell, and -v cannot carry a space, so
+# ORDERS=... in front of qsub does nothing and multiple orders go in as
+# ORDERS=7:15:31 (jobs/subpipe_ncu.sh splits on colons and commas).
 #
 # REQUIRES the current jobs/subpipe_ncu.sh (SHAPES knob + L1 / latency
 # counters).  SHAPES is 8x8x4 to stay iso-shape with the calibration machines;
