@@ -371,18 +371,22 @@ def stall_cycles(agg, src, tgt):
 # model and section 5M says so.
 UNLOADED_SHARE = 0.07
 
-# Unloaded global-memory latency, SM cycles, from jobs/global_latency_probe.cu
-# (section 5N.4, 5N.8, 5N.10).  Two minutes per machine, and it is NOT a
-# constant: 444 / 477 / 367 ns across these three, a 30% spread, and in SM
-# cycles the order changes again.  With it the long-scoreboard law splits into
-# the two halves that were measured separately:
+# Unloaded global-memory latency, SM cycles.  These are the CO-RUN values from
+# jobs/contended_latency_probe.cu (section 5Q.7), not the idle-GPU ones from
+# jobs/global_latency_probe.cu: a lone kernel on an otherwise empty GPU is not
+# what a production kernel sees, and measures 442 / 473 / 366 ns against
+# 224 / 252 / 223 ns beside a light co-runner.  On A100 part of that is the GPU
+# sitting at 1095 MHz, 78% of boost, while it is idle; on the other two the
+# clock does not move and the effect is still a factor of two.
 #     S_long ratio = (L0 ratio in SM cycles) x QUEUE_K x (DRAM B/SM-clk ratio)
-# QUEUE_K is the one number fitted here, on two points that agree to 5%
-# (1.17 from A100, 1.23 from H100).  This form reproduces both measured
-# S_long ratios to 1%, using a probe measurement rather than a fit for the
-# latency half.
-PROBE_L0 = {"GB200": 916.0, "A100": 672.6, "H100": 726.0}
-QUEUE_K = 1.20
+# With the co-run latencies QUEUE_K comes out at 1.12 (A100) and 1.02 (H100),
+# i.e. CONSISTENT WITH 1 given the +-6% spread of the L0 measurement itself.
+# The idle latencies made it look like a real constant (1.17 and 1.23); it was
+# the error in L0.  Keeping 1.07 as the midpoint, and note that setting it to
+# exactly 1 costs 11% on A100 and 2% on H100 -- there is no evidence here for a
+# fitted correction beyond the two measured ratios.
+PROBE_L0 = {"GB200": 462.5, "A100": 355.3, "H100": 441.5}
+QUEUE_K = 1.07
 
 # Where the roof model stops applying, on the calibration machine's own eta.
 # Section 5E.3 measured the error bands at this boundary; it is not fitted to
