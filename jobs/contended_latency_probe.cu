@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <vector>
+#include <string>
 #include <cuda_runtime.h>
 #include <nvml.h>
 
@@ -59,8 +60,21 @@ __global__ void loader(const double* __restrict__ buf, size_t n, int iters,
     if (acc == 1.0e308) sink[0] = acc;
 }
 
-int main()
+// Third control: a co-runner that touches NO memory at all.  If the chase
+// speeds up beside this one too, the co-run effect is not the memory system
+// being busy but the machine being busy (a power or clock state), and it
+// cannot be a queue.  Section 5R.
+__global__ void spinner(int iters, double* sink)
 {
+    double acc = threadIdx.x;
+    for (int it = 0; it < iters; ++it)
+        for (int d = 0; d < 4096; ++d) acc = acc * 1.0000001 + 1e-12;
+    if (acc == 1.0e308) sink[0] = acc;
+}
+
+int main(int argc, char** argv)
+{
+    bool with_spin = (argc > 1 && std::string(argv[1]) == "--spin");
     cudaDeviceProp pr; CK(cudaGetDeviceProperties(&pr, 0));
     int khz = 0; CK(cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, 0));
     const uint32_t n = 128u * 1024u * 1024u;          // 512 MiB of indices
@@ -114,10 +128,11 @@ int main()
     // Fixed width (32 blocks per SM), swept throttle.  delay = -1 is the
     // unloaded point.
     const int delays[] = {-1, 4096, 1024, 256, 64, 32, 16, 8, 4, 2, 1, 0};
-    for (int pass = 0; pass < 2; ++pass) {
-      const double* lbuf = pass ? d_small : d_buf;
-      size_t ln = pass ? ns_small : nb;
-      printf("-- %s loader\n", pass ? "L2-resident (contention control)" : "DRAM");
+    for (int pass = 0; pass < (with_spin ? 3 : 2); ++pass) {
+      const double* lbuf = pass == 1 ? d_small : d_buf;
+      size_t ln = pass == 1 ? ns_small : nb;
+      printf("-- %s loader\n", pass == 2 ? "compute-only (no memory at all)"
+                             : pass ? "L2-resident (contention control)" : "DRAM");
       L0 = 0.0;
       for (int wi = 0; wi < (int)(sizeof(delays) / sizeof(int)); ++wi) {
         int delay = delays[wi];
@@ -133,7 +148,8 @@ int main()
         if (blocks > 0) {                    // calibrate: how long is one pass?
             cudaEvent_t pa, pb; cudaEventCreate(&pa); cudaEventCreate(&pb);
             cudaEventRecord(pa, sLoad);
-            loader<<<blocks, 256, 0, sLoad>>>(lbuf, ln, 1, d_sink, delay);
+            if (pass == 2) spinner<<<blocks, 256, 0, sLoad>>>(1, d_sink);
+            else loader<<<blocks, 256, 0, sLoad>>>(lbuf, ln, 1, d_sink, delay);
             cudaEventRecord(pb, sLoad);
             CK(cudaDeviceSynchronize());
             float pms = 0; cudaEventElapsedTime(&pms, pa, pb);
@@ -145,7 +161,8 @@ int main()
         }
         if (blocks > 0) {
             cudaEventRecord(la, sLoad);
-            loader<<<blocks, 256, 0, sLoad>>>(lbuf, ln, iters, d_sink, delay);
+            if (pass == 2) spinner<<<blocks, 256, 0, sLoad>>>(iters, d_sink);
+            else loader<<<blocks, 256, 0, sLoad>>>(lbuf, ln, iters, d_sink, delay);
             cudaEventRecord(lb, sLoad);
         }
         cudaEventRecord(ca, sChase);
@@ -157,7 +174,8 @@ int main()
         double gbs = 0.0;
         if (blocks > 0) {
             cudaEventElapsedTime(&lms, la, lb);
-            gbs = (double)ln * sizeof(double) * iters / (lms * 1e-3) / 1e9;
+            gbs = pass == 2 ? 0.0
+                  : (double)ln * sizeof(double) * iters / (lms * 1e-3) / 1e9;
         }
         if (nvml_ok) {                       // sampled while the loader still runs
             nvmlDeviceGetClockInfo(nvd, NVML_CLOCK_SM, &sm_clk);

@@ -27,13 +27,25 @@
 
 #define CK(x) do { cudaError_t e=(x); if(e){printf("CUDA %s @%d\n",cudaGetErrorString(e),__LINE__);return 1;} } while(0)
 
+// A streaming kernel run before every measurement.  It does two jobs, and the
+// probe is wrong without it (section 5R): it evicts the chase's own lines from
+// L2, and it keeps the GPU out of whatever state an idle GPU is in.
+__global__ void evict(const double* __restrict__ b, size_t n, double* sink)
+{
+    double a = 0.0;
+    for (size_t j = blockIdx.x * (size_t)blockDim.x + threadIdx.x; j < n;
+         j += (size_t)gridDim.x * blockDim.x) a += b[j];
+    if (a == 1.0e308) sink[0] = a;
+}
+
 template <int CHAINS>
 __global__ void chase(const uint32_t* __restrict__ idx, uint32_t n,
-                      uint32_t steps, uint32_t* out, uint32_t stride)
+                      uint32_t steps, uint32_t* out, uint32_t stride,
+                      uint32_t start)
 {
     uint32_t p[CHAINS];
 #pragma unroll
-    for (int c = 0; c < CHAINS; ++c) p[c] = (threadIdx.x + c * stride) % n;
+    for (int c = 0; c < CHAINS; ++c) p[c] = (threadIdx.x + start + c * stride) % n;
     for (uint32_t s = 0; s < steps; ++s) {
 #pragma unroll
         for (int c = 0; c < CHAINS; ++c) p[c] = idx[p[c]];
@@ -47,13 +59,18 @@ __global__ void chase(const uint32_t* __restrict__ idx, uint32_t n,
 }
 
 template <int CHAINS>
-static double run(const uint32_t* d_idx, uint32_t n, uint32_t* d_out, uint32_t steps)
+static double run(const uint32_t* d_idx, uint32_t n, uint32_t* d_out, uint32_t steps,
+                  const double* d_ev, size_t nev, double* d_sink, uint32_t start)
 {
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
-    chase<CHAINS><<<1, 32>>>(d_idx, n, 64, d_out, n / (CHAINS + 1));   // warm
+    // Evict, then chase from a start this process has not visited.  Repeating
+    // the same chase without this reads 158 ns on GB200 against 448 ns -- the
+    // 2048 lines it walks are still in L2 -- and that artefact is what made
+    // the first version of section 5Q look like an idle-GPU effect.
+    evict<<<1024, 256>>>(d_ev, nev, d_sink);
     cudaDeviceSynchronize();
     cudaEventRecord(a);
-    chase<CHAINS><<<1, 32>>>(d_idx, n, steps, d_out, n / (CHAINS + 1));
+    chase<CHAINS><<<1, 32>>>(d_idx, n, steps, d_out, n / (CHAINS + 1), start);
     cudaEventRecord(b);
     cudaDeviceSynchronize();
     float ms = 0; cudaEventElapsedTime(&ms, a, b);
@@ -77,18 +94,23 @@ int main()
         uint32_t nxt = (uint32_t)(((uint64_t)cur + stride * 7 + 4099) % n);
         h[cur] = nxt; cur = nxt;
     }
-    uint32_t *d_idx, *d_out;
+    uint32_t *d_idx, *d_out; double *d_ev, *d_sink;
+    const size_t nev = 256u * 1024u * 1024u;          // 2 GiB, bigger than any L2
     CK(cudaMalloc(&d_idx, (size_t)n * 4)); CK(cudaMalloc(&d_out, 4));
+    CK(cudaMalloc(&d_ev, nev * sizeof(double))); CK(cudaMalloc(&d_sink, 8));
+    CK(cudaMemset(d_ev, 0, nev * sizeof(double)));
     CK(cudaMemcpy(d_idx, h.data(), (size_t)n * 4, cudaMemcpyHostToDevice));
     const uint32_t steps = 4096;
     printf("device %s  SM %d  clock %.3f GHz  L2 %.1f MB\n", pr.name,
            pr.multiProcessorCount, khz / 1e6, pr.l2CacheSize / 1e6);
     printf("%8s %12s %12s\n", "chains", "ns/access", "SM cycles");
     double f = khz / 1e6;               // GHz (nominal boost)
-#define ONE(C) { double t = run<C>(d_idx, n, d_out, steps); \
+    uint32_t start = 0;
+#define ONE(C) { double t = run<C>(d_idx, n, d_out, steps, d_ev, nev, d_sink, \
+                                   start); start += 7654321u; \
                  printf("%8d %12.1f %12.1f\n", C, t, t * f); }
     ONE(1) ONE(2) ONE(3) ONE(4) ONE(6) ONE(8) ONE(12) ONE(16) ONE(24) ONE(32)
 #undef ONE
-    cudaFree(d_idx); cudaFree(d_out);
+    cudaFree(d_idx); cudaFree(d_out); cudaFree(d_ev); cudaFree(d_sink);
     return 0;
 }
