@@ -233,6 +233,50 @@ def load_case(machine, order, path_name):
     return load_case_raw(machine, order, path_name)
 
 
+def launch_multiplicity(seq):
+    """Launches of each role in one tendency call, from the launch order.
+
+    `seq` is the roles in launch order.  A tendency call is one period of that
+    sequence, so find the shortest period that the whole sequence agrees with
+    (allowing the window to clip a partial call at either end) and count each
+    role inside it.  Falls back to one launch per role if nothing is periodic.
+    """
+    n = len(seq)
+    for period in range(1, n // 2 + 1):
+        if all(seq[i] == seq[i % period] for i in range(n)):
+            out = defaultdict(int)
+            for r in seq[:period]:
+                out[r] += 1
+            return dict(out)
+    # No exact period (the window can start mid-call): try every rotation of a
+    # candidate period and take the first that fits the interior.
+    for period in range(1, n // 2 + 1):
+        for off in range(period):
+            if all(seq[i] == seq[off + (i - off) % period]
+                   for i in range(off, n)):
+                out = defaultdict(int)
+                for r in seq[off:off + period]:
+                    out[r] += 1
+                if len(out) == len(set(seq)):
+                    return dict(out)
+    return {r: 1 for r in set(seq)}
+
+
+def split_occurrences(per_role, mult):
+    """role -> role#i for the i-th launch of that role inside one call."""
+    out = {}
+    for role, lst in per_role.items():
+        m = mult.get(role, 1)
+        if m <= 1:
+            out[role] = lst
+            continue
+        for i in range(m):
+            sub = lst[i::m]
+            if sub:
+                out["%s#%d" % (role, i + 1)] = sub
+    return out
+
+
 def load_case_raw(machine, order, path_name):
     """Per-role, per-launch means for one (machine, order, path).
 
@@ -251,22 +295,40 @@ def load_case_raw(machine, order, path_name):
             break
     per_role = defaultdict(list)
     stall_role = defaultdict(list)
+    order_seq = []
+    order_seq_done = [False]
     for f in files:
         b_pass = f.endswith("_b.csv")
-        for _, (role, mets) in read_csv(f).items():
+        for _, (role, mets) in sorted(read_csv(f).items(),
+                                      key=lambda kv: int(kv[0])):
             if role and "dur" in mets:
                 (stall_role if b_pass else per_role)[role].append(mets)
+                if not b_pass and not order_seq_done[0]:
+                    order_seq.append(role)
+        if not b_pass and order_seq:
+            order_seq_done[0] = True
     if not per_role:
         return {}
-    # One tendency call launches every role at least once, so the rarest role
-    # counts the calls in the profiling window.  (The window can clip the last
-    # call, which is why the per-role multiplicity is rounded below.)
-    calls = min(len(v) for v in per_role.values())
-    if not calls:
-        return {}
+    # How many launches of each role make up one tendency call.  Counting them
+    # as "count / (launches of the rarest role)" is wrong when the profiling
+    # window does not start and end on a call boundary: at p=1023 the GEMM path
+    # gave 15 cuBLAS launches against 3 of each peripheral kernel, so the cuBLAS
+    # multiplicity came out 5 where the path issues 3, and the per-call total
+    # read 300 ms against the 194 ms/stage of p1023_gap_study.md.  Take the
+    # period of the launch SEQUENCE instead, which is what a call is.
+    # Split a role that appears more than once per call into its occurrences,
+    # because they are not the same kernel: the three volume GEMMs are x, y and
+    # z, and at p=1023 the plain-GEMM path issues five cuBLAS launches whose
+    # durations differ (the period is CCCCCLve).  Taking a median over them and
+    # multiplying by the count read 300 ms/call against the 194 ms/stage of
+    # p1023_gap_study.md; per occurrence it is right.
+    mult = launch_multiplicity(order_seq)
+    per_role, stall_role = split_occurrences(per_role, mult), \
+        split_occurrences(stall_role, mult)
+    mult = {r: 1 for r in per_role}
     out = {}
     for role, lst in per_role.items():
-        agg = {"n": len(lst), "mult": max(1, round(len(lst) / calls)),
+        agg = {"n": len(lst), "mult": mult.get(role, 1),
                "dmma_flop": statistics.median([dmma_flop_of(x["_name"])
                                                for x in lst])}
         for k in METRICS:
