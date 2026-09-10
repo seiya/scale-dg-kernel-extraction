@@ -458,16 +458,17 @@ UNLOADED_SHARE = 0.07
 # QUEUE_K is fitted on two points that agree to 5% (1.17 from A100, 1.23 from
 # H100), and this form reproduces both measured S_long ratios to 1%.
 #
-# These went to co-run values 462.5 / 355.3 / 441.5 for one commit and are back:
-# the "co-run latency" was the chase hitting in L2 on its own lines, not a
-# property of a busy machine (section 5R).  With eviction and a fresh start the
-# probe reads 449-451 ns on GB200, i.e. what it always read.
+# These went to co-run values 462.5 / 355.3 / 441.5 for one commit and came
+# back: the "co-run latency" was the chase hitting in L2 on its own lines, not a
+# property of a busy machine (section 5R).
 #
-# CAVEAT still open: the A100 entry was measured while that GPU sat at 1095 MHz,
-# 78% of boost (NVML, section 5Q.6).  672.6 = 477 ns x 1.410 GHz assumes a clock
-# the probe did not have.  It needs re-taking with the current probe, whose
-# eviction pass also keeps the clock up.
-PROBE_L0 = {"GB200": 916.0, "A100": 672.6, "H100": 726.0}
+# All three are now re-taken with the fixed probe, which evicts L2 and starts
+# each chase at an address it has not visited (section 5R.7): 450.3 / 485.2 /
+# 374.7 ns, against 444.0 / 477.0 / 366.4 from the original version -- +1.4 to
+# +2.3%, the residual reuse its 64-step warm-up left behind.  The A100 clock
+# caveat of 5Q.6 closed with it: this wait is DRAM nanoseconds and barely
+# depends on the SM clock.
+PROBE_L0 = {"GB200": 928.5, "A100": 684.1, "H100": 741.9}
 QUEUE_K = 1.20
 
 # Where the roof model stops applying, on the calibration machine's own eta.
