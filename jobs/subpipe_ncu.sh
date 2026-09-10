@@ -61,6 +61,13 @@
 # All of these exist on gb100, gh100 and ga100 (checked with
 # ncu --query-metrics --chip), so the same sweep runs on all three machines.
 #
+# CORRECTION (2026-09-10, reports/subpipe_transfer_model.md 5N.3): the query
+# returning a name is not the same as the counter having a value.  On sm_80
+# sm__inst_executed_pipe_lsu_mem_lg_cmd_read.sum comes back "n/a" for every
+# kernel, so the long-latency population above is NOT collected on A100.  Use
+# l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum there, which is collected on
+# all three and is identical kernel by kernel.
+#
 # ncu is a mechanism instrument here, not a wall-time result (AGENTS.md).
 # --clock-control none by default, for the reason reports/a100_report.md 12.2
 # gives: percentages taken under a locked clock cannot be lifted to boost.
