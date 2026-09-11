@@ -40,9 +40,10 @@ p = 15, 31, 63, 127 の 2 冪だけで（`p15_gap_study.md` §1）、p=127 は `
 **p=127 はコードを 1 行も足さずに 5 経路すべてで走った。** これは p=63 の作業
 （`p63_gap_study.md` §2）で入れた一般化がそのまま効いたということである。確認した点:
 
-- `mod_mesh.f90:271` は `operator_data/p127.dat` が無いので `generate_lgl_operators(p,...)` に
+- `mod_mesh.f90` の演算子読み込みは `operator_data/p127.dat` が無いので
+  `generate_lgl_operators(p,...)` に
   落ちる。生成は 1 秒未満で、数値は §3 のとおり基準実装と一致する。
-- `mod_mesh.f90:279` の `dense_lift = (Nq <= 128)` は Nq=128 を**含むように書かれていた**
+- `mod_mesh.f90` の `dense_lift = (Nq <= 128)` は Nq=128 を**含むように書かれていた**
   （コメントが「100 MB at Nq=128」と名指ししている）。`Lift_mat(128,128,128,6)` = 100.7 MB が
   実体化されるので、`OPENACC_SPLIT` と `CUDAFORTRAN_SPLIT` を基準実装として使える。
 - `mod_dg_optr_kernel.f90` の 4 か所の `select case(Nq-1)` は `case default` で
@@ -1378,7 +1379,7 @@ xz+y カーネルとして C++ に戻した。login GPU 1、`conf_perf_p127_fuse
 | `CUDAFORTRAN_FUSED_TC`（§15） | 2.380 | 706.1 |
 
 CC 1593.5 µs は旧 Fortran 〜1585 µs と同水準で、iso-schedule DFMA より速い。
-論文の主比は **TC / FUSED = 706.1 / 1593.5 = 2.26×**。
+論文の主比は **FUSED / TC = 1593.5 / 706.1 = 2.26×**。
 点変化係数、`nstep=1` の owned `dqdt` は性能と同じ `Ne=2³`（16,777,216 点）で
 `FUSED` / `FUSED_DFMA` / `FUSED_TC` が全点ビット一致。`nstep=1` の device 時間は
 FUSED 5.08 ms / DFMA 6.86 ms / TC 2.61 ms と分かれるので、同一カーネルの
@@ -1417,7 +1418,7 @@ p=63 §24–§25 が「p=127 はチャンクを残したまま 512 スレッド�
 `CUDA device fused tendency` / 297。FP64 ピーク比 **20.7% → 28.7%**
 （13.24 GFLOP / 1149.9 µs = 11.51 TFLOP/s）。unique DRAM は 0.70 →
 **0.96 TB/s**（屋根 7.9 の 12.2%）。論文の主比は
-**TC / FUSED = 706.1 / 1149.9 = 1.61×**（§16 の 2.26× から縮小。TC 側は未変更）。
+**FUSED / TC = 1149.9 / 706.1 = 1.63×**（§16 の 2.26× から縮小。TC 側は未変更）。
 
 1 文: **xz は依然 L1/TEX（shared/MIO）律速で、チャンクと ILP と y の 2 CTA が
 同じ屋根の下で待ちを隠した。**
@@ -2179,7 +2180,7 @@ unique DRAM **1.30 TB/s（7.9 の 16.4%）**、path DRAM 1.35 TB/s（17.1%）
 （バイト数は README p=127 表の 1149.9 µs 時点の測定を時間で割り直したもの。
 §24.7 のとおり DRAM バイトはこの改修で動いていない）。
 
-- 論文の主比 B は **TC / FUSED = 590.8 / 1149.9 = 1.95× → 590.8 / 851.7 =
+- 論文の主比 B は **FUSED / TC = 1149.9 / 590.8 = 1.95× → 851.7 / 590.8 =
   1.44×**。分子（`FUSED_TC` 590.8、§23.8）は動いていない。
 - iso-schedule DFMA（2137.3 µs、README 表、§15 の測定）に対しては
   1.86× → **2.51×**。
@@ -2272,7 +2273,7 @@ owned `dqdt` 全 16,777,216 点で **max abs 3.55271e-15（相対 4.34e-16）**�
 **823.6 µs/stage** = **16.08 TFLOP/s（ピーク 40.1 の 40.1%）**、
 unique DRAM **1.34 TB/s（7.9 の 17.0%）**、path DRAM 1.40 TB/s（17.7%）。
 
-- 論文の主比 B は **TC / FUSED = 590.8 / 1149.9 = 1.95× → 590.8 / 823.6 =
+- 論文の主比 B は **FUSED / TC = 1149.9 / 590.8 = 1.95× → 823.6 / 590.8 =
   1.39×**。分子（`FUSED_TC`）は動いていない。
 - iso-schedule DFMA（2137.3 µs、README 表、§15 の測定）に対しては
   1.86× → **2.60×**。

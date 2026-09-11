@@ -2885,8 +2885,11 @@ contains
 
     nq2 = Nq*Nq
     p31_early_face = fuse_epilogue .and. (Nq == 32)
-    ! Weighted z: Nq>64 (CUTLASS x/y scale) and Nq=64 (cuBLAS x plus y
-    ! epilogue Ey*acc + Ex*Dx). Nq<64 stays unweighted; the fold is +2.3% at
+    ! Weighted z: Nq>64 (CUTLASS x/y scale) and Nq=64 (plain x plus a y
+    ! epilogue that builds Ey*acc + Ex*Dx, so Escale_x is applied by y and
+    ! there is nothing left for x to forward -- x itself is CUTLASS tile 3
+    ! there, as the table at the top of this module says).
+    ! Nq<64 stays unweighted; the fold is +2.3% at
     ! p=31 and +39% at p=7, where y is the dominant kernel and pays for the
     ! three extra volume tensors that z saves.
     xy_weighted = 0
@@ -3099,7 +3102,7 @@ contains
     else if (fuse_epilogue) then
       if (Nq <= 64) then
         if (Nq == 64) then
-          ! y reads unweighted deriv_x, so it cannot run beside cuBLAS x.
+          ! y reads unweighted deriv_x, so it cannot run beside x.
           call launch_volume_gemm_x_common( plan, &
             deriv_x, flux_x, D1D, Escale, Nq, Np, Ne, istat )
           if (istat /= 0) call cuda_failure("x-deriv (fused)",istat)

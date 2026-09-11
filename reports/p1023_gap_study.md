@@ -548,7 +548,8 @@ repad が入ったのは `run_gemm_batched_nn_capped`（`GEMM_CUTE` の y/z と
   ローンチ列の話である）。
 - 3 GEMM 合計 172.68 ms、6.597e12 FLOP で **38.20 TFLOP/s = ピーク 40.1 の
   95.3%**。
-- `rk_update` は `main.f90:401`。`qq0`, `qq`, `dq` を読み `qq` を書く 4 pass ×
+- `rk_update` は `main.f90` の `rk_update_stage`。`qq0`, `qq`, `dq` を読み
+  `qq` を書く 4 pass ×
   8.59 GB = 34.36 GB を 4.787 ms、**7.18 TB/s = 7.9 の 90.8%**。
   `volume_flux` と同じ DRAM 屋根で、しかも DG カーネルの外である。
 
@@ -764,8 +765,9 @@ stage 周期 186.06 ms のうち **92.8%（172.68 ms）は FP64 ピークの 95.
 **断定しない**。ツリー差（job `74738` は `3d4045c` より前）の寄与も
 当時の実行ファイルが凍結されていないため分離できない。
 
-内訳と、これを踏まえた `README.md` の p=1023 の扱いは
-[`measurement_inventory.md` §12.5](measurement_inventory.md) にある。
+内訳は [`measurement_inventory.md` §12.6](measurement_inventory.md)、
+これを踏まえた `README.md` の p=1023 の扱いは同 §12.5 にある
+（2026-09-11 まで両方が「§12.5」で、本文はその 1 つの番号で 2 節を指していた）。
 **§13.2 の表は書き換えていない。**
 
 ---

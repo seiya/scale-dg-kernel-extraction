@@ -44,7 +44,8 @@ p=31 に挟まっている**こと（`README.md`）と、Nq=32 が **1 要素の
 
 **既存 5 経路（`OPENACC_SPLIT` / `CUDAFORTRAN_SPLIT` / `GEMM` / `GEMM_FUSED` /
 `GEMM_CUTE`）はコード変更ゼロで走った。** p=63 の作業で入れた一般化がそのまま効いている:
-`mod_mesh.f90:272` は `operator_data/p31.dat` が無いので `generate_lgl_operators` に落ち、
+`mod_mesh.f90` の演算子読み込みは `operator_data/p31.dat` が無いので
+`generate_lgl_operators` に落ち、
 `dense_lift = (Nq <= 128)` が真なので `Lift_mat(32,32,32,6)` = 1.57 MB が実体化され、
 `mod_dg_optr_kernel.f90` の 4 か所の `select case(Nq-1)` は `case default` に落ちる。
 ERB の `AUTOGEN_PMAX = 15` は上げていない（p=31 の OPT1 特殊化が効くのは CUDA 経路ではなく
@@ -876,11 +877,11 @@ C++ に戻した（TC の `P31_THREADS=512` ではない）。login GPU 1、
 | `CUDAFORTRAN_FUSED_TC`（§16） | 1.342 | 359.7 |
 
 CC 998.4 µs は旧 Fortran 〜995 µs と同水準。論文の主比は
-**TC / FUSED = 359.7 / 998.4 = 2.78×**。
+**FUSED / TC = 998.4 / 359.7 = 2.78×**。
 点変化係数、`Ne=2³` の owned `dqdt` は `FUSED` と `FUSED_TC` がビット一致。
 
 > **（追記 2026-08-30、§20）** CC 融合を 718.2 µs/stage まで詰めた。上表の
-> 998.4 は改修前。論文の主比は **TC / FUSED = 359.7 / 718.2 = 2.00×**。
+> 998.4 は改修前。論文の主比は **FUSED / TC = 718.2 / 359.7 = 2.00×**。
 
 ## 18. `FUSED_TC` の残り天井を測って探索を終了した（2026-08-30）
 
@@ -1084,7 +1085,7 @@ CC と**ビット一致**、`CUDAFORTRAN_SPLIT` に対する最大絶対差は 2
 改修後の CC は iso-schedule DFMA（790.1 µs）より **1.10× 速い**。
 
 > §14 が書いた「TC は CUDA core 融合の 2.66 倍」は当時の 374.8 / 1001.7 である。
-> いまの device 時間どうしでは 359.7 / 718.2 = **2.00 倍**。
+> いまの device 時間どうしでは 718.2 / 359.7 = **2.00 倍**。
 
 ### 20.3 不採用
 
@@ -1737,7 +1738,7 @@ ncu duration 342 → 175 µs。global セクタは同一（17,039,360）。占�
 503.4 µs/stage は **7.20 TFLOP/s（ピーク 40.1 の 17.9%）**、unique DRAM
 **2.38 TB/s（7.9 の 30.2%）**、path DRAM 2.78 TB/s。最速は
 `CUDAFORTRAN_FUSED_TC`（README 表 359.7 µs、§25 の PDL 込みで 354.7 µs）の
-ままだが、**論文の主比 TC / FUSED は 2.00× → 1.40×**（§25 の値で 1.42×）に
+ままだが、**論文の主比 FUSED / TC は 2.00× → 1.40×**（§25 の値で 1.42×）に
 縮んだ。iso-schedule DFMA（790.1 µs）に対しては 1.10× → **1.57×** である。
 
 §20.4 の「契約内で実装できる候補の天井は測った」は**取り消す**。天井を測って

@@ -150,9 +150,15 @@ implementation is fastest.
   may carry them where `GEMM_CUTE` cannot, and which of them to carry at a
   given order is a measurement, not a rule stated here. They are gated by
   `xy_weighted`, whose value depends on the carrier: with z carrying it folds
-  Escale into x/y and `deriv_x` into y, and with x carrying it forwards
-  Escale_x only. The orders where each measured faster are in the gap studies,
-  and the gate itself is in `cuda_cal_dqdt_gemm_cutlass`.
+  Escale into x/y and `deriv_x` into y, and with x carrying it can forward
+  Escale_x into x alone — but which of these the tree actually runs is a
+  measurement, and as of 2026-09-11 **no Escale factor is forwarded at any
+  order**: every order's plan has `x_mode = 1` (plain CUTLASS x) and
+  `xfwd = 0`, so only the z-carrier fold at `Nq >= 64` is on. The per-order
+  table at the top of `mod_cuda_dg_kernels.cuf` is authoritative for this too;
+  the orders where each measured faster are in the gap studies
+  (`gemm_assignment_and_carrier.md` §4 and §11), and the gate itself is in
+  `cuda_cal_dqdt_gemm_cutlass`.
   CUTLASS tile types live in `VolumeGemmSet` (or an explicitly shared
   order-specialized set) in `cuda_cutlass_gemm_fused.cu`.
   **`GEMM_FUSED` does not share the three-way volume-GEMM schedule, and that
@@ -235,11 +241,19 @@ performance win must never be treated as implicit permission to redefine it.
 - `jobs/` is local (gitignored) apart from an allowlist in `.gitignore`: the
   cross-machine measurement harness is tracked, because a published
   machine-to-machine ratio is only reproducible if every column's script is.
-  That is the shared body `tsubame_paths.sh`, its per-scheduler wrappers
+  It started as the shared body `tsubame_paths.sh`, its per-scheduler wrappers
   (`rikyu_paths.sh` for Slurm, `wisteria_paths.sh` for Fujitsu TCS), the
-  summarizer, and the `cublas_kernel_names_nsys.sh` body with its wrapper.
-  Everything else in `jobs/` -- one-off ablations, sweeps, `ncu` probes --
-  stays local, and durable profiler commands still go in `reports/`.
+  summarizer, and the `cublas_kernel_names_nsys.sh` body with its wrapper, and
+  it has grown the same way ever since: every probe and `ncu` sweep whose
+  result a report compares **across machines** is on it too -- the latency and
+  shared-memory probes, the roof-byte and L1-roof sweeps, the sub-pipe sweeps,
+  the Ozaki and OpenACC runs, the MPS balance sweep. Read `.gitignore`, not
+  this paragraph, for the current list; the rule it encodes is "one body plus
+  one wrapper per machine, tracked, whenever a published number puts two
+  machines in the same table".
+  Everything else in `jobs/` -- one-off ablations, single-machine sweeps,
+  scratch `ncu` probes -- stays local, and durable profiler commands still go
+  in `reports/`.
 - `analysis/`: tracked analysis code and its distilled inputs, for results a
   reader has to be able to re-derive. Today that is the sub-pipe transfer
   model's predictor (`subpipe_predict.py`) and the table it reads

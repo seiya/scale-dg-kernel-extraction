@@ -1586,7 +1586,7 @@ fragment 日程の DFMA より遅い（再測でも約 2.6 倍）。最速パス
 作業ツリー親 `959ad50`、login GPU 1、各次数の既存 `conf_perf_p*` の type だけ
 `CUDAFORTRAN_FUSED`、3-run 中央値:
 
-| p | conf | Main [ms/step] | µs/stage | TC / FUSED |
+| p | conf | Main [ms/step] | µs/stage | FUSED / TC |
 |---:|---|---:|---:|---:|
 | 7 | `conf_perf_p7.conf` | 1.227 | 326.8 | 1.19× |
 | 15 | `conf_perf_p15.conf` | 1.583 | 446.7 | 1.64× |
