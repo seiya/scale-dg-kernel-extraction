@@ -157,7 +157,14 @@ readonly TIME_BUDGET=${TIME_BUDGET:-5400}
 readonly T_START=$(date +%s)
 readonly JOB_TAG=${JOB_ID:-${SLURM_JOB_ID:-${PJM_JOBID:-manual}}}
 readonly OUTDIR=${OUTDIR:-"subpipe_ncu_${JOB_TAG}"}
-readonly KERNELS=${KERNELS:-'regex:tendency_|elembnd|volume_flux|separable_lift|cutlass|gemm|Kernel'}
+# flux_all is NOT optional: SCALE_DG_FLUXFUSE defaults to 1, which fuses
+# volume_flux_kernel and elembnd_flux_kernel into flux_all_kernel wherever they
+# would run back to back, and that name matched none of the alternatives above
+# (the capital-K "Kernel" does not match "..._flux_all_kernel_").  Every sweep
+# before 2026-09-11 therefore dropped it silently, which is where the 42-54%
+# shortfall of the low-order unfused GEMM cells against production came from
+# (reports/subpipe_transfer_model.md 5V.1, 5Y).
+readonly KERNELS=${KERNELS:-'regex:tendency_|elembnd|volume_flux|flux_all|separable_lift|cutlass|gemm|Kernel'}
 readonly LAUNCH_SKIP=${LAUNCH_SKIP:-4}
 readonly LAUNCH_COUNT=${LAUNCH_COUNT:-24}
 # CutlassMmaShape.  On sm_100 every shape lowers to DMMA.8x8x4 (2/4/8 of
