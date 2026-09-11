@@ -149,6 +149,9 @@ def role_of(name):
 
 
 DMMA_RE = re.compile(r"tensor(\d+)x(\d+)x(\d+)")
+# CUTLASS spells the instruction shape as the GemmShape inside arch::Mma.
+CUTLASS_MMA_RE = re.compile(
+    r"arch::Mma<cutlass::gemm::GemmShape<\(int\)(\d+), \(int\)(\d+), \(int\)(\d+)>")
 
 
 def dmma_flop_of(name):
@@ -159,7 +162,7 @@ def dmma_flop_of(name):
     cutlass_80_tensorop_d884gemm family and every hand-written kernel here are
     m8n8k4).  No timing is read from the target to obtain it.
     """
-    m = DMMA_RE.search(name)
+    m = CUTLASS_MMA_RE.search(name) or DMMA_RE.search(name)
     if m:
         a, b, c = (int(x) for x in m.groups())
         return 2.0 * a * b * c
@@ -227,10 +230,10 @@ def load_table():
     return _TABLE_CACHE
 
 
-def load_case(machine, order, path_name):
-    if USE_TABLE[0] or not sweep_dirs(machine):
+def load_case(machine, order, path_name, shape="8x8x4"):
+    if shape == "8x8x4" and (USE_TABLE[0] or not sweep_dirs(machine)):
         return load_table().get((machine, order, path_name), {})
-    return load_case_raw(machine, order, path_name)
+    return load_case_raw(machine, order, path_name, shape)
 
 
 def launch_multiplicity(seq):
@@ -277,19 +280,19 @@ def split_occurrences(per_role, mult):
     return out
 
 
-def load_case_raw(machine, order, path_name):
+def load_case_raw(machine, order, path_name, shape="8x8x4"):
     """Per-role, per-launch means for one (machine, order, path).
 
     Returns {role: {"n": launches, "mult": launches per tendency call, metrics...}}
     """
     files = []
     for d in sweep_dirs(machine):
-        f = sorted(glob.glob(os.path.join(d, "p%d_%s_8x8x4_none_r*_a.csv"
-                                          % (order, path_name))))
+        f = sorted(glob.glob(os.path.join(d, "p%d_%s_%s_none_r*_a.csv"
+                                          % (order, path_name, shape))))
         # The stall metrics are collected in a second ncu pass (suffix _b), a
         # different set of launches of the same kernels; merged per role below.
-        f += sorted(glob.glob(os.path.join(d, "p%d_%s_8x8x4_none_r*_b.csv"
-                                           % (order, path_name))))
+        f += sorted(glob.glob(os.path.join(d, "p%d_%s_%s_none_r*_b.csv"
+                                           % (order, path_name, shape))))
         if f:
             files = f
             break
@@ -494,7 +497,7 @@ RATIOS = [("GEMM_FUSED", "FUSED_TC"), ("GEMM", "FUSED_TC"),
           ("FUSED", "FUSED_TC")]
 
 
-def predict_case(srcs, tgt, order, path_name, verbose=False):
+def predict_case(srcs, tgt, order, path_name, verbose=False, tgt_shape="8x8x4"):
     """Predict per-tendency-call device time on `tgt` from calibration `srcs`.
 
     Returns (predicted_us, measured_us or None, rows).
@@ -503,7 +506,7 @@ def predict_case(srcs, tgt, order, path_name, verbose=False):
     cal = {s: c for s, c in cal.items() if c}
     if not cal:
         return None, None, []
-    obs = load_case(tgt, order, path_name)
+    obs = load_case(tgt, order, path_name, shape=tgt_shape)
     roles = set()
     for c in cal.values():
         roles |= set(c)
