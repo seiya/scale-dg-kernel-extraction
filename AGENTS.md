@@ -261,7 +261,10 @@ performance win must never be treated as implicit permission to redefine it.
   reader has to be able to re-derive. Today that is the sub-pipe transfer
   model's predictor (`subpipe_predict.py`) and the table it reads
   (`subpipe_inputs.csv`, distilled from the three machines' `ncu` sweeps,
-  which are 102 MB and stay local). Same reasoning as the `jobs/` allowlist: a
+  which are 102 MB and stay local), plus the ranking audit that scores the
+  model's threshold rule on both axes (`subpipe_rank_audit.py`) and the
+  balance-axis times it reads (`subpipe_balance_times.csv`, distilled from the
+  two machines' MPS sweeps; `subpipe_transfer_model.md` §5AA). Same reasoning as the `jobs/` allowlist: a
   published cross-machine prediction is only reproducible if the code that
   made it is. Ad-hoc analysis still does not go here -- only what a report
   cites.
