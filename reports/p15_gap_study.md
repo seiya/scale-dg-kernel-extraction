@@ -1,5 +1,7 @@
 # p=15 (Nq=16) — p=7 と p=255 の間を同一 DOF で埋める
 
+> **Status:** `record`（初出 2026-08-27） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 測定環境: RIKYU NVIDIA GB200 1 GPU、`make CUDA=1 GPUFLAGS=-gpu=cc100`。
 コミット: 本レポートを追加したコミット（親は `e8e1885`）。
 ncu は Slurm job `54662`（`job_ncu_p15.sh`、CUDA core 版）、

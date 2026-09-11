@@ -1,5 +1,7 @@
 # Ozaki Scheme I 本体実装レポート（`CUDAFORTRAN_GEMM_OZAKI1`）
 
+> **Status:** `record`（初出 2026-08-28） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 作成日: 2026-08-28
 対象リポジトリ: `scale-dg-kernel-extraction`（worktree `scale-dg-kernel-extraction-ozaki`）
 ブランチ / HEAD: `feature/ozaki` / `74f09bc`（§6.2・§7.2 の slice 統計はその上の未コミット差分）

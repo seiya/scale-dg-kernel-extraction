@@ -1,5 +1,7 @@
 # arXiv:2407.09621 からの最適化取り込み候補 調査メモ
 
+> **Status:** `survey`（初出 2026-08-25） — **着手前の文献調査・事前予測**。結論は後の実測で覆りうる。実測は別文書。
+
 作成日: 2026-08-25
 対象論文: Cu Cui, *Acceleration of Tensor-Product Operations with Tensor Cores*,
 arXiv:2407.09621v1 (Heidelberg Univ., 2024). NVIDIA A100 SXM4, SIPG-DG Laplacian,

@@ -1,5 +1,7 @@
 # cuBLAS FP64 fixed-point emulation のストール調査
 
+> **Status:** `record`（初出 2026-08-27） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 - 日付: 2026-08-27
 - 対象: base commit `1d9b7ec` 上の本変更
 - GPU: NVIDIA GB200、compute capability 10.0
@@ -11,7 +13,7 @@
 - nsys job: Slurm `53863`、host `c392`
 - profiler command: `timeout 180 nsys profile --trace=cuda --sample=none --cpuctxsw=none --resolve-symbols=false --force-overwrite=true -o output/cublas_emu_p7_final ./scale-dg_extraction.emuworkspace input_p7_perf_gemm_emu.conf`
 
-## 1. 結論
+## 1. 結論（2026-08-27 時点）
 
 観測された停止は deadlock ではない。`CublasEmulation=.true.` が cuBLAS の
 `EAGER` strategy を強制し、p=7 の K=8 GEMM にも FP64 fixed-point emulation を

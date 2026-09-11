@@ -1,5 +1,7 @@
 # p=255 (Nq=256, Ne=1) — GEMM 融合から手書き Tensor Core で CUTLASS を抜くまで
 
+> **Status:** `record`（初出 2026-08-28） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 測定環境: RIKYU NVIDIA GB200 1 GPU、`make CUDA=1 GPUFLAGS=-gpu=cc100`（nvcc は
 `-arch=native` = `sm_100`）。コミット: 本レポートを追加したコミット。
 入力: `conf_perf_p255_tc.conf` / `conf_perf_p255.conf`

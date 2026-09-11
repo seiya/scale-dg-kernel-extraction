@@ -1,6 +1,18 @@
 # p=511 GEMM / GEMM_FUSED 対応
 
-## 1. 結論
+> **Status:** `record`（初出 2026-08-28） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
+> **現在地（2026-09-11 追記）。§1 は 2026-08-28 の当初結論であり、現在値では
+> ない。** 現行ツリーの p=511 は [`measurement_inventory.md`](measurement_inventory.md) §18.3（tree `e113535`、job `83460`、占有 GPU） で
+> **`GEMM_FUSED` 12405.9 µs/stage が最速**、`FUSED_TC` 13086.3、`GEMM`
+> 13271.0、`GEMM_CUTE` 13349.1、`FUSED_DFMA` 30274.2 µs/stage。§1 の
+> 「GEMM と GEMM_FUSED の 2 経路」は当時の dispatch guard の記述で、現行
+> ゲートは GEMM 系 5 経路（Ozaki 2 経路を含む）＋ `FUSED_TC` / `FUSED_DFMA` の
+> **7 経路**を許す（§14–§15、[`p767_gap_study.md`](p767_gap_study.md) §1.2 の
+> 同じゲート）。§1 の 13.528 / 13.159 ms/stage は `a8e0f1a` の login-node 測定
+> として残す。**測定済みの表は書き換えていない。**
+
+## 1. 当初の結論（2026-08-28 時点）
 
 `PolyOrder=511`（`Nq=512`）を `CUDAFORTRAN_GEMM` と
 `CUDAFORTRAN_GEMM_FUSED` で実行可能にした。既存の cuBLAS / CUTLASS

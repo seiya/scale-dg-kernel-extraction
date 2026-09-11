@@ -1,5 +1,7 @@
 # 時間積分後の精度検証
 
+> **Status:** `current`（初出 2026-09-06） — **現行ツリーに対する主張**として読んでよい文書。古くなったら更新する。
+
 - 日付: 2026-09-06
 - GPU: NVIDIA GB200 1 GPU（RIKYU ログインノード）
 - ビルド: commit `48eb7da` + 本コミット、`make CUDA=1 GPUFLAGS=-gpu=cc100 GPUNVCCFLAGS=-arch=sm_100`

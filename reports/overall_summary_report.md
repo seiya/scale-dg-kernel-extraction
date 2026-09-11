@@ -1,10 +1,31 @@
-# SCALE-DG kernel extraction — GPU 実装・性能 総合まとめレポート
+# SCALE-DG kernel extraction — GPU 実装・性能 総合まとめレポート（2026-08-25 スナップショット / 歴史文書）
+
+> **Status:** `snapshot`（初出 2026-08-25、`299a868`） — **特定時点の横断まとめ**。以後更新しない歴史文書。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
 
 作成日: 2026-08-25
 対象リポジトリ: `scale-dg-kernel-extraction`
 ブランチ / HEAD: `feature/cuda` / `299a868`
 対象GPU: NVIDIA GB200 (RIKYU) 1 GPU
 ビルド: `make CUDA=1 GPUFLAGS=-gpu=cc100`（nvcc は `-arch=sm_100`、NVIDIA HPC SDK `nvhpc-hpcx`）
+
+> **この文書は 2026-08-25（`299a868`）のスナップショットであり、現在の結論では
+> ない（2026-09-11 追記）。** 表と本文は記録として一切書き換えていないが、
+> §1 の主要 4 主張はその後の測定で**すべて覆っている**:
+>
+> | §1 の主張 | 現在（`measurement_inventory.md` §18.3、tree `e113535`） |
+> |---|---|
+> | 1. p=7 は `CUDAFORTRAN_FUSED` が最速 | `FUSED_TC` が最速（253.8 対 `FUSED` 292.5 µs/stage） |
+> | 2. p=255 は GEMM 化（`GEMM_FUSED`）が最速 | `FUSED_TC` が最速（883.7 対 `GEMM_FUSED` 943.3 µs/stage） |
+> | 3. 最適戦略は p=7 と p=255 で逆転する | 逆転しない。**両端とも融合カーネルが勝つ**。GEMM 化は p=7 で 5.84× 遅く、p=255 でも 1.07× 遅い |
+> | 4. p=255 の手書き TC は CUTLASS/cuBLAS に負ける | 負けていない。p=255 の最速は手書き TC である |
+>
+> **現在の最速経路は、p = 7 / 15 / 31 / 63 / 127 / 255 が
+> `CUDAFORTRAN_FUSED_TC`、p = 511 / 575 / 767 / 1023 が
+> `CUDAFORTRAN_GEMM_FUSED`。** 交叉は p=255 と p=511 の間にあり、その位置は
+> GPU によって変わる（H100 / A100 は [`h100_report.md`](h100_report.md) §8、
+> [`a100_report.md`](a100_report.md)）。
+> **現在値を引くときは [`measurement_inventory.md`](measurement_inventory.md)
+> §18.3 を使い、この文書は使わないこと。**
 
 本レポートは、ソースコード、`README.md` / `AGENTS.md`、および `output/`
 配下の nsys / ncu 測定結果（Slurm job `43219`、`job_all.sh`）を横断して

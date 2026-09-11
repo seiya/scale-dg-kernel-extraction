@@ -1,5 +1,7 @@
 # Ozaki Scheme II 本体実装レポート（`CUDAFORTRAN_GEMM_OZAKI2`）
 
+> **Status:** `record`（初出 2026-08-28） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 作成日: 2026-08-28
 対象リポジトリ: `scale-dg-kernel-extraction`（worktree `scale-dg-kernel-extraction-ozaki`）
 ブランチ / HEAD: `feature/ozaki` / `cb23b98`（moduli テーブル GEMMul8 整合は本レポート作業時の未コミット差分）

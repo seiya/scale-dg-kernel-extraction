@@ -1,5 +1,7 @@
 # GEMM 経路のライブラリ割り当てとエピローグ担い手（2026-09-02）
 
+> **Status:** `record`（初出 2026-09-02） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 `CUDAFORTRAN_GEMM_FUSED` / `CUDAFORTRAN_GEMM_CUTE` の 2 つのノブを、
 文書が固定していたのをやめて測り直した記録。**p=7 −15.2%、p=15 −9.1%、
 p=31 −23.0%、p=63 −1.2%**（いずれも `GEMM_FUSED` の `CUDA device` µs/stage）。

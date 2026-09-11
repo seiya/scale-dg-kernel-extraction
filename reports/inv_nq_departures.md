@@ -1,5 +1,7 @@
 # `1/Nq` から外れる 2 か所の機構（2026-09-09、GB200）
 
+> **Status:** `record`（初出 2026-09-09） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 `gemm_assignment_and_carrier.md` §12.1.4 と §13.8.1 が「測っていない」と
 明記していた 2 か所を、カーネル別 nsys で閉じた記録。
 

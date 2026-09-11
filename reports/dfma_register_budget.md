@@ -1,5 +1,7 @@
 # `FUSED_DFMA` のレジスタ予算 —— iso-schedule が DFMA に払わせている代金（2026-09-03）
 
+> **Status:** `record`（初出 2026-09-03） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 `AGENTS.md` は `CUDAFORTRAN_FUSED_DFMA` を「`FUSED_TC` と同一ソースの
 `UseTc=false`、MMA 命令だけの iso-schedule アブレーション」と定義している。
 `__launch_bounds__` は `UseTc` を見ない —— それが iso-schedule の条件そのもの

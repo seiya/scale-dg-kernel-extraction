@@ -266,8 +266,11 @@ performance win must never be treated as implicit permission to redefine it.
   made it is. Ad-hoc analysis still does not go here -- only what a report
   cites.
 - `reports/`: committed performance and optimization reports. See
-  `reports/README.md` for the index and the current fastest path per
-  polynomial order.
+  `reports/README.md` for the index, and `reports/measurement_inventory.md`
+  §18.3 for the current time of every (order, path) cell. Every report carries
+  a `Status:` line naming it `current` / `record` / `snapshot` / `survey`;
+  `reports/check_report_status.py` checks that, and the two rules that go with
+  it, mechanically. Both are defined in the `reports/` section below.
 - `.claude/skills/dg-optimize/` and `.cursor/skills/dg-optimize/`: the
   kernel-optimization procedure for Claude Code and Cursor. Same tree
   (Cursor path is a symlink). It follows this file and does not add rules.
@@ -447,9 +450,12 @@ that change.
 Finished reports live in `reports/` and are committed. Working notes,
 profiler output, and Slurm logs are not; see the commit rules below.
 
-- Read `reports/README.md` before starting a performance task. It states which
-  path is currently fastest at each polynomial order, which is the thing most
-  often out of date elsewhere.
+- Read `reports/README.md` before starting a performance task. It is the index
+  and it says where the current numbers live. **The single authority for the
+  current time of a (polynomial order, path) cell is
+  `reports/measurement_inventory.md` §18.3**, which re-measures every published
+  cell on the current tree; README's own per-order table carries the date of
+  the campaign that produced it. No other report states a current value.
 - Every report states the commit, Slurm job, input file, and GPU it was
   measured on. Keep that habit for new reports.
 - When a change invalidates a published conclusion, update the affected
@@ -458,6 +464,38 @@ profiler output, and Slurm logs are not; see the commit rules below.
   state the commit they belong to, and add a note where the conclusion
   changed. Past numbers are evidence, not claims about the current tree.
 - `reports/README.md` is the index. Add a row when adding a report.
+
+**Historical record and current truth are separated formally, not by prose.**
+A report that is a chronological development record is not wrong when its
+opening section states the number that was measured on the day it was written
+-- but a reader must not have to reach §16 to find that out. So:
+
+- **Every file in `reports/` carries a `Status:` line directly under its H1**,
+  naming one of four kinds and the date it was first committed:
+  - `current` -- read as a claim about the current tree; update it when it goes
+    stale.
+  - `record` -- a chronological development record. Each section's numbers
+    belong to that section's measurement date. Its opening section is not a
+    statement about the current tree.
+  - `snapshot` -- a cross-cutting summary of one moment, never updated again.
+  - `survey` -- a literature survey or a pre-measurement prediction, written
+    before the work; later measurement may overturn it.
+- **A `record`'s first section must not be an unqualified "結論" / "まとめ".**
+  Put the date in the heading (`## 1. 当初の結論（2026-08-28 時点）`), and put a
+  short "現在地" block under the H1 that gives the current numbers and points at
+  `measurement_inventory.md` §18.3. This is the exact failure that
+  `p511` / `p575` / `p767` / `p1023` / `p7_gemm_fused.md` had on 2026-09-11:
+  the bodies were updated by later sections, the opening was not, and the
+  opening is what gets read and quoted.
+- **A line that claims "現在" / "現行" / the fastest path, and prints a
+  µs/stage, ms/stage or ms/step figure, must print a figure that is in §18.3.**
+  If the figure is the one measured that day, say so on the same line ("当時",
+  "§10 時点", or a date) -- then it is a record, not a claim.
+- `python3 reports/check_report_status.py` checks all three mechanically. It
+  exits non-zero on a missing or malformed `Status:` line, and warns on an
+  unqualified first-section heading and on a stale "current" figure. Run it
+  when adding or updating a report, the same way `git diff --check` is run
+  before committing. Its WARNs can be false positives; its ERRORs are not.
 
 ## Working Tree and Commits
 

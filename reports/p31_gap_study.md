@@ -1,5 +1,7 @@
 # p=31 (Nq=32) — 同一 DOF ギャップの 6 点目、そして曲線の極大点
 
+> **Status:** `record`（初出 2026-08-27） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 測定環境: RIKYU NVIDIA GB200 1 GPU（152 SM）、`make CUDA=1 GPUFLAGS=-gpu=cc100`。
 コミット: 本レポートを追加したコミット（親は `1c36e92`）。
 実行ファイルは `scale-dg_extraction.p31` に凍結し、実測・nsys・ncu すべてで同じものを使った。
@@ -14,6 +16,13 @@ UseCudaGraph=.false.`）。検証: `input_p31_val*.conf`（`Ne=2³`、`nstep=1`�
 > 同一 DOF 6 点の曲線から極大点は消えている（§14.1 / §14.2、および §14.2 内の
 > 「§8 と §11 の『p=31 は曲線の極大点である』は、この節をもって成立しない」）。
 > 表題は当時の記録として残す。
+>
+> **現在地（2026-09-11 追記）**: 現行ツリーの p=31 は
+> [`measurement_inventory.md`](measurement_inventory.md) §18.3（tree
+> `e113535`、job `83460`、占有 GPU）で **`FUSED_TC` 355.3 µs/stage が最速**、
+> `FUSED` 421.7、`GEMM_FUSED` 545.0、`GEMM_CUTE` 595.1、`GEMM` 610.8、
+> `FUSED_DFMA` 786.1、`SPLIT` 2634.4 µs/stage。本文の値は当時のもので、
+> **測定済みの表は書き換えていない。**
 
 ## 1. なぜ p=31 か
 

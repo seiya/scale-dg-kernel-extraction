@@ -1,5 +1,7 @@
 # p=63 (Nq=64) — 同一 DOF ギャップの 4 点目、GEMM 側の最初の点
 
+> **Status:** `record`（初出 2026-08-27） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 測定環境: RIKYU NVIDIA GB200 1 GPU、`make CUDA=1 GPUFLAGS=-gpu=cc100`。
 コミット: 本レポートを追加したコミット（親は `7780f7d`）。
 ncu は Slurm job `57411`（`job_ncu_p63.sh`、`--set full`、p=63 と p=255 を同一実行ファイルで）。
@@ -7,6 +9,17 @@ nsys は Slurm job `57413`（`job_nsys_p63.sh`、カーネル別 device 時間�
 入力: `conf_perf_p63*.conf`（`NeX=NeY=NeZ=4, PolyOrder=63, nstep=20, UseCudaGraph=.false.`）。
 検証: `input_p63_val*.conf`（`Ne=2³`）と `conf_perf_p63.conf` の `nstep=1` 版（`Ne=4³`）、
 いずれも `SCALE_DG_VARYING_COEFF=1`。
+
+> **現在地（2026-09-11 追記）。表題の「GEMM 側の最初の点」と §1 末の
+> 「新規融合カーネルを書かずに」は、本レポートの初回スコープであって現在の
+> 状態ではない。** §13（2026-08-28）で `FUSED` / `FUSED_TC` を Nq=64 に書き、
+> §16 で `FUSED_TC` を 661.6 → 539.0 µs にして **p=63 の最速が `GEMM_FUSED`
+> から `FUSED_TC` に替わった**。現行ツリーの p=63 は
+> [`measurement_inventory.md`](measurement_inventory.md) §18.3（tree
+> `e113535`、job `83460`、占有 GPU）で **`FUSED_TC` 407.7 µs/stage が最速**、
+> `FUSED` 463.2、`GEMM_FUSED` 560.9、`GEMM` 608.6、`GEMM_CUTE` 612.5、
+> `FUSED_DFMA` 836.5、`SPLIT` 3969.8 µs/stage。表題と §1 のスコープ記述は
+> 当時の記録として残す。**測定済みの表は書き換えていない。**
 
 ## 1. なぜ p=63 か
 

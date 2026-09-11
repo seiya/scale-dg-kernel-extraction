@@ -1,5 +1,7 @@
 # p=127 (Nq=128) — 同一 DOF ギャップの 5 点目、マシンバランスを越える最小の次数
 
+> **Status:** `record`（初出 2026-08-27） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 測定環境: RIKYU NVIDIA GB200 1 GPU、`make CUDA=1 GPUFLAGS=-gpu=cc100`。
 コミット: 本レポートを追加したコミット（親は `760e96e`）。
 実行ファイルは `scale-dg_extraction.p127` に凍結し、実測・nsys・ncu すべてで同じものを使った。

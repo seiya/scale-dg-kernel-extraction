@@ -1,5 +1,7 @@
 # 64-bit indexing boundary validation
 
+> **Status:** `current`（初出 2026-08-28） — **現行ツリーに対する主張**として読んでよい文書。古くなったら更新する。
+
 ## 1. 結論
 
 高次数で default integer の境界を越える可能性がある、次の2つのホスト側

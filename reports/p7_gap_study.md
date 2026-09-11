@@ -1,5 +1,7 @@
 # p=7 CUDA-core `FUSED` gap study
 
+> **Status:** `record`（初出 2026-08-30） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 GB200 1 GPU、`make CUDA=1 GPUFLAGS=-gpu=cc100`（nvcc `-arch=sm_100`）、
 `namelists/perf_p7_fused.conf`（`Ne=32³`、`nstep=20`、graph off）。
 親 commit `9dfea48`。対象は `CUDAFORTRAN_FUSED`（`cuda_dg_kernels_fused.cu`）だけ。

@@ -1,5 +1,7 @@
 # TMA（Tensor Memory Accelerator）適用調査
 
+> **Status:** `survey`（初出 2026-08-26） — **着手前の文献調査・事前予測**。結論は後の実測で覆りうる。実測は別文書。
+
 作成日: 2026-08-26
 対象リポジトリ: `scale-dg-kernel-extraction`
 ブランチ / HEAD: `feature/cuda` / `c353993`

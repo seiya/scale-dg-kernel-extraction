@@ -1,5 +1,7 @@
 # 実測 DRAM トラフィックと、経路ごとの屋根（GB200）
 
+> **Status:** `record`（初出 2026-09-06） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 - 日付: 2026-09-06
 - GPU: NVIDIA GB200 1 GPU（RIKYU、node `c116`、cc 10.0、SM boost 2062 MHz）
 - ビルド: commit `357e2f8`、`make CUDA=1 GPUFLAGS=-gpu=cc100 GPUNVCCFLAGS=-arch=sm_100`

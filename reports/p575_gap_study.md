@@ -1,6 +1,17 @@
 # p=575 GEMM / GEMM_FUSED 対応
 
-## 1. 結論
+> **Status:** `record`（初出 2026-08-28） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
+> **現在地（2026-09-11 追記）。§1 は 2026-08-28 の当初結論であり、現在値では
+> ない。** 現行ツリーの p=575 は [`measurement_inventory.md`](measurement_inventory.md) §18.3（tree `e113535`、job `83460`、占有 GPU） で
+> **`GEMM_FUSED` 19305.3 µs/stage が最速**、`GEMM_CUTE` 20671.6、`GEMM`
+> 20698.7 µs/stage。経路の集合は §1.2 のとおり **GEMM 系 5 経路**で、
+> tile カーネル（`FUSED_TC` / `FUSED_DFMA`）のインスタンスは p=575 には無い
+> （[`p767_gap_study.md`](p767_gap_study.md) §1.2）。§1 の 20.912 / 20.453
+> ms/stage は `70ed842` の login-node 3 回中央値として残す。
+> **測定済みの表は書き換えていない。**
+
+## 1. 当初の結論（2026-08-28 時点）
 
 `PolyOrder=575`（`Nq=576`）を `CUDAFORTRAN_GEMM` と
 `CUDAFORTRAN_GEMM_FUSED` で実行可能にした。既存の cuBLAS / CUTLASS

@@ -1,5 +1,7 @@
 # CUTLASS volume GEMM の MMA 命令形状（8x8x4 / 16x8x4 / 16x8x8 / 16x8x16）
 
+> **Status:** `record`（初出 2026-08-26） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
 - 日付: 2026-08-26
 - 対象: `CUDAFORTRAN_GEMM_CUTE` / `CUDAFORTRAN_GEMM_FUSED` の volume GEMM
 - 測定環境: RIKYU NVIDIA GB200 1 GPU（login node で直接実行）、

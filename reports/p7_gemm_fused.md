@@ -1,9 +1,22 @@
 # p=7 `CUDAFORTRAN_GEMM_FUSED`
 
+> **Status:** `record`（初出 2026-08-31） — **時系列の開発記録**。各節の値は**その節の測定日のもの**であり、冒頭の結論が現在値とは限らない。現在値は [`measurement_inventory.md`](measurement_inventory.md) §18.3。
+
+> **現在地（2026-09-11 追記）。** 本文の値は**作業当時のもの**である。現行
+> ツリー（`e113535`、job `83460`、占有 GPU）の p=7 `GEMM_FUSED` は
+> **1482.0 µs/stage**（Main 4.635 ms/step）で、最速の `FUSED_TC`
+> **253.8 µs/stage** の **5.84 倍**（[`measurement_inventory.md`](measurement_inventory.md)
+> §18.3）。本文冒頭と §10 の **1960.3 µs/stage は §10 時点（2026-08-31）の値**で、
+> その後 §11（y batch 1 ローンチ）・§12（y epilogue repad）・§13（z epilogue
+> パッケージ）・§14（CUDA graph）と
+> [`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §1–2
+> （x を次数専用タイルの CUTLASS、y を cuBLAS）で 1505.1 を経て現在値に至った。
+> **測定済みの表は書き換えていない。**
+
 GB200 1 GPU、`make CUDA=1 GPUFLAGS=-gpu=cc100`（nvcc `-arch=sm_100`）、
 `namelists/perf_p7_gemm_fused.conf`（`Ne=32³`、`nstep=20`、graph off）。
 親 commit `40fff1a` の作業ツリー。対象は `CUDAFORTRAN_GEMM_FUSED`。最速は
-`FUSED_TC`（274.9 µs/stage）のまま。この次数で GEMM 経路が最速を抜く見込みは
+`FUSED_TC`（当時 274.9 µs/stage）のまま。この次数で GEMM 経路が最速を抜く見込みは
 無い（同一 DOF で面点率 75%、経路 DRAM は unique の 2.6 倍）。作業の目的は
 `Nq*Ne > 65535` で閉じていた列を開き、浅い `K=8` で融合が負ける理由を測って
 モデルに残すことである。
@@ -11,16 +24,18 @@ GB200 1 GPU、`make CUDA=1 GPUFLAGS=-gpu=cc100`（nvcc `-arch=sm_100`）、
 **2026-08-31 訂正**: §6--9 の 510--380 µs は要素 CTA の手書き CUDA-core
 体積カーネルへ置換した探索値であり、`GEMM_FUSED` の役割（`GEMM_CUTE` と
 CUTLASS mainloop を共有）を満たさない。測定済みの範囲外結果として表は残すが、
-本番コードには採用しない。役割準拠の最終値は §10 の device **1960.3
-µs/stage**、Main **6.042 ms/step** である。
+本番コードには採用しない。役割準拠の値は §10 の device **1960.3
+µs/stage**、Main **6.042 ms/step** である（**§10 時点**。以後 §11–§14 で
+更新された）。
 
 µs/stage = `CUDA device GEMM fused` / (19 measured steps × 3 RK)。
 点変化係数の owned `dqdt` は `Ne=2³` で `CUDAFORTRAN_SPLIT` と最大絶対差 0、
 `Ne=32³`（16,777,216 点）で `CUDAFORTRAN_GEMM` と**ビット一致**（§2 まで。
 §6 の要素 CTA は加算順が変わりうるが、SPLIT との最大絶対差は 0）。
 
-現在の占有 GPU interleaved A/B は device **1960.3 µs/stage**、Main
-**6.042 ms/step**（§10）。`FUSED_TC` の **7.13 倍**。
+**§10 時点（2026-08-31）**の占有 GPU interleaved A/B は device **1960.3
+µs/stage**、Main **6.042 ms/step**。当時の `FUSED_TC` の **7.13 倍**。
+**現在値ではない**（冒頭の「現在地」を見よ）。
 
 nsys: Slurm job `70974`（c082、cuBLAS y 時代）、`70989`（手書き y/z）、
 `70991`、`71056`（flux_deriv）。`--resolve-symbols=false`、
