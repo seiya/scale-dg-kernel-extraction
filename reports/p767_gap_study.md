@@ -245,6 +245,21 @@ commit `38952e4`、`nstep=20`、`WarmupStep=2`、
 > `OZAKI2` は FIXED / ADP・7 / 14 moduli のどれでも数値が合わない（同 §9.8.5）ので、
 > **`OZAKI2` の行はどの設定でも「その精度での速度」である。**
 > **本表は当時の DYNAMIC 既定での測定として書き換えずに残す。**
+>
+> **訂正注記（2026-09-11、追加測定なし）: 上の「精度を満たす FIXED」は p=7 で
+> しか確かめていない主張で、本節が張る p=767 では成り立たない。**
+> [`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §14.3 /
+> §14.5（2026-09-09、Slurm `88634`）が同じ既定 **FIXED / 55 bit / 7 slices** を
+> 高次数で測り、**相対差は p=255 で 4.15e-13、p=511 で 1.77e-12** ——
+> 同じ p=511 の `GEMM` 対 `GEMM_FUSED` が 3.55e-15、全 CUDA 経路の最悪値が
+> 2.113e-13（`measurement_inventory.md` §18.4）なので、**既定の Scheme I は
+> p=511 で他のどの CUDA 経路よりも 8.4 倍大きい差を出しており、`AGENTS.md` の
+> 言う roundoff 水準ではない**（8 枚なら 1.90e-14 で届くが、**8 枚の速度は
+> 測っていない**。同 §14.6）。**したがって上の 618.8 ms/stage（9.78×）は「既定 7 枚の速度」
+> として読むこと。**合否の判定（DYNAMIC と `OZAKI2` が不合格）は 12〜14 桁
+> 違うので動かない。同じ注記が `measurement_inventory.md` §10.1 / §18.7、
+> [`ozaki1_implementation_report.md`](ozaki1_implementation_report.md)、
+> `README.md`「最新結果のまとめ」にある。
 
 > **（訂正 2026-08-29）** 上表の native **188.4 ms** は 1 step の device 合計で、
 > RK 3 stage で割っていない。1 stage は約 62.8 ms で、§5 の GEMM 62.817 ms/stage
