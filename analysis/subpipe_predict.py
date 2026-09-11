@@ -669,8 +669,12 @@ def main():
                                  fmt_err(r["pred_us"], r["meas_us"])))
         if errs:
             ae = sorted(abs(e) for e in errs)
+            # statistics.median, i.e. the average of the two middle values when
+            # n is even -- the same convention as the per-ratio medians below.
+            # It printed ae[n // 2] (the upper median) until 2026-09-11, which
+            # differed from the numbers the report quotes in the even-n cells.
             print("  path totals: n=%d  |err| median %.1f%%  max %.1f%%"
-                  % (len(ae), 100 * ae[len(ae) // 2], 100 * ae[-1]))
+                  % (len(ae), 100 * statistics.median(ae), 100 * ae[-1]))
             print("  binding resource: %d / %d kernels" % (roof_hit, roof_n))
         # Error by order band: the model declares its own validity domain
         # (report section 5E.3), so report inside and outside it separately.
@@ -682,7 +686,7 @@ def main():
             if band[k]:
                 v = sorted(band[k])
                 print("  |err| %-10s n=%2d median %5.1f%%  max %5.1f%%"
-                      % (k, len(v), 100 * v[len(v) // 2], 100 * v[-1]))
+                      % (k, len(v), 100 * statistics.median(v), 100 * v[-1]))
         # The ranking question the paper asks.
         print("  %-5s %10s %10s   %10s %10s" % ("p", "GF/TC pred", "GF/TC meas",
                                                 "G/TC pred", "G/TC meas"))
