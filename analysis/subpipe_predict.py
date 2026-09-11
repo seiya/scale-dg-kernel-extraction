@@ -65,12 +65,17 @@ MACHINES = {
 # machine: the original all-order sweep, then the extensions (p >= 767, and the
 # paths the first sweep did not cover).  Searched in order; the first directory
 # that has the file wins.
+# The lowgemm directories come FIRST: they are the re-take of the unfused GEMM
+# paths below p=63 with flux_all in the kernel filter, and they supersede the
+# same cells in the original sweeps (section 5Y).
 SWEEPS = {
-    "GB200": ["subpipe_orders_92904/ncu", "subpipe_hi_94874/ncu",
-              "subpipe_paths_94875/ncu"],
-    "A100":  ["wisteria/a100_subpipe_orders_9569112/ncu",
+    "GB200": ["subpipe_lowgemm_96222/ncu", "subpipe_orders_92904/ncu",
+              "subpipe_hi_94874/ncu", "subpipe_paths_94875/ncu"],
+    "A100":  ["wisteria/a100_subpipe_lowgemm_9579761/ncu",
+              "wisteria/a100_subpipe_orders_9569112/ncu",
               "wisteria/a100_subpipe_paths_*/ncu"],
-    "H100":  ["tsubame/h100_subpipe_orders_*/ncu",
+    "H100":  ["tsubame/h100_subpipe_lowgemm_8631948/ncu",
+              "tsubame/h100_subpipe_orders_*/ncu",
               "tsubame/h100_subpipe_paths_*/ncu"],
 }
 
