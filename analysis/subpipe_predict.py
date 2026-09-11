@@ -484,8 +484,13 @@ CLAMP_Q = [False]
 PATHS = ["FUSED_TC", "GEMM_FUSED", "GEMM", "FUSED", "FUSED_DFMA", "GEMM_CUTE",
          "GEMM_OZAKI1"]
 ORDERS = [7, 15, 31, 63, 127, 255, 511, 575, 767, 1023]
+# Each pair isolates one axis: fusion (CUTE vs FUSED), the mma instruction on
+# an iso-schedule (DFMA vs TC), the library under one schedule (CUTE vs GEMM),
+# the mma fragment layout against natural order on CUDA cores (DFMA vs FUSED),
+# and CUDA core against tensor core (FUSED vs TC).
 RATIOS = [("GEMM_FUSED", "FUSED_TC"), ("GEMM", "FUSED_TC"),
           ("FUSED_DFMA", "FUSED_TC"), ("GEMM_CUTE", "GEMM_FUSED"),
+          ("GEMM_CUTE", "GEMM"), ("FUSED_DFMA", "FUSED"),
           ("FUSED", "FUSED_TC")]
 
 
