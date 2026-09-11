@@ -51,6 +51,9 @@ advect3d/advect3d
 !/jobs/mps_balance.sh
 !/jobs/tsubame_mps_balance.sh
 !/jobs/wisteria_mps_balance.sh
+!/jobs/mps_smid_probe.cu
+!/jobs/rikyu_mps_smid.sh
+!/jobs/wisteria_mps_smid.sh
 !/jobs/tsubame_p511_clock.sh
 !/jobs/rikyu_p511_dir1_ncu.sh
 !/jobs/wisteria_p511_dir1_ncu.sh
