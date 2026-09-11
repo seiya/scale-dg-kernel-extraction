@@ -48,6 +48,9 @@ advect3d/advect3d
 !/jobs/wisteria_subpipe_paths.sh
 !/jobs/tsubame_subpipe_gaps.sh
 !/jobs/wisteria_subpipe_gaps.sh
+!/jobs/mps_balance.sh
+!/jobs/tsubame_mps_balance.sh
+!/jobs/wisteria_mps_balance.sh
 !/jobs/tsubame_p511_clock.sh
 !/jobs/rikyu_p511_dir1_ncu.sh
 !/jobs/wisteria_p511_dir1_ncu.sh
