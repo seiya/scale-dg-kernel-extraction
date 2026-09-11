@@ -153,8 +153,11 @@ implementation is fastest.
   Escale into x/y and `deriv_x` into y, and with x carrying it can forward
   Escale_x into x alone — but which of these the tree actually runs is a
   measurement, and as of 2026-09-11 **no Escale factor is forwarded at any
-  order**: every order's plan has `x_mode = 1` (plain CUTLASS x) and
-  `xfwd = 0`, so only the z-carrier fold at `Nq >= 64` is on. The per-order
+  order**: no order's plan sets the forwarding modes (`x_mode` is 1, plain
+  CUTLASS x, at `Nq <= 256`, and 0 at `Nq > 256`, where 0 means the generic
+  CUTLASS `launch_volume_gemm_x` rather than cuBLAS — the tiled x launcher and
+  its cuBLAS branch only exist at the six swept orders), and `xfwd = 0`
+  everywhere, so only the z-carrier fold at `Nq >= 64` is on. The per-order
   table at the top of `mod_cuda_dg_kernels.cuf` is authoritative for this too;
   the orders where each measured faster are in the gap studies
   (`gemm_assignment_and_carrier.md` §4 and §11), and the gate itself is in
