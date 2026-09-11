@@ -596,6 +596,11 @@ def main():
     ap.add_argument("--eta-rule", default="closest",
                     choices=["closest", "mean", "min", "max"],
                     help="with two calibration machines, how to combine eta")
+    ap.add_argument("--dump-logo",
+                    help="with --logo, also write one row per (held-out "
+                         "machine, order, path) to this CSV: the schema the "
+                         "paper's Figure 9 reads (figs/data/"
+                         "logo_path_totals.csv)")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     USE_TABLE[0] = a.from_table
@@ -640,6 +645,7 @@ def main():
     else:
         dirs = [(a.src or ["GB200"], a.tgt or "H100")]
 
+    dump = []
     for srcs, tgt in dirs:
         print("\n===== calibrate %s -> hold out %s =====" % ("+".join(srcs), tgt))
         hdr = "%-5s %-11s %10s %10s %8s" % ("p", "path", "pred us", "meas us", "err")
@@ -657,6 +663,8 @@ def main():
                 ratios.setdefault(p, {})[path_name] = (pr, me)
                 print("%-5d %-11s %10.1f %10.1f %8s" % (p, path_name, pr, me,
                                                         fmt_err(pr, me)))
+                dump.append((tgt, p, path_name, pr, me,
+                             (pr / me - 1.0) * 100.0))
                 for r in rows:
                     if r["roof_obs"]:
                         roof_n += 1
@@ -714,6 +722,15 @@ def main():
         print("  sign of ratio-1: "
               + ", ".join("%s %d/%d" % (k, v[0], v[1])
                           for k, v in sorted(sign.items())))
+
+    if a.dump_logo and dump:
+        with open(a.dump_logo, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["tgt", "order", "path", "pred", "meas", "err"])
+            for tgt, p, path_name, pr, me, e in dump:
+                w.writerow([tgt, p, path_name, "%.3f" % pr, "%.3f" % me,
+                            "%.2f" % e])
+        print("\nwrote %s (%d rows)" % (a.dump_logo, len(dump)))
 
 
 if __name__ == "__main__":

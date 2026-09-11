@@ -139,25 +139,60 @@ def score(cells, label):
                  st.median([c["err"] for c in rest])))
 
 
+def keep_axis(cells):
+    """Freeze the per-axis family error before score() is called again.
+
+    score() recomputes fam_loo over whatever set it is given, so the final
+    both-axes call would otherwise overwrite the per-axis values that the
+    figure is scored with.
+    """
+    for c in cells:
+        c["fam_axis"], c["sn_axis"] = c["fam_loo"], c["sn_prior"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--axis", default="both",
                     choices=["machine", "balance", "both"])
     ap.add_argument("--from-table", action="store_true",
                     help="read counters from analysis/subpipe_inputs.csv")
+    ap.add_argument("--dump-cells",
+                    help="write one row per scored cell to this CSV, in the "
+                         "schema the paper's Figure 8 reads (figs/data/"
+                         "sn_cells.csv): axis, machine, order, the two paths, "
+                         "the predicted and measured ratio, the leave-one-out "
+                         "family error as a fraction, the a priori S/N and the "
+                         "hit.  The MPS fraction of a balance cell is not "
+                         "carried: the figure does not distinguish them.")
     a = ap.parse_args()
     sp.USE_TABLE[0] = a.from_table
     cells = []
     if a.axis in ("machine", "both"):
         m = machine_axis()
         score(m, "machine axis (leave-one-GPU-out)")
+        keep_axis(m)
         cells += m
     if a.axis in ("balance", "both"):
         b = balance_axis()
         score(b, "balance axis (MPS SM fraction)")
+        keep_axis(b)
         cells += b
     if len(cells) > len(m if a.axis == "machine" else []) and a.axis == "both":
         score(cells, "both axes")
+    if a.dump_cells:
+        with open(a.dump_cells, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["axis", "grp", "order", "num", "den", "pred", "meas",
+                        "famerr", "sn", "hit"])
+            for c in cells:
+                grp = c["tag"].split()[0]
+                order = int(c["tag"].split("p=")[1].split()[0])
+                num, den = [x.strip() for x in c["ratio"].split("/")]
+                w.writerow([c["axis"], grp, order, num, den,
+                            "%.4f" % c["rp"], "%.4f" % c["rm"],
+                            "%.4f" % (c["fam_axis"] / 100.0),
+                            "%.4f" % c["sn_axis"], int(c["hit"])])
+        print("\nwrote %s (%d cells)" % (a.dump_cells, len(cells)))
 
 
 if __name__ == "__main__":
