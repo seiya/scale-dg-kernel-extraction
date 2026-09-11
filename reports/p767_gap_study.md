@@ -33,6 +33,32 @@ Wisteria/BDEC-01 の **40 GiB** と Tsubame の **94 GiB** の 2 つで、
 p=575 / p=767 だけが 2 冪でないのは、この容量基準で選ばれたためである。
 p=575 の選定理由は [`p575_gap_study.md`](p575_gap_study.md) §1.1 を見よ。
 
+### 1.2 dispatch guard は現在 7 経路を許す（2026-09-11 追記）
+
+§1 の「p=767 を対応済みの2経路だけに制限する dispatch guard」は本レポートの
+base commit `bc5aac4` 時点の記述であり、そのまま残す。現行 tree の
+`mod_advect3d_eq.f90` のゲート（`Np == 768**3` を含む分岐）は、p=767 に対して
+`CUDAFORTRAN_GEMM`、`CUDAFORTRAN_GEMM_FUSED`、`CUDAFORTRAN_GEMM_CUTE`、
+`CUDAFORTRAN_GEMM_OZAKI1`、`CUDAFORTRAN_GEMM_OZAKI2` の GEMM 系 5 経路に加えて、
+`CUDAFORTRAN_FUSED_TC` と `CUDAFORTRAN_FUSED_DFMA` の **合計 7 経路**を許す。
+
+- Ozaki 2 経路は本レポート自身の §8（2026-08-28 追記）が p=767 で測っている。
+- `GEMM_CUTE` は本レポート §12（2026-09-01）が p=767 で開通させた。
+- tile カーネル（`FUSED_TC` / `FUSED_DFMA`）は commit `ba24055`（2026-09-04）で
+  p=767 に開通した。`tendency_p255_kernel` の形は `Nq` を grid とチャンク数に
+  しか持たず、768 は `BM255`/`BN255` = 64 も `BK255` = 16 も割り切る。測定は
+  [`dfma_register_budget.md`](dfma_register_budget.md) §19、セルの現況は
+  [`measurement_inventory.md`](measurement_inventory.md) §0 の該当注記
+  （`FUSED_DFMA` は production 形 `4×4` で測定済み、`FUSED_TC` は数値検証のみ）。
+
+**p=575 と p=1023 には tile カーネルのインスタンスが無い**（p=1023 は原理的に
+持てない。32-bit 添字の境界は同 §19.6、通常 GEMM 側の同じ境界は
+[`p1023_gap_study.md`](p1023_gap_study.md) §3.2）。したがって §1 の判断のうち
+**p=767 についての部分だけが現行 tree に当てはまらない。**
+
+なお本レポートには **§7 が無い**（§6 の次が §8）。欠番であって、削除された
+節ではない —— §8 以降はすべて 2026-08-28 以降の追記として足された節である。
+
 ## 2. 測定条件
 
 - 日付: 2026-08-28（Asia/Tokyo）

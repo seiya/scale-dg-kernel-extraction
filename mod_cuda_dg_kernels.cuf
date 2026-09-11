@@ -2915,9 +2915,14 @@ contains
     ! cannot disagree.
     if (fuse_epilogue .and. (plan%x_mode == 2 .or. plan%x_mode == 4)) &
       xy_weighted = 2
-    ! Nq = 8 keeps the five-tensor z epilogue but does take the paired face
-    ! layout: the three 16-byte lift loads are -2.4% there (p7_gemm_fused.md
-    ! section 13).  Nq = 16, 32 and 64 lose from it.
+    ! Nq >= 64 (z carrier) takes the paired face layout.  Nq = 8 sets it here
+    ! for the same reason it once had -- the three 16-byte lift loads were
+    ! -2.4% there (p7_gemm_fused.md section 13) -- but that measurement was
+    ! taken with the z carrier, and the carrier moved to x on 2026-09-02: the
+    ! x-carrier block below clears pair_nq2 again unless xpkg bit 1 asks for
+    ! the 16-byte lift, which no order's plan does (the same section's note
+    ! records +2.1 to +3.2% at four orders once x carries, from 124 -> 154
+    ! registers).  So at Nq = 8 this line has no effect in the default plan.
     if (fuse_epilogue .and. (Nq >= 64 .or. Nq == 8)) pair_nq2 = nq2
     !- SCALE_DG_ZPKG selects the interleaved face layout explicitly.
     if (fuse_epilogue .and. plan%zpkg >= 0) then

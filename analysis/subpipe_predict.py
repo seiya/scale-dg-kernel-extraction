@@ -463,8 +463,9 @@ UNLOADED_SHARE = 0.07
 
 # Unloaded global-memory latency, SM cycles, from jobs/global_latency_probe.cu.
 #     S_long ratio = (L0 ratio in SM cycles) x QUEUE_K x (DRAM B/SM-clk ratio)
-# QUEUE_K is fitted on two points that agree to 5% (1.17 from A100, 1.23 from
-# H100), and this form reproduces both measured S_long ratios to 1%.
+# QUEUE_K is fitted on two points that agree to 5% (1.165 from A100, 1.220 from
+# H100, on the fixed-probe L0 below; 1.169 / 1.230 on the original probe), and
+# this form reproduces both measured S_long ratios to 1%.
 #
 # These went to co-run values 462.5 / 355.3 / 441.5 for one commit and came
 # back: the "co-run latency" was the chase hitting in L2 on its own lines, not a
