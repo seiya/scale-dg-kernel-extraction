@@ -33,6 +33,15 @@ stop() { echo quit | nvidia-cuda-mps-control >/dev/null 2>&1; }
 trap stop EXIT TERM INT
 nvidia-cuda-mps-control -d || { echo "ERROR: no user MPS daemon here" >&2; exit 1; }
 sleep 2
+# Record the SM count this job actually gets, in this job, on this node: the
+# percentage-to-SM mapping is a machine property (TPC granularity, section
+# 5Z.7) and borrowing it from another job's measurement is exactly the kind of
+# cross-job assumption this study keeps catching itself making.
+nvcc -O3 -arch=sm_100 -o "$OUT/smid" jobs/mps_smid_probe.cu || exit 1
+for pct in $PCTS; do
+  printf "smid pct=%-4s " "$pct"
+  CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$pct "$OUT/smid"
+done | tee "$OUT/smid.txt"
 { date --iso-8601=seconds; echo "commit=$(git rev-parse HEAD)"; echo "nes=$NES pcts=$PCTS rounds=$ROUNDS"; } > "$OUT/metadata.txt"
 for ne in $NES; do
   for path in $PATHS; do
