@@ -5,7 +5,11 @@
 // CUDAFORTRAN_FUSED_DFMA and CUDAFORTRAN_FUSED_TC both instantiate
 // cuda_dg_kernels_tc.cu. CUDAFORTRAN_FUSED (CUDA-core schedule) lives in
 // cuda_dg_kernels_fused.cu / cuda_dg_kernels_fused_highp.cu and must not
-// reuse TC thread counts (p=31 CC is 1024 threads, not P31_THREADS).
+// reuse TC thread counts.  The CC thread counts are knobs of their own and
+// have been retuned since: p=31 CC now launches 128 threads (xz) and 256
+// (y), not P31_THREADS = 512, and p=15 CC launches 128.  See
+// reports/dfma_register_budget.md section 13 and reports/p31_gap_study.md
+// section 34.
 
 // --------------------------------------------------------------------------
 // Out-of-role knob: give the UseTc=false (CUDAFORTRAN_FUSED_DFMA)

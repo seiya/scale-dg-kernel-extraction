@@ -4,8 +4,12 @@
 #include "fused_kernel_geom.h"
 
 // CUDAFORTRAN_FUSED CUDA-core schedule for p=15..255.
-// Geometry matches 2dadc41^ Fortran, not fused_kernel_geom.h TC sizes
-// (p=31 is 1024 threads, not P31_THREADS=512).
+// Geometry started from the 2dadc41^ Fortran and is not the
+// fused_kernel_geom.h TC sizes.  The output tiles below have been retuned
+// since (e1740b0, reports/dfma_register_budget.md section 13): p=31 CC now
+// launches P31_CC_XZ_THREADS = 128 and P31_CC_Y_THREADS = 256 threads, and
+// p=15 CC P15_CC_THREADS = 128 -- not the 1024 of the first port and not
+// P31_THREADS = 512 either.
 
 extern cudaStream_t dg_cuda_stream;
 
