@@ -137,8 +137,8 @@ def role_of(name):
         return "elembnd_flux"
     if "gemmSN" in name or "_simt_" in name:
         return "cublas_gemm_simt"
-    if ("d884gemm" in name or "sm90_xmma_gemm" in name or "_tensorop_" in name
-            or "dgemm" in name):
+    if ("d884gemm" in name or re.search(r"sm\d+_xmma_gemm", name)
+            or "_tensorop_" in name or "dgemm" in name):
         return "cublas_gemm"
     if "GemmBatchedDqdtAssembly" in name:
         return "cutlass_assembly"
