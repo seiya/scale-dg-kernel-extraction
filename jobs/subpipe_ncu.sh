@@ -294,9 +294,15 @@ def short(n):
 
 # samples[(tag, kernel, clock)] -> list of dicts, one per profiled launch
 samples = {}
-for path in sorted(glob.glob(os.path.join(outdir, 'ncu', '*.csv'))):
+# Group b holds no roof metric, so its rows would make a (tag, kernel) group
+# whose five utilisations are all None -- which is what made this summary die
+# with "max() arg is an empty sequence" on every sweep from the one that
+# introduced the b pass (SGE 8621140) to 8648736, truncating the table after
+# the first path.  The CSVs were never affected; only this printout was.
+for path in sorted(glob.glob(os.path.join(outdir, 'ncu', '*_a.csv'))):
     base = os.path.basename(path)[:-4]
-    m = re.match(r'(.+)_(base|none|hz)_r(\d+)$', base)
+    # ..._<clock>_r<NN>_a is the current name; the _a is new, hence optional.
+    m = re.match(r'(.+)_(base|none|hz)_r(\d+)(?:_[ab])?$', base)
     tag, clk = (m.group(1), m.group(2)) if m else (base, 'base')
     try:
         lines = [l for l in open(path, newline='') if l.strip()]
@@ -321,7 +327,10 @@ def fmt(x, w=5):
 for (tag, k, clk) in sorted(samples):
     rows = samples[(tag, k, clk)]
     vals = {n: med(rows, n) for n in ORDER}
-    top = max((v, n) for n, v in vals.items() if v is not None)
+    cand = [(v, n) for n, v in vals.items() if v is not None]
+    if not cand:
+        continue
+    top = max(cand)
     hz = med(rows, 'hz')
     spread = ''
     d = [r['dram'] for r in rows if r.get('dram') is not None]
