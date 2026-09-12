@@ -128,7 +128,11 @@ module mod_cuda_dg_kernels
   ! Epilogue package: bit 0 clamp aggregation, bit 1 16-byte lift, bit 2
   ! 16-byte epilogue.  So xpkg 4 is the wide epilogue alone and xpkg/zpkg 5
   ! is the wide epilogue plus clamp aggregation; the 16-byte lift is off
-  ! everywhere.  No Escale factor is forwarded at any order any more.
+  ! everywhere.  No order sets the plan's own Escale forwarding modes any more
+  ! (xfwd = 0 and x_mode is never 2 or 4).  That is NOT the same as "no Escale
+  ! is forwarded": the Nq >= 64 xy_weighted fold below is on and forwards the
+  ! weighting out of the carrier -- into both non-carrying epilogues at
+  ! Nq > 64, and into the y epilogue alone at Nq = 64.
   !
   ! Nq = 128 and 256 tile 0 IS the generic 64x128 tile (warp 32x64, TileK 16,
   ! three stages) that launch_volume_gemm_x has always run, so naming it here

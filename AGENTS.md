@@ -152,12 +152,19 @@ implementation is fastest.
   `xy_weighted`, whose value depends on the carrier: with z carrying it folds
   Escale into x/y and `deriv_x` into y, and with x carrying it can forward
   Escale_x into x alone — but which of these the tree actually runs is a
-  measurement, and as of 2026-09-11 **no Escale factor is forwarded at any
-  order**: no order's plan sets the forwarding modes (`x_mode` is 1, plain
+  measurement, and as of 2026-09-11 **none of the plan's own forwarding modes
+  is set at any order**: no order's plan sets them (`x_mode` is 1, plain
   CUTLASS x, at `Nq <= 256`, and 0 at `Nq > 256`, where 0 means the generic
   CUTLASS `launch_volume_gemm_x` rather than cuBLAS — the tiled x launcher and
   its cuBLAS branch only exist at the six swept orders), and `xfwd = 0`
-  everywhere, so only the z-carrier fold at `Nq >= 64` is on. The per-order
+  everywhere, so the only weighting that leaves the carrier is the z-carrier
+  fold at `Nq >= 64`, which IS on. That fold does forward Escale, and the two
+  brackets differ: at `Nq > 64` the x GEMM applies Escale_x itself
+  (`run_volume_gemm_x_scale`) and the y GEMM applies Escale_y while adding
+  `deriv_x`, so each non-carrier weights its own epilogue; at `Nq = 64` the x
+  GEMM stays plain and the y epilogue applies BOTH factors
+  (`Ey*acc + Ex*Dx`). Do not read `xfwd = 0` as "no Escale is forwarded
+  anywhere" — that is only true of the x-carrier forwarding modes. The per-order
   table at the top of `mod_cuda_dg_kernels.cuf` is authoritative for this too;
   the orders where each measured faster are in the gap studies
   (`gemm_assignment_and_carrier.md` §4 and §11), and the gate itself is in
