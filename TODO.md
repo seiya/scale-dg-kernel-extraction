@@ -2239,3 +2239,24 @@ x+y 融合の賞金も tight アブレーションで **14.9 µs** しかない�
   `sm__icc_*` の他テンプレート適用（`p255` 系で `no_instruction` が実質ゼロと
   分かったので**動機は下がった**）、**§28.5 (a) の二重計上**は §29 のまま。
 - **役割外である。追加測定は無く、ソースは 1 バイトも編集していない。**
+
+---
+
+## 追記（2026-09-12、論文投稿時の公開）
+
+論文 `scale-dg-paper` の §2.1 と Data availability が、本リポジトリ（GPU 実装、
+現在は非公開フォーク `seiya/scale-dg-kernel-extraction-private`）を
+`thiswork-code` として引用している。上流の抽出コード
+`ywkawai/scale-dg-kernel-extraction` は `kawai-extraction` として別に引いてある。
+
+- [ ] **投稿時に本リポジトリを公開する。** 公開したら
+  `scale-dg-paper/refs.bib` の `thiswork-code` の URL
+  （現在 `https://github.com/XXXX/XXXX` のプレースホルダ）を実際のものに直す。
+  `paper.tex` の Data availability の TODO コメントも消す。
+- [ ] Zenodo DOI を取るなら `thiswork-code` に併記する。
+- [ ] 公開前に、論文の captions / Appendix A（来歴表）が挙げるコミットが
+  公開先で解決できることを確認する。Data availability に
+  「those commits are resolvable in that repository」と書いてある。
+- [ ] 公開範囲の棚卸し: `slurm-*.out`、`nsys_*.nsys-rep` / `.sqlite`、
+  ジョブ出力ディレクトリ、凍結実行ファイル `scale-dg_extraction.*` を
+  そのまま出すかどうか（履歴にも入っている）。
