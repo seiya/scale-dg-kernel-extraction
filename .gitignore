@@ -79,6 +79,8 @@ advect3d/advect3d
 !/jobs/wisteria_subpipe_orders.sh
 !/jobs/tsubame_subpipe_ncu.sh
 !/jobs/tsubame_subpipe_hi_shape.sh
+!/jobs/tsubame_subpipe_cute_shape.sh
+!/jobs/rikyu_subpipe_hi_shape.sh
 !/jobs/tsubame_subpipe_shape.sh
 !/jobs/tsubame_subpipe_orders.sh
 /output/
