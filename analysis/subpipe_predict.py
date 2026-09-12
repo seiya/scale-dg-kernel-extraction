@@ -52,13 +52,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # dram_B is DRAM bytes per SM-clock; both are peak/(N_SM*f).  Sources are in
 # reports/subpipe_transfer_model.md section 1 and reports/h100_report.md 2.
 # ---------------------------------------------------------------------------
+# `arch` is the -arch= target the binary that runs on the machine is built for.
+# It is what decides how a requested MMA shape lowers to hardware instructions
+# (MMA_EXPANSION below); `dmma_shapes` is derived from that, not listed here.
 MACHINES = {
     "GB200": dict(sm=152, ghz=2.062, fp64_tc=127.9, fp64_cc=127.9, dram_B=25.21,
-                  dram_TBs=7.9, dmma_shapes={"8x8x4"}),
+                  dram_TBs=7.9, arch="sm_100"),
     "A100":  dict(sm=108, ghz=1.410, fp64_tc=128.1, fp64_cc=63.7,  dram_B=10.21,
-                  dram_TBs=1.555, dmma_shapes={"8x8x4"}),
+                  dram_TBs=1.555, arch="sm_80"),
     "H100":  dict(sm=132, ghz=1.980, fp64_tc=256.0, fp64_cc=128.2, dram_B=9.17,
-                  dram_TBs=2.396, dmma_shapes={"8x8x4", "16x8x8", "16x8x16"}),
+                  dram_TBs=2.396, arch="sm_90"),
 }
 
 # Sub-pipe sweeps, all at CutlassMmaShape 8x8x4.  More than one directory per
@@ -76,7 +79,12 @@ SWEEPS = {
               "wisteria/a100_subpipe_paths_*/ncu"],
     "H100":  ["tsubame/h100_subpipe_lowgemm_8631948/ncu",
               "tsubame/h100_subpipe_orders_*/ncu",
-              "tsubame/h100_subpipe_paths_*/ncu"],
+              "tsubame/h100_subpipe_paths_*/ncu",
+              # Last, so it only ever supplies a file the three above lack:
+              # the p=511 GEMM_CUTE sweep at 16x8x4, which is the only
+              # GEMM_CUTE measurement at H100's production shape (SGE 8621412).
+              # Verified not to move any 8x8x4 number (V1 item 4).
+              "tsubame/h100_subpipe_shape_*/ncu"],
 }
 
 
@@ -209,14 +217,71 @@ def dmma_flop_of(name):
 # omission.  static_dmma_flop() returns None for it, and SHAPE_SRC decides
 # what happens then.
 # ---------------------------------------------------------------------------
-OWN_MMA_SHAPE = (8, 8, 4)
-# (machine, role base) -> (m, n, k).  Overrides for a build that differs from
-# OWN_MMA_SHAPE; empty because cuobjdump says none does.
+OWN_MMA_SHAPE = "8x8x4"
+
+# V1 (2026-09-12): how a REQUESTED MMA shape lowers to hardware instructions,
+# per -arch target.  Measured here, with no GPU: one kernel per
+# `mma.sync.aligned.m*.f64` PTX instruction in one .cu, `nvcc -arch=<t> -cubin`,
+# `cuobjdump -sass | grep -c DMMA` (nvhpc 26.3, CUDA 13.1.115, 2026-09-12).
+# Reproduces reports/sm90_mma_shape_survey.md section 6 exactly.
+#
+#     PTX                 sm_80        sm_90              sm_100
+#     mma.sync.m8n8k4     DMMA.884 x1  DMMA.8x8x4 x1      DMMA.8x8x4 x1
+#     mma.sync.m16n8k4    (not compilable) DMMA.16x8x4 x1 DMMA.8x8x4 x2
+#     mma.sync.m16n8k8    (not compilable) DMMA.16x8x8 x1 DMMA.8x8x4 x4
+#     mma.sync.m16n8k16   (not compilable) DMMA.16x8x16 x1 DMMA.8x8x4 x8
+#
+# sm_80 refuses the three wide shapes at ptxas time ("Feature '.m16n8k4 with
+# double types' requires .target sm_90 or higher"), which is the static form of
+# "A100 has no shape knob" (section 5X.3 had it as a device trap at run time).
+#
+# This is the expansion rule the paper's instruction-priced sub-pipe section
+# asserts, and it is a property of ptxas and the target, not of the machine:
+# readable from a cross-compile, which is why it belongs in a static table.
+MMA_EXPANSION = {
+    ("sm_80", "8x8x4"): 1,
+    ("sm_90", "8x8x4"): 1, ("sm_90", "16x8x4"): 1,
+    ("sm_90", "16x8x8"): 1, ("sm_90", "16x8x16"): 1,
+    ("sm_100", "8x8x4"): 1, ("sm_100", "16x8x4"): 2,
+    ("sm_100", "16x8x8"): 4, ("sm_100", "16x8x16"): 8,
+}
+
+# Which roles the namelist entry CutlassMmaShape actually moves.  Measured from
+# the 16x8x4 sweeps (tsubame/h100_subpipe_orders_16x8x4 and
+# h100_subpipe_shape_8621412): every `cutlass*` role goes 512 -> 1024 FLOP per
+# instruction with exactly half the tensor count, at every order from p=7 to
+# p=575 and for both GEMM_FUSED and GEMM_CUTE -- including the x GEMM, whose
+# XAdopted* aliases in cuda_cutlass_gemm_fused.cu carry the shape since the
+# commit that added them.  Our own kernels (volume_flux, elembnd_flux,
+# separable_lift, flux_all, the fused tendency kernels) stay at m8n8k4, which
+# is hard-coded in their source.  cuBLAS ignores CutlassMmaShape entirely, as
+# it must: it is a different library.
+CUTLASS_ROLE_PREFIX = "cutlass"
+
+# (machine, role base) -> shape string.  Overrides for a build whose own
+# kernels differ from OWN_MMA_SHAPE; empty because cuobjdump says none does
+# (sm_100 build of this tree: 807 kernels, 46340 MMA, all DMMA.8x8x4).
 STATIC_MMA_SHAPE = {}
 
 
-def static_dmma_flop(machine, role):
+def parse_shape(shape):
+    m, n, k = (int(x) for x in shape.split("x"))
+    return m, n, k
+
+
+def static_dmma_flop(machine, role, req_shape=OWN_MMA_SHAPE):
     """FLOP per MMA instruction from the binary alone, or None if not knowable.
+
+    `req_shape` is the CutlassMmaShape the target will be run with.  It reaches
+    the hardware through MMA_EXPANSION: the same requested 16x8x4 is one
+    1024-FLOP DMMA.16x8x4 on sm_90 and two 512-FLOP DMMA.8x8x4 on sm_100, and
+    `demands()` prices per hardware instruction, so that is what is returned.
+
+    Ignoring `req_shape` -- which this function did between 2026-09-12's U4 and
+    V1 of the same day -- made `--shape static` shape-blind: it priced a
+    16x8x4 run of H100 as if it were 8x8x4 and turned the section 5X ranking
+    (predicted GEMM_FUSED/FUSED_TC at p=511: 0.710 against a measured 0.857)
+    into 1.096, i.e. the wrong side of 1.
 
     None means "the library picks at runtime" -- today that is exactly the
     cuBLAS roles.  It is a stated limit of the transfer, not a gap to paper
@@ -226,7 +291,14 @@ def static_dmma_flop(machine, role):
     if base.startswith("cublas"):
         return None
     shape = STATIC_MMA_SHAPE.get((machine, base), OWN_MMA_SHAPE)
-    return 2.0 * shape[0] * shape[1] * shape[2]
+    if base.startswith(CUTLASS_ROLE_PREFIX):
+        shape = req_shape
+    n_inst = MMA_EXPANSION.get((MACHINES[machine]["arch"], shape))
+    if n_inst is None:
+        raise ValueError("%s (%s) cannot issue CutlassMmaShape %s"
+                         % (machine, MACHINES[machine]["arch"], shape))
+    m, n, k = parse_shape(shape)
+    return 2.0 * m * n * k / n_inst
 
 
 # How the target's MMA shape is obtained.
@@ -244,11 +316,11 @@ def static_dmma_flop(machine, role):
 SHAPE_SRC = ["static"]
 
 
-def target_dmma_flop(role, obs, tgt):
+def target_dmma_flop(role, obs, tgt, req_shape=OWN_MMA_SHAPE):
     """FLOP per MMA instruction to price `role` with on machine `tgt`."""
     if SHAPE_SRC[0] == "target":
         return obs.get(role, {}).get("dmma_flop") if obs else None
-    st = static_dmma_flop(tgt, role)
+    st = static_dmma_flop(tgt, role, req_shape)
     if st is not None:
         return st
     if SHAPE_SRC[0] == "static-only":
@@ -658,7 +730,8 @@ def predict_case(srcs, tgt, order, path_name, verbose=False, tgt_shape="8x8x4"):
             _, src, eta, roof_src, agg = min(cands)
             if rule == "mean":
                 eta = sum(t[2] for t in cands) / len(cands)
-        d = demands(agg, tgt, dmma_flop_tgt=target_dmma_flop(role, obs, tgt))
+        d = demands(agg, tgt, dmma_flop_tgt=target_dmma_flop(role, obs, tgt,
+                                                             tgt_shape))
         roof = max(d, key=d.get)
         cyc = eta * d[roof]
         if MODEL[0] != "roof" and agg.get("warps_pct"):
@@ -748,6 +821,66 @@ def print_eta_strata(dirs):
                   % (nm, len(v), statistics.median(v), pct90(v)))
 
 
+def shape_check(dirs, shapes=("8x8x4", "16x8x4")):
+    """V1 item 3: is `--shape static` really equal to `--shape target`?
+
+    The 2026-09-12 U4 commit claimed "static reproduces target to the byte".
+    That check only ever ran at CutlassMmaShape 8x8x4, because --dump-logo
+    passes nothing else -- and `static_dmma_flop` ignored the requested shape,
+    so the shape axis was exactly the axis the check did not walk.  This walks
+    it: per role, the static table's FLOP per hardware MMA instruction against
+    the one read out of the target's own ncu kernel name, for every
+    (direction, order, path) that has a sweep at each shape.
+
+    Disagreements are the statically unknowable quantities, printed by role.
+    """
+    print("\n=== shape equivalence check: static table vs target's own kernel "
+          "name")
+    tot = defaultdict(lambda: [0, 0])
+    bad = defaultdict(lambda: [0, set()])
+    for shape in shapes:
+        for srcs, tgt in dirs:
+            for p_ in ORDERS:
+                for path_name in LOGO_PATHS:
+                    obs = load_case(tgt, p_, path_name, shape=shape)
+                    if not obs:
+                        continue
+                    for role, agg in sorted(obs.items()):
+                        try:
+                            st = static_dmma_flop(tgt, role, shape)
+                        except ValueError:
+                            st = "unsupported"
+                        ob = agg.get("dmma_flop")
+                        if st is None:
+                            tot[(shape, "cuBLAS: no static answer")][1] += 1
+                            continue
+                        key = (shape, "static == target")
+                        tot[key][1] += 1
+                        if st == ob:
+                            tot[key][0] += 1
+                        else:
+                            b = bad[(shape, role.split("#")[0])]
+                            b[0] += 1
+                            b[1].add("%s->%s/%s p=%d: static %s obs %s"
+                                     % ("+".join(srcs), tgt, path_name, p_,
+                                        st, ob))
+    for (shape, what), (ok, n) in sorted(tot.items()):
+        if what.startswith("static =="):
+            print("  %-8s %-28s %d / %d roles agree" % (shape, what, ok, n))
+        else:
+            print("  %-8s %-28s %d roles (priced with the calibration shape "
+                  "under --shape static-only)" % (shape, what, n))
+    if bad:
+        print("  DISAGREEMENTS (statically unknowable):")
+        for (shape, base), (n, ex) in sorted(bad.items()):
+            print("    %-8s %-22s %d launches, e.g. %s"
+                  % (shape, base, n, sorted(ex)[0]))
+    else:
+        print("  no disagreement on any role the static table answers, at "
+              "either shape")
+    return not bad
+
+
 def fmt_err(p, m):
     return "%+6.1f%%" % ((p / m - 1.0) * 100.0) if (p and m) else "    n/a"
 
@@ -796,6 +929,18 @@ def main():
                          "enters -- the version that honours the published "
                          "contract (section 5AC.4).  target: the "
                          "pre-2026-09-12 behaviour")
+    ap.add_argument("--tgt-shape", default="8x8x4",
+                    help="the CutlassMmaShape the TARGET is run with.  The "
+                         "calibration machines are always read at 8x8x4 (the "
+                         "only shape their sweeps have).  H100's production "
+                         "setting is 16x8x4 (section 5X); sm_80 cannot issue "
+                         "anything but 8x8x4, so A100 raises")
+    ap.add_argument("--shape-check", action="store_true",
+                    help="compare the static MMA-shape table against the "
+                         "shape read out of each target's own ncu kernel name, "
+                         "at 8x8x4 AND 16x8x4, and exit.  This is the "
+                         "equivalence test --shape static has to pass before "
+                         "it may be the default (V1 item 3)")
     ap.add_argument("--eta-strata", action="store_true",
                     help="with --logo, also print the eta stratification of "
                          "the per-kernel transfers (section 5AC.6), both over "
@@ -840,24 +985,37 @@ def main():
                   % (m, s["sm"], s["ghz"], s["fp64_tc"], s["fp64_cc"], s["dram_B"]))
         return
 
-    if a.logo:
+    if a.logo or a.shape_check:
         dirs = [(["A100", "H100"], "GB200"), (["GB200", "H100"], "A100"),
                 (["GB200", "A100"], "H100")]
     else:
         dirs = [(a.src or ["GB200"], a.tgt or "H100")]
 
+    if a.shape_check:
+        shape_check(dirs)
+        return
+
     dump = []
     for srcs, tgt in dirs:
-        print("\n===== calibrate %s -> hold out %s =====" % ("+".join(srcs), tgt))
+        print("\n===== calibrate %s -> hold out %s (target CutlassMmaShape "
+              "%s) =====" % ("+".join(srcs), tgt, a.tgt_shape))
         hdr = "%-5s %-11s %10s %10s %8s" % ("p", "path", "pred us", "meas us", "err")
         print(hdr)
         errs, roof_hit, roof_n, n_mismatch = [], 0, 0, 0
+        shape_warned = False
         flat = {}
         ratios = {}
         for p in ([a.order] if a.order else ORDERS):
             for path_name in LOGO_PATHS:
-                pr, me, rows, led = predict_case(srcs, tgt, p, path_name,
-                                                 a.verbose)
+                try:
+                    pr, me, rows, led = predict_case(srcs, tgt, p, path_name,
+                                                     a.verbose,
+                                                     tgt_shape=a.tgt_shape)
+                except ValueError as e:
+                    if not shape_warned:
+                        print("  skipped: %s" % e)
+                        shape_warned = True
+                    continue
                 if pr is None or not me:
                     continue
                 errs.append(pr / me - 1.0)
