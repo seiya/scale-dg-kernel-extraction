@@ -73,7 +73,12 @@ MACHINES = {
 # same cells in the original sweeps (section 5Y).
 SWEEPS = {
     "GB200": ["subpipe_lowgemm_96222/ncu", "subpipe_orders_92904/ncu",
-              "subpipe_hi_94874/ncu", "subpipe_paths_94875/ncu"],
+              "subpipe_hi_94874/ncu", "subpipe_paths_94875/ncu",
+              # Last, so it only ever supplies a file the four above lack:
+              # (GB200, 767, GEMM_CUTE), which subpipe_hi_94874 did not take
+              # and which is the only calibration source for that cell --
+              # A100 cannot hold p=767 (40 GB).  Slurm 106536.
+              "subpipe_hi_shape_106536/ncu"],
     "A100":  ["wisteria/a100_subpipe_lowgemm_9579761/ncu",
               "wisteria/a100_subpipe_orders_9569112/ncu",
               "wisteria/a100_subpipe_paths_*/ncu"],
@@ -84,7 +89,13 @@ SWEEPS = {
               # the p=511 GEMM_CUTE sweep at 16x8x4, which is the only
               # GEMM_CUTE measurement at H100's production shape (SGE 8621412).
               # Verified not to move any 8x8x4 number (V1 item 4).
-              "tsubame/h100_subpipe_shape_*/ncu"],
+              "tsubame/h100_subpipe_shape_*/ncu",
+              # Also last, for the same reason: (H100, 767, GEMM_CUTE) at
+              # 8x8x4 exists only in the repeat of the gaps job (SGE
+              # 8631255), so without this entry the cell whose GB200
+              # calibration Slurm 106536 supplies has no target to score
+              # against at 8x8x4.
+              "tsubame/h100_subpipe_repeat_8631255/ncu"],
 }
 
 
