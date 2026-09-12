@@ -83,6 +83,9 @@ advect3d/advect3d
 !/jobs/rikyu_subpipe_hi_shape.sh
 !/jobs/tsubame_subpipe_shape.sh
 !/jobs/tsubame_subpipe_orders.sh
+!/jobs/rikyu_subpipe_repeat.sh
+!/jobs/wisteria_subpipe_repeat.sh
+!/jobs/tsubame_subpipe_repeat.sh
 /output/
 
 # Paper drafting notes (outline, abstract drafts, figure plan) stay local: the
