@@ -681,6 +681,73 @@ def predict_case(srcs, tgt, order, path_name, verbose=False, tgt_shape="8x8x4"):
     return pred_ns / 1e3, (meas_ns / 1e3 if obs else None), rows, ledger_ok
 
 
+# Bins of the eta stratification (report section 5AC.6, paper Table
+# "eta-strata").  eta is measured on the CALIBRATION machine, so the bin a
+# kernel falls in is known before the target is touched -- that is the whole
+# point of the table.
+ETA_BINS = [("1.0-1.2", 1.0, 1.2), ("1.2-1.6", 1.2, 1.6),
+            ("1.6-2.5", 1.6, 2.5), (">2.5", 2.5, float("inf"))]
+
+
+def pct90(vals):
+    """90th percentile, NEAREST-RANK: the ceil(0.9 n)-th smallest, 1-based.
+
+    Fixed here because the paper's table was built with
+    `sorted(v)[round(0.9 * (n - 1))]`, which is not any standard convention
+    and degenerates at small n: at n = 8 it returns the 7th of 8 values, i.e.
+    the 81st percentile.  Nearest-rank is defined for every n and needs no
+    interpolation.  Note that the two highest bins hold 5 to 12 kernels, where
+    a 90th percentile carries almost no information whatever the convention --
+    report the n beside it (section 5AC.6).
+    """
+    v = sorted(vals)
+    import math
+    return v[max(0, math.ceil(0.9 * len(v)) - 1)] if v else None
+
+
+def eta_strata(dirs, only_ledger_ok=False):
+    """Per-kernel transfer errors bucketed by eta on the calibration machine.
+
+    One row per (hold-out direction, order, path, kernel role) that the target
+    actually measured.  `only_ledger_ok` drops the cells whose calibration and
+    target kernel ledgers disagree -- which is also exactly what empties the
+    `> 2.5` bin, because that bin is entirely tiny low-order cuBLAS launches
+    (section 5AC.6c).
+    """
+    buck = defaultdict(list)
+    for srcs, tgt in dirs:
+        for p_ in ORDERS:
+            for path_name in LOGO_PATHS:
+                pr, me, rows, led = predict_case(srcs, tgt, p_, path_name)
+                if pr is None or not me or (only_ledger_ok and not led):
+                    continue
+                for r in rows:
+                    if not r["meas_us"] or not r["pred_us"]:
+                        continue
+                    e = abs(r["pred_us"] / r["meas_us"] - 1.0) * 100.0
+                    for nm, a, b in ETA_BINS:
+                        if a <= r["eta"] < b:
+                            buck[nm].append(e)
+                            break
+    return buck
+
+
+def print_eta_strata(dirs):
+    for only in (False, True):
+        b = eta_strata(dirs, only)
+        tot = sum(len(v) for v in b.values())
+        print("\n  eta strata (%s): n=%d"
+              % ("ledger_ok cells only" if only else "all cells", tot))
+        print("    %-8s %5s %9s %9s" % ("eta", "n", "median", "p90"))
+        for nm, _, _ in ETA_BINS:
+            v = b[nm]
+            if not v:
+                print("    %-8s %5d %9s %9s" % (nm, 0, "--", "--"))
+                continue
+            print("    %-8s %5d %8.1f%% %8.1f%%"
+                  % (nm, len(v), statistics.median(v), pct90(v)))
+
+
 def fmt_err(p, m):
     return "%+6.1f%%" % ((p / m - 1.0) * 100.0) if (p and m) else "    n/a"
 
@@ -729,6 +796,11 @@ def main():
                          "enters -- the version that honours the published "
                          "contract (section 5AC.4).  target: the "
                          "pre-2026-09-12 behaviour")
+    ap.add_argument("--eta-strata", action="store_true",
+                    help="with --logo, also print the eta stratification of "
+                         "the per-kernel transfers (section 5AC.6), both over "
+                         "all cells and over the ledger-consistent ones.  p90 "
+                         "is nearest-rank; see pct90()")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     USE_TABLE[0] = a.from_table
@@ -857,6 +929,9 @@ def main():
         print("  sign of ratio-1: "
               + ", ".join("%s %d/%d" % (k, v[0], v[1])
                           for k, v in sorted(sign.items())))
+
+    if a.logo and a.eta_strata:
+        print_eta_strata(dirs)
 
     if a.dump_logo and dump:
         with open(a.dump_logo, "w", newline="") as fh:
