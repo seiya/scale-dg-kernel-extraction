@@ -44,7 +44,16 @@ LOGO = [(["A100", "H100"], "GB200"), (["GB200", "H100"], "A100"),
 
 
 def cell(axis, tag, ratio, rp, rm):
-    return dict(axis=axis, tag=tag, ratio=ratio, rp=rp, rm=rm,
+    # The leave-one-out GROUP (U1).  The report defines eps_family as "the
+    # median error over the OTHER hold-out directions, or on the balance axis
+    # over the OTHER machines", and claims that no information about the
+    # target machine enters the decision.  The group is therefore the hold-out
+    # GPU on the machine axis and the machine on the balance axis -- and in
+    # both cases that is the first token of the tag ("GB200 p=511",
+    # "A100 p=511 50%").  The axis is carried too, so that the combined
+    # both-axes call does not merge a machine's machine-axis cells with its
+    # balance-axis cells.
+    return dict(axis=axis, tag=tag, ratio=ratio, rp=rp, rm=rm, grp=tag.split()[0],
                 err=abs(rp / rm - 1.0) * 100.0, hit=(rp > 1) == (rm > 1))
 
 
@@ -53,8 +62,8 @@ def machine_axis():
     for srcs, tgt in LOGO:
         got = {}
         for p in sp.ORDERS:
-            for path in sp.PATHS:
-                pr, me, _ = sp.predict_case(srcs, tgt, p, path)
+            for path in sp.LOGO_PATHS:
+                pr, me, _, _ = sp.predict_case(srcs, tgt, p, path)
                 if pr is None or not me:
                     continue
                 got.setdefault(p, {})[path] = (pr, me)
@@ -85,7 +94,7 @@ def balance_axis():
         sp.MACHINES[key] = spec
         sp.SWEEPS[key] = []                     # no sweep of its own: predict only
         for path in meas[(mach, order, pct)]:
-            p, _, _ = sp.predict_case([mach], key, order, path)
+            p, _, _, _ = sp.predict_case([mach], key, order, path)
             if p:
                 pred.setdefault((mach, order, pct), {})[path] = p
     cells = []
@@ -102,12 +111,22 @@ def balance_axis():
 
 
 def score(cells, label):
+    # U1.  Until 2026-09-12 the family error was the median over every cell of
+    # the same ratio with the ONE cell being scored removed:
+    #
+    #     fam[c["ratio"]].append(c["err"])
+    #     rest = list(fam[c["ratio"]]); rest.remove(c["err"])
+    #
+    # That leaves the other orders of the SAME hold-out direction in the
+    # denominator, i.e. the target GPU's own measured errors, which is exactly
+    # what the rule's statement in section 5W.2 says it does not use.  The
+    # leave-one-out unit has to be the group the rule holds out: the hold-out
+    # GPU on the machine axis, the machine on the balance axis.
     fam = collections.defaultdict(list)
     for c in cells:
-        fam[c["ratio"]].append(c["err"])
+        fam[(c["axis"], c["ratio"])].append((c["grp"], c["err"]))
     for c in cells:
-        rest = list(fam[c["ratio"]])
-        rest.remove(c["err"])
+        rest = [e for g, e in fam[(c["axis"], c["ratio"])] if g != c["grp"]]
         c["fam_loo"] = st.median(rest) if rest else c["err"]
         c["sn_post"] = (abs(c["rm"] - 1) * 100 / c["err"]) if c["err"] else 9e9
         c["sn_prior"] = abs(c["rp"] - 1) * 100 / c["fam_loo"]
@@ -164,8 +183,13 @@ def main():
                          "family error as a fraction, the a priori S/N and the "
                          "hit.  The MPS fraction of a balance cell is not "
                          "carried: the figure does not distinguish them.")
+    ap.add_argument("--shape", default="static",
+                    choices=["static", "static-only", "target"],
+                    help="passed through to subpipe_predict.SHAPE_SRC; see "
+                         "its --shape")
     a = ap.parse_args()
     sp.USE_TABLE[0] = a.from_table
+    sp.SHAPE_SRC[0] = a.shape
     cells = []
     if a.axis in ("machine", "both"):
         m = machine_axis()

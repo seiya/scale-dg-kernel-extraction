@@ -162,10 +162,14 @@ CUTLASS_MMA_RE = re.compile(
 def dmma_flop_of(name):
     """FLOP per DMMA instruction, from the kernel NAME of the build that runs.
 
-    A static input: the name says which MMA shape the SASS contains
-    (cuBLAS advertises it, e.g. sm90_xmma_..._tensor16x8x8_...; the
-    cutlass_80_tensorop_d884gemm family and every hand-written kernel here are
-    m8n8k4).  No timing is read from the target to obtain it.
+    The name says which MMA shape the SASS contains (cuBLAS advertises it,
+    e.g. sm90_xmma_..._tensor16x8x8_...; the cutlass_80_tensorop_d884gemm
+    family and every hand-written kernel here are m8n8k4).
+
+    This reads a NAME, not a timing -- but for the target machine the name
+    comes out of the target's own ncu output, which is a target measurement
+    all the same.  See static_dmma_flop() and SHAPE_SRC: the default path asks
+    the static table first and only falls back here for cuBLAS.
     """
     m = CUTLASS_MMA_RE.search(name) or DMMA_RE.search(name)
     if m:
@@ -174,6 +178,82 @@ def dmma_flop_of(name):
     if "d884gemm" in name:
         return 2.0 * 8 * 8 * 4
     return 2.0 * 8 * 8 * 4          # CutlassMmaShape = 8x8x4 everywhere else
+
+
+# ---------------------------------------------------------------------------
+# U4: the MMA shape as a STATIC property of the cross-compiled binary.
+#
+# The model's contract (docstring at the top of this file) is that the target
+# machine contributes its spec sheet and the instruction shape of the binary
+# that will run on it -- and nothing measured.  Until 2026-09-12 the predictor
+# honoured the first half and broke the second: it read `dmma_flop` out of
+# `obs`, i.e. out of the TARGET's ncu sweep.  Where the shape differs between
+# calibration and target that is a hidden target measurement.
+#
+# What a binary actually tells you, with no GPU and no run:
+#
+#     module load nvhpc && cuobjdump -sass scale-dg_extraction
+#
+# on the sm_100 build of this tree gives 807 kernels (our own plus every
+# CUTLASS instantiation) and 46340 MMA instructions, of which 46340 are
+# `DMMA.8x8x4` and none is anything else.  That is the whole of what we
+# compile: `CutlassMmaShape` is 8x8x4 and every hand-written kernel issues
+# `mma.sync.m8n8k4`.  The same source cross-compiles to sm_80 and sm_90, so
+# the shape is a property of the source, not of the machine -- which is why
+# the table below is flat and why an override slot exists anyway (a machine
+# whose build did differ would need one row here, still no measurement).
+#
+# cuBLAS is NOT in the binary -- `ldd` shows libcublas.so.13 -- and which
+# kernel family it dispatches is a runtime heuristic (report section 5AB.2).
+# So its shape is not statically knowable, by construction and not by
+# omission.  static_dmma_flop() returns None for it, and SHAPE_SRC decides
+# what happens then.
+# ---------------------------------------------------------------------------
+OWN_MMA_SHAPE = (8, 8, 4)
+# (machine, role base) -> (m, n, k).  Overrides for a build that differs from
+# OWN_MMA_SHAPE; empty because cuobjdump says none does.
+STATIC_MMA_SHAPE = {}
+
+
+def static_dmma_flop(machine, role):
+    """FLOP per MMA instruction from the binary alone, or None if not knowable.
+
+    None means "the library picks at runtime" -- today that is exactly the
+    cuBLAS roles.  It is a stated limit of the transfer, not a gap to paper
+    over; --shape controls whether it is papered over.
+    """
+    base = role.split("#")[0]
+    if base.startswith("cublas"):
+        return None
+    shape = STATIC_MMA_SHAPE.get((machine, base), OWN_MMA_SHAPE)
+    return 2.0 * shape[0] * shape[1] * shape[2]
+
+
+# How the target's MMA shape is obtained.
+#   "static"      static table, falling back to the target's observed kernel
+#                 name for the roles the table cannot know (cuBLAS).  Default:
+#                 numerically identical to the pre-2026-09-12 behaviour,
+#                 because the table and the observation agree everywhere the
+#                 table has an answer.
+#   "static-only" static table only; no fallback, so a cuBLAS role is priced
+#                 with the calibration machine's shape.  This is the version
+#                 that actually honours the published contract.  Scored in
+#                 report section 5AC.4.
+#   "target"      the old behaviour, observed name first.  Kept to show that
+#                 "static" reproduces it exactly.
+SHAPE_SRC = ["static"]
+
+
+def target_dmma_flop(role, obs, tgt):
+    """FLOP per MMA instruction to price `role` with on machine `tgt`."""
+    if SHAPE_SRC[0] == "target":
+        return obs.get(role, {}).get("dmma_flop") if obs else None
+    st = static_dmma_flop(tgt, role)
+    if st is not None:
+        return st
+    if SHAPE_SRC[0] == "static-only":
+        return None                 # -> demands() uses the calibration shape
+    return obs.get(role, {}).get("dmma_flop") if obs else None
 
 
 def read_csv(path):
@@ -490,8 +570,23 @@ MODEL = ["roof"]
 USE_PROBE = [False]
 CLAMP_Q = [False]
 # FUSED_TC first: it is the denominator of the ranking ratios below.
+# PATHS is the DISTILL list: what --distill pulls out of the raw ncu sweeps and
+# writes into analysis/subpipe_inputs.csv.  GEMM_OZAKI1 stays in it because the
+# Ozaki appendix uses those rows.
 PATHS = ["FUSED_TC", "GEMM_FUSED", "GEMM", "FUSED", "FUSED_DFMA", "GEMM_CUTE",
          "GEMM_OZAKI1"]
+
+# U2: what the leave-one-GPU-out score and --dump-logo actually range over.
+# GEMM_OZAKI1 is NOT transferred -- section 5U.3 took it out of scope and
+# section 5AB.2 excluded it again when scoring -- but it stayed in the scored
+# list until 2026-09-12 and contributed 23 of the 161 dumped rows.  It does not
+# belong there on its own terms either: its ncu capture is a single
+# `cublas_gemm` role at mult=1, so the row is one kernel, not a path total
+# (GB200 p=511 reads 106.2 us against the 174511.4 us the appendix measures for
+# that path -- three orders of magnitude, because the split and sum kernels
+# were never captured).  Scoring it was scoring a kernel against a path.
+NO_TRANSFER = {"GEMM_OZAKI1"}
+LOGO_PATHS = [p_ for p_ in PATHS if p_ not in NO_TRANSFER]
 ORDERS = [7, 15, 31, 63, 127, 255, 511, 575, 767, 1023]
 # Each pair isolates one axis: fusion (CUTE vs FUSED), the mma instruction on
 # an iso-schedule (DFMA vs TC), the library under one schedule (CUTE vs GEMM),
@@ -506,16 +601,40 @@ RATIOS = [("GEMM_FUSED", "FUSED_TC"), ("GEMM", "FUSED_TC"),
 def predict_case(srcs, tgt, order, path_name, verbose=False, tgt_shape="8x8x4"):
     """Predict per-tendency-call device time on `tgt` from calibration `srcs`.
 
-    Returns (predicted_us, measured_us or None, rows).
+    Returns (predicted_us, measured_us or None, rows, ledger_ok).
+
+    `ledger_ok` is False when the calibration machines' kernel ledger for this
+    path is not the same set of roles as the target's.
+
+    U3: pred and meas are summed over the SAME set of roles.  Until 2026-09-12
+    they were not: `roles` was the union over the calibration machines and
+    pred summed all of it, while meas (below) only added the target launches
+    whose role name happened to match.  So a role the target does not have was
+    predicted and not measured, and a role only the target has was measured by
+    neither -- the error of such a cell is an artefact of the mismatch, not of
+    the model.  Section 5AB.1 found one instance of this (H100's
+    sm80_xmma_gemm) and fixed the role name; the general form is here.
+    Intersecting is the conservative repair: it scores the part of the path
+    both ledgers agree on, and `ledger_ok` marks the cell so a consumer can
+    drop it entirely.  It is NOT a claim that the dropped kernels are free --
+    which is exactly why the flag exists.
+
+    When the target has no sweep at all (the balance axis builds pseudo
+    machines with SWEEPS = []), obs is empty and there is nothing to intersect
+    with; the union is used and `ledger_ok` is True vacuously.
     """
     cal = {s: load_case(s, order, path_name) for s in srcs}
     cal = {s: c for s, c in cal.items() if c}
     if not cal:
-        return None, None, []
+        return None, None, [], True
     obs = load_case(tgt, order, path_name, shape=tgt_shape)
     roles = set()
     for c in cal.values():
         roles |= set(c)
+    ledger_ok = True
+    if obs:
+        ledger_ok = (roles == set(obs))
+        roles &= set(obs)
     pred_ns = 0.0
     meas_ns = 0.0
     rows = []
@@ -539,8 +658,7 @@ def predict_case(srcs, tgt, order, path_name, verbose=False, tgt_shape="8x8x4"):
             _, src, eta, roof_src, agg = min(cands)
             if rule == "mean":
                 eta = sum(t[2] for t in cands) / len(cands)
-        o_name = obs.get(role, {}).get("dmma_flop") if obs else None
-        d = demands(agg, tgt, dmma_flop_tgt=o_name)
+        d = demands(agg, tgt, dmma_flop_tgt=target_dmma_flop(role, obs, tgt))
         roof = max(d, key=d.get)
         cyc = eta * d[roof]
         if MODEL[0] != "roof" and agg.get("warps_pct"):
@@ -560,7 +678,7 @@ def predict_case(srcs, tgt, order, path_name, verbose=False, tgt_shape="8x8x4"):
                          roof_tgt=roof, pred_us=ns / 1e3,
                          meas_us=ons / 1e3 if o else None,
                          roof_obs=(eta_of(o, tgt)[1] if o else None)))
-    return pred_ns / 1e3, (meas_ns / 1e3 if obs else None), rows
+    return pred_ns / 1e3, (meas_ns / 1e3 if obs else None), rows, ledger_ok
 
 
 def fmt_err(p, m):
@@ -601,9 +719,20 @@ def main():
                          "machine, order, path) to this CSV: the schema the "
                          "paper's Figure 9 reads (figs/data/"
                          "logo_path_totals.csv)")
+    ap.add_argument("--shape", default="static",
+                    choices=["static", "static-only", "target"],
+                    help="where the target's MMA shape comes from.  static: "
+                         "the cuobjdump table, falling back to the target's "
+                         "observed kernel name for cuBLAS only (default; "
+                         "reproduces --shape target exactly).  static-only: "
+                         "no fallback, so nothing measured on the target "
+                         "enters -- the version that honours the published "
+                         "contract (section 5AC.4).  target: the "
+                         "pre-2026-09-12 behaviour")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     USE_TABLE[0] = a.from_table
+    SHAPE_SRC[0] = a.shape
     ETA_RULE[0] = a.eta_rule
     MODEL[0] = a.model
     USE_PROBE[0] = a.l0_probe
@@ -650,21 +779,25 @@ def main():
         print("\n===== calibrate %s -> hold out %s =====" % ("+".join(srcs), tgt))
         hdr = "%-5s %-11s %10s %10s %8s" % ("p", "path", "pred us", "meas us", "err")
         print(hdr)
-        errs, roof_hit, roof_n = [], 0, 0
+        errs, roof_hit, roof_n, n_mismatch = [], 0, 0, 0
         flat = {}
         ratios = {}
         for p in ([a.order] if a.order else ORDERS):
-            for path_name in PATHS:
-                pr, me, rows = predict_case(srcs, tgt, p, path_name, a.verbose)
+            for path_name in LOGO_PATHS:
+                pr, me, rows, led = predict_case(srcs, tgt, p, path_name,
+                                                 a.verbose)
                 if pr is None or not me:
                     continue
                 errs.append(pr / me - 1.0)
                 flat[(p, path_name)] = (pr, me)
                 ratios.setdefault(p, {})[path_name] = (pr, me)
-                print("%-5d %-11s %10.1f %10.1f %8s" % (p, path_name, pr, me,
-                                                        fmt_err(pr, me)))
+                if not led:
+                    n_mismatch += 1
+                print("%-5d %-11s %10.1f %10.1f %8s%s"
+                      % (p, path_name, pr, me, fmt_err(pr, me),
+                         "" if led else "   ledger!"))
                 dump.append((tgt, p, path_name, pr, me,
-                             (pr / me - 1.0) * 100.0))
+                             (pr / me - 1.0) * 100.0, int(led)))
                 for r in rows:
                     if r["roof_obs"]:
                         roof_n += 1
@@ -684,6 +817,8 @@ def main():
             print("  path totals: n=%d  |err| median %.1f%%  max %.1f%%"
                   % (len(ae), 100 * statistics.median(ae), 100 * ae[-1]))
             print("  binding resource: %d / %d kernels" % (roof_hit, roof_n))
+            print("  kernel-ledger mismatch (cal roles != tgt roles): %d / %d "
+                  "cells" % (n_mismatch, len(ae)))
         # Error by order band: the model declares its own validity domain
         # (report section 5E.3), so report inside and outside it separately.
         band = defaultdict(list)
@@ -726,10 +861,11 @@ def main():
     if a.dump_logo and dump:
         with open(a.dump_logo, "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["tgt", "order", "path", "pred", "meas", "err"])
-            for tgt, p, path_name, pr, me, e in dump:
+            w.writerow(["tgt", "order", "path", "pred", "meas", "err",
+                        "ledger_ok"])
+            for tgt, p, path_name, pr, me, e, led in dump:
                 w.writerow([tgt, p, path_name, "%.3f" % pr, "%.3f" % me,
-                            "%.2f" % e])
+                            "%.2f" % e, led])
         print("\nwrote %s (%d rows)" % (a.dump_logo, len(dump)))
 
 
