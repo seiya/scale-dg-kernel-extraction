@@ -309,6 +309,18 @@ paths_for_order() { # echo the path specs that exist at this order
       # No CUDA-core FUSED at p>=511 (p511_gap_study.md 14.6 / 15.7).
       echo "CUDAFORTRAN_FUSED_TC CUDAFORTRAN_FUSED_DFMA CUDAFORTRAN_GEMM CUDAFORTRAN_GEMM_CUTE CUDAFORTRAN_GEMM_FUSED${shapes}" ;;
     575|767)
+      # p=767 also has FUSED_TC / FUSED_DFMA in production dispatch since
+      # ba24055 (2026-09-04), and both were measured on 2026-09-12: they lose to
+      # all three GEMM paths, FUSED_TC by 11.3% and FUSED_DFMA by 151%
+      # (reports/measurement_inventory.md 27).  They stay out of the default
+      # list because this script's p=767 column is the cross-machine one and the
+      # A100 wrapper does not even sweep the order (29 GB unique payload), so
+      # adding two settled cells here would only lengthen the H100 and GB200
+      # sweeps.  Get them with the per-order override instead -- Slurm 105229 is
+      #   SCALE_DG_PATHS_767=CUDAFORTRAN_FUSED_TC:CUDAFORTRAN_FUSED_DFMA:\
+      #   CUDAFORTRAN_GEMM:CUDAFORTRAN_GEMM_CUTE:CUDAFORTRAN_GEMM_FUSED
+      # p=575 has no tile-kernel instance and p=1023 cannot have one (32-bit
+      # node index), so this line is GEMM-only for a different reason there.
       echo "CUDAFORTRAN_GEMM CUDAFORTRAN_GEMM_CUTE CUDAFORTRAN_GEMM_FUSED${shapes}" ;;
     *) echo "" ;;
   esac

@@ -12,6 +12,18 @@
 > （[`measurement_inventory.md`](measurement_inventory.md) §0 の該当注記）。
 > §1 の 62.817 / 60.362 ms/stage は `bc5aac4` の login-node 3 回中央値として
 > 残す。**測定済みの表は書き換えていない。**
+>
+> **更新（2026-09-12、Slurm `105229`、node `c395`、tree `22e7297`、
+> 6 ラウンド交互）。上の「`FUSED_TC` は時間未測定」は閉じた。**
+> p=767 の 5 経路を 1 ジョブに並べた結果は
+> [`measurement_inventory.md`](measurement_inventory.md) §27 で、
+> §18.3 にも 2 行足してある:
+> **`GEMM_FUSED` 60 197.0 が最速**、`GEMM` 63 313.6、`GEMM_CUTE` 63 601.7、
+> **`FUSED_TC` 67 024.4（初出、+11.34%）**、`FUSED_DFMA` 151 145.5 µs/stage。
+> GEMM 系 3 セルは §18.3 と **0.06% 以内**で再現した。
+> **p=767 では手書き融合は GEMM 系 3 経路のどれにも勝たない**
+> （[`p511_gap_study.md`](p511_gap_study.md) §15.7 の損益分岐 86.6–88.0% の
+> 外挿に対し、実測の損益分岐は 86.9%）。
 
 ## 1. 当初の結論（2026-08-28 時点）
 
@@ -63,6 +75,10 @@ base commit `bc5aac4` 時点の記述であり、そのまま残す。現行 tre
   [`dfma_register_budget.md`](dfma_register_budget.md) §19、セルの現況は
   [`measurement_inventory.md`](measurement_inventory.md) §0 の該当注記
   （`FUSED_DFMA` は production 形 `4×4` で測定済み、`FUSED_TC` は数値検証のみ）。
+  **2026-09-12 追記: `FUSED_TC` の実時間も
+  [`measurement_inventory.md`](measurement_inventory.md) §27 で測った**
+  （67 024.4 µs/stage、job `105229`）。**7 経路のうち Ozaki 2 経路以外の
+  5 経路が 1 ジョブ・1 物差しでそろっている。**
 
 **p=575 と p=1023 には tile カーネルのインスタンスが無い**（p=1023 は原理的に
 持てない。32-bit 添字の境界は同 §19.6、通常 GEMM 側の同じ境界は
