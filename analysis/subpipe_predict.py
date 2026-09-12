@@ -832,6 +832,112 @@ def print_eta_strata(dirs):
                   % (nm, len(v), statistics.median(v), pct90(v)))
 
 
+# Path-level calibration-side scalars (report section 5AF).  The kernel
+# strata above bucket ONE kernel's transfer error by ITS eta; a path total is
+# a sum over kernels, and a reviewer asked how eta is aggregated to the path
+# and what the accept rule is.  These three are the candidates that were
+# scored.  Every one of them is a function of the calibration machines' eta
+# and of the PREDICTED time only, so each is known before the target is
+# touched -- that is the property the band would need to be decidable.
+PATH_ETA_BINS = [("<=1.2", 0.0, 1.2), ("1.2-1.5", 1.2, 1.5),
+                 (">1.5", 1.5, float("inf"))]
+
+
+def path_eta_scalars(rows):
+    """(eta_wmean, frac_on_roof, eta_p90) of one path total, from its rows.
+
+    eta_wmean    predicted-time-weighted mean of the kernels' eta (the
+                 aggregation section 5AB.2 and the paper used).
+    frac_on_roof share of the predicted path time spent in kernels with
+                 eta <= AUTO_ETA, i.e. kernels the model says sit on a roof.
+    eta_p90      nearest-rank 90th percentile of the kernels' eta, one entry
+                 per role (mult is not expanded), via pct90().
+    Rows without a prediction contribute nothing.  Returns Nones on an empty
+    path.
+    """
+    rs = [r for r in rows if r["pred_us"]]
+    if not rs:
+        return None, None, None
+    tot = sum(r["pred_us"] for r in rs)
+    wmean = sum(r["eta"] * r["pred_us"] for r in rs) / tot
+    on = sum(r["pred_us"] for r in rs if r["eta"] <= AUTO_ETA) / tot
+    return wmean, on, pct90([r["eta"] for r in rs])
+
+
+def print_eta_band(dump, abs_tol=10.0):
+    """Can a calibration-side path scalar reproduce the p >= 255 band?
+
+    `dump` is the --dump-logo row list.  For each of the three scalars a
+    threshold is swept over the values the scalar actually takes (so every
+    distinct selection is visited); a cell is "selected" when the scalar is on
+    the roof side of the threshold (eta_wmean / eta_p90 <= t, frac_on_roof
+    >= t).  For each threshold: cells selected, how many of them are hits
+    (|err| <= abs_tol %), median and nearest-rank p90 of |err| inside the
+    selection, the size of the symmetric difference to the current p >= 255
+    band, and how many of the p = 255 cells are inside.  Run twice, on all
+    cells and on ledger_ok cells only.  Also prints the path-level eta strata
+    of section 5AB.2 (eta_wmean binned at 1.2 / 1.5) so that table is
+    reproducible.
+    """
+    import math
+    cells = [dict(tgt=t, order=p_, path=pa, err=abs(e), led=led, wmean=wm,
+                  on=on, p90=p9)
+             for t, p_, pa, pr, me, e, led, wm, on, p9 in dump
+             if wm is not None]
+    for only in (False, True):
+        cs = [c for c in cells if c["led"] or not only]
+        band = set(i for i, c in enumerate(cs) if c["order"] >= 255)
+        bv = [c["err"] for c in cs if c["order"] >= 255]
+        hits = sum(1 for c in cs if c["err"] <= abs_tol)
+        print("\n  === eta band scan (%s): n=%d, |err|<=%.0f%% hits=%d, "
+              "p>=255 band n=%d median %.1f%% p90 %.1f%%"
+              % ("ledger_ok cells only" if only else "all cells", len(cs),
+                 abs_tol, hits, len(bv), statistics.median(bv), pct90(bv)))
+        print("  path-level eta strata (eta_wmean):")
+        for nm, a, b in PATH_ETA_BINS:
+            v = [c["err"] for c in cs if a < c["wmean"] <= b]
+            print("    %-8s n=%3d median %5.1f%%  p90 %5.1f%%"
+                  % (nm, len(v), statistics.median(v) if v else float("nan"),
+                     pct90(v) if v else float("nan")))
+        for key, low_is_roof, lab in (("wmean", True, "eta_wmean <= t"),
+                                      ("p90", True, "eta_p90 <= t"),
+                                      ("on", False, "frac_on_roof >= t")):
+            print("  --- %s" % lab)
+            print("    %7s %4s %4s %7s %7s %6s %6s  %s"
+                  % ("t", "n", "hit", "median", "p90", "symd", "p255",
+                     "hit-rate outside"))
+            vals = sorted(set(c[key] for c in cs))
+            best = None
+            for t in vals:
+                sel = set(i for i, c in enumerate(cs)
+                          if (c[key] <= t if low_is_roof else c[key] >= t))
+                if not sel:
+                    continue
+                v = [cs[i]["err"] for i in sel]
+                h = sum(1 for x in v if x <= abs_tol)
+                out = [cs[i]["err"] for i in range(len(cs)) if i not in sel]
+                ho = sum(1 for x in out if x <= abs_tol)
+                p255 = sum(1 for i in sel if cs[i]["order"] == 255)
+                n255 = sum(1 for c in cs if c["order"] == 255)
+                symd = len(sel ^ band)
+                med = statistics.median(v)
+                print("    %7.3f %4d %4d %6.1f%% %6.1f%% %6d %3d/%-3d %s"
+                      % (t, len(sel), h, med, pct90(v), symd, p255, n255,
+                         ("%d/%d" % (ho, len(out))) if out else "--"))
+                # "best": the largest selection whose median stays under the
+                # band's own median -- the closest a rule can come to
+                # reproducing the band without being worse than it.
+                if med <= statistics.median(bv) and (best is None
+                                                     or len(sel) > best[1]):
+                    best = (t, len(sel), h, med, symd, p255)
+            if best:
+                print("    best (largest selection with median <= band's "
+                      "%.1f%%): t=%.3f n=%d hit=%d median %.1f%% symd=%d "
+                      "p255=%d" % (statistics.median(bv), *best))
+            else:
+                print("    no threshold reaches the band's median")
+
+
 def shape_check(dirs, shapes=("8x8x4", "16x8x4")):
     """V1 item 3: is `--shape static` really equal to `--shape target`?
 
@@ -957,6 +1063,11 @@ def main():
                          "the per-kernel transfers (section 5AC.6), both over "
                          "all cells and over the ledger-consistent ones.  p90 "
                          "is nearest-rank; see pct90()")
+    ap.add_argument("--eta-band", action="store_true",
+                    help="with --logo, sweep the three path-level "
+                         "calibration-side scalars (eta_wmean, frac_on_roof, "
+                         "eta_p90) against the p >= 255 absolute-time band "
+                         "(report section 5AF)")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     USE_TABLE[0] = a.from_table
@@ -1038,7 +1149,8 @@ def main():
                       % (p, path_name, pr, me, fmt_err(pr, me),
                          "" if led else "   ledger!"))
                 dump.append((tgt, p, path_name, pr, me,
-                             (pr / me - 1.0) * 100.0, int(led)))
+                             (pr / me - 1.0) * 100.0, int(led))
+                            + path_eta_scalars(rows))
                 for r in rows:
                     if r["roof_obs"]:
                         roof_n += 1
@@ -1101,15 +1213,21 @@ def main():
 
     if a.logo and a.eta_strata:
         print_eta_strata(dirs)
+    if a.logo and a.eta_band:
+        print_eta_band(dump)
 
     if a.dump_logo and dump:
         with open(a.dump_logo, "w", newline="") as fh:
             w = csv.writer(fh)
+            # The first seven columns are the schema the paper's figures
+            # read; their order and formats are frozen.  The three path-level
+            # calibration-side scalars (section 5AF) are appended after them.
             w.writerow(["tgt", "order", "path", "pred", "meas", "err",
-                        "ledger_ok"])
-            for tgt, p, path_name, pr, me, e, led in dump:
+                        "ledger_ok", "eta_wmean", "frac_on_roof", "eta_p90"])
+            for tgt, p, path_name, pr, me, e, led, wm, on, p9 in dump:
                 w.writerow([tgt, p, path_name, "%.3f" % pr, "%.3f" % me,
-                            "%.2f" % e, led])
+                            "%.2f" % e, led, "%.4f" % wm, "%.4f" % on,
+                            "%.4f" % p9])
         print("\nwrote %s (%d rows)" % (a.dump_logo, len(dump)))
 
 
