@@ -4191,3 +4191,69 @@ p=1023 の旧 job `79016` は 185 147.6 µs / `volume_flux` 8 320.5 µs =
   別途必要である。
 - 本節の timing / profiler ジョブは `VALIDATE=0`。数値正当性は既存の
   job `79164` と §18.2 の検証に依存し、`f3667e8` で新たに検証したとは言わない。
+
+## 29. Fig. 4(a,b) の統一再測定（Slurm `109874` / `110017`、2026-09-14）
+
+commit `cec10a6655459519918f3bcd4dd098c43ae7a8c4`、node `c190` の exclusive
+GB200 で一度だけ build し、SHA256
+`e0514e20075c4e2cf727f5092200d8060536f45ffd48b245a7197fbb9a7c6d02` の凍結
+binary を全 run に使った。timing / nsys / validation の raw と環境・clock 情報は
+`fig4_uniform_20260914_109874/`、訂正した fold A/B の raw は
+`fig4_fold_fixed4_20260914_110017/` に残す（いずれも commit しない）。CSV は
+`../scale-dg-paper/figs/data/fig4{a,b}_uniform.csv`。再生成は
+`python3 analysis/summarize_fig4_uniform.py --run-dir fig4_uniform_20260914_109874 --fold-run-dir fig4_fold_fixed4_20260914_110017 --paper-data-dir ../scale-dg-paper/figs/data`
+である。
+
+Fig. 4(a) circles は各 trace の warm-up 3 stage を除き、69 volume launches / 68
+start-to-start periods を同じ規則で使った。diamonds は追加 Slurm `110017`
+（node `c055`）で `XYW` だけを変え、`XYOVL=0`、`ZS3=0`（z = 4 stage）を
+両辺に固定した10 round interleaved A/B の CUDA-device tendency time である。
+120 run は全て `rc=0`、各次数・各側の min–max は非重複だった。
+
+| p | fusion prize [%] | fold only gain [%] |
+|---:|---:|---:|
+| 127 | 17.6973 | 32.3876 |
+| 255 | 12.6071 | 25.1977 |
+| 511 | 8.08691 | 14.0914 |
+| 575 | 7.36113 | 12.1886 |
+| 767 | 5.78805 | 9.53275 |
+| 1023 | 4.49496 | 5.55512 |
+
+初回 job `109874` の fold 部分は `SCALE_DG_ZS3` に段数そのものの `3` / `4` を
+渡したが、このノブは `0` = 4 stage / `1` = 3 stage のフラグである。したがって
+on は全次数で3段、off は未実装の3段 ablation carrier から4段へ fallback し、
+段数差を混ぜていた。上表の diamond と CSV はその値を使わず、同じ frozen binary
+を使った `110017` の4段固定値だけを使う。新しい6点は旧 job `79164` の
+stage-matched 値 32.48 / 25.11 / 14.08 / 12.22 / 9.51 / 5.57% を
+最大 0.10 point で再現した。
+
+Fig. 4(b) は同一 frozen binary で各 path 10 rounds を順序反転して測り、README の
+共通 `FLOP / RK stage` 表を集計スクリプトが直接読んだ。値は effective rate / 40.1
+TFLOP/s（%）、lead は TC − GF points。
+
+| p | GEMM_FUSED [%] | FUSED_TC [%] | lead [pt] |
+|---:|---:|---:|---:|
+| 7 | 2.37283 | 13.8518 | +11.4789 |
+| 15 | 8.70437 | 19.0269 | +10.3225 |
+| 31 | 16.3648 | 25.0660 | +8.70115 |
+| 63 | 30.4002 | 41.7105 | +11.3103 |
+| 127 | 51.3616 | 55.2269 | +3.86528 |
+| 255 | 69.3176 | 73.9499 | +4.63235 |
+| 511 | 83.5668 | 79.2123 | −4.35451 |
+
+したがって current crossover は Nq=256 と 512 の間に残る。旧 Fig. 4 の p=255
+67.6/73.7 と current-check 69.3/73.9 の provenance 不一致は、旧 table を書き換えず
+この section の同一 job 値を paper replacement source とする。p=575/767 の circle は
+今回が初めて同じ定義で得た点である。
+
+点変化 `u,v,w,Escale,normal_fn,Fscale` の full owned `dqdt` は p=7…255 の
+16,777,216 点で `CUDAFORTRAN_SPLIT`（p=255 は `GEMM`）に比較した。`GEMM_FUSED`
+は max abs `1.78e-15`（p=63/255 は `3.55e-15`）、`FUSED_TC` は
+`3.55e-15`〜`1.81e-12`（p=7…63 だけなら `3.18e-13`〜`1.81e-12`）で、
+いずれも roundoff level である。追加 job `109985`
+(node `c160`、同一 frozen binary) は p=255 Ne=2^3 = 134,217,728 点を smoke し、
+`GEMM_FUSED` `1.78e-15`、`FUSED_TC` `3.55e-15` を確認した。同じジョブの
+Ne=1（16,777,216 点）で4-stage fold-off も `3.55e-15` を確認した。
+p>=511 は1 field dump が数 GiB〜数十 GiBになるため今回の full-text
+dump は省略し、production/ablation の run rc=0 と既存の p=511 full-field validation
+を補助証拠として記録する。

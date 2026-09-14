@@ -262,6 +262,17 @@ FUSED_TC の `dqdt` はビット一致。
 > [`p255_gap_study.md`](p255_gap_study.md) §30、
 > [`p1023_gap_study.md`](p1023_gap_study.md) §16 にある。両ジョブは timing-only。
 
+> **追記（2026-09-14、Slurm `109874` / `110017`）: Fig. 4 の全点を同じ
+> frozen binary で統一再測定した。** `109874`（node `c190`）の current-production
+> `volume_flux` / stage 周期は Nq=128 / 256 / 512 / 576 / 768 / 1024 で
+> **17.697 / 12.607 / 8.087 / 7.361 / 5.788 / 4.495%**。`110017`
+>（node `c055`）は z carrier を両辺4段に固定した fold-only A/B を10ラウンドで
+> 取り直し、利得は **32.388 / 25.198 / 14.091 / 12.189 / 9.533 / 5.555%**。
+> 旧 stage-matched 系列を最大 0.10 point で再現した。初回 `109874` の fold 部分は
+> `SCALE_DG_ZS3` の 0/1 フラグへ誤って 3/4 を渡して段数差を混ぜたため不採用。
+> 完全な provenance、10-round レンジ、訂正理由は
+> [`measurement_inventory.md`](measurement_inventory.md) §29。
+
 GB200 1 GPU（login node GPU 1）、`make CUDA=1 GPUFLAGS=-gpu=cc100`、
 `UseCudaGraph = .false.`。p=7…255 の DFMA / TC / GEMM / SPLIT 行は
 **2026-08-29 に同一実行ファイルで 3-run 中央値を採り直した値**（各次数の既存
