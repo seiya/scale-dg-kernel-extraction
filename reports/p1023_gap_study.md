@@ -830,3 +830,38 @@ p=1023 はステージ数が最も少ない（本節は 36、`recheck_all_83460`
 > 上限として読む**」であって、device 値を落とすわけではない。
 > 「stage 時間を使う Fig. 2 と §5 / §6 はこの問題の影響を受けない」が
 > 正確な言い方である。
+
+---
+
+## 16. 現行バイナリで stage 周期を再測定（2026-09-13、Slurm `109215`）
+
+node `c360` の占有 GB200、凍結バイナリ、無変更の
+`namelists/perf_p1023_gemm_fused.conf`（`nstep=10`、`WarmupStep=3`、graph off）
+に `nsys --trace=cuda` を当てた。30 stage / 29 周期の trace である。
+実行ファイルの provenance と完全なコマンドは
+[`measurement_inventory.md`](measurement_inventory.md) §28.1。
+
+| 要素 | µs/stage | stage 比 |
+|---|---:|---:|
+| x GEMM | 56 889.611 | 30.75% |
+| y `GemmBatchedScaleAdd` | 56 265.116 | 30.41% |
+| z carrier | 58 617.003 | 31.68% |
+| `volume_flux_kernel` | **8 317.150** | **4.50%** |
+| `rk_update_stage` | 4 760.982 | 2.57% |
+| `update_halo` | 79.655 | 0.043% |
+| main-stream kernel 和に入らない隙間 | 74.413 | 0.040% |
+| **stage 周期（`volume_flux` 開始間隔の中央値）** | **185 004.000** | **100%** |
+| `elembnd_flux_kernel`（side） | 312.353 | 完全に critical path の外 |
+
+main-stream kernel 和 184 929.587 µs + 隙間 74.413 µs = 周期
+185 004.000 µs に閉じる。同一実行の `Step loop per stage` は 184 937 µs
+（−0.036%）、trace のテンダンシー小計 180 088.880 µs は
+`CUDA device GEMM fused` ÷22 = 180 103.182 µs と −0.008% で一致する。
+
+§14 の job `79016`（185 147.6 µs、flux 8 320.5 µs = 4.49%）と、§13.2 の
+旧 4.47% を、現行の同じ定義で **4.50%** と再現した。したがって
+「full-fusion prize は Nq=1024 で約 4.5%まで縮む」という結論は変わらない。
+一方、先頭の初期化込み周期は 221 460 µs で、29 周期の平均を取ると
+186 235.241 µs になる。定常値としては中央値を使う。
+
+本ジョブは timing-only で、点変化係数による全場検証は取り直していない。

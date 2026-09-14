@@ -4019,3 +4019,23 @@ side stream にあり、どちらの critical path にも入っていない**の
   （§15.6 当時は 67.6 / 73.7 ＝ +6.1 pt）。`GEMM_FUSED` が 966.9 → 940.3 µs に
   なったぶんで、**交差点は §15.6 が書いたときより Nq=256 側に寄っている**。
   過去の表は書き換えず、ここに注記として残す。
+
+---
+
+## 30. 現行 3-stage carrier を含む fold package の再測定（2026-09-13、Slurm `109215`）
+
+node `c360` の占有 GB200 で `GEMM_FUSED` の fold on / off / off+overlap を
+10 ラウンド交互に取り直した。`CUDA device GEMM fused` ÷57 の中央値は
+**944.006 / 1261.975 / 1250.581 µs/stage**（各レンジ
+942.763–944.809 / 1261.265–1262.932 / 1249.711–1251.344、全て非重複）。
+
+- off を分母にした production on の利得は **25.20%**。
+- fold を切った後に x‖y を重ねて返るのは **0.90%**。
+- `Step loop per stage` では 1016.465 / 1328.945 / 1319.225 µs、同じ比は
+  **23.51% / 0.73%**。device と stage-period の物差しは混ぜない。
+
+§12.1 の旧 4-stage 一軸値 25.11% / 0.89% を現行 package が再現したが、
+**新しい 25.20% は fold 単独の一軸値ではない。** on は現行の 3-stage carrier、
+役割外の `SCALE_DG_XYW=0` は 4-stage carrier を使うためである。完全な p=127
+との対表、実行ファイル provenance、数値検証を取り直していないことは
+[`measurement_inventory.md`](measurement_inventory.md) §28.3 / §28.5 に記録した。

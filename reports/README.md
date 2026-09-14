@@ -244,6 +244,24 @@ FUSED_TC の `dqdt` はビット一致。
 > 値と機構は [`measurement_inventory.md`](measurement_inventory.md) §27、
 > セルは同 §18.3 の p=767 行（† 付きの 2 行）にある。**下の表は書き換えていない。**
 
+> **追記（2026-09-13、Slurm `109215` / `109244`、node `c360` / `c164`、
+> いずれも占有 GB200）: 論文で直接使う比と機構量を現行 production 実装で
+> 再測定した。経路 × 次数の現在値の正本 §18.3 と、下の当時値表は書き換えて
+> いない。** p=7 / 63 の `FUSED_TC` / `FUSED` を 10 ラウンドへ揃えた結果、
+> TC / CC は **0.8993 / 0.8982**（TC の時間が 10.07% / 10.18% 短い）で、
+> 旧 6 ラウンドの順位と差を再現した。p=127 / 255 の `xy_weighted` on は off
+> より device time が **32.89% / 25.20% 短く**、off 後の x‖y overlap は
+> **0.98% / 0.90%** しか返さなかった。ただし on だけが現行の 3-stage carrier、
+> off は 4-stage carrier なので、これは fold 単独ではなく **production package
+> の利得**である。現行 `nsys` で `volume_flux` / stage 周期は p=127 **17.95%**、
+> p=1023 **4.50%**。後者は旧 4.47–4.49% と同じ「高次数の full-fusion prize は
+> 約 4.5%」を再現した。完全な provenance、レンジ、stage 分解、残件は
+> [`measurement_inventory.md`](measurement_inventory.md) §28、fold は
+> [`gemm_assignment_and_carrier.md`](gemm_assignment_and_carrier.md) §15、次数別の
+> 内訳は [`p127_gap_study.md`](p127_gap_study.md) §27、
+> [`p255_gap_study.md`](p255_gap_study.md) §30、
+> [`p1023_gap_study.md`](p1023_gap_study.md) §16 にある。両ジョブは timing-only。
+
 GB200 1 GPU（login node GPU 1）、`make CUDA=1 GPUFLAGS=-gpu=cc100`、
 `UseCudaGraph = .false.`。p=7…255 の DFMA / TC / GEMM / SPLIT 行は
 **2026-08-29 に同一実行ファイルで 3-run 中央値を採り直した値**（各次数の既存

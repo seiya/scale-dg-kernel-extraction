@@ -4053,3 +4053,141 @@ mma 命令の利得は Nq=256 以上では次数に依らない。主比 B（`FU
   入れていない。§10.3 の 618 781.8 / 82 149.1 µs/stage が最後の値である。
 - **`CutlassMmaShape = "16x8x4"`。** 本ジョブは既定形だけで走っている
   （p=767 の形状軸は §18.6 と `h100_report.md` §8.10.3 にある）。
+
+---
+
+## 28. 論文用の鮮度再測定 —— GB200 10 ラウンド、fold、stage-period 分解（2026-09-13、Slurm `109215` / `109244`）
+
+2026-09-13 の鮮度監査で再測定が必要と判定された GB200 の量を、現行の
+production 実装を含む凍結バイナリ 1 本で取り直した。**経路 × 次数の現在値の
+正本 §18.3 は書き換えない。** 本節が測ったのは、(a) その表とは別の
+`Step loop per stage` の 10 ラウンド幅、(b) 役割外 fold ablation、(c) `nsys`
+の stage-period 分解である。
+
+### 28.1 provenance と実行条件
+
+| | Slurm `109215` | Slurm `109244` |
+|---|---|---|
+| node / GPU | `c360` / NVIDIA GB200 | `c164` / NVIDIA GB200 |
+| scheduler | `--gpus=1 --exclusive` | `--gpus=1 --exclusive` |
+| 対象 | p=7/63 `FUSED_TC` / `FUSED`、p=127/255 fold、p=1023 `nsys` | p=127 `GEMM_FUSED` の `nsys` |
+| 入力 | 既存 perf namelist。fold は `perf_p{127,255}_gemm.conf` から経路名だけを `GEMM_FUSED` に変更 | `namelists/perf_p127_gemm_fused.conf`（無変更） |
+| toolchain | NVIDIA HPC SDK 26.3、CUDA 13.1、sm_100 | 同左 |
+| 成果物 | `refresh_20260913_109215/` | `f4_p127_20260913_109244/` |
+
+両ジョブとも `export DEBUGINFOD_URLS=`、`UseCudaGraph=.false.`、凍結した
+`scale-dg_extraction.gb200` を使用した。`nsys` は
+`timeout 900 nsys profile --trace=cuda --sample=none --cpuctxsw=none
+--resolve-symbols=false --force-overwrite=true`、集計は
+`timeout 600 nsys stats --report=cuda_gpu_trace --format=csv
+--force-export=true` である。ジョブスクリプト
+`jobs/measurement_refresh_20260913.sh` / `jobs/measurement_f4_p127_20260913.sh`
+は GB200 だけの一回限りの測定なので、規約どおり未追跡のままにする。
+
+**実行ファイルの provenance に注意が要る。** 外側の metadata はジョブ投入時の
+HEAD `f3667e8` を記録するが、`cp -p` された実行ファイルの mtime は
+2026-09-12 16:07:48、直前の commit は `c63e72d` である。したがって正確には
+**`c63e72d` 時点でビルドされたバイナリを `f3667e8` の作業ツリーから凍結して
+走らせた測定**である。`git diff c63e72d..f3667e8` では本節が走らせる
+`mod_cuda_dg_kernels.cuf`、CUTLASS / CC / TC カーネル、`main.f90`、性能 namelist
+に差が無いので、対象コードは HEAD と同一である。この区別を隠して
+「`f3667e8` でビルド」とは書かない。
+
+また `109215/f1/metadata.txt` の `machine=h100`、H100 の peak 値、
+`job_id=unknown` は、共有本体 `jobs/tsubame_paths.sh` を wrapper なしで呼び、
+metadata 用環境変数を上書きしなかったための**誤記**である。外側の
+`metadata.txt`、Slurm ログ、`nvidia-smi` は job `109215` / node `c360` /
+GB200 を記録している。時間の実行・集計に peak 値や `machine` は使わないので、
+測定値には影響しない。
+
+### 28.2 Fig. 1(b) 用の GB200 10 ラウンド —— 順位と幅を再現
+
+4 セルを同一ジョブ・同一ノードで 10 ラウンド交互に実行した。物差しは
+`Step loop per stage`、比は各経路の中央値どうし、幅は現行の図スクリプトと同じ
+`min(TC)/max(CC)` から `max(TC)/min(CC)` である。
+
+| p | `FUSED_TC` [µs/stage] | `FUSED` [µs/stage] | TC / CC | 比の min–max | 判定 |
+|---:|---:|---:|---:|---:|---|
+| 7 | **337.029** (335.823–337.509) | 374.754 (374.086–375.421) | **0.8993** | 0.8945–0.9022 | 非重複、TC の時間が **10.07% 短い** |
+| 63 | **488.435** (486.474–491.982) | 543.790 (543.511–544.279) | **0.8982** | 0.8938–0.9052 | 非重複、TC の時間が **10.18% 短い** |
+
+旧 6 ラウンド（job `83460`）の 0.8983 / 0.9001 に対して +0.0010 /
+−0.0019 で、**符号も大きさも変わらない**。今回の目的は 10 ラウンドへ揃える
+ことであって、§18.3 の device-time セルを更新することではない。本ジョブは
+`VALIDATE=0` の timing-only であり、数値検証の新しい証拠には数えない。
+
+### 28.3 現行既定の fold package —— p=127 / 255
+
+各次数で `on`（production）、`off`（`SCALE_DG_XYW=0`）、`off_overlap`
+（さらに `SCALE_DG_XYOVL=1`）を 10 ラウンド交互に走らせ、全 60 run が `rc=0`。
+`CUDA device GEMM fused` は既存レポートと同じく `3*Measured steps` で割った。
+絶対値には delayed-event harvest の +1 stage 偏りがあるが、3 変種で分母も
+ウォームアップも同じなので、**同一次数内の比では相殺する**。
+
+| p | on [µs/stage] | off [µs/stage] | off+overlap [µs/stage] | on の利得（off 分母） | overlap の回収（off 分母） |
+|---:|---:|---:|---:|---:|---:|
+| 127 | **636.875** (636.017–637.418) | 948.993 (947.956–949.428) | 939.702 (939.034–940.276) | **32.89%** | **0.98%** |
+| 255 | **944.006** (942.763–944.809) | 1261.975 (1261.265–1262.932) | 1250.581 (1249.711–1251.344) | **25.20%** | **0.90%** |
+
+全ての隣接レンジは非重複。逆向きに書けば、fold を切る代金は +49.01% /
++33.68% である。外側を含む `Step loop per stage` の中央値はそれぞれ
+723.341 / 1034.705 / 1026.605 µs（p=127）と
+1016.465 / 1328.945 / 1319.225 µs（p=255）で、on の利得は 30.09% /
+23.51%、overlap の回収は 0.78% / 0.73%。**device-time の比と stage-period の
+比を混ぜない。**
+
+これは job `79164` の古い一軸値を単に置換する測定ではない。現行コードは
+`xy_weighted==1` の production 側だけ z carrier を 3 段にし、
+`SCALE_DG_XYW=0` の役割外 ablation は 4 段へ落ちる。したがって本節の
+32.89% / 25.20% は **fold と現行 3-stage carrier を合わせた production package
+の利得**であり、「段数を固定した fold 単独」とは呼ばない。一方、旧 job
+`79164` の同一 4 段 A/B（32.48% / 25.11%、off 後の重ね 0.92% / 0.89%）は
+歴史的な一軸の機構実験として有効なままである。新旧が近いことは結論を
+補強するが、一軸性を新ジョブへ遡及させない。
+
+### 28.4 現行 `nsys` の stage-period 分解 —— p=127 / 1023
+
+`volume_flux_kernel` の開始から次の開始までの周期の中央値を分母にした。
+p=127 は 300 stage / 299 周期、p=1023 は 30 stage / 29 周期を trace した。
+カーネル時間は全 launch の和を stage 数で割った値である。
+
+| 要素 | p=127 [µs/stage] | p=1023 [µs/stage] |
+|---|---:|---:|
+| x GEMM | 163.012 | 56 889.611 |
+| y `GemmBatchedScaleAdd` | 138.164 | 56 265.116 |
+| z carrier | 184.412 | 58 617.003 |
+| `volume_flux_kernel` | **129.763** | **8 317.150** |
+| `rk_update_stage` | 75.476 | 4 760.982 |
+| `update_halo` | 6.249 | 79.655 |
+| main-stream kernel 和に入らない周期残差 | 25.734 | 74.413 |
+| **stage 周期（中央値）** | **722.816** | **185 004.000** |
+| `volume_flux` / stage 周期 | **17.95%** | **4.50%** |
+| `elembnd_flux_kernel`（side、単純和。分母へは加えない） | 47.488 | 312.353 |
+
+`elembnd_flux` は side stream なので、その単純和を main stream の和へ足しては
+ならない。p=127 の 25.734 µs は launch 間隙と fork/join の critical tail を
+分離していない残差であり、`elembnd_flux` 47.488 µs の全額とも呼ばない。
+p=1023 は main-stream kernel 和 184 929.587 µs に残差 74.413 µs を足すと
+周期 185 004.000 µs に閉じる。同じ実行の `Step loop per stage`
+184 937 µs と −0.036% で一致する。
+
+p=1023 の旧 job `79016` は 185 147.6 µs / `volume_flux` 8 320.5 µs =
+4.49%、さらに古い job `74738` は 4.47% だった。本節は
+**185 004.0 µs / 8 317.2 µs = 4.50%** と再現したので、違いは 0.03 point、
+「fusion prize が高次数で約 4.5% まで縮む」という結論は動かない。
+初期化を含む先頭周期は p=127 で 47 560.3 µs、p=1023 で 221 460 µs と外れ、
+全周期の平均は 879.158 / 186 235.241 µs になる。**定常 stage の値には中央値を
+使い、先頭込み平均を混ぜない。**
+
+### 28.5 帰結と残件
+
+- §18.3 の最速経路・主比 A/B・全セルの current 値は動かない。
+- `xy_weighted` は現行 package でも p=127 / 255 の両方で大差で勝ち、off 後の
+  overlap は 1% 未満しか返さない。production gate の判断は維持する。
+- p=1023 の `volume_flux` 比は current trace で **4.50%**。旧 4.47% は当時値として
+  残し、現在値を述べる箇所は本節を引く。
+- **3 段に固定した fold-off carrier は実装していない。** fold 単独の現行一軸値が
+  必要なら、その ablation の実装・点変化係数による全場検証・同一ジョブ A/B が
+  別途必要である。
+- 本節の timing / profiler ジョブは `VALIDATE=0`。数値正当性は既存の
+  job `79164` と §18.2 の検証に依存し、`f3667e8` で新たに検証したとは言わない。

@@ -2355,3 +2355,35 @@ DFMA を独立に最適化しないという役割（`AGENTS.md`）の帰結と�
 owned `dqdt(:,1:Ne)` 16,777,216 点が **`FUSED_TC` と `FUSED_DFMA` でビット一致**、
 `CUDAFORTRAN_SPLIT`（`namelists/val_p127_split.conf`）対照で両者とも
 max abs **3.55e-15**（相対 4.34e-16）。
+
+---
+
+## 27. 現行 `GEMM_FUSED` の stage-period 分解（2026-09-13、Slurm `109244`）
+
+node `c164` の占有 GB200、凍結バイナリ、無変更の
+`namelists/perf_p127_gemm_fused.conf` に `nsys --trace=cuda` を当てた。
+完全なコマンド、実行ファイル provenance、CSV の集計規約は
+[`measurement_inventory.md`](measurement_inventory.md) §28.1 / §28.4。
+300 stage の `volume_flux` 開始時刻から得た 299 周期の中央値は
+**722.816 µs/stage**（実行ファイルの `Step loop per stage` 722.522 µs と
++0.041%）。
+
+| 要素 | µs/stage | stage 比 |
+|---|---:|---:|
+| x GEMM | 163.012 | 22.55% |
+| y `GemmBatchedScaleAdd` | 138.164 | 19.12% |
+| z carrier | 184.412 | 25.51% |
+| `volume_flux_kernel` | **129.763** | **17.95%** |
+| `rk_update_stage` | 75.476 | 10.44% |
+| `update_halo` | 6.249 | 0.86% |
+| main-stream kernel 和に入らない残差 | 25.734 | 3.56% |
+| `elembnd_flux_kernel`（side の単純和） | 47.488 | 6.57% |
+
+side stream の 47.488 µs は main stream と重なるため stage 合計へ足さない。
+25.734 µs の残差は launch 間隙と fork/join の critical tail を分離していない。
+この trace だけから side kernel のうち何 µs が露出したかは断定しない。
+
+本節で新しく立った量は、現行の p=127 では `volume_flux` が stage 周期の
+**17.95%**を占めることである。これは性能経路の更新でも最適化でもなく、
+`GEMM_FUSED` が `FUSED_TC` に対して持つ full-fusion prize の低次側の分解である。
+ジョブは timing-only で、数値検証は取り直していない。
