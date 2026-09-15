@@ -5,6 +5,11 @@ The FLOP column is deliberately parsed from reports/README.md's authoritative
 ``FLOP / RK stage`` table, rather than duplicated as a second hand-maintained
 table.  nsys intervals use volume_flux launch starts; all summaries retain
 unrounded samples in the output CSVs.
+
+volume_flux_us_per_stage is the MEDIAN of the per-launch durations over the
+kept launches (measurement_inventory.md section 28.4 uses the mean, i.e. the
+sum over launches divided by the stage count; at p=127 the two differ by
+about 1%).  The category sums (gemm_, rk_update_, ...) are means.
 """
 import argparse, csv, re, statistics, pathlib
 
@@ -97,12 +102,23 @@ def main():
       vol=vol[3:]; periods=[(vol[i+1][0]-vol[i][0])/1e3 for i in range(len(vol)-1)]
       cats={}
       first,last=vol[0][0],vol[-1][0]
+      # Kernels launched in [first, last) belong to the 68 complete stage
+      # periods; the last volume_flux launch opens a stage whose GEMMs start
+      # after `last`, so a closed window would count 69 flux kernels against
+      # 68 stages of GEMMs.  Category sums are therefore per period.
       for st,du,name in ev:
-        if first <= st <= last: cats.setdefault(classify(name),[]).append(du/1e3)
+        if first <= st < last: cats.setdefault(classify(name),[]).append(du/1e3)
+      nper=len(periods)
       on=[r['device_us_per_stage'] for r in expect_rounds(fold_rows,section='fold_fixed4',p=p,path='CUDAFORTRAN_GEMM_FUSED',mode='on')]
       off=[r['device_us_per_stage'] for r in expect_rounds(fold_rows,section='fold_fixed4',p=p,path='CUDAFORTRAN_GEMM_FUSED',mode='off')]
       vm=med([x[1]/1e3 for x in vol]); pm=med(periods)
-      a.append(dict(commit=meta.get('commit',''),binary_sha256=meta.get('binary_sha256',''),trace_job=meta.get('job',''),trace_node=meta.get('node',''),fold_job=fold_meta.get('job',''),fold_node=fold_meta.get('node',''),p=p,Nq=NQ[p],fusion_stage_count=len(vol),fusion_period_count=len(periods),volume_flux_us_per_stage=vm,median_stage_period_us=pm,fusion_prize_percent=100*vm/pm,fold_fixed_z_stage_count=4,fold_on_round_us=';'.join(map(str,on)),fold_off_round_us=';'.join(map(str,off)),fold_on_median_us=med(on),fold_on_min_us=min(on),fold_on_max_us=max(on),fold_off_median_us=med(off),fold_off_min_us=min(off),fold_off_max_us=max(off),fold_gain_percent=100*(med(off)-med(on))/med(off),side_elembnd_us_per_stage=sum(cats.get('side_elembnd',[]))/len(vol),gemm_us_per_stage=sum(cats.get('gemm',[]))/len(vol),rk_update_us_per_stage=sum(cats.get('rk_update',[]))/len(vol),update_halo_us_per_stage=sum(cats.get('update_halo',[]))/len(vol),residual_us_per_stage=sum(cats.get('residual',[]))/len(vol)))
+      # Main-stream kernel sums per period (side-stream elembnd and the
+      # unclassified kernels, which may sit on other streams, excluded); the
+      # period residual is what the main stream's kernels do not account for
+      # (launch gaps and the fork/join tail).  The sums are means and the
+      # period is a median, so the residual can come out slightly negative.
+      main=sum(sum(cats.get(k,[])) for k in ('volume_flux','gemm','rk_update','update_halo'))/nper
+      a.append(dict(commit=meta.get('commit',''),binary_sha256=meta.get('binary_sha256',''),trace_job=meta.get('job',''),trace_node=meta.get('node',''),fold_job=fold_meta.get('job',''),fold_node=fold_meta.get('node',''),p=p,Nq=NQ[p],fusion_stage_count=len(vol),fusion_period_count=len(periods),volume_flux_us_per_stage=vm,median_stage_period_us=pm,fusion_prize_percent=100*vm/pm,fold_fixed_z_stage_count=4,fold_on_round_us=';'.join(map(str,on)),fold_off_round_us=';'.join(map(str,off)),fold_on_median_us=med(on),fold_on_min_us=min(on),fold_on_max_us=max(on),fold_off_median_us=med(off),fold_off_min_us=min(off),fold_off_max_us=max(off),fold_gain_percent=100*(med(off)-med(on))/med(off),side_elembnd_us_per_stage=sum(cats.get('side_elembnd',[]))/nper,gemm_us_per_stage=sum(cats.get('gemm',[]))/nper,rk_update_us_per_stage=sum(cats.get('rk_update',[]))/nper,update_halo_us_per_stage=sum(cats.get('update_halo',[]))/nper,unclassified_kernel_us_per_stage=sum(cats.get('residual',[]))/nper,period_residual_us_per_stage=pm-main))
     for path,data in ((args.paper_data_dir/'fig4a_uniform.csv',a),(args.paper_data_dir/'fig4b_uniform.csv',b)):
       with path.open('w',newline='') as f: w=csv.DictWriter(f,fieldnames=list(data[0])); w.writeheader(); w.writerows(data)
 if __name__=='__main__': main()

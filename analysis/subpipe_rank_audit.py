@@ -396,7 +396,7 @@ def main():
                          ".csv).  The balance-matched job is in "
                          "analysis/subpipe_balance_match.csv and is NOT part "
                          "of the published 190-cell score; pass both to score "
-                         "the 41% column as well.")
+                         "the 41%% column as well.")
     a = ap.parse_args()
     sp.USE_TABLE[0] = a.from_table
     sp.SHAPE_SRC[0] = a.shape

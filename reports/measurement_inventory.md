@@ -4204,8 +4204,36 @@ binary を全 run に使った。timing / nsys / validation の raw と環境・
 `python3 analysis/summarize_fig4_uniform.py --run-dir fig4_uniform_20260914_109874 --fold-run-dir fig4_fold_fixed4_20260914_110017 --paper-data-dir ../scale-dg-paper/figs/data`
 である。
 
+**入力は committed namelist そのものではない**（2026-09-15 追記）。
+`jobs/fig4_uniform_20260914.sh` の `make_conf` は `namelists/perf_p{p}_gemm.conf`
+から `DqdtKernel_Type` を差し替えるのと同時に **`nstep` を全次数・全 section
+（timing / nsys / fold）で一律 24 に書き換えて**いる（committed 値は p=127 で
+100、p=7 / 511 で 20、p=1023 で 10）。`Ne` / `PolyOrder` / `dt` / `WarmupStep`
+は無変更。したがって Fig. 4(b) の device 時間は 72 stage（＝計時 23 step × 3 ＋
+delayed-event の +1 stage 偏り）を分母にしており、`nstep=100` の §18.3 と
+並べると p ≤ 255 で約 +0.9% 高く出る（p=127 `GEMM_FUSED` 642.8 対 637.1、
+`FUSED_TC` 597.9 対 592.6 µs/stage。偏りの相対量が 1/72 対 1/300 で違うぶん）。
+同一 job 内の 2 経路には同じ偏りが載るので lead には効かない。**絶対効率（%）
+を §18.3 と混ぜて引用しないこと。**
+
 Fig. 4(a) circles は各 trace の warm-up 3 stage を除き、69 volume launches / 68
-start-to-start periods を同じ規則で使った。diamonds は追加 Slurm `110017`
+start-to-start periods を同じ規則で使った。**`volume_flux` の時間は 69 launch
+の per-launch 中央値、分母は 68 周期の中央値である**（2026-09-15 追記。§28.4 /
+`p127_gap_study.md` §27 の 17.95% は全 launch の和 ÷ stage 数、すなわち平均で、
+同じ trace でも mean 129.76 / median 128.45 µs と 1.0% 違う。p=127 の
+17.95% 対 17.70% の差はほぼこの定義差で、p=1023 では 4.50 対 4.49% と
+一致する。2 つを同じ量として並べない）。
+2026-09-15 の同じ監査で `summarize_fig4_uniform.py` の副次列を 2 点直した:
+(a) 旧 `residual_us_per_stage` は周期残差ではなく「分類されないカーネルの
+時間」だったので `unclassified_kernel_us_per_stage` に改名し、main-stream
+和（`volume_flux` + GEMM + `rk_update` + `update_halo`）を周期中央値から
+引いた `period_residual_us_per_stage` を足した（p=127 で 24.5 µs、§28.4 の
+25.7 µs と同じ桁）; (b) カテゴリ和の窓が閉区間 `[first, last]` で、69 本目の
+`volume_flux` が開く stage の GEMM が窓の外に落ちて 68 周期分の GEMM を
+69 で割っていた（GEMM 列が 1/69 ≈ 1.4% 低い）。窓を `[first, last)`、分母を
+周期数 68 にした。**論文が読む列（`fusion_prize_percent`、`fold_*`、
+`fusion_*_count`、Fig. 4(b) の全列）は 1 バイトも変わらない**。配布 CSV の
+副次列は上の再生成コマンドで更新する。diamonds は追加 Slurm `110017`
 （node `c055`）で `XYW` だけを変え、`XYOVL=0`、`ZS3=0`（z = 4 stage）を
 両辺に固定した10 round interleaved A/B の CUDA-device tendency time である。
 120 run は全て `rc=0`、各次数・各側の min–max は非重複だった。
