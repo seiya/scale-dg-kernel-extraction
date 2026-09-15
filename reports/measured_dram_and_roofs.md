@@ -678,6 +678,12 @@ A100 は 2 経路とも同じ向きに 8〜12% 遅い（`FUSED_TC` 2.223 対 2.0
 | 767 | `GEMM` | 61579 / 77.60 / 27.0 | 60040 / 79.49 / 26.4 | — | 72.0 |
 | 767 | `GEMM_FUSED` | 58526 / 66.64 / 31.5 | 58466 / 68.31 / 30.7 | — | 72.0 |
 
+> **追記（2026-09-15）: p=1023（GB200 のみ）を §7.5 に足した。** 上表は当時の
+> まま残す。GB200 は p=1023 まで走る唯一の機械（payload 176 GiB）で、この表
+> だけが p=767 で止まっていたため、論文の roofline 図（A5）が GB200 の最高
+> 次数を欠いていた。値は `GEMM` 187 967 / 185.07 / 35.8、`GEMM_FUSED`
+> 180 357 / 159.33 / 41.5、`I_alg` 96.0（Slurm `115157`、commit `7004e82`）。
+
 ジョブ: GB200 = Slurm `83141`（p=7/63/255/767）、`83209`（p=575）、
 `83214`（p=15/31/127/511、15 起動とも `rc=0`、3 分 43 秒）、
 H100 = SGE `8585090`（p=7/63/255/767）と `8585547`（p=15/31/127/511/575、17 起動とも `rc=0`）、
@@ -908,3 +914,58 @@ p=511 は **A100 でだけ `FUSED_TC` が最速**になる次数である
   H100 ではそれを現金化できない」がこの次数でも効いていることを示す。
   **「TC 屋根が 2 倍ある機械では mma 経路が有利」という素朴な予想が
   外れる 3 例目**（`a100_report.md` §3.2 と §8.7.1 に続く）。
+
+## 7.5 p=1023（GB200、2026-09-15、Slurm `115157`）——§7.1 の表の最終行
+
+- 日付: 2026-09-15、node `c272`、GB200 189 471 MiB、SM boost 2062 MHz、
+  driver 580.173.02、ncu 2025.4.1.0、nvhpc 26.3
+- ビルド: commit `7004e82`（カーネルソースは `d74e199` 以降変更なし。
+  実行ファイルは 2026-09-14 11:12 ビルド、ジョブが `roof_bytes_p1023_115157/scale-dg_extraction.frozen` に凍結）
+- 入力: `namelists/perf_p1023_gemm.conf` から `DqdtKernel_Type` と
+  `nstep=4` / `output_interval=4` だけを差し替えたコピー（`8x8x4`、`UseCudaGraph=.false.`）
+- コマンド: `jobs/roof_bytes_ncu.sh` の本体を `ORDERS=1023`、
+  `OUTDIR=roof_bytes_p1023_115157` で実行（§7.1 と同じ 22 メトリクス、
+  `--clock-control none --replay-mode kernel -s 24 -c 24`、`-k` フィルタ無し）。
+  投入には一回限りのラッパー `jobs/rikyu_p1023_roof_bytes.sh`（未追跡）を
+  使った: p=1023 は 189 GiB 中 176 GiB を占めるので、kernel replay の
+  save/restore バッファが載らず CSV が空になったら application replay で
+  取り直す分岐を足してある。**分岐は発火しなかった**（2 起動とも `rc=0`、
+  547 / 548 行）ので、実効的には `ORDERS=1023 sbatch jobs/rikyu_roof_bytes_ncu.sh`
+  と同じである。所要 12 分 33 秒（うち ncu は各 5〜6 分）。
+- 集計: §7.1 と同じく「`update_halo` の次から `rk_update` の手前まで」を
+  1 stage の tendency とし、`gpu__time_duration.sum` と `dram__bytes.sum` を足す。
+  同じ集計を job `83141` の p=767 に当てると §7.1 の 61 575 / 77.60 と
+  58 526 / 66.64 が桁まで再現する。
+
+| p | 経路 | GB200 µs / GB / I_meas | H100 | A100 | `I_alg` |
+|---:|---|---|---|---|---:|
+| 1023 | `GEMM` | 187967 / 185.07 / 35.8 | — | — | 96.0 |
+| 1023 | `GEMM_FUSED` | 180357 / 159.33 / 41.5 | — | — | 96.0 |
+
+（`GEMM_FUSED` は 24 launch に完全な stage が 3 つ入り 180 298 / 180 355 /
+180 357 µs、159.33 / 159.33 / 159.34 GB。表は最初の完全な stage。`GEMM` は
+1 stage に 10 launch——cuBLAS の x / z が split-K で `splitKreduce_kernel` を
+伴う——なので完全な stage は 1 つだけ。H100 / A100 は p=1023 が載らないので
+原理的に取れない: `h100_report.md`、`a100_report.md`。）
+
+`FLOP / RK stage` = 6.619e12、unique = 68 971 MB（`reports/README.md` の
+work-per-stage 表）。
+
+- **`GEMM_FUSED` は 36.70 TFLOP/s ＝ 40.1 の 91.5%**、`GEMM` は 35.21 ＝ 87.8%。
+  p=767 の 89.3% / 84.9% より上で、GB200 の最速経路の演算屋根に対する到達率は
+  p=1023 で最大になる。HBM 側は `I_meas` で 0.883 TB/s ＝ 7.9 の 11.2%
+  （`GEMM` 0.985 ＝ 12.5%）。
+- **実測 ÷ unique は `GEMM` 2.68、`GEMM_FUSED` 2.31。** p=767 の 2.66 / 2.29 と
+  同じ値であり、§7.1.1 の「比は経路の構造で決まり、次数にはあまり依らない」
+  はもう 1 次数延びる。GB200 の GEMM 族レンジ 2.18〜2.75 は動かない。
+- **`I_meas ÷ I_alg` は 0.37 / 0.43**。§7.1.1 の「高次ほど右にずれる」の下端
+  （p=767 で 0.38）と同じ水準で、これ以上は落ちない。
+- 3 つの体積 GEMM は `GEMM_FUSED` で 56.7 / 56.3 / 58.7 ms（SM 96.9 / 97.6 / 94.6%、
+  `math_pipe_throttle` が支配ストール）、`GEMM` は cuBLAS の x / z が
+  56.5 ms（SM 97.2%）、CUTLASS の y が 56.9 ms。周辺は `volume_flux` 8.32 ms
+  （DRAM 91.1%）、`separable_lift_assembly` 9.39 ms（DRAM 84.8%、`GEMM` のみ）、
+  `elembnd_flux` 0.28〜0.30 ms。`p1023_gap_study.md` §12–13 の nsys 内訳
+  （x 57.14 / y 56.68 / z 58.86、flux は DRAM 91%）と一致する。
+- 同じ 24 launch の `rk_update` は 4.72〜4.97 ms（DRAM 87〜92%）、
+  `update_halo` 0.076 ms。tendency 180.36 + RK 4.72 + halo 0.08 ＝ 185.16 ms は
+  `p1023_gap_study.md` §12 のログインノード実測 185.851 ms/stage の −0.4%。
