@@ -14,6 +14,12 @@ than the floor at 75/40/25%).
   python3 analysis/subpipe_balance_distill.py MACHINE JOB OUTDIR [--sm 41=44 ...]
       [--csv analysis/subpipe_balance_times.csv] [--write] [--check]
 
+The two-machine sweep lives in subpipe_balance_times.csv and is the input of
+the published 190-cell balance score; a job that re-runs a (machine, order,
+pct) the sweep already has -- the balance-matched job of 2026-09-15 re-ran 40%
+and 100% beside 41% -- goes to subpipe_balance_match.csv (--csv), because the
+audit refuses duplicate cells rather than let a later job replace the campaign.
+
 Without --write it prints the rows.  --write merges them into the CSV,
 replacing any row with the same (machine, job, order, pct, path).  --check
 compares them to the rows already in the CSV for that job and exits non-zero

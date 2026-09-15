@@ -142,13 +142,24 @@ def isolated_pools():
     return out
 
 
-def balance_axis():
-    meas, sm_of = {}, {}
-    with open(BAL_TIMES) as fh:
-        for r in csv.DictReader(fh):
-            key = (r["machine"], int(r["order"]), int(r["pct"]))
-            meas.setdefault(key, {})[r["path"]] = float(r["device_s_median"])
-            sm_of[key] = int(r["sm"])
+def balance_axis(files=None):
+    meas, sm_of, seen = {}, {}, {}
+    for fn in files or [BAL_TIMES]:
+        with open(fn) as fh:
+            for r in csv.DictReader(fh):
+                key = (r["machine"], int(r["order"]), int(r["pct"]))
+                # One measurement per cell.  A second job at the same
+                # (machine, order, pct, path) -- the 2026-09-15 match job
+                # re-ran 40% and 100% beside 41% -- must not silently replace
+                # the campaign the published score was taken on, so it lives
+                # in its own file (subpipe_balance_match.csv) and is scored
+                # only when asked for with --bal-times.
+                if (key, r["path"]) in seen:
+                    sys.exit("duplicate balance cell %s %s in %s (already from "
+                             "job %s)" % (key, r["path"], fn, seen[(key, r["path"])]))
+                seen[(key, r["path"])] = r["job"]
+                meas.setdefault(key, {})[r["path"]] = float(r["device_s_median"])
+                sm_of[key] = int(r["sm"])
     pred = {}
     for (mach, order, pct), sm in sorted(sm_of.items()):
         key = "%s@%dpct" % (mach, pct)
@@ -379,6 +390,13 @@ def main():
                          "balance axis's groups are already isolated, since a "
                          "machine's family error there comes from the other "
                          "machine's MPS sweep")
+    ap.add_argument("--bal-times", default=BAL_TIMES,
+                    help="comma-separated CSVs of balance-axis times (default: "
+                         "the two-machine sweep, analysis/subpipe_balance_times"
+                         ".csv).  The balance-matched job is in "
+                         "analysis/subpipe_balance_match.csv and is NOT part "
+                         "of the published 190-cell score; pass both to score "
+                         "the 41% column as well.")
     a = ap.parse_args()
     sp.USE_TABLE[0] = a.from_table
     sp.SHAPE_SRC[0] = a.shape
@@ -391,7 +409,7 @@ def main():
                     pool)
         cells += m
     if a.axis in ("balance", "both"):
-        b = balance_axis()
+        b = balance_axis(a.bal_times.split(","))
         report_axis(b, "balance axis (MPS SM fraction)")
         cells += b
     if a.axis == "both" and len(cells) > len(m):
