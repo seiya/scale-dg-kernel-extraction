@@ -139,18 +139,29 @@ for r in $(seq 1 "$ROUNDS"); do
         now=$(date +%s); [ $((now - T0)) -lt "$TIME_BUDGET" ] || { echo "TIME_BUDGET reached"; break 4; }
         tag="r${r}_p${p}_${pct}pct_${path#CUDAFORTRAN_}"
         conf="$OUTDIR/config/p${p}_${path#CUDAFORTRAN_}.conf"
-        # SM clock, memory clock, active throttle reasons, temperature and
-        # power just before the run.  The SM clock alone did not explain the
-        # 2026-09-15 evening A100 jobs (9624982 / 9624991), which ran p<=255
-        # 4-13% slower than every earlier job on two nodes at once while p=511
-        # and the SM clock were unchanged -- a memory-side state, if anything.
-        clk=$(nvidia-smi ${CUDA_VISIBLE_DEVICES:+-i "${CUDA_VISIBLE_DEVICES%%,*}"} \
-                --query-gpu=clocks.sm,clocks.mem,clocks_throttle_reasons.active,temperature.gpu,power.draw \
+        # SM clock, memory clock, active throttle reasons, temperature, power
+        # and the host's 1-minute load average just before the run.  The SM
+        # clock alone did not explain the 2026-09-15 evening A100 jobs
+        # (9624982 / 9624991 / 9625160), which ran p<=255 4-16% slower than
+        # every earlier job on two nodes at once while p=511 and the SM clock
+        # were unchanged.  UseCudaGraph is off in these namelists, so a host
+        # starved of CPU by a co-tenant on a shared node shows up as launch
+        # gaps inside the device-timed window, and short-kernel orders suffer
+        # first -- the load average is the cheap witness for that.
+        # clocks_throttle_reasons.* was renamed clocks_event_reasons.* in
+        # driver 535 (the old name is an alias again in newer drivers), so
+        # try both.
+        smi="nvidia-smi ${CUDA_VISIBLE_DEVICES:+-i ${CUDA_VISIBLE_DEVICES%%,*}}"
+        clk=$($smi --query-gpu=clocks.sm,clocks.mem,temperature.gpu,power.draw \
                 --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+        thr=$($smi --query-gpu=clocks_event_reasons.active --format=csv,noheader 2>/dev/null | head -1)
+        case "$thr" in 0x*) ;; *) thr=$($smi --query-gpu=clocks_throttle_reasons.active --format=csv,noheader 2>/dev/null | head -1);; esac
+        case "$thr" in 0x*) ;; *) thr=-;; esac
+        clk="${clk:--},${thr},load=$(cut -d' ' -f1 /proc/loadavg)"
         out=$(CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$pct timeout 900 "$EXE" "$conf" 2>&1)
         rc=$?
         printf '%s\n' "$out" > "$OUTDIR/logs/${tag}.log"
-        printf "%-40s rc=%-3s clk=%-28s dev=%-12s stage=%-12s main=%s\n" "$tag" "$rc" "${clk:--}" \
+        printf "%-40s rc=%-3s clk=%-40s dev=%-12s stage=%-12s main=%s\n" "$tag" "$rc" "${clk:--}" \
           "$(printf '%s\n' "$out" | awk '/CUDA device/{s+=$NF} END{if (s>0) printf "%.5E", s; else printf "-"}')" \
           "$(printf '%s\n' "$out" | awk '/Step loop per stage:/{print $NF}')" \
           "$(printf '%s\n' "$out" | awk '/Main per step:/{print $NF}')"
