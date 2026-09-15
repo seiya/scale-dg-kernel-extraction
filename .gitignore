@@ -50,6 +50,7 @@ advect3d/advect3d
 !/jobs/wisteria_subpipe_gaps.sh
 !/jobs/mps_balance.sh
 !/jobs/tsubame_mps_balance.sh
+!/jobs/rikyu_mps_balance.sh
 !/jobs/wisteria_mps_balance.sh
 !/jobs/mps_smid_probe.cu
 !/jobs/rikyu_mps_smid.sh

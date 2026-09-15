@@ -1,51 +1,33 @@
 #!/bin/bash
 #PJM -N dg_a100_mps_match
-#PJM -L rscgrp=share-debug
+#PJM -L rscgrp=share-short
 #PJM -L gpu=1
-#PJM -L elapse=0:30:00
+#PJM -L elapse=1:00:00
 #PJM -g CHANGE_ME
 #PJM -j
-# The one point reports/subpipe_transfer_model.md 5Z.7 needs: A100 at 41%,
-# which is 44 SMs = 25.06 DRAM bytes per SM-clock against GB200's 25.21 (-0.6%).
-# The balance sweep ran 40%, which the smid probe showed is 42 SMs = 26.25, i.e.
-# 4.1% leaner, so the matched-balance comparison has never been taken at the
-# matched balance.  p=511, the two paths of the main ratio, three rounds.
+#PJM -S
+# The matched-balance point of reports/subpipe_transfer_model.md 5Z, taken for
+# EVERY cell the balance sweep has, not just the one ratio.
+#
+# GB200 at 100% is 25.21 DRAM bytes per SM-clock.  The balance sweep
+# (jobs/wisteria_mps_balance.sh, TCS 9580356) ran A100 at 40%, which the smid
+# probe showed is 42 SMs = 26.25 B/SM-clk, 4.1% leaner than the balance it was
+# meant to match; the matched point is 41% = 44 SMs = 25.06 (-0.6%).  The
+# first version of this job (TCS 9580806) took 41% for p=511 and the two paths
+# of the main ratio only, so every other order and path of the "matched
+# balance" comparison was still standing on the 42-SM data.  This run takes
+# 41% for the sweep's full grid -- p=63/255/511, all six paths, three rounds --
+# with 40% interleaved in the same job so the 42-vs-44 SM difference is an
+# in-job A/B and not a comparison across two jobs.  The SM count granted at
+# each percentage is measured inside the job (smid.txt), never borrowed.
+#
+# Same body, same timers, same namelists as the sweep, so the 41% column drops
+# into analysis/subpipe_balance_times.csv beside the others.
+#   pjsub jobs/wisteria_mps_match.sh          (fill in -g first)
 set -u
-ROOT="${PJM_O_WORKDIR:-$PWD}"; cd "$ROOT" || exit 1
-OUT="a100_mps_match_${PJM_JOBID:-manual}"; mkdir -p "$OUT/config" "$OUT/logs" "$OUT/mps_pipe" "$OUT/mps_log"
-module load nvidia/25.9
-[ -x ./scale-dg_extraction ] || { echo "ERROR: build first" >&2; exit 1; }
-cp -p ./scale-dg_extraction "$OUT/scale-dg_extraction.frozen"
-EXE="$(cd "$OUT" && pwd)/scale-dg_extraction.frozen"
-export CUDA_MPS_PIPE_DIRECTORY="$(cd "$OUT" && pwd)/mps_pipe"
-export CUDA_MPS_LOG_DIRECTORY="$(cd "$OUT" && pwd)/mps_log"
-stop() { echo quit | nvidia-cuda-mps-control >/dev/null 2>&1; }
-trap stop EXIT TERM INT
-nvidia-cuda-mps-control -d || { echo "ERROR: no user MPS daemon here" >&2; exit 1; }
-sleep 2
-# Record the SM count this job actually gets, in this job, on this node: the
-# percentage-to-SM mapping is a machine property (TPC granularity, section
-# 5Z.7) and borrowing it from another job's measurement is exactly the kind of
-# cross-job assumption this study keeps catching itself making.
-nvcc -O3 -arch=sm_80 -o "$OUT/smid" jobs/mps_smid_probe.cu || exit 1
-for pct in 41 40; do
-  printf "smid pct=%-4s " "$pct"
-  CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$pct "$OUT/smid"
-done | tee "$OUT/smid.txt"
-for path in CUDAFORTRAN_FUSED_TC CUDAFORTRAN_GEMM_FUSED; do
-  sed -e "s/DqdtKernel_Type *= *\"[A-Z0-9_]*\"/DqdtKernel_Type = \"$path\"/" \
-      namelists/perf_p511_gemm.conf > "$OUT/config/${path#CUDAFORTRAN_}.conf"
-done
-for r in 1 2 3; do
-  for pct in 41 40; do
-    for path in CUDAFORTRAN_FUSED_TC CUDAFORTRAN_GEMM_FUSED; do
-      tag="r${r}_${pct}pct_${path#CUDAFORTRAN_}"
-      out=$(CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$pct timeout 900 "$EXE" \
-            "$OUT/config/${path#CUDAFORTRAN_}.conf" 2>&1); rc=$?
-      printf '%s\n' "$out" > "$OUT/logs/${tag}.log"
-      printf "%-36s rc=%-3s stage=%s\n" "$tag" "$rc" \
-        "$(printf '%s\n' "$out" | awk '/Step loop per stage:/{print $NF}')"
-    done
-  done
-done
-stop; echo ALL_DONE
+export SCALE_DG_ROOT="${PJM_O_WORKDIR:-$PWD}"
+export SCALE_DG_MODULES="nvidia/25.9" SCALE_DG_MODULE_PURGE=0
+export ORDERS="${ORDERS:-63 255 511}" PCTS="${PCTS:-41 40}" ROUNDS="${ROUNDS:-3}"
+export TIME_BUDGET="${TIME_BUDGET:-3000}"
+export OUTDIR="a100_mps_match_${PJM_JOBID:-manual}"
+exec bash "$SCALE_DG_ROOT/jobs/mps_balance.sh"

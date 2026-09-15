@@ -84,6 +84,21 @@ fi
 sleep 2
 echo get_server_list | nvidia-cuda-mps-control
 
+# Record the SM count each percentage actually grants, in this job, on this
+# node.  The percentage-to-SM mapping is a machine property with TPC (2 SM)
+# granularity that differs from the obvious floor on A100 (section 5Z.7), and
+# borrowing it from another job is the cross-job assumption that left the
+# "matched balance" point of 5Z.3 4.1% off the balance it claimed to match.
+if nvcc -O3 -arch=native -o "$OUTDIR/smid" jobs/mps_smid_probe.cu 2>/dev/null \
+   || nvcc -O3 -o "$OUTDIR/smid" jobs/mps_smid_probe.cu; then
+  for pct in $PCTS; do
+    printf "smid pct=%-4s " "$pct"
+    CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$pct "$OUTDIR/smid"
+  done | tee "$OUTDIR/smid.txt"
+else
+  echo "WARNING: smid probe did not build; SM counts must be taken from another job" | tee "$OUTDIR/smid.txt"
+fi
+
 {
   echo "date=$(date --iso-8601=seconds) job=$JOB_TAG host=$(hostname)"
   echo "commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
