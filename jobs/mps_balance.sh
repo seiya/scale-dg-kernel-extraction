@@ -116,17 +116,23 @@ for p in $ORDERS; do
   done
 done
 
-# Warm the GPU before the first measured run.  The first run of a job follows
-# a 10-12 s cold start (shared libraries, cuBLAS init) during which the GPU
-# idles, and on A100 the run that follows an idle of 2 s or more is slower by a
-# fixed 15-40 ms -- 12-19% of a p=63 run (reports/subpipe_transfer_model.md
-# 5AG.3.2c).  Three rounds' median discards one such run; a two-round sweep
-# cannot, which is how 9580356's 100% p=63 FUSED_TC / FUSED came out 2.7 / 5.7%
-# high.  One discarded run of the first configuration takes the cold start.
+# Warm up before the first measured run.  The first run of a job follows a
+# 10-12 s cold start (shared libraries, cuBLAS init), and on A100 the runs in
+# the first 10-15 s after that are slower by a fixed 5-20 ms each -- 3-15% of
+# a p=63 run (reports/subpipe_transfer_model.md 5AG.3.2c / 5AG.3.5): with a
+# single discarded run, TCS 9631289 still had its whole first p=63 round slow.
+# Three rounds' median discards one such round; a two-round sweep cannot,
+# which is how 9580356's 100% p=63 FUSED_TC / FUSED came out 2.7 / 5.7% high.
+# So run the first configuration, discarded, for at least WARMUP_S seconds.
 first_p=${ORDERS%% *}; first_path=${PATHS%% *}
-CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${PCTS%% *} timeout 900 "$EXE" \
-  "$OUTDIR/config/p${first_p}_${first_path#CUDAFORTRAN_}.conf" > "$OUTDIR/logs/warmup.log" 2>&1
-echo "warmup rc=$? (discarded)"
+w0=$(date +%s); n=0
+while :; do
+  CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${PCTS%% *} timeout 900 "$EXE" \
+    "$OUTDIR/config/p${first_p}_${first_path#CUDAFORTRAN_}.conf" > "$OUTDIR/logs/warmup.log" 2>&1
+  n=$((n + 1))
+  [ $(( $(date +%s) - w0 )) -ge "${WARMUP_S:-30}" ] && break
+done
+echo "warmup: $n runs of p${first_p} ${first_path#CUDAFORTRAN_} over $(( $(date +%s) - w0 )) s (discarded)"
 
 # Rounds outermost and percentage inside, so a drift in the machine hits every
 # percentage equally -- the same interleaving rule the path sweeps use.
