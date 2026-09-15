@@ -116,8 +116,22 @@ for p in $ORDERS; do
   done
 done
 
+# Warm the GPU before the first measured run.  The first run of a job follows
+# a 10-12 s cold start (shared libraries, cuBLAS init) during which the GPU
+# idles, and on A100 the run that follows an idle of 2 s or more is slower by a
+# fixed 15-40 ms -- 12-19% of a p=63 run (reports/subpipe_transfer_model.md
+# 5AG.3.2c).  Three rounds' median discards one such run; a two-round sweep
+# cannot, which is how 9580356's 100% p=63 FUSED_TC / FUSED came out 2.7 / 5.7%
+# high.  One discarded run of the first configuration takes the cold start.
+first_p=${ORDERS%% *}; first_path=${PATHS%% *}
+CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${PCTS%% *} timeout 900 "$EXE" \
+  "$OUTDIR/config/p${first_p}_${first_path#CUDAFORTRAN_}.conf" > "$OUTDIR/logs/warmup.log" 2>&1
+echo "warmup rc=$? (discarded)"
+
 # Rounds outermost and percentage inside, so a drift in the machine hits every
 # percentage equally -- the same interleaving rule the path sweeps use.
+# clk= is the SM clock nvidia-smi reports just before the run starts: the
+# direct check on whether a slow run started at the idle clock (5AG.3.2c).
 for r in $(seq 1 "$ROUNDS"); do
   for p in $ORDERS; do
     for pct in $PCTS; do
@@ -125,10 +139,12 @@ for r in $(seq 1 "$ROUNDS"); do
         now=$(date +%s); [ $((now - T0)) -lt "$TIME_BUDGET" ] || { echo "TIME_BUDGET reached"; break 4; }
         tag="r${r}_p${p}_${pct}pct_${path#CUDAFORTRAN_}"
         conf="$OUTDIR/config/p${p}_${path#CUDAFORTRAN_}.conf"
+        clk=$(nvidia-smi ${CUDA_VISIBLE_DEVICES:+-i "${CUDA_VISIBLE_DEVICES%%,*}"} \
+                --query-gpu=clocks.sm --format=csv,noheader,nounits 2>/dev/null | head -1)
         out=$(CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=$pct timeout 900 "$EXE" "$conf" 2>&1)
         rc=$?
         printf '%s\n' "$out" > "$OUTDIR/logs/${tag}.log"
-        printf "%-40s rc=%-3s dev=%-12s stage=%-12s main=%s\n" "$tag" "$rc" \
+        printf "%-40s rc=%-3s clk=%-5s dev=%-12s stage=%-12s main=%s\n" "$tag" "$rc" "${clk:--}" \
           "$(printf '%s\n' "$out" | awk '/CUDA device/{s+=$NF} END{if (s>0) printf "%.5E", s; else printf "-"}')" \
           "$(printf '%s\n' "$out" | awk '/Step loop per stage:/{print $NF}')" \
           "$(printf '%s\n' "$out" | awk '/Main per step:/{print $NF}')"

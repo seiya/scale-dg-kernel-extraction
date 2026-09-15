@@ -24,10 +24,13 @@
 # Same body, same timers, same namelists as the sweep, so the 41% column drops
 # into analysis/subpipe_balance_times.csv beside the others.
 #   pjsub jobs/wisteria_mps_match.sh          (fill in -g first)
+# The same body re-takes the sweep's 100% calibration point, whose p=63
+# FUSED_TC / FUSED rows in 9580356 are the cold-start cells of 5AG.3.4:
+#   pjsub -x TAG=full,PCTS=100,ROUNDS=5 jobs/wisteria_mps_match.sh
 set -u
 export SCALE_DG_ROOT="${PJM_O_WORKDIR:-$PWD}"
 export SCALE_DG_MODULES="nvidia/25.9" SCALE_DG_MODULE_PURGE=0
 export ORDERS="${ORDERS:-63 255 511}" PCTS="${PCTS:-41 40}" ROUNDS="${ROUNDS:-3}"
 export TIME_BUDGET="${TIME_BUDGET:-3000}"
-export OUTDIR="a100_mps_match_${PJM_JOBID:-manual}"
+export OUTDIR="a100_mps_${TAG:-match}_${PJM_JOBID:-manual}"
 exec bash "$SCALE_DG_ROOT/jobs/mps_balance.sh"
