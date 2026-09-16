@@ -35,6 +35,16 @@ module mod_cuda_dg_kernels
   !  finished by then.  cuda_dg_flush_kernel_time collects the last, still
   !  unread measurement at the end of the run.  The measured intervals are
   !  unchanged; only the moment they are read back is.
+  !
+  !  The one-call lag has a consequence for the measured window.  The time
+  !  loop resets the timers after the warm-up steps, and at that moment the
+  !  measurement of the last warm-up call is still pending; the first call of
+  !  the window would harvest it and add it to the reset sum.  Until 2026-09-16
+  !  it did (with the flush at the end, N measured stages summed N+1
+  !  intervals; the summaries divided by N and were high by (N+1)/N).
+  !  cuda_dg_reset_kernel_time now drops the pending measurement, so the sum
+  !  covers exactly the calls of the window, and dg_ev_nharvest counts the
+  !  measurements that went into it so that the report can print the divisor.
   integer, parameter :: DG_EV_SINGLE     = 1 ! 2 boundaries, 1 interval
   integer, parameter :: DG_EV_CUTE       = 2 ! 4 boundaries
   integer, parameter :: DG_EV_GEMM_FUSED = 3 ! 5 boundaries
@@ -76,6 +86,7 @@ module mod_cuda_dg_kernels
   integer, save :: ev_buf = 2         ! buffer the current call records into
   integer, save :: ev_pending = 0     ! buffer holding an unread measurement
   integer, save :: ev_pending_mode = 0
+  integer, save :: dg_ev_nharvest = 0 ! measurements read back since the reset
   real(RP), save :: dg_kernel_time(4) = 0.0_RP ! result of the last harvest
 
   !> .false. suppresses the event records entirely.  A graph replay does not
@@ -551,6 +562,8 @@ module mod_cuda_dg_kernels
   public :: cuda_dg_bind_acc_stream
   public :: cuda_dg_set_side_stream
   public :: cuda_dg_flush_kernel_time
+  public :: cuda_dg_reset_kernel_time
+  public :: cuda_dg_kernel_time_count
   public :: cuda_dg_set_event_timing
   public :: cuda_dg_graph_capture_begin
   public :: cuda_dg_graph_capture_end
@@ -1357,9 +1370,38 @@ contains
     end select
 
     ev_pending = 0
+    dg_ev_nharvest = dg_ev_nharvest + 1
 
     return
   end subroutine dg_ev_harvest
+
+  !> Start a measurement window: drop the still-unread measurement of the
+  !! previous call (a warm-up call when the time loop calls this) and restart
+  !! the count of harvested measurements.  Nothing is synchronized; the events
+  !! are simply recorded over on the next use of their buffer.
+  subroutine cuda_dg_reset_kernel_time()
+    implicit none
+    !------------------------------------------------------------
+
+    ev_pending = 0
+    dg_ev_nharvest = 0
+
+    return
+  end subroutine cuda_dg_reset_kernel_time
+
+  !> Number of device-time measurements read back since the last reset, i.e.
+  !! the number of tendency calls whose intervals the accumulated device time
+  !! covers.  After cuda_dg_flush_kernel_time it is the divisor that turns the
+  !! reported "CUDA device ..." sums into a per-call time.
+  function cuda_dg_kernel_time_count() result(n)
+    implicit none
+    integer :: n
+    !------------------------------------------------------------
+
+    n = dg_ev_nharvest
+
+    return
+  end function cuda_dg_kernel_time_count
 
   !> Read back the measurement of the last tendency call, which no later call
   !! harvested.  Call it once, after the time-stepping loop.

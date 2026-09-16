@@ -45,6 +45,8 @@ module mod_cuda_dg_kernels
   public :: cuda_cal_elembnd_flux
   public :: cuda_dg_bind_acc_stream
   public :: cuda_dg_flush_kernel_time
+  public :: cuda_dg_reset_kernel_time
+  public :: cuda_dg_kernel_time_count
   public :: cuda_dg_set_event_timing
   public :: cuda_dg_set_side_stream
   public :: cuda_dg_graph_capture_begin
@@ -81,6 +83,23 @@ contains
 
     return
   end subroutine cuda_dg_flush_kernel_time
+
+  !> No CUDA events are recorded in this build, so there is nothing to drop.
+  subroutine cuda_dg_reset_kernel_time()
+    implicit none
+
+    return
+  end subroutine cuda_dg_reset_kernel_time
+
+  !> No CUDA events are recorded in this build, so none were read back.
+  function cuda_dg_kernel_time_count() result(n)
+    implicit none
+    integer :: n
+
+    n = 0
+
+    return
+  end function cuda_dg_kernel_time_count
 
   !> No CUDA events are recorded in this build, so the switch does nothing.
   subroutine cuda_dg_set_event_timing(on)

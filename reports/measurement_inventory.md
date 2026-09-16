@@ -1863,6 +1863,14 @@ tendency 外の割合が違いうる）。
 
 ### 18.3 結果 —— 現行ツリーの全セル
 
+> **注記（2026-09-16、§30）: 下表の CUDA 経路の µs/stage は `CUDA device *`
+> ÷ (3 × steps) だが、旧バイナリの `CUDA device *` は (3 × steps + 1) 区間を
+> 積算していたので、値は (N+1)/N 倍に膨らんでいる（p=7/15/63/255 で +1.75%、
+> 31 で +0.17%、127 で +0.34%、511 で +1.85%、575 で +0.74%、767 で +3.03%、
+> 1023 で +4.76%。係数表は §30.4）。TFLOP/s と対 40.1 はそのぶん低く出る
+> （p=7 `FUSED_TC` 13.8% → 14.0%、p=255 `FUSED_TC` 73.7% → 75.0%）。
+> 経路間の比と順位は同一 conf なので不変。表は測定どおり残す。**
+
 | p | 経路 | ms/step | µs/stage | min–max | TFLOP/s | vs 40.1 | TB/s unique | vs 7.9 |
 |---:|---|---:|---:|---|---:|---:|---:|---:|
 | 7 | `SPLIT` | 2.563 | 763.3 | 762.1–764.3 | 1.84 | 4.6% | 2.07 | 26.2% |
@@ -4214,7 +4222,9 @@ binary を全 run に使った。timing / nsys / validation の raw と環境・
 である（`raw_results.txt` の `steps=23`）。一方 CUDA device 時間は
 delayed-event の harvest が 1 stage 遅れるぶん **70 stage** 分を積算する
 （`p767_gap_study.md` §15.5: device 系は ÷ (3·steps + 1) が正しい）。したがって
-Fig. 4(b) の µs/stage には +1/69 ＝ +1.45% の偏りが載っており、`nstep=100`
+Fig. 4(b) の µs/stage には +1/69 ＝ +1.45% の偏りが載っており（**2026-09-16
+に `summarize_fig4_uniform.py` の除数を直して CSV を再生成した。訂正値と
+機構は §30**）、`nstep=100`
 （計時 99 step ＝ 297 stage、偏り +1/297 ＝ +0.34%）の §18.3 と並べると
 期待差 +1.1%、実測 p=127 で約 +0.9% 高く出る（`GEMM_FUSED` 642.8 対 637.1、
 `FUSED_TC` 597.9 対 592.6 µs/stage）。
@@ -4297,3 +4307,125 @@ Ne=1（16,777,216 点）で4-stage fold-off も `3.55e-15` を確認した。
 p>=511 は1 field dump が数 GiB〜数十 GiBになるため今回の full-text
 dump は省略し、production/ablation の run rc=0 と既存の p=511 full-field validation
 を補助証拠として記録する。
+
+---
+
+## 30. CUDA device 時間の積算区間数は N ではなく N+1 だった —— 物差しの訂正と計測側の修正（2026-09-16、追加 Slurm なし）
+
+### 30.1 欠陥
+
+`CUDA device *` 行は、計時窓の N ＝ 3 × `Measured steps` 回のテンダンシー
+呼び出しに対して **N+1 区間**を積算していた。機構はコードで確定している:
+
+- `mod_cuda_dg_kernels.cuf` 冒頭「Device-time measurement」のとおり、イベント対
+  は 1 呼び出し遅れて読み戻す（`dg_ev_begin` が前回分を `dg_ev_harvest` する）。
+- `main.f90` は `istep == nwarmup + 1` で `advect3d_eq_reset_timers()` を呼んで
+  積算をゼロにするが、その時点で `ev_pending` にはウォームアップ最終呼び出しの
+  測定が残っている。計時窓の 1 回目の呼び出しがそれを harvest して積む。
+- `setup_advect3d_eq_finalize` の `cuda_dg_flush_kernel_time` が最後の呼び出し分
+  も積む（`e910708` 以降）。
+- 合計: ウォームアップ最終 1 区間 ＋ 窓の N 区間 ＝ **N+1**。`nwarmup = 0` の
+  ときだけ reset 時点で `ev_pending == 0` なので N のまま。committed namelist
+  はすべて `WarmupStep >= 1`（既定値 1）である。
+
+`advect3d_eq_reset_timers` の旧コメント「the number of accumulated measurements
+is right, the window is shifted by one call」は誤りだった（本数が 1 本多い）。
+`p767_gap_study.md` §15.5 が 5 点回帰で見つけた「CUDA イベント系は +1.00 stage」
+はまさにこの 1 区間で、そこで採った「割る数を ÷(3·steps+1) に直す」は正しい
+物差しだったが、`analysis/summarize_fig4_uniform.py` と §18.2 の物差し
+（÷ 3·steps）には反映されていなかった。
+
+### 30.2 直接検証（login node GB200、追加 Slurm なし）
+
+`fig4_uniform_20260914_109874/config/timing_p7_CUDAFORTRAN_GEMM_FUSED.conf`
+（`nstep=24`、`WarmupStep=1`、計時 23 step ＝ 69 stage）を、Slurm `109874` の
+凍結バイナリ（`cec10a6`、SHA256 `e0514e20…`）と本コミットのバイナリで 3 回ずつ
+交互に走らせた `CUDA device GEMM fused` の総和 [s]:
+
+| 回 | `cec10a6`（旧、70 区間） | 本コミット（69 区間） |
+|---:|---:|---:|
+| 1 | 0.102070 | 0.100536 |
+| 2 | 0.102030 | 0.100536 |
+| 3 | 0.102045 | 0.100557 |
+
+中央値比 0.102045 / 0.100536 ＝ **1.0150**、期待値 70/69 ＝ 1.0145（login node
+のノイズ +0.05%）。1 区間分の差がそのまま見える。
+
+### 30.3 計測側の修正（本コミット）
+
+- `cuda_dg_reset_kernel_time()`（`mod_cuda_dg_kernels.cuf`、スタブにも同名）:
+  pending の測定を捨て、harvest 数を 0 にする。`advect3d_eq_reset_timers` が
+  呼ぶ。同期は伴わない（イベントは次回のバッファ使用で上書きされる）。
+- `dg_ev_harvest` が読み戻した本数を数え、`setup_advect3d_eq_finalize` が
+  `CUDA device *` 行の直後に **`Device-time calls summed:`** として印字する。
+  ラベルに「CUDA device」を含めないのは、`jobs/tsubame_paths.sh` などが
+  `awk '/CUDA device/{s+=$NF}'` で総和を取るためである。
+- したがって **本コミット以降のバイナリでは `CUDA device *` ÷ `Device-time
+  calls summed` が per-call の device 時間であり、`Device-time calls summed`
+  ＝ 3 × `Measured steps`** になる（§30.2 の新バイナリ: 69）。
+  `WarmupStep = 0` でも同じ（72 で確認）。
+- **本コミットより前のバイナリのログは、この行が無いことで見分けられ、
+  `WarmupStep >= 1` なら ÷ (3·steps + 1)、`= 0` なら ÷ (3·steps) が正しい。**
+  `summarize_fig4_uniform.py` は各 round のログからこの規則で除数を決め、
+  CSV に `device_calls_summed` 列として書き出す。
+- 非 CUDA ビルド（`make ACC=1`）でスタブの同期を確認した。
+
+### 30.4 既存の表の読み方（表は書き換えない）
+
+**CUDA device 系の µs/stage はすべて (N+1)/N 倍に膨らんでいる。** N は
+各 (次数, conf) の計時 stage 数で、同一 job 内の経路比・fold on/off 比・
+順位・レンジ判定は N が共通なので**厳密に不変**。ncu の `gpu__time_duration`
+や nsys の周期に基づく値、`Step loop` / `Main` は影響を受けない。
+動くのは絶対値と、それを 40.1 TFLOP/s で割った効率だけである。
+
+§18.3（`namelists/perf_p{p}_gemm.conf` の `nstep` / `WarmupStep`）の係数:
+
+| p | 計時 stage N | 係数 (N+1)/N | 表の µs/stage の膨らみ |
+|---:|---:|---:|---:|
+| 7 / 15 / 63 / 255 | 57 | 1.01754 | +1.75% |
+| 31 | 597 | 1.00168 | +0.17% |
+| 127 | 297 | 1.00337 | +0.34% |
+| 511 | 54 | 1.01852 | +1.85% |
+| 575 | 135 | 1.00741 | +0.74% |
+| 767 | 33 | 1.03030 | +3.03% |
+| 1023 | 21 | 1.04762 | +4.76% |
+
+例: §18.3 の p=7 `FUSED_TC` 253.8 µs/stage → 249.4、対 40.1 TF は
+13.8% → **14.0%**; p=255 `FUSED_TC` 883.7 → 868.5、73.7% → **75.0%**。
+`p255_gap_study.md` §29.2 の 940.3 / 880.5（N=57）も同じ +1.75%。
+
+**p=1023 の「device > Step loop」（`p1023_gap_study.md` §15、§12.6）は
+区間数が N+1 であることだけで全額説明される。** 21 stage 197.22 ms/stage と
+63 stage 191.22 ms/stage を「N·s + e」で解くと定常 s ＝ 188.22 ms/stage、
+余分な 1 区間 e ＝ **189.0 ms（定常の 1.004 倍）**。§15 が書いた「混入した
+1 本が約 377.2 ms（2.0 倍）」は「N 区間のうち 1 本が入れ替わる」という誤った
+模型で解いた値であり、**約 2 倍の汚染区間は存在しない**。device/stage 比は
+1.020 → 0.974（188.22 / 193.10）になり、device < 壁時計に戻る。
+
+### 30.5 Fig. 4 の CSV（§29 の再生成）
+
+除数を直した `summarize_fig4_uniform.py` で §29 と同じコマンドを再実行した。
+入力 raw は不変（Slurm `109874` / `110017`、凍結バイナリ `cec10a6`）。
+
+Fig. 4(b)（`fig4b_uniform.csv`、中央値、10 round）:
+
+| p | 除数 | `GEMM_FUSED` µs/stage | `FUSED_TC` µs/stage | `GEMM_FUSED` [%] | `FUSED_TC` [%] | lead [pt] |
+|---:|---:|---:|---:|---:|---:|---:|
+| 7 | 70 | 1455.5 | 249.3 | 2.4072 | 14.0263 | +11.6453 |
+| 15 | 70 | 586.8 | 268.5 | 8.8304 | 19.3296 | +10.4721 |
+| 31 | 70 | 544.2 | 355.3 | 16.6009 | 25.4325 | +8.8273 |
+| 63 | 70 | 550.7 | 401.4 | 30.8406 | 42.3727 | +11.4742 |
+| 127 | 70 | 633.7 | 589.3 | 52.0728 | 55.9155 | +3.9213 |
+| 255 | 70 | 925.9 | 867.9 | 70.3116 | 75.0347 | +4.6995 |
+| 511 | 67 | 12199.4 | 12870.0 | 84.8337 | 80.4121 | −4.4205 |
+
+§29 の表に対して効率は一律 ×(N+1)/N（p≤255 で 70/69、p=511 は `steps=22`
+なので 67/66）、lead も同じ係数（+11.48 → +11.65、+4.63 → +4.70、
+−4.35 → −4.42 pt）。符号も crossover（Nq=256 と 512 の間）も動かない。
+
+Fig. 4(a)（`fig4a_uniform.csv`）: 動くのは `fold_on_*` / `fold_off_*` の
+絶対値だけ（除数 70 / 70 / 67 / 58 / 61 / 64、p=127…1023）。
+`fold_gain_percent` 6 値（32.38756 / 25.19766 / 14.09138 / 12.18865 /
+9.53275 / 5.55512）と nsys 由来の全列は不変（差は 1e-14 の丸めのみ）。
+新しい CSV の SHA256 は本コミットのコミットメッセージに記す
+（`fig4a` `e05fcca4…`、`fig4b` `e9a85d5e…`）。

@@ -445,6 +445,10 @@ p=7…255 は同一体積 DOF（`NeX*Nq = 256`、16,777,216 点）。p≥511 は
 **µs/stage のタイマー**: CUDA 経路は実行ファイルの `CUDA device *`（SPLIT は
 4 本の device 時間 + `Element boundary flux`）。OpenACC は
 `Volume derivate + surface lift` + `Element boundary flux`。
+（2026-09-16 注: 2026-09-16 より前のバイナリの `CUDA device *` は
+3·steps + 1 区間の和なので、÷ 3·steps の表は (N+1)/N 倍膨らんでいる。
+以降のバイナリは `Device-time calls summed:` を印字し、÷ その値が正しい。
+[`measurement_inventory.md`](measurement_inventory.md) §30。）
 以前の表の一部は `Cal_tend`（launch 込み）だったので、同じカーネルでも
 数 %〜十数 % 遅めに出ていた。FLOP/s と TB/s はすべてこの µs/stage で割る。
 Main ms/step は `Main per step:`（RK 更新と halo を含む）。
@@ -1683,6 +1687,17 @@ SM 2062 MHz 固定、900 W / 上限 1200 W、56 °C、throttle 0x0）。
 
 - **タイマ本体は直さない**（2026-09-01 の判断）。直すと過去の全次数・全レポートの
   per-stage と基準が 1 stage 分ずれ、並行して走っている測定ともぶつかる。
+  > **2026-09-16 に撤回し、CUDA イベント系だけ直した**
+  > （[`measurement_inventory.md`](measurement_inventory.md) §30）。
+  > +1 stage の正体は「計時窓の N 呼び出しに対して N+1 区間を積算する」こと
+  > （リセット時点で pending だったウォームアップ最終呼び出しの測定を、窓の
+  > 1 回目が harvest して積む）で、リセット時にそれを捨てるようにした。
+  > 本コミット以降のバイナリは `CUDA device *` の直後に
+  > `Device-time calls summed:`（＝ 3·steps）を印字し、÷ その値が正しい。
+  > **この行が無いログ（旧バイナリ）は従来どおり ÷ (3·steps + 1)**。
+  > 既存の表は書き換えない: 各表の CUDA device 系 µs/stage は (N+1)/N 倍
+  > （§18.3 の conf で +0.17〜+4.76%）膨らんだまま残し、§30.4 に係数表を置いた。
+  > ホスト時計系（`Cal_tend` の −1 stage）は触っていない。
 - `Cal_tend` の傾きは `Main`/3 と一致する。つまり **RK 更新などタイマ区間の外で
   enqueue された仕事も含んでおり**、「テンダンシーだけの device 時間」ではない。
   テンダンシーだけが要るなら `CUDA device GEMM fused` ÷ (3·steps + 1) を使う。

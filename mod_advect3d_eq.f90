@@ -28,7 +28,8 @@ module mod_advect3d_eq
     cuda_ozaki1_slice_stats_print, &
     cuda_gemm_setup, cuda_cutlass_set_mma_shape, cuda_gemm_finalize, &
     cuda_cal_elembnd_flux, cuda_dg_bind_acc_stream, &
-    cuda_dg_flush_kernel_time, cuda_dg_set_event_timing, &
+    cuda_dg_flush_kernel_time, cuda_dg_reset_kernel_time, &
+    cuda_dg_kernel_time_count, cuda_dg_set_event_timing, &
     cuda_dg_set_side_stream, &
     cuda_dg_graph_capture_begin, cuda_dg_graph_capture_end, &
     cuda_dg_graph_launch, cuda_dg_graph_is_ready, cuda_dg_graph_finalize
@@ -451,9 +452,12 @@ contains
   !!
   !! Called by the time loop once the warm-up steps are over, so that the
   !! report covers the measured steps only.  The CUDA device time of a call is
-  !! read back on the following call, so the first device time accumulated
-  !! after a reset is still the one of the last warm-up call: the number of
-  !! accumulated measurements is right, the window is shifted by one call.
+  !! read back on the following call, so at this point the measurement of the
+  !! last warm-up call is still pending.  It is dropped here: otherwise the
+  !! first call of the window would add it to the sum, and with the flush in
+  !! setup_advect3d_eq_finalize the sum over N measured calls would cover N+1
+  !! intervals (which it did until 2026-09-16; the count printed next to the
+  !! "CUDA device ..." lines is what makes the two cases distinguishable).
 !OCL SERIAL
   subroutine advect3d_eq_reset_timers()
     implicit none
@@ -465,6 +469,7 @@ contains
     call Timer_reset(timer_volume_deriv)
     call Timer_reset(timer_surface_lift)
     call Timer_reset(timer_dqdt_assemble)
+    call cuda_dg_reset_kernel_time()
 
     return
   end subroutine advect3d_eq_reset_timers
@@ -605,6 +610,13 @@ contains
         write(*,'(A30,ES24.5)') "  Tensor-product derivative:", Timer_elapsed(timer_volume_deriv)
         write(*,'(A30,ES24.5)') "  Surface lift:", Timer_elapsed(timer_surface_lift)
         write(*,'(A30,ES24.5)') "  Dqdt assembly:", Timer_elapsed(timer_dqdt_assemble)
+      end if
+      if (dqdt_kernel_typeid /= DQDT_KERNEL_OPENACC_SPLIT) then
+        !- The number of tendency calls the "CUDA device ..." sums cover.  A
+        !  report without this line (before 2026-09-16) summed one call more
+        !  than the measured stages.  The label must not contain "CUDA device"
+        !  so that scripts summing those lines do not add the count.
+        write(*,'(A30,I24)') "  Device-time calls summed:", cuda_dg_kernel_time_count()
       end if
       if (allocated(volume_flux_x)) then
         !$acc exit data delete(volume_flux_x,volume_flux_y,volume_flux_z)
