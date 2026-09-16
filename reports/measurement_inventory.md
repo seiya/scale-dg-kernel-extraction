@@ -4209,12 +4209,24 @@ binary を全 run に使った。timing / nsys / validation の raw と環境・
 から `DqdtKernel_Type` を差し替えるのと同時に **`nstep` を全次数・全 section
 （timing / nsys / fold）で一律 24 に書き換えて**いる（committed 値は p=127 で
 100、p=7 / 511 で 20、p=1023 で 10）。`Ne` / `PolyOrder` / `dt` / `WarmupStep`
-は無変更。したがって Fig. 4(b) の device 時間は 72 stage（＝計時 23 step × 3 ＋
-delayed-event の +1 stage 偏り）を分母にしており、`nstep=100` の §18.3 と
-並べると p ≤ 255 で約 +0.9% 高く出る（p=127 `GEMM_FUSED` 642.8 対 637.1、
-`FUSED_TC` 597.9 対 592.6 µs/stage。偏りの相対量が 1/72 対 1/300 で違うぶん）。
-同一 job 内の 2 経路には同じ偏りが載るので lead には効かない。**絶対効率（%）
-を §18.3 と混ぜて引用しないこと。**
+は無変更。`WarmupStep=1` なので走るのは 24 step ＝ 72 stage、計時されるのは
+23 step ＝ **69 stage** で、`summarize_fig4_uniform.py` の分母も `3 × steps` ＝ 69
+である（`raw_results.txt` の `steps=23`）。一方 CUDA device 時間は
+delayed-event の harvest が 1 stage 遅れるぶん **70 stage** 分を積算する
+（`p767_gap_study.md` §15.5: device 系は ÷ (3·steps + 1) が正しい）。したがって
+Fig. 4(b) の µs/stage には +1/69 ＝ +1.45% の偏りが載っており、`nstep=100`
+（計時 99 step ＝ 297 stage、偏り +1/297 ＝ +0.34%）の §18.3 と並べると
+期待差 +1.1%、実測 p=127 で約 +0.9% 高く出る（`GEMM_FUSED` 642.8 対 637.1、
+`FUSED_TC` 597.9 対 592.6 µs/stage）。
+（2026-09-16 訂正: 当初「72 stage（＝計時 23 step × 3 ＋ delayed-event の +1
+stage 偏り）」「1/72 対 1/300」と書いていたが、23 × 3 ＋ 1 は 70 であり、72 は
+warm-up 込みの全実行の stage 数、69 が集計の分母、70 が device 計時の相当量、
+偏りは 1/69 対 1/297 である。CSV の値は変わらない。）
+同一 job 内の 2 経路には同じ偏り係数 70/69 が掛かるので、**時間比と順位には
+効かない**。ただし効率（%）と lead（pt）はどちらもその係数ぶん小さく出る:
+偏りを外すと下表の lead は 70/69 倍（+11.48 → +11.65、−4.35 → −4.42 pt）に
+なり、符号と crossover の位置は動かない。**絶対効率（%）を §18.3 と混ぜて
+引用しないこと。**
 
 Fig. 4(a) circles は各 trace の warm-up 3 stage を除き、69 volume launches / 68
 start-to-start periods を同じ規則で使った。**`volume_flux` の時間は 69 launch

@@ -142,11 +142,18 @@ def isolated_pools():
     return out
 
 
-def balance_axis(files=None):
+def balance_axis(files=None, jobs=None):
     meas, sm_of, seen = {}, {}, {}
     for fn in files or [BAL_TIMES]:
         with open(fn) as fh:
             for r in csv.DictReader(fh):
+                # subpipe_balance_match.csv holds several jobs of the same
+                # cells (the 44 SM point was re-run three times, and 100% was
+                # re-measured after it, report section 5AG.3.2b/3.2c/3.5), so
+                # it can only be scored one job at a time: --bal-jobs picks
+                # which.  Without the filter the duplicate check below stops.
+                if jobs and r["job"] not in jobs:
+                    continue
                 key = (r["machine"], int(r["order"]), int(r["pct"]))
                 # One measurement per cell.  A second job at the same
                 # (machine, order, pct, path) -- the 2026-09-15 match job
@@ -397,6 +404,12 @@ def main():
                          "analysis/subpipe_balance_match.csv and is NOT part "
                          "of the published 190-cell score; pass both to score "
                          "the 41%% column as well.")
+    ap.add_argument("--bal-jobs", default="",
+                    help="comma-separated job ids to keep from the balance "
+                         "CSVs; rows of any other job are ignored.  Needed "
+                         "with analysis/subpipe_balance_match.csv, which "
+                         "holds the same cells from several jobs and is "
+                         "otherwise refused as duplicate (section 5AG.3.3)")
     a = ap.parse_args()
     sp.USE_TABLE[0] = a.from_table
     sp.SHAPE_SRC[0] = a.shape
@@ -409,7 +422,8 @@ def main():
                     pool)
         cells += m
     if a.axis in ("balance", "both"):
-        b = balance_axis(a.bal_times.split(","))
+        b = balance_axis(a.bal_times.split(","),
+                         set(a.bal_jobs.split(",")) - {""})
         report_axis(b, "balance axis (MPS SM fraction)")
         cells += b
     if a.axis == "both" and len(cells) > len(m):
