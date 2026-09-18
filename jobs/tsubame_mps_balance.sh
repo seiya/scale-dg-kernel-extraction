@@ -10,7 +10,7 @@
 # Overrides colon-separated: -v PCTS=100:50:36, ORDERS=63:511
 set -u
 export SCALE_DG_ROOT="${SGE_O_WORKDIR:-$PWD}"
-export SCALE_DG_MODULES="nvhpc"
+export SCALE_DG_MODULES="nvhpc/26.1_cuda13.1"
 export ORDERS="${ORDERS:-63 255 511}" ROUNDS="${ROUNDS:-2}" TIME_BUDGET="${TIME_BUDGET:-5400}"
 export OUTDIR="h100_mps_balance_${JOB_ID:-manual}"
 exec bash "$SCALE_DG_ROOT/jobs/mps_balance.sh"

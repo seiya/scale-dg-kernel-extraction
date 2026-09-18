@@ -29,10 +29,25 @@
 #
 # Build on TSUBAME before submitting (cc90 / sm_90):
 #   module purge
-#   module load nvhpc
+#   module load nvhpc/26.1_cuda13.1
 #   make clean
 #   make CUDA=1 GPUFLAGS=-gpu=cc90 GPUNVCCFLAGS=-arch=sm_90
 #   qsub -g <TSUBAME_GROUP> jobs/tsubame_paths.sh
+#
+# The TSUBAME modulefile is nvhpc/26.1_cuda13.1 (the H100 toolchain of
+# reports/h100_report.md); there is no nvhpc/26.1.  Under SGE this script
+# loads that name by default, so that the run does not depend on which
+# version the site marks as `nvhpc`'s default.
+#
+# Watch the node the job lands on.  SGE 8703634 (2026-09-18) was satisfied on
+# r6n3 as `gg_mig=2(...)`, i.e. a node in MIG mode handing out two MIG
+# instances for one gpu_1: the measured stage times were correct (full-GPU
+# numbers, -0.3% against 8567869) but every process took about three minutes
+# to start, which puts the 390-run sweep far outside h_rt.  On r15n6 the same
+# binary started in 1.3 s (14 s cold).  After submitting, check
+#   qstat -j <id> | grep -i "granted_req\|exec_host"
+# and if `gg_mig` appears, qdel and resubmit with -l 'h=!<node>' (quote it:
+# bash history expansion eats the `!`).
 #
 # Submit FROM the checkout: the job writes its output tree into the working
 # copy and finds it through SGE_O_WORKDIR.  From anywhere else, name it:
@@ -98,11 +113,15 @@ fi
 cd "$ROOT" || exit 1
 echo "root=$ROOT"
 
-# The module names differ per machine (TSUBAME/RIKYU: nvhpc; Wisteria
-# Aquarius: nvidia/<version>, which conflicts with the gcc/* modules and so
-# must be loaded alone).  Defaults keep TSUBAME and RIKYU
-# exactly as they were.
-readonly MODULES=${SCALE_DG_MODULES:-nvhpc}
+# The module names differ per machine (TSUBAME: nvhpc/26.1_cuda13.1, pinned
+# below whenever SGE is the scheduler; RIKYU: nvhpc; Wisteria Aquarius:
+# nvidia/<version>, which conflicts with the gcc/* modules and so must be
+# loaded alone).  SCALE_DG_MODULES overrides the default on any machine.
+if [ -n "${SGE_O_WORKDIR:-}" ]; then
+  readonly MODULES=${SCALE_DG_MODULES:-nvhpc/26.1_cuda13.1}
+else
+  readonly MODULES=${SCALE_DG_MODULES:-nvhpc}
+fi
 readonly MODULE_PURGE=${SCALE_DG_MODULE_PURGE:-1}
 # Some sites load a compiler by default and its modulefile conflicts with the
 # one wanted here, so `module load` alone silently keeps the wrong runtime.
