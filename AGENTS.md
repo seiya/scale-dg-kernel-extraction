@@ -313,10 +313,21 @@ before any CUDA build; without it `cutlass/cutlass.h` is missing. A `git
 worktree` does not get submodules from the main checkout either -- run the
 same command in the worktree, or symlink `third_party` to the main one.
 
-Module names differ per machine. RIKYU and TSUBAME use `nvhpc`; on
-Wisteria/BDEC-01 Aquarius the module is `nvidia/<version>` and it conflicts
-with the `gcc/*` modules, so do not try to load both (see
+Module names differ per machine. RIKYU uses `nvhpc`; TSUBAME 4 has no
+unversioned `nvhpc/26.1`, the H100 toolchain is `nvhpc/26.1_cuda13.1` (the
+site's `nvhpc` default resolves to it today, and `jobs/tsubame_paths.sh` pins
+it under SGE); on Wisteria/BDEC-01 Aquarius the module is `nvidia/<version>`
+and it conflicts with the `gcc/*` modules, so do not try to load both (see
 `reports/a100_prediction.md` section 8.1).
+
+On TSUBAME, also check the node a `gpu_1` job landed on before trusting its
+numbers: `qstat -j <id> | grep granted_req` showing `gg_mig` means a node in
+MIG mode (correct stage times, but minutes of start-up per process), and a
+node can run the same binary 7-20% slower on every compute-bound cell with
+the bandwidth-bound cells unchanged (r16n4, 2026-09-18). The first
+`r01 p127 CUDAFORTRAN_FUSED_TC` stage of a base sweep should be about
+1.21 ms; if not, drop the job and resubmit with `-l 'h=!<node>'`
+(`reports/measurement_inventory.md` §32-§33).
 
 The same module load is required inside Slurm profiling jobs before running
 NVIDIA profiling tools. Do not assume that a module loaded in the login shell

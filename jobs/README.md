@@ -23,7 +23,7 @@ machine is a new wrapper and no edit to the body:
 
 | variable | default (TSUBAME / RIKYU) | Wisteria |
 |---|---|---|
-| `SCALE_DG_MODULES` | `nvhpc` | `nvidia/<version>` |
+| `SCALE_DG_MODULES` | `nvhpc` (RIKYU); `nvhpc/26.1_cuda13.1` when SGE is the scheduler (TSUBAME; there is no `nvhpc/26.1`) | `nvidia/<version>` |
 | `SCALE_DG_MODULE_PURGE` | `1` | `0` |
 | `SCALE_DG_MACHINE` | `h100` | `a100` |
 | `SCALE_DG_PEAK_FP64_CUDA` / `_TENSOR` / `_HBM` | 33.5 / 66.9 / 2.39587 | 9.7 / 19.5 / 1.555 |
