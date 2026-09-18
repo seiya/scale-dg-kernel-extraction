@@ -197,6 +197,15 @@ readonly EXE
   echo "gpu:"
   nvidia-smi --query-gpu=name,uuid,driver_version,compute_cap,memory.total,clocks.max.sm \
     --format=csv,noheader
+  # Clock and power state of the GPU the job got.  SGE 8706653 (r16n4,
+  # 2026-09-18) ran every compute-bound cell 7-20% slower than the same binary
+  # on r6n3 and r13n10 with the bandwidth-bound cells unchanged, i.e. a lower
+  # SM clock, and nothing in this file said so.  These are the fields that
+  # would have: the applications clock, the power limit against its maximum,
+  # and the throttle reasons active at job start.
+  echo "gpu_clocks_power:"
+  nvidia-smi --query-gpu=clocks.applications.graphics,clocks.applications.memory,clocks.sm,clocks.mem,power.limit,power.max_limit,power.default_limit,temperature.gpu,clocks_event_reasons.active,ecc.mode.current \
+    --format=csv 2>&1
   echo
   echo "nvfortran_version:"; nvfortran --version 2>&1 | head -n 4
   echo
