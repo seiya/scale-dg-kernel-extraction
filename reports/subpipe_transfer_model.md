@@ -52,6 +52,7 @@ H100 の時間を一切使わずに H100 を 1% で当てるモデルを立て�
 | **順位を当てられる条件**（機械軸 155 ＋ バランス軸 190 ＝ **345 セル**） | **予測した差が族誤差の 1.1 倍を超えるセルは、機械軸 118 中 112（94.9%）・バランス軸 162 中 152（93.8%）。2 軸は 1.1 pt で一致する**（下回る側は 62.2% / 67.9%）。**バランス軸の 4 件の外れは同一 (マシン, 次数, レシオ) の MPS 4 水準で、独立なセルではない**（§5AC.1） | **§5AC**（2026-09-12 に採点器の 4 件の欠陥を直した。同日 `(GB200, 767, GEMM_CUTE)` が入って機械軸が 151 → 155 セルになり、114 中 108 ＝ 94.7% は 118 中 112 ＝ 94.9% に動いた。§5AD.8d。修正前の 111/114 ＝ 97.4% と 145/149 ＝ 97.3% は §5AA.2 / §5AB.1 の記録として残す。§5Y.3 / §5Z.10 の「265/265」は対象機の実測を使う判定で、100% は定義の帰結。§5AA.1） |
 | 同、**経路全体の比だけで採点**（台帳が一致するセルのみ） | **機械軸 104 中 98（94.2%）**、バランス軸は 162 中 152（93.8%、全セルが台帳一致）。機械軸 155 セルのうち **18 は共通部分の比**で、全部 p = 7 / 15（そこでは 15 中 13） | **§5AD.2 / §5AD.4**（§5AD.4 の 99 中 95 ＝ 96.0% は 151 セル時点の記録。2026-09-15 に現行の 155 セル出力へ更新） |
 | 同、**族誤差を対象機から完全に隔離**（他 2 台の単一機較正を分母に） | 機械軸 全セル 115 中 108（**93.9%**）、台帳一致 99 中 94（**94.9%**）。**隔離は分母を 1.21 倍に膨らませる別構成なので、利点ではなく制約** | **§5AD.3**（同節の 111 中 105 / 95 中 91 は 151 セル時点の記録。2026-09-15 に 155 セル出力へ更新） |
+| 同、**原稿の閾値 `t` = 1.0**（隔離、台帳一致 `sn_led` / バランス `sn`） | 機械軸 **102 中 96（94.1%）**、バランス軸 **167 中 156（93.4%）**、合計 269 中 252。非隔離分母では機械軸 105 中 99。閾値超えで幅の無いセルは `t` = 1.1 と同じ 31 件（全て的中）。**`CAP_L2_B` = 64 のときの数**で、L2 容量は名目値（32〜∞ で 94.1〜94.6% / 92.1〜94.4%） | **§5AH**（2026-09-18） |
 | **交差の位置の予測** | A100 のバランスを絞った 6 点を **1.4% 以内**で当て、1 をまたぐ位置（75–50%）も当てる | §5Z.10 |
 | 実測の再現幅 | 経路合計 0.09%（最大 1.05%）、比 0.09%（最大 1.30%）＝ モデル誤差の 2 桁下 | §5Y.2 |
 | **本番形での順位**（H100 を `16x8x4` で） | **7 次数とも符号的中。形状が順位を裏返す p=511 も当てる**（`GEMM_CUTE@16x8x4` の p=511 も。ただし絶対値は −10〜−25% で、どちらも `S/N < 1`。`0db88f3`〜`51a705e` では既定が形状を無視する回帰があり再現しなかった） | §5X, **§5AD.1** |
@@ -224,6 +225,10 @@ shared は 44–53%、p=63 `GEMM_FUSED` scaleadd は dram 62% が屋根である
 - `D_dram(k,m) = B_dram(k) / (HBM per SM-cycle of m)`
 - `D_l1(k,m) = D_l1(k, ref) * L1cap(ref)/L1cap(m)`
 - 他は機械不変（3 機とも 4 issue slot / SM-clk、ALU / FMA / LSU 波面は同率）
+  （**2026-09-18 注記、§5AH.3**: issue 4 / ALU 2 / LSU 波面 1 は `ncu` の peak
+  定義で 3 機一致を確認した。FMA 4 は A100 では 2 だが律速にならず不活性。
+  L2 の 64 B/SM-clk は出所の無い名目値で、`ncu` の implied peak は 3 機で
+  違う。感度は §5AH.3 の表）
 - `eta(k) = (measured cycles) / max_r D_r` は較正機で測った屋根到達率で、
   カーネル側の量として持ち越す。低占有率（12–18%）で露出するレイテンシを
   ここが吸っている。**1 カーネルにつきパラメータ 1 個、機種には依存しない。**
@@ -5328,6 +5333,8 @@ GB200 の本ジョブ（`106648`）の間で比べると、**中央値 0.25% / �
   そこが 3 機で唯一の「決まらない」セルを出した）ので、GB200 と H100 の
   p=127 は同じ性質を持つかどうか分かっていない。p=63 / p=511 の欠けは
   `FUSED` / `FUSED_DFMA` を含む比で、高次の反復ジョブが 4 経路だったため。
+  **2026-09-18 追記（§5AH.1b）: 原稿の閾値 1.0 でも 269 中 31、内訳・的中は
+  同じ**（1.0〜1.1 で入る機械軸 3 件はすべて幅つき）。
   **これら 31 件はすべて「的中」である**（外れは 15 件とも幅つき）ので、
   §5AE の結論は変わらないが、**幅で裏を取れているのは閾値超え 261 件中
   230 件**である。
@@ -6049,6 +6056,205 @@ Fig. 9 / `sn_cells.csv` の 190 セルは**動かない**（`subpipe_balance_tim
 判断で、入れるなら `--bal-times` の両ファイル指定ではなく（重複で止まる）
 `analysis/subpipe_balance_match.csv` 単独に `--bal-jobs <job>` を付けた
 `--dump-cells` から 41% の行を取る（§5AG.3.3 の 2026-09-16 追記）。
+
+---
+
+## 5AH. 原稿の閾値 1.0 への切り替えに伴う補助数値、per-kernel カウンタ表の公開形、容量の出所（2026-09-18、GPU 実行なし）
+
+原稿側が主判定を `S/N ≥ 1.1` から `S/N ≥ 1.0` に切り替えた（`sn_led` 列、
+§5AE.0 の規約）ことに伴い、原稿側で再計算できない 2 つの補助数値を
+`analysis/subpipe_rank_audit.py` から出し直した。同時に、査読者対策として
+モデル入力の per-kernel カウンタを machine-readable で配布する形を作り、
+§4 が「機械不変」と置いた容量の出所を 1 つずつ点検した。
+**追加測定は無い。** 配布 `sn_cells.csv` は現行ツリーでバイト一致
+（`--famerr isolated --dump-cells`、345 セル）を確認した上で使っている。
+
+### 5AH.1 閾値 1.0 の補助数値
+
+**(a) 非隔離分母（`--famerr loo-group`）の機械軸、台帳一致セル（137 セル母集団）**:
+
+| `t` | 隔離分母（`--famerr isolated`、原稿の規約） | 非隔離分母（`--famerr loo-group`） |
+|---|---|---|
+| 1.1 | **94/99 ＝ 94.9%**（§5AD.3） | **98/104 ＝ 94.2%**（§5AD.2） |
+| **1.0** | **96/102 ＝ 94.1%**（閾値未満 23/35） | **99/105 ＝ 94.3%**（閾値未満 20/32） |
+
+全 155 セル（台帳不一致を含む `sn` 列）では非隔離 `t` = 1.0 が 113/120 ＝ 94.2%
+（`t` = 1.1 は 112/118）、隔離が 110/118 ＝ 93.2%（108/115）。バランス軸は分母の
+規約に依らず `t` = 1.0 で **156/167 ＝ 93.4%**（閾値未満 15/23）、両軸合計
+（隔離、台帳一致）**252/269 ＝ 93.7%**。
+
+`t` を 1.1 から 1.0 に下げて入るセルは 8 件で、内訳は:
+
+| 軸 | セル | `S/N` | 的中 | 幅 |
+|---|---|---:|---|---|
+| 機械 | GB200 p=31 `GEMM_CUTE/GEMM` | 1.0875 | ✗ | 0.924%（`106648`、差 2.58%、§5AE.2） |
+| 機械 | A100 p=511 `GEMM_FUSED/FUSED_TC` | 1.0367 | ✓ | `9592752`（§5Y.2 の A100 高次） |
+| 機械 | H100 p=31 `FUSED/FUSED_TC` | 1.0029 | ✓ | `8650141`（§5AE.3） |
+| バランス | GB200 p=255 `GEMM/FUSED_TC` × MPS 4 水準 | 1.0971 | ✓ ×4 | MPS 掃引の反復（§5AE.1） |
+| バランス | GB200 p=511 `GEMM_CUTE/GEMM` | 1.0662 | ✗ | 同上 |
+
+機械軸 +2 的中 / +1 外れ、バランス軸 +4 / +1 で、94/99 → 96/102、
+152/162 → 156/167 になる。
+
+**(b) 幅なしセル**。定義は §5AE.7 のとおり: 閾値以上のセルのうち、その
+(機械, 次数) の repeat ジョブ（§5Y.2 / §5AE.2〜5AE.5、ラウンド ≥ 2）が比の
+**両方の経路**を覆っていないもの。repeat ジョブの被覆は
+
+| 機械 | 6 経路（`FUSED` / `FUSED_DFMA` 含む） | 4 経路（`GEMM` / `GEMM_CUTE` / `GEMM_FUSED` / `FUSED_TC`） | 5 経路（4 経路 + `FUSED_DFMA`） |
+|---|---|---|---|
+| GB200 | p=7/15/31（`106648`） | p=63/511/575（`95805`） | p=767（`106952`） |
+| H100 | p=7/15/31（`8650141`）、p=255（`8650255`） | p=63/511/575/767（`8650143`、`8631255`） | p=767（`8650257`+`8650967`+`8652177`） |
+| A100 | p=7/15/31（`9592751`）、p=63（`9593022`）、p=127（`9593023`） | p=63/511/575（`9579033`、`9592752`） | — |
+
+で、この定義を配布 `sn_cells.csv` に当てると `t` = 1.1 で **261 中 31、全て的中**
+（§5AE.7 の内訳 GB200 p=127 ×7、H100 p=127 ×6、GB200 / A100 p=255 ×5、
+GB200 p=63 ×3、H100 p=63 ×2、3 機の p=511 ×1 を再現する）。
+**`t` = 1.0 では 269 中 31 で、内訳も同じ、全て的中。** 上の表の機械軸 3 件は
+いずれも幅つき（GB200 p=31 は 6 経路 repeat、A100 p=511 は 4 経路 repeat の
+`GEMM_FUSED` / `FUSED_TC`、H100 p=31 は 6 経路 repeat）、バランス軸は 190 セル
+全部に幅がある。したがって原稿の A7 の 2 文は「269 中 31、全て的中」になる。
+（原稿側の推定「32 前後」は、入ってくる 3 件のどれかが幅なしと仮定した数で、
+実際は 3 件とも幅つきである。）
+
+### 5AH.2 per-kernel カウンタ表の公開形（`analysis/subpipe_inputs_export.py`）
+
+`analysis/subpipe_inputs.csv`（666 行 ＝ GB200 238 / H100 225 / A100 203、
+1 行 ＝ (機械, 次数, 経路, カーネル役割)）はモデルが読む 12 カウンタ＋ストール
+内訳だけを蒸留した形で、公開用には**出所（ジョブ・commit）、役割が指す
+カーネル名、起動構成、§2 の値段の法則を当てた共有パイプ利用率、
+モデルの派生量（資源需要・律速資源・η）**が無い。
+`analysis/subpipe_inputs_export.py` はそれらを同じ raw sweep から同じ集約
+（役割ごと・呼び出し内出現ごとの launch 中央値）で出し、**共有する全列が
+`subpipe_inputs.csv` と値まで一致することを検査してから書く**（不一致なら
+書かない）。現行ツリーで 666 行 × 80 列、666 行すべて一致。
+`--distill` の再実行も `subpipe_inputs.csv` とバイト一致することを確認した
+（raw sweep がそのまま出所である）。
+
+出力は `../scale-dg-paper/figs/data/subpipe_inputs.csv`（1.15 MB、sha256
+`faa2c907…`）と列定義 `subpipe_inputs_README.md` に置いた。列は
+`machine, order, path, role, kernel_name, kernel_names_seen, job, commit,
+sweep_date, sweep_dir, cutlass_mma_shape, dmma_shape_in_sass,
+dmma_flop_per_inst, launches_profiled, launches_per_call,
+gpu__time_duration.sum_ns, sm__cycles_elapsed.avg.per_second_hz,
+elapsed_sm_cycles`、続いてグループ A の 41 カウンタ（ncu のメトリック名そのまま。
+`sm__pipe_shared_cycles_active`、`sm__inst_executed_pipe_{tensor,fp64,alu,fma,
+lsu,adu,cbu,uniform,xu}`、LSU 波面、`dram__bytes`、`lts__t_bytes`、
+`launch__{grid_size,block_size,registers_per_thread}` など）、グループ B の
+ストール 12 本（`st_*`）、`D_{shared,dram,lsu_wf,issue,fma,alu,l2}_cycles`
+（較正機自身の上での需要、SM サイクル / launch）、`binding_resource`、`eta`。
+空欄は 2 種類だけ: 最初の GB200 掃引 `92904`（106 行）は §5H.2 が後から足した
+7 カウンタを持たず、A100 は `sm__inst_executed_pipe_lsu_mem_{lg,shared}_cmd_read`
+が sm_80 で n/a（§5N.3）。**どちらもモデル入力ではない。**
+`GEMM_OZAKI1` の 23 行は Ozaki 付録用で、転写採点には入っていない（§5AB.2）。
+`subpipe_inputs.csv.bal` は同表の 166 行の部分集合（ヘッダ無し、行は同一）で、
+配布には要らない。
+
+### 5AH.3 サブパイプ掃引で要求したカウンタの完全なリストと、容量の出所
+
+**メトリック名**（`jobs/subpipe_ncu.sh` の `METRICS_A` / `METRICS_B`、
+`ncu --csv --clock-control none --metrics … -k regex:… -s 4 -c 24`、
+グループごとに別起動）。グループ A は 43 本:
+
+```
+gpu__time_duration.sum
+sm__cycles_elapsed.avg.per_second
+sm__throughput.avg.pct_of_peak_sustained_elapsed
+sm__pipe_shared_cycles_active.avg.pct_of_peak_sustained_active
+sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_active
+sm__pipe_alu_cycles_active.avg.pct_of_peak_sustained_active
+sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active
+sm__inst_executed.sum
+sm__inst_executed_pipe_tensor.sum
+sm__inst_executed_pipe_fp64.sum
+sm__inst_executed_pipe_alu.sum
+sm__inst_executed_pipe_fma.sum
+sm__inst_executed_pipe_lsu.sum
+sm__inst_executed_pipe_adu.sum
+sm__inst_executed_pipe_cbu.sum
+sm__inst_executed_pipe_uniform.sum
+sm__inst_executed_pipe_xu.sum
+smsp__inst_executed.avg.per_cycle_active
+l1tex__throughput.avg.pct_of_peak_sustained_elapsed
+l1tex__t_bytes.sum
+l1tex__data_pipe_lsu_wavefronts_mem_shared.sum
+l1tex__data_pipe_lsu_wavefronts.sum
+l1tex__t_sectors.sum
+l1tex__t_requests.sum
+l1tex__lsuin_requests.sum
+l1tex__f_wavefronts.sum                                   (93312 以降)
+l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum            (93312 以降)
+l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum            (93312 以降)
+sm__inst_executed_pipe_lsu_mem_lg_cmd_read.sum            (93312 以降、sm_80 は n/a)
+sm__inst_executed_pipe_lsu_mem_shared_cmd_read.sum        (93312 以降、sm_80 は n/a)
+lts__t_sectors_lookup_hit.sum                             (93312 以降)
+lts__t_sectors_lookup_miss.sum                            (93312 以降)
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum
+lts__throughput.avg.pct_of_peak_sustained_elapsed
+lts__t_bytes.sum
+dram__throughput.avg.pct_of_peak_sustained_elapsed
+dram__bytes.sum
+sm__warps_active.avg.pct_of_peak_sustained_active
+launch__registers_per_thread
+launch__occupancy_limit_registers
+launch__grid_size
+launch__block_size
+```
+
+グループ B は `gpu__time_duration.sum`、`sm__cycles_elapsed.avg.per_second` と
+`smsp__average_warps_issue_stalled_<r>_per_issue_active.ratio`（`<r>` ＝
+`long_scoreboard, short_scoreboard, math_pipe_throttle, mio_throttle,
+lg_throttle, tex_throttle, barrier, membar, wait, drain, no_instruction,
+not_selected`）の 14 本。Slurm `92904`（§5E、2026-09-10 10:56）はグループ A の
+36 本（「93312 以降」の 7 本を除く）で、グループ B は無い。Slurm `93312`
+（§5H.2、同日 11:33）で 43 本＋グループ B になり、以後の全掃引（3 機）は同一
+リストである（`96222` の CSV のメトリック集合が `93312` と一致することを確認）。
+モデル（`subpipe_predict.METRICS`）が読むのはこのうち 12 本＋グループ B である。
+
+**容量の出所**（`analysis/subpipe_predict.py` の `CAP_*` と `MACHINES`。
+「3 機で同一」の根拠を、raw sweep の `pct_of_peak_sustained` から逆算した
+implied peak ＝ カウンタ ÷ (利用率 × 経過 SM サイクル × N_SM) で点検した。
+対象は 3 機の orders 掃引の `_r01_a` 全 launch、利用率 > 5% のもの）:
+
+| 資源 | モデルの容量（/SM/SM-clk） | 出所 | 3 機の implied peak（中央値 / 最大） | 判定 |
+|---|---|---|---|---|
+| 共有パイプ（fp64+tensor） | DMMA 1 命令 `max(4, FLOP/C_tc)` サイクル、fp64 warp 命令 `64/C_cc` | **実測**: サイクル/DMMA 3.97〜4.03（§2、§5A.1）、`C_tc` / `C_cc` は諸元 | `shared_cycles / (4·N_tensor + 0.5·N_fp64)` 中央値 1.03 / 1.06 / 1.03（GB200 / A100 / H100） | 機械ごとに `C_tc`, `C_cc` で入る |
+| DRAM | 25.21 / 10.21 / 9.17 B | 諸元 HBM ピーク ÷ (N_SM × boost) | `dram__bytes / dram%` 中央値 25.7 / 10.4 / 9.4 | 機械ごと |
+| LSU 波面 | **1** | **実測**（§5E.1: `100 × 波面/SM-clk` と `l1tex__throughput` の差 中央値 −1.0 pt） | 中央値 1.000 / 1.000 / 1.000、**最大 1.000 / 1.001 / 1.001** | 3 機で同一（`ncu` の peak 定義そのもの） |
+| issue | **4** | アーキテクチャ（SMSP 4 基 × 1 warp 命令/clk） | `sm__inst_executed / (4·cycles·N_SM)` ÷ `smsp__inst_executed.avg.per_cycle_active` 中央値 0.97 / 0.98 / 0.98 | 3 機で同一 |
+| ALU | **2** | `ncu` の `sm__pipe_alu_cycles_active` の peak | 中央値 1.95 / 1.98 / 1.97、最大 2.15 / 2.07 / 2.04 | 3 機で同一 |
+| FMA | **4** | SM 当たり FP32 ユニット数（128 → 4 warp 命令/clk） | GB200 最大 3.54、H100 最大 3.83、**A100 中央値 1.99 / 最大 2.01** | **A100 は 2**（FP32 64 ユニット）。ただし FMA 項は 666 役割のどれでも律速でなく（律速需要に対する最大 28%）、2 でも 4 でも採点は 1 セルも動かない |
+| L2 | **64 B** | **出所無し**。コード注釈は「`--audit` で較正」と言うが `--audit` にその行は無く、本書にも導出が無い | `lts__t_bytes / lts%` 最大 **111 / 67 / 57 B**（中央値 84 / 36 / 26。`lts__throughput` は sub-metric の max なので下限） | **3 機で同一ではない**。律速になるのは 666 役割中 23（3 機の p ≤ 15 の cuBLAS、GB200 p=7/15 `GEMM_FUSED` の `elembnd_flux`、`GEMM_OZAKI1`） |
+
+L2 容量は当てはめでも実測でもない名目値なので、感度を測った（隔離規約、
+台帳一致 `sn_led` / バランス `sn`）:
+
+| `CAP_L2_B` | 機械軸 `t`=1.0 | バランス軸 `t`=1.0 | 機械軸 `t`=1.1 | バランス軸 `t`=1.1 |
+|---:|---|---|---|---|
+| 32 | 105/111 ＝ 94.6% | 151/160 ＝ 94.4% | 103/107 | 151/160 |
+| 48 | 102/108 ＝ 94.4% | 163/177 ＝ 92.1% | 99/104 | 162/167 |
+| **64（現行）** | **96/102 ＝ 94.1%** | **156/167 ＝ 93.4%** | **94/99** | **152/162** |
+| 96 | 95/101 ＝ 94.1% | 157/169 ＝ 92.9% | 93/98 | 155/165 |
+| 128 | 95/101 ＝ 94.1% | 155/167 ＝ 92.8% | 93/98 | 154/164 |
+| ∞（項を外す） | 95/101 ＝ 94.1% | 154/166 ＝ 92.8% | 93/98 | 152/162 |
+
+**閾値超えの的中率は 32〜∞ で 94.1〜94.6%（機械軸）/ 92.1〜94.4%（バランス軸）
+の中に留まり、L2 の項を外しても 64 の値と 1 pt 以内。** セル数は動く
+（L2 が律速の低次 cuBLAS セルの予測比が変わり、`S/N` が閾値をまたぐ）ので、
+原稿の分子・分母（96/102、156/167）は「`CAP_L2_B` = 64 のときの数」として
+読むべきで、L2 容量が名目値であることは表の脚注に要る。他の容量
+（`CAP_ISSUE` 2/8、`CAP_ALU` 1/4、`CAP_FMA` 2、`CAP_LSU_WF` 0.5/2）も同じ
+やり方で振ったが、`CAP_FMA` は 1 セルも動かさず、`CAP_ALU` = 4 も動かさない。
+`CAP_ISSUE` = 2 / 8 は 92/97 / 95/101 に、`CAP_LSU_WF` = 0.5 / 2 は 101/107 /
+96/98 に動かすが、これらは上の表のとおり `ncu` の peak 定義と一致した値なので、
+振る根拠が無い。
+
+**§4 の「他は機械不変（3 機とも 4 issue slot / SM-clk、ALU / FMA / LSU 波面は
+同率）」は、issue / ALU / LSU 波面については `ncu` の peak 定義で 3 機一致が
+確認でき、FMA は A100 で 2 倍違うが不活性、L2 は根拠の無い名目値で 3 機一致
+でもない、と読み替える。** 実装は変えない（名目値を変えると §5AC 以降の
+全採点が動くので、変えるなら測って決める。`lts__throughput` の sub-metric
+内訳を採る 1 ジョブで済むが、本節の時点では未実施）。
 
 ---
 

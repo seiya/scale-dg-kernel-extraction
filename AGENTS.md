@@ -271,7 +271,12 @@ performance win must never be treated as implicit permission to redefine it.
   which are 102 MB and stay local), plus the ranking audit that scores the
   model's threshold rule on both axes (`subpipe_rank_audit.py`) and the
   balance-axis times it reads (`subpipe_balance_times.csv`, distilled from the
-  two machines' MPS sweeps; `subpipe_transfer_model.md` §5AA). Same reasoning as the `jobs/` allowlist: a
+  two machines' MPS sweeps; `subpipe_transfer_model.md` §5AA), and the
+  exporter that writes the publication form of the per-kernel counter table
+  (`subpipe_inputs_export.py`: the same rows with provenance, kernel names,
+  launch configuration, every counter the sweep requested and the model's
+  derived quantities, checked column by column against `subpipe_inputs.csv`;
+  §5AH.2). Same reasoning as the `jobs/` allowlist: a
   published cross-machine prediction is only reproducible if the code that
   made it is. Ad-hoc analysis still does not go here -- only what a report
   cites.
