@@ -865,7 +865,7 @@ def path_eta_scalars(rows):
 
 
 def print_eta_band(dump, abs_tol=10.0):
-    """Can a calibration-side path scalar reproduce the p >= 255 band?
+    """Can a calibration-side path scalar reproduce the p >= 511 band?
 
     `dump` is the --dump-logo row list.  For each of the three scalars a
     threshold is swept over the values the scalar actually takes (so every
@@ -873,11 +873,13 @@ def print_eta_band(dump, abs_tol=10.0):
     the roof side of the threshold (eta_wmean / eta_p90 <= t, frac_on_roof
     >= t).  For each threshold: cells selected, how many of them are hits
     (|err| <= abs_tol %), median and nearest-rank p90 of |err| inside the
-    selection, the size of the symmetric difference to the current p >= 255
-    band, and how many of the p = 255 cells are inside.  Run twice, on all
-    cells and on ledger_ok cells only.  Also prints the path-level eta strata
-    of section 5AB.2 (eta_wmean binned at 1.2 / 1.5) so that table is
-    reproducible.
+    selection, the size of the symmetric difference to the claimed band
+    (p >= ABS_BAND_MIN, i.e. p >= 511 since 2026-09-18; it was p >= 255
+    before), and -- as a separate column, since the transition order is no
+    longer part of the band -- how many of the p = 255 cells the selection
+    takes.  Run twice, on all cells and on ledger_ok cells only.  Also
+    prints the path-level eta strata of section 5AB.2 (eta_wmean binned at
+    1.2 / 1.5) so that table is reproducible.
     """
     import math
     cells = [dict(tgt=t, order=p_, path=pa, err=abs(e), led=led, wmean=wm,
@@ -886,13 +888,18 @@ def print_eta_band(dump, abs_tol=10.0):
              if wm is not None]
     for only in (False, True):
         cs = [c for c in cells if c["led"] or not only]
-        band = set(i for i, c in enumerate(cs) if c["order"] >= 255)
-        bv = [c["err"] for c in cs if c["order"] >= 255]
+        band = set(i for i, c in enumerate(cs) if c["order"] >= ABS_BAND_MIN)
+        bv = [c["err"] for c in cs if c["order"] >= ABS_BAND_MIN]
+        tv = [c["err"] for c in cs if c["order"] == TRANSITION_ORDER]
         hits = sum(1 for c in cs if c["err"] <= abs_tol)
         print("\n  === eta band scan (%s): n=%d, |err|<=%.0f%% hits=%d, "
-              "p>=255 band n=%d median %.1f%% p90 %.1f%%"
+              "p>=%d band n=%d median %.1f%% p90 %.1f%%; transition p=%d "
+              "n=%d median %.1f%% p90 %.1f%%"
               % ("ledger_ok cells only" if only else "all cells", len(cs),
-                 abs_tol, hits, len(bv), statistics.median(bv), pct90(bv)))
+                 abs_tol, hits, ABS_BAND_MIN, len(bv), statistics.median(bv),
+                 pct90(bv), TRANSITION_ORDER, len(tv),
+                 statistics.median(tv) if tv else float("nan"),
+                 pct90(tv) if tv else float("nan")))
         print("  path-level eta strata (eta_wmean):")
         for nm, a, b in PATH_ETA_BINS:
             v = [c["err"] for c in cs if a < c["wmean"] <= b]
@@ -903,8 +910,8 @@ def print_eta_band(dump, abs_tol=10.0):
                                       ("p90", True, "eta_p90 <= t"),
                                       ("on", False, "frac_on_roof >= t")):
             print("  --- %s" % lab)
-            print("    %7s %4s %4s %7s %7s %6s %6s  %s"
-                  % ("t", "n", "hit", "median", "p90", "symd", "p255",
+            print("    %7s %4s %4s %7s %7s %6s %7s  %s"
+                  % ("t", "n", "hit", "median", "p90", "symd", "p255tr",
                      "hit-rate outside"))
             vals = sorted(set(c[key] for c in cs))
             best = None
@@ -917,11 +924,14 @@ def print_eta_band(dump, abs_tol=10.0):
                 h = sum(1 for x in v if x <= abs_tol)
                 out = [cs[i]["err"] for i in range(len(cs)) if i not in sel]
                 ho = sum(1 for x in out if x <= abs_tol)
-                p255 = sum(1 for i in sel if cs[i]["order"] == 255)
-                n255 = sum(1 for c in cs if c["order"] == 255)
+                # transition-order cells the selection takes; they are not
+                # in `band`, so they count toward symd when selected.
+                p255 = sum(1 for i in sel
+                           if cs[i]["order"] == TRANSITION_ORDER)
+                n255 = sum(1 for c in cs if c["order"] == TRANSITION_ORDER)
                 symd = len(sel ^ band)
                 med = statistics.median(v)
-                print("    %7.3f %4d %4d %6.1f%% %6.1f%% %6d %3d/%-3d %s"
+                print("    %7.3f %4d %4d %6.1f%% %6.1f%% %6d  %3d/%-3d %s"
                       % (t, len(sel), h, med, pct90(v), symd, p255, n255,
                          ("%d/%d" % (ho, len(out))) if out else "--"))
                 # "best": the largest selection whose median stays under the
@@ -933,7 +943,7 @@ def print_eta_band(dump, abs_tol=10.0):
             if best:
                 print("    best (largest selection with median <= band's "
                       "%.1f%%): t=%.3f n=%d hit=%d median %.1f%% symd=%d "
-                      "p255=%d" % (statistics.median(bv), *best))
+                      "p255tr=%d" % (statistics.median(bv), *best))
             else:
                 print("    no threshold reaches the band's median")
 
@@ -996,6 +1006,24 @@ def shape_check(dirs, shapes=("8x8x4", "16x8x4")):
         print("  no disagreement on any role the static table answers, at "
               "either shape")
     return not bad
+
+
+# The order bands the paper's figure f7 uses.  ABS_BAND_MIN is the lowest
+# order of the band the paper claims absolute time in; it was 255 until
+# 2026-09-18 and p = 255 is now reported as the transition order.
+ABS_BAND_MIN = 511
+TRANSITION_ORDER = 255
+ORDER_BANDS = ("p<=31", "p=63..127", "p=255", "p>=511")
+
+
+def order_band(p):
+    if p <= 31:
+        return "p<=31"
+    if p <= 127:
+        return "p=63..127"
+    if p == TRANSITION_ORDER:
+        return "p=255"
+    return "p>=511"
 
 
 def fmt_err(p, m):
@@ -1066,8 +1094,9 @@ def main():
     ap.add_argument("--eta-band", action="store_true",
                     help="with --logo, sweep the three path-level "
                          "calibration-side scalars (eta_wmean, frac_on_roof, "
-                         "eta_p90) against the p >= 255 absolute-time band "
-                         "(report section 5AF)")
+                         "eta_p90) against the p >= 511 absolute-time band, "
+                         "with p = 255 as the transition order in its own "
+                         "column (report sections 5AF, 5AI)")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     USE_TABLE[0] = a.from_table
@@ -1174,15 +1203,24 @@ def main():
                   "cells" % (n_mismatch, len(ae)))
         # Error by order band: the model declares its own validity domain
         # (report section 5E.3), so report inside and outside it separately.
+        # The band the paper claims absolute time in is p >= 511 since
+        # 2026-09-18 (it was p >= 255 until then); p = 255 is the transition
+        # order and gets its own line, the same four bands as figure f7.
+        # The p >= 255 line (transition included) is printed as well because
+        # the paper quotes both.
         band = defaultdict(list)
         for (pp, pa), (pr, me) in flat.items():
-            band["p<=31" if pp <= 31 else ("p=63..127" if pp <= 127 else "p>=255")
-                 ].append(abs(pr / me - 1.0))
-        for k in ("p<=31", "p=63..127", "p>=255"):
+            v = abs(pr / me - 1.0)
+            band[order_band(pp)].append(v)
+            if pp >= 255:
+                band["p>=255"].append(v)
+        for k in ORDER_BANDS + ("p>=255",):
             if band[k]:
                 v = sorted(band[k])
-                print("  |err| %-10s n=%2d median %5.1f%%  max %5.1f%%"
-                      % (k, len(v), 100 * statistics.median(v), 100 * v[-1]))
+                print("  |err| %-10s n=%2d median %5.1f%%  max %5.1f%%%s"
+                      % (k, len(v), 100 * statistics.median(v), 100 * v[-1],
+                         "  (band + transition p=255)" if k == "p>=255"
+                         else ("  (claimed band)" if k == "p>=511" else "")))
         # The ranking question the paper asks.
         print("  %-5s %10s %10s   %10s %10s" % ("p", "GF/TC pred", "GF/TC meas",
                                                 "G/TC pred", "G/TC meas"))
