@@ -93,3 +93,8 @@ advect3d/advect3d
 # figure plan was tracked as reports/paper_figures.md until 2026-09-06 and is
 # now here, out of the public tree.
 /paper_notes/
+!/jobs/graph_ab_lowp.sh
+!/jobs/rikyu_graph_ab_lowp.sh
+!/jobs/tsubame_graph_ab_lowp.sh
+!/jobs/wisteria_graph_ab_lowp.sh
+!/jobs/graph_ab_lowp_summarize.py
