@@ -737,8 +737,8 @@ def main():
                          "the 7 published pairs are identical to --dump-cells.")
     ap.add_argument("--no-width", action="store_true",
                     help="skip W2 (the repeat-job scan); width columns empty")
-    ap.add_argument("--shape", default="static",
-                    choices=["static", "static-only", "target"],
+    ap.add_argument("--shape", default="enum",
+                    choices=["enum", "static", "static-only", "target"],
                     help="passed through to subpipe_predict.SHAPE_SRC; see "
                          "its --shape")
     ap.add_argument("--famerr", default="loo-group",

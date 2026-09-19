@@ -27,9 +27,15 @@ measured on the calibration machine and carried to the target as a kernel
 property: one parameter per kernel, no machine dependence.
 
 WHAT THE TARGET MACHINE CONTRIBUTES: its spec sheet only (SM count, boost
-clock, the two pipe throughputs, HBM bandwidth).  No target timing, no target
-counter, ever enters a prediction.  --audit prints the provenance of every
-input so this can be checked.
+clock, the two pipe throughputs, HBM bandwidth) and the -arch its binary is
+built for, from which the MMA shape of every kernel in the binary is read
+statically (static_dmma_flop).  The one shape the binary does not hold is
+cuBLAS's, picked by the library at run time; the default --shape enum prices
+that role with the cheapest shape the arch can issue (enum_dmma_flop), so no
+target timing and no target counter ever enters a prediction.  --shape static
+is the option that reads the cuBLAS shape out of one run of the target
+instead; on the three machines here both give byte-identical CSVs.  --audit
+prints the provenance of every input so this can be checked.
 
 Usage:
     python3 analysis/subpipe_predict.py --logo            # all three directions
@@ -187,8 +193,9 @@ def dmma_flop_of(name):
 
     This reads a NAME, not a timing -- but for the target machine the name
     comes out of the target's own ncu output, which is a target measurement
-    all the same.  See static_dmma_flop() and SHAPE_SRC: the default path asks
-    the static table first and only falls back here for cuBLAS.
+    all the same.  See static_dmma_flop() and SHAPE_SRC: every setting asks
+    the static table first, and only --shape static / target come here for
+    the cuBLAS roles; the default (enum) does not read the target's name.
     """
     m = CUTLASS_MMA_RE.search(name) or DMMA_RE.search(name)
     if m:
@@ -312,23 +319,59 @@ def static_dmma_flop(machine, role, req_shape=OWN_MMA_SHAPE):
     return 2.0 * m * n * k / n_inst
 
 
-# How the target's MMA shape is obtained.
+# How the target's MMA shape is obtained for the roles the static table
+# cannot answer (cuBLAS; every other role comes from the table whatever the
+# setting).
+#   "enum"        enumerate every shape the target's `arch` can issue
+#                 (MMA_EXPANSION) and price the role with the one that gives
+#                 the smallest max_r D_r; ties go to the first candidate.
+#                 Nothing measured on the target enters, so this is the
+#                 version that honours the published contract AND models
+#                 what cuBLAS's heuristic is for: picking the instruction
+#                 that runs its GEMM fastest.  Default since 2026-09-19.
 #   "static"      static table, falling back to the target's observed kernel
-#                 name for the roles the table cannot know (cuBLAS).  Default:
-#                 numerically identical to the pre-2026-09-12 behaviour,
-#                 because the table and the observation agree everywhere the
-#                 table has an answer.
+#                 name for cuBLAS.  Available only when the target has a
+#                 sweep; it is what "run the target once and read the kernel
+#                 name" means, and it is the pre-2026-09-19 default.
 #   "static-only" static table only; no fallback, so a cuBLAS role is priced
-#                 with the calibration machine's shape.  This is the version
-#                 that actually honours the published contract.  Scored in
-#                 report section 5AC.4.
-#   "target"      the old behaviour, observed name first.  Kept to show that
-#                 "static" reproduces it exactly.
-SHAPE_SRC = ["static"]
+#                 with the calibration machine's shape.  The ablation of
+#                 report section 5AC.4: it shows that the H100 GEMM cells
+#                 need the shape, not that they need a target run.
+#   "target"      the pre-2026-09-12 behaviour, observed name first.  Kept to
+#                 show that "static" reproduces it exactly.
+SHAPE_SRC = ["enum"]
 
 
-def target_dmma_flop(role, obs, tgt, req_shape=OWN_MMA_SHAPE):
-    """FLOP per MMA instruction to price `role` with on machine `tgt`."""
+def enum_dmma_flop(agg, tgt):
+    """FLOP per hardware MMA instruction of the shape, among those the
+    target's `arch` can issue, that prices `agg` lowest (smallest max_r D_r).
+
+    The candidates are the MMA_EXPANSION rows of the target's arch in table
+    order: one shape on sm_80, four on sm_90, four on sm_100 -- where all four
+    lower to DMMA.8x8x4 and so cost the same.  On sm_90 every shape of
+    >= 1024 FLOP sits on demands()' 4-cycle floor at the same price, so the
+    first of them (16x8x4) is returned; that is the tie rule, and it does not
+    matter for the prediction, which reads only max_r D_r.
+    """
+    arch = MACHINES[tgt]["arch"]
+    best = None
+    for (a, shape), n_inst in MMA_EXPANSION.items():
+        if a != arch:
+            continue
+        m, n, k = parse_shape(shape)
+        flop = 2.0 * m * n * k / n_inst
+        top = max(demands(agg, tgt, dmma_flop_tgt=flop).values())
+        if best is None or top < best[0]:
+            best = (top, flop)
+    return best[1]
+
+
+def target_dmma_flop(role, obs, tgt, req_shape=OWN_MMA_SHAPE, agg=None):
+    """FLOP per MMA instruction to price `role` with on machine `tgt`.
+
+    `agg` is the calibration-side counter aggregate of the role; "enum" needs
+    it to price the candidate shapes, the other settings ignore it.
+    """
     if SHAPE_SRC[0] == "target":
         return obs.get(role, {}).get("dmma_flop") if obs else None
     st = static_dmma_flop(tgt, role, req_shape)
@@ -336,6 +379,8 @@ def target_dmma_flop(role, obs, tgt, req_shape=OWN_MMA_SHAPE):
         return st
     if SHAPE_SRC[0] == "static-only":
         return None                 # -> demands() uses the calibration shape
+    if SHAPE_SRC[0] == "enum":
+        return enum_dmma_flop(agg, tgt)
     return obs.get(role, {}).get("dmma_flop") if obs else None
 
 
@@ -513,12 +558,15 @@ def load_case_raw(machine, order, path_name, shape="8x8x4"):
 def demands(agg, machine, dmma_flop_tgt=None):
     """Resource demands in SM cycles for one kernel launch on `machine`.
 
-    `dmma_flop_tgt` is the FLOP per DMMA instruction of the code that will run
-    on the target (read from the target build's kernel name, never from a
-    target measurement).  It differs from the calibration machine only where
-    the library picks a different kernel, i.e. cuBLAS: sm_80/sm_100 issue
-    m8n8k4, sm_90 issues m16n8k8.  The instruction count is rescaled by the
-    FLOP ratio, so the arithmetic is held fixed and only the pricing moves.
+    `dmma_flop_tgt` is the FLOP per hardware DMMA instruction of the code that
+    will run on the target: from the static table for everything the binary
+    holds, and for cuBLAS from whatever SHAPE_SRC says (by default the
+    cheapest shape the target arch can issue; see target_dmma_flop).  It
+    differs from the calibration machine only where the library picks a
+    different kernel, i.e. cuBLAS: sm_80/sm_100 issue m8n8k4, sm_90 issues a
+    wide shape (m16n8k8 observed; every shape of >= 1024 FLOP prices the same
+    here).  The instruction count is rescaled by the FLOP ratio, so the
+    arithmetic is held fixed and only the pricing moves.
     """
     m = MACHINES[machine]
     n_sm = m["sm"]
@@ -742,7 +790,7 @@ def predict_case(srcs, tgt, order, path_name, verbose=False, tgt_shape="8x8x4"):
             if rule == "mean":
                 eta = sum(t[2] for t in cands) / len(cands)
         d = demands(agg, tgt, dmma_flop_tgt=target_dmma_flop(role, obs, tgt,
-                                                             tgt_shape))
+                                                             tgt_shape, agg))
         roof = max(d, key=d.get)
         cyc = eta * d[roof]
         if MODEL[0] != "roof" and agg.get("warps_pct"):
@@ -995,8 +1043,9 @@ def shape_check(dirs, shapes=("8x8x4", "16x8x4")):
         if what.startswith("static =="):
             print("  %-8s %-28s %d / %d roles agree" % (shape, what, ok, n))
         else:
-            print("  %-8s %-28s %d roles (priced with the calibration shape "
-                  "under --shape static-only)" % (shape, what, n))
+            print("  %-8s %-28s %d roles (priced by enumeration under the "
+                  "default --shape enum, with the calibration shape under "
+                  "--shape static-only)" % (shape, what, n))
     if bad:
         print("  DISAGREEMENTS (statically unknowable):")
         for (shape, base), (n, ex) in sorted(bad.items()):
@@ -1064,16 +1113,19 @@ def main():
                          "machine, order, path) to this CSV: the schema the "
                          "paper's Figure 9 reads (figs/data/"
                          "logo_path_totals.csv)")
-    ap.add_argument("--shape", default="static",
-                    choices=["static", "static-only", "target"],
-                    help="where the target's MMA shape comes from.  static: "
-                         "the cuobjdump table, falling back to the target's "
-                         "observed kernel name for cuBLAS only (default; "
-                         "reproduces --shape target exactly).  static-only: "
-                         "no fallback, so nothing measured on the target "
-                         "enters -- the version that honours the published "
-                         "contract (section 5AC.4).  target: the "
-                         "pre-2026-09-12 behaviour")
+    ap.add_argument("--shape", default="enum",
+                    choices=["enum", "static", "static-only", "target"],
+                    help="where the MMA shape of the roles the cuobjdump "
+                         "table cannot answer (cuBLAS) comes from; every "
+                         "other role comes from the table.  enum: every "
+                         "shape the target arch can issue, priced, and the "
+                         "cheapest taken (default; nothing measured on the "
+                         "target enters).  static: the target's observed "
+                         "kernel name, i.e. run the target once and read it "
+                         "(reproduces --shape target exactly; the default "
+                         "before 2026-09-19).  static-only: no fallback, "
+                         "the calibration shape -- the ablation of section "
+                         "5AC.4.  target: the pre-2026-09-12 behaviour")
     ap.add_argument("--tgt-shape", default="8x8x4",
                     help="the CutlassMmaShape the TARGET is run with.  The "
                          "calibration machines are always read at 8x8x4 (the "
@@ -1084,8 +1136,8 @@ def main():
                     help="compare the static MMA-shape table against the "
                          "shape read out of each target's own ncu kernel name, "
                          "at 8x8x4 AND 16x8x4, and exit.  This is the "
-                         "equivalence test --shape static has to pass before "
-                         "it may be the default (V1 item 3)")
+                         "equivalence test --shape static had to pass before "
+                         "it could be the default (V1 item 3; enum is the default since 2026-09-19)")
     ap.add_argument("--eta-strata", action="store_true",
                     help="with --logo, also print the eta stratification of "
                          "the per-kernel transfers (section 5AC.6), both over "
