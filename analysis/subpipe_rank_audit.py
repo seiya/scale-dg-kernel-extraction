@@ -67,6 +67,19 @@ W3  --dump-all-pairs writes the same schema for all 15 pairs of the six
     changed; the 7 published ratios' rows in that file are identical to
     sn_cells.csv, since a ratio's family error only ever pools that ratio.
 
+W4  (2026-09-19) The production yardstick beside the profiler one, on the
+    machine axis: meas_prod is the target machine's ratio of production CUDA
+    device time per stage (no profiler; devsum / (steps x 3) of the base
+    path sweeps in PROD_LOGS, median over the interleaved rc=0 rounds, the
+    same logs and aggregation as the paper's Fig. 2) and hit_prod is the
+    sign agreement of pred with it.  Section 5V scored 5 ratios this way
+    (59/60); the two ratios section 5W added, GEMM_CUTE/GEMM and
+    FUSED_DFMA/FUSED, are exactly where the machine-axis misses of the ncu
+    yardstick sit, and had never been checked on production.  Empty where
+    the sweep has no production time for either path (p=767 FUSED_TC /
+    FUSED_DFMA are supplementary jobs, not sweep rows), and on the balance
+    axis, whose meas already IS production time.  Columns at the END only.
+
 Machine axis: 3 leave-one-GPU-out directions x 7 ratios x all orders, from the
 counters in analysis/subpipe_inputs.csv (or the local ncu sweeps).
 Balance axis: 2 machines x 3 orders x 7 ratios x 5 MPS fractions.  Predictions
@@ -84,6 +97,7 @@ import csv
 import glob
 import math
 import os
+import re
 import statistics as st
 import sys
 
@@ -152,6 +166,48 @@ REPEATS = {
 # 5AE.1).  The job id is the CSV row's `job`; the directory is found by glob.
 BAL_ROUNDS = ["mps_balance_%s", "*/a100_mps_balance_%s", "*/h100_mps_balance_%s"]
 
+# W4.  The base path sweeps (jobs/tsubame_paths.sh body, one wrapper per
+# scheduler), one log per machine, the same three the paper's Fig. 2 reads:
+#   GB200  Slurm 123614, node c286, 3d6ce77   H100  SGE 8708077, r17n2, 1cfb57e
+#   A100   TCS 9652100, wa35, 1cfb57e
+# Each "rNN pP PATH rc=0 steps=S devsum=D stage=.. main=.." line is one run;
+# devsum is the CUDA device time of the whole step loop, so devsum / (S * 3)
+# is the device time per Runge-Kutta stage, the quantity §19.3 of
+# measurement_inventory.md tabulates and §5V scored against.  Only the plain
+# path names are read (the "@16x8x4" shape variants are a different axis); a
+# plain name runs the namelist default, CutlassMmaShape 8x8x4, which is the
+# shape the machine-axis predictions are made at.  The logs are local (the
+# paper keeps copies in figs/data/); a missing log leaves the columns empty.
+PROD_LOGS = {
+    "GB200": ["slurm-123614.out", "../scale-dg-paper/figs/data/slurm-123614.out"],
+    "H100":  ["tsubame/dg_h100_paths.o8708077",
+              "../scale-dg-paper/figs/data/dg_h100_paths.o8708077"],
+    "A100":  ["wisteria/dg_a100_paths.9652100.out",
+              "../scale-dg-paper/figs/data/dg_a100_paths.9652100.out"],
+}
+PROD_RE = re.compile(r"^r(\d+) p(\d+) CUDAFORTRAN_([A-Z_0-9]+)\s+rc=0\s+steps=(\d+)"
+                     r"\s+devsum=(\S+)\s+stage=(\S+)\s+main=(\S+)")
+
+
+def prod_times(machine, _cache={}):
+    """(order, path) -> production device time per stage, median over the
+    rounds of the machine's base sweep (W4).  Empty when no log is found."""
+    if machine in _cache:
+        return _cache[machine]
+    runs = collections.defaultdict(list)
+    for rel in PROD_LOGS.get(machine, []):
+        fn = os.path.join(sp.ROOT, rel)
+        if not os.path.exists(fn):
+            continue
+        for line in open(fn, errors="ignore"):
+            m = PROD_RE.match(line.strip())
+            if m:
+                _, p, path, steps, dev = m.groups()[:5]
+                runs[(int(p), path)].append(float(dev) / (int(steps) * 3))
+        break                                    # first log found wins
+    _cache[machine] = {k: st.median(v) for k, v in runs.items()}
+    return _cache[machine]
+
 
 def cell(axis, tag, ratio, rp, rm, ledger=True):
     # The leave-one-out GROUP (U1).  The report defines eps_family as "the
@@ -193,7 +249,7 @@ def direction_cells(srcs, tgt, grp=None, ratios=None):
             # W2: the kernel ledger r_meas was summed over, so that the width
             # can be taken on the same quantity.
             roles[(p, path)] = [r["role"] for r in rows]
-    cells = []
+    cells, prod = [], prod_times(tgt)
     for num, den in ratios or sp.RATIOS:
         for p, r in sorted(got.items()):
             if num in r and den in r:
@@ -204,6 +260,10 @@ def direction_cells(srcs, tgt, grp=None, ratios=None):
                          ledger=led[(p, num)] and led[(p, den)])
                 c["mach"], c["order"] = tgt, p
                 c["roles"] = (roles[(p, num)], roles[(p, den)])
+                # W4: the same ratio on the target's production device time.
+                if (p, num) in prod and (p, den) in prod:
+                    c["rprod"] = prod[(p, num)] / prod[(p, den)]
+                    c["hit_prod"] = (c["rp"] > 1) == (c["rprod"] > 1)
                 cells.append(c)
     return cells
 
@@ -569,6 +629,45 @@ def report_widths(cells, label):
                                           for kv in sorted(miss.items())))
 
 
+def report_prod(cells, pmin=63):
+    """W4.  The machine-axis cells scored on the production yardstick, per
+    ratio, at p >= pmin: n, hits on production, and the number of cells on
+    which the two yardsticks agree in sign; then every production miss and
+    every cell where the two yardsticks disagree.  This is the table section
+    5V.3 printed for 5 ratios, extended to the 7 of section 5W."""
+    have = [c for c in cells if "rprod" in c and c["order"] >= pmin]
+    if not have:
+        return
+    print("\n  production yardstick (W4), p >= %d, %d cells with a sweep time "
+          "for both paths:" % (pmin, len(have)))
+    print("    %-24s %4s %8s %8s" % ("ratio", "n", "hit_prod", "agree"))
+    tot = [0, 0, 0]
+    for num, den in sp.RATIOS:
+        r = [c for c in have if c["ratio"] == num + " / " + den]
+        if not r:
+            continue
+        n, h = len(r), sum(c["hit_prod"] for c in r)
+        g = sum((c["rm"] > 1) == (c["rprod"] > 1) for c in r)
+        print("    %-24s %4d %8d %8d" % (num + "/" + den, n, h, g))
+        tot = [tot[0] + n, tot[1] + h, tot[2] + g]
+    print("    %-24s %4d %8d %8d" % ("total", *tot))
+    for title, sel in (("production misses (hit_prod = 0)",
+                        lambda c: not c["hit_prod"]),
+                       ("yardsticks disagree (sign of meas != meas_prod)",
+                        lambda c: (c["rm"] > 1) != (c["rprod"] > 1))):
+        rows = [c for c in have if sel(c)]
+        print("    %s: %d" % (title, len(rows)))
+        for c in rows:
+            print("      %-6s p=%-4d %-24s pred %.4f  meas %.4f  meas_prod %.4f"
+                  % (c["mach"], c["order"], c["ratio"].replace(" ", ""),
+                     c["rp"], c["rm"], c["rprod"]))
+    left = sorted({(c["mach"], c["order"], c["ratio"].replace(" ", ""))
+                   for c in cells if "rprod" not in c and c["order"] >= pmin})
+    if left:
+        print("    no production time (not in the sweep): "
+              + ", ".join("%s p=%d %s" % t for t in left))
+
+
 def report_axis(cells, label, pool=None):
     """V2: score the path-total cells and the partial-sum cells separately.
 
@@ -677,6 +776,7 @@ def main():
         pool = isolated_pools() if a.famerr == "isolated" else None
         report_axis(m, "machine axis (leave-one-GPU-out, famerr=%s)" % a.famerr,
                     pool)
+        report_prod(m)
         cells += m
     if a.axis in ("balance", "both"):
         b = balance_axis(a.bal_times.split(","),
@@ -727,14 +827,17 @@ def dump(fn, cells):
     percent; resolved is 1/0, empty when there is no width; pct is the MPS
     fraction of a balance cell (the published columns do not carry it, so
     the five fractions of one (machine, order, ratio) were told apart only by
-    row order) and empty on the machine axis."""
+    row order) and empty on the machine axis.  W4 adds meas_prod / hit_prod
+    at the very end: the production-yardstick ratio and its sign agreement
+    with pred, machine axis only, empty where the sweep lacks a path."""
     with open(fn, "w", newline="") as fh:
         w = csv.writer(fh, lineterminator="\n")
         w.writerow(["axis", "grp", "order", "num", "den", "pred", "meas",
                     "famerr", "sn", "hit", "ledger_ok", "famerr_led",
                     "sn_led",
                     "famerr_log", "sn_log", "famerr_led_log", "sn_led_log",
-                    "width", "resolved", "width_job", "pct"])
+                    "width", "resolved", "width_job", "pct",
+                    "meas_prod", "hit_prod"])
         for c in cells:
             grp = c["tag"].split()[0]
             order = int(c["tag"].split("p=")[1].split()[0])
@@ -752,7 +855,9 @@ def dump(fn, cells):
                         "%.4f" % c["snlog_led"] if "snlog_led" in c else "",
                         "%.3f" % c["width"] if c.get("width") is not None else "",
                         int(c["resolved"]) if c.get("width") is not None else "",
-                        c.get("width_job") or "", c.get("pct", "")])
+                        c.get("width_job") or "", c.get("pct", ""),
+                        "%.4f" % c["rprod"] if "rprod" in c else "",
+                        int(c["hit_prod"]) if "rprod" in c else ""])
     print("\nwrote %s (%d cells)" % (fn, len(cells)))
 
 
