@@ -4844,6 +4844,72 @@ python3 analysis/subpipe_predict.py --logo --from-table --tgt-shape 16x8x4
 - **p=511 / 575 の行が `FUSED_TC@8x8x4` を分母に使っていたのは正しかった。**
   分母の形状不変性はここで初めて実測された（−0.1%）。
 
+#### 5AD.7c′ 配布 CSV `logo_path_totals_16x8x4.csv`（2026-09-19 追記、GPU 実行なし）
+
+§5AD.7c の表と、原稿 §operational-predictions の「20 path totals、|err|
+中央値 8.1%、12 ranking cells 中 11 正解」、および Table
+`tab:fastest-path-preferred` は、いずれも上のコマンドの画面出力から写した数で、
+原稿の規約（本文の数はすべて `figs/data/*.csv` から再計算する）を満たして
+いなかった。`--dump-logo` を付けて書き出し、原稿側に置いた:
+
+```
+python3 analysis/subpipe_predict.py --logo --from-table --tgt-shape 16x8x4 \
+    --dump-logo ../scale-dg-paper/figs/data/logo_path_totals_16x8x4.csv
+```
+
+- 生成ツリー `4cc3084`（`subpipe_predict.py` / `subpipe_inputs.csv` は
+  §5AJ 以降変更なし）。schema は `logo_path_totals.csv` と同一、LF、
+  ヘッダを除いて **22 行**。
+- 内訳: **H100 hold-out 20 行**（p=7…575 の `GEMM_FUSED` / `GEMM_CUTE`
+  各 2 行＝16 行、p=767 の `FUSED_TC` / `GEMM_FUSED` / `GEMM` / `GEMM_CUTE`
+  4 行）と **GB200 hold-out 2 行**（p=767 `GEMM_FUSED` / `GEMM_CUTE`）。
+  A100 は sm_80 が `16x8x4` を出せない（§5AD.1、`MMA_EXPANSION`）ので
+  hold-out ごと skip される。
+- H100 20 行の |err|: 中央値 **8.1%**、最大 **19.0%**（p=511 `GEMM_FUSED`
+  −19.03%）。順位 12 セル（`GEMM_FUSED/FUSED_TC` p=767、`GEMM/FUSED_TC`
+  p=767、`GEMM_CUTE/GEMM_FUSED` p=7…767 の 9、`GEMM_CUTE/GEMM` p=767）の
+  符号は **11/12**、外れは `GEMM_CUTE/GEMM_FUSED` p=127（`r_pred` 0.988 対
+  `r_meas` 1.117）。
+- §5AD.7c の表で「較正側に無く予測不能」だった p=767 `GEMM_CUTE` は、
+  §5AD.8d で `(GB200, 767, GEMM_CUTE)` が較正表に入ったので CSV では予測が
+  付く（pred 58531.2 / meas 67903.4 / −13.8%）。上の表は当時の記録として
+  そのまま残す。
+
+**GB200 hold-out 2 行の `meas` は `logo_path_totals.csv`（`8x8x4`）と
+一致せず、原稿はこの 2 行を使わない。** `pred` は 2 形状で同一
+（`GEMM_FUSED` 59256.433、`GEMM_CUTE` 62130.594）で、これは sm_100 では
+`16x8x4` が 2 つの `DMMA.8x8x4` に展開されて静的 FLOP 表が同じ値を返す
+（§5AD.8c、`static_dmma_flop`）ため期待どおり。`meas` が動くのは
+`load_case(tgt, order, path, shape)` の分岐による:
+
+```python
+def load_case(machine, order, path_name, shape="8x8x4"):
+    if shape == "8x8x4" and (USE_TABLE[0] or not sweep_dirs(machine)):
+        return load_table().get((machine, order, path_name), {})
+    return load_case_raw(machine, order, path_name, shape)
+```
+
+`--from-table` でも **`shape != "8x8x4"` は表を通らず `load_case_raw` に
+落ち**、`SWEEPS["GB200"]` を先頭から走査して
+`p767_<path>_16x8x4_none_r*_{a,b}.csv` を持つ最初のディレクトリを採る。
+GB200 でその形状のファイルを持つのは末尾の
+`subpipe_hi_shape_106536/ncu` だけ（Slurm `106536`、c186、§5AD.8c）である。
+一方 `8x8x4` の `meas` は `subpipe_inputs.csv` の値で、その出所は
+`GEMM_FUSED` が `subpipe_hi_94874/ncu`（Slurm `94874`、c069、§5T）、
+`GEMM_CUTE` が同じ `106536` の `8x8x4` 側（§5AD.8d）。つまり:
+
+| 行 | `16x8x4` meas（出所） | `8x8x4` meas（出所） | Δ |
+|---|---:|---:|---:|
+| GB200 p=767 `GEMM_FUSED` | 58721.232（`106536`） | 58550.848（`94874`） | +0.29%（別ジョブ・別ノード） |
+| GB200 p=767 `GEMM_CUTE` | 61963.280（`106536`） | 61935.358（`106536`） | +0.05%（同一ジョブ、形状のみ） |
+
+（`load_case_raw` を `106536` の `8x8x4` `GEMM_FUSED` に当てると 58605.9 で、
+§5AD.8c の表の値。表側が 58550.8 なのは `SWEEPS` の探索順で `94874` が
+先に当たるから。）差はどちらも GB200 の run-to-run 幅（§5AE.2）の中で、
+形状の効果ではない。**GB200 の 2 行は「較正が GB200 抜き（A100＋H100）に
+なる」点でも H100 の 9 セルとは別の実験であり、原稿の `16x8x4` の主張は
+H100 hold-out の 20 行だけで立てる。** S2 にはそう書く。
+
 #### 5AD.7d p=1023 は TSUBAME H100 では採れない
 
 第 2 段（p=1023、GEMM 系 3 経路）は 3 経路とも `rc=1`:
