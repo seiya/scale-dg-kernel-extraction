@@ -714,6 +714,11 @@ nsys を graph 再生パスに当てるとハングする**（job `45707`、nsys
 180 s で timeout、`.nsys-rep` は `PROCESSED (EMPTY RESULTS)`）。
 `UseCudaGraph = .false.` なら同じバイナリで nsys は採れる。RIKYU では
 `export DEBUGINFOD_URLS=` と `--resolve-symbols=false` の両方が必須。
+【2026-09-19 注】このハングは nsys 2025.6.3 以降 × p ≤ 15 の fused 経路 ×
+2 回目の graph launch に限る。nsys 2025.1.3 なら同じ p=7 `FUSED_TC` を graph
+粒度・node 粒度とも 3〜4 s で採れ、2026.1.1 でも GEMM 系全次数と p ≥ 31 の
+fused 経路は採れる。graph の効果は 3 機 × p=7/15 × 6 経路の交互計測で
+測り直した（p=7 `FUSED_TC` −29.0、`FUSED` −28.4 µs/step；`cuda_graph_lowp.md`）。
 
 数値検証: 点変化係数、p=7 `Ne=60` で graph on/off は `q` 全点ビット一致。
 p=255 は `Ne=1` と `Ne=2` で 5 経路とも min/max が一致。

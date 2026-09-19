@@ -1922,6 +1922,9 @@ graph 再生と直接ローンチは同じカーネルを同じ順で流すの�
   `CUDA device *` が**すべて出ない**（`overall_summary_report.md` §8.3）。
   公開表と各 gap study の µs/stage はこれらを分母にしている。
 - `nsys` は graph 経路に当てられない（ハングし GPU trace が空になる）。
+  【2026-09-19 注】p=31 `FUSED_TC` の既定ビルドは nsys 2026.1.1 でも graph
+  再生を採れる（`cuda_graph_lowp.md` §1.3、job `124798`）。止まるのは p ≤ 15
+  の fused 経路と、PDL を外した p=31 で、nsys 2025.1.3 なら全部採れる。
 - `p63_gap_study.md` §43 が同じ理由で既定を off に据え置いており、
   次数間で既定を割るのは比較を壊す。
 

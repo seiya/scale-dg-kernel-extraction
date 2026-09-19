@@ -355,6 +355,18 @@ are not tracked either.
 commit で、`jobs/` を一切含まない。`6466dc0` 版との差はチェックアウトを探す
 24 行の追加だけで、測定内容は同じ（`jobs/MAPPING.md` §1）。
 
+## Tracked: CUDA graph on/off at the production orders
+
+| file | role |
+|---|---|
+| `graph_ab_lowp.sh` | the shared body. p=7 and 15, the six paper paths, `UseCudaGraph` off and on adjacent inside each round, six rounds; final-`q` agreement off vs on, one pair per cell. Knobs: `ROUNDS`, `ORDERS`, `SCALE_DG_PATHS`, `SCALE_DG_SHAPE_SPECS`, `VALIDATE`, `OUTDIR`, `EXE`. |
+| `rikyu_graph_ab_lowp.sh` | Slurm wrapper (GB200 job `124807`) |
+| `tsubame_graph_ab_lowp.sh` | SGE wrapper, adds the two CUTLASS paths at 16x8x4 (SGE `8714147`) |
+| `wisteria_graph_ab_lowp.sh` | Fujitsu TCS wrapper (TCS `9659039`) |
+| `graph_ab_lowp_summarize.py` | round median / MAD, the graph's saving per path, and the sign of every p <= 15 ranking the paper claims, off vs on; `--csv` writes `figs/data/graph_ab_lowp.csv` |
+
+Report: `reports/cuda_graph_lowp.md` section 2.
+
 ## Submitting
 
 Submit from the repository root; each script finds the checkout and `cd`s

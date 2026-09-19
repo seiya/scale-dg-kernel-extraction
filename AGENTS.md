@@ -414,10 +414,18 @@ invocation a few times its known duration, and when one times out, check
 `sacct -j <id> --format=NodeList` first and resubmit with
 `#SBATCH --exclude=<node>` before changing the profiler command.
 
-`nsys` cannot profile the CUDA graph path (`UseCudaGraph = .true.`); it hangs
-and the report contains no GPU trace.
-Profile that configuration with `UseCudaGraph = .false.`, whose kernels and
-order are identical.
+`nsys` can trace the CUDA graph path (`UseCudaGraph = .true.`) in general:
+at the default `--cuda-graph-trace=graph` one `GRAPH_TRACE` record per graph
+launch (one step), at `node` every kernel inside the replay. What hangs, on
+this machine, is one combination: nsys 2025.6.3 and later (including the
+2026.1.1 in nvhpc/26.3) on the p <= 15 `FUSED` / `FUSED_TC` / `FUSED_DFMA`
+graphs, at the second graph launch, with the GPU idle and the host spinning
+in `cuStreamSynchronize` (`reports/cuda_graph_lowp.md` section 1, 2026-09-19;
+the cause is not known). nsys 2025.1.3 (`module load cuda/12.9.2`) traces
+those too, and 2026.1.1 traces the GEMM paths at every order and the fused
+paths at p >= 31. Profile a hanging configuration with `UseCudaGraph =
+.false.`, whose kernels and order are identical, and bound every nsys
+invocation with `timeout` (a run that works finishes in seconds).
 
 Keep the input configuration identical when comparing implementations.
 Do not change `NeX/NeY/NeZ`, `PolyOrder`, `dt`, or `nstep` as part of a
