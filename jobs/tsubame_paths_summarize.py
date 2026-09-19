@@ -183,7 +183,7 @@ def main() -> int:
     if args.csv:
         import csv
         with open(args.csv, "w", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")
             writer.writeheader()
             writer.writerows(rows)
         print("\nwrote %s" % args.csv)

@@ -729,7 +729,7 @@ def dump(fn, cells):
     the five fractions of one (machine, order, ratio) were told apart only by
     row order) and empty on the machine axis."""
     with open(fn, "w", newline="") as fh:
-        w = csv.writer(fh)
+        w = csv.writer(fh, lineterminator="\n")
         w.writerow(["axis", "grp", "order", "num", "den", "pred", "meas",
                     "famerr", "sn", "hit", "ledger_ok", "famerr_led",
                     "sn_led",

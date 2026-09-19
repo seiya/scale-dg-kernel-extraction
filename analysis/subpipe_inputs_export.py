@@ -260,7 +260,7 @@ def main():
         sys.exit("export does not reproduce analysis/subpipe_inputs.csv:\n  "
                  + "\n  ".join(mismatch[:20]))
     with open(a.out, "w", newline="") as fh:
-        w = csv.writer(fh)
+        w = csv.writer(fh, lineterminator="\n")
         w.writerow(cols)
         w.writerows(rows)
     print("wrote %s: %d rows, %d columns; %d rows checked against %s"

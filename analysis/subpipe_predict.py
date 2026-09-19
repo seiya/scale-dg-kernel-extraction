@@ -1108,7 +1108,7 @@ def main():
 
     if a.distill:
         with open(TABLE, "w", newline="") as fh:
-            w = csv.writer(fh)
+            w = csv.writer(fh, lineterminator="\n")
             w.writerow(TABLE_COLS)
             for m in SWEEPS:
                 for o in ORDERS:
@@ -1256,7 +1256,7 @@ def main():
 
     if a.dump_logo and dump:
         with open(a.dump_logo, "w", newline="") as fh:
-            w = csv.writer(fh)
+            w = csv.writer(fh, lineterminator="\n")
             # The first seven columns are the schema the paper's figures
             # read; their order and formats are frozen.  The three path-level
             # calibration-side scalars (section 5AF) are appended after them.
