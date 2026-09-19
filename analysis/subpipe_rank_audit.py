@@ -38,6 +38,35 @@ V3  The family error that the prior S/N divides by was built from the OTHER
     constraint, not a feature: report_axis() prints how much bigger or smaller
     the isolated pool's errors are.
 
+Three additions of 2026-09-19 (W1 / W2 / W3), all as NEW columns or a NEW file
+so that the columns and rows of the distributed sn_cells.csv stay byte-equal:
+
+W1  A log-symmetric S/N beside the published one.  |r_pred - 1| and the
+    family's |r_pred / r_meas - 1| both change value when a ratio A/B is
+    written as B/A, so the published rule can admit a cell in one spelling
+    and reject it in the other.  famerr_log = median |ln(r_pred / r_meas)|
+    over the same pool as famerr, sn_log = |ln r_pred| / famerr_log; both are
+    invariant under A/B <-> B/A.  Columns famerr_log / sn_log, and
+    famerr_led_log / sn_led_log on the ledger-consistent cells.
+
+W2  The run-to-run width of every cell's measured ratio, from the repeat jobs
+    (REPEATS below; report sections 5Y.2 and 5AE.2-5AE.5).  width is
+    (max - min) / min of the ratio over the rounds of ONE job, in percent,
+    with each round's path total summed over the SAME kernel ledger the cell
+    is scored on (the intersection of the calibration and target ledgers, V2),
+    so that the width and the scored r_meas are the same quantity.  Empty
+    when no repeat job covers both paths of the ratio at that order.
+    resolved = 1 when |r_meas - 1| exceeds the width, i.e. when the
+    measurement itself settles the rank; 0 when it does not; empty with the
+    width.  width_job names the job the width came from.
+
+W3  --dump-all-pairs writes the same schema for all 15 pairs of the six
+    transferred paths (ALL_PAIRS), not only the 7 one-axis ratios of
+    subpipe_predict.RATIOS, so the predicted-fastest path of a (target,
+    order) can be scored against EVERY competitor.  RATIOS itself is not
+    changed; the 7 published ratios' rows in that file are identical to
+    sn_cells.csv, since a ratio's family error only ever pools that ratio.
+
 Machine axis: 3 leave-one-GPU-out directions x 7 ratios x all orders, from the
 counters in analysis/subpipe_inputs.csv (or the local ncu sweeps).
 Balance axis: 2 machines x 3 orders x 7 ratios x 5 MPS fractions.  Predictions
@@ -47,10 +76,13 @@ measured times are the distilled medians in analysis/subpipe_balance_times.csv.
 
   python3 analysis/subpipe_rank_audit.py [--axis machine|balance|both]
                                         [--famerr loo-group|isolated]
+                                        [--dump-cells F] [--dump-all-pairs F]
 """
 import argparse
 import collections
 import csv
+import glob
+import math
 import os
 import statistics as st
 import sys
@@ -75,6 +107,51 @@ SINGLE_POOL = {
 }
 FAMERR = ["loo-group"]
 
+# W3.  Every pair of the six transferred paths, oriented like the 7 published
+# ratios: the denominator is the path that comes first in LOGO_PATHS
+# (FUSED_TC, GEMM_FUSED, GEMM, FUSED, FUSED_DFMA, GEMM_CUTE), which puts
+# FUSED_TC under everything and GEMM_CUTE over everything, exactly as RATIOS
+# has them.  The 7 published pairs come first, in RATIOS order, so that the
+# rows of --dump-all-pairs restricted to them are --dump-cells row for row.
+ALL_PAIRS = list(sp.RATIOS) + [
+    (sp.LOGO_PATHS[j], sp.LOGO_PATHS[i])
+    for i in range(len(sp.LOGO_PATHS))
+    for j in range(i + 1, len(sp.LOGO_PATHS))
+    if (sp.LOGO_PATHS[j], sp.LOGO_PATHS[i]) not in sp.RATIOS]
+assert len(ALL_PAIRS) == 15 and len(set(ALL_PAIRS)) == 15
+
+# W2.  The repeat jobs, per machine, in the order they are searched: the first
+# job that covers BOTH paths of a ratio at that order, with every kernel role
+# the cell is scored on, in at least two rounds, supplies the width.  Each
+# entry is one job, given as a list of directories because SGE 8650257 hit
+# its TIME_BUDGET after two rounds and 8650967 / 8652177 added rounds three
+# and four (section 5AE.5); they are one logical job and are pooled, and the
+# round key is (directory, round) so that their r01s are not merged.  Jobs are
+# never pooled otherwise: the width is within one job, as sections 5Y.2 and
+# 5AE define it (between jobs the same ratio moves up to 1.14% on GB200 and
+# the A100 changes device, section 5AE.6 / 5Y.2 note).  Directories that are
+# not present (the raw ncu output stays local) simply supply nothing.
+REPEATS = {
+    "GB200": [["subpipe_repeat_106648"],            # p=7/15/31, 6 paths, 3 rounds
+              ["subpipe_repeat_95805"],             # p=63/511/575, 4 paths, 3
+              ["subpipe_repeat_106952"]],           # p=767, 5 paths, 3
+    "H100":  [["tsubame/h100_subpipe_repeat_8650141"],   # p=7/15/31, 6, 3
+              ["tsubame/h100_subpipe_repeat_8650255"],   # p=255, 6, 3
+              ["tsubame/h100_subpipe_repeat_8650143"],   # p=63/511/575, 4, 3
+              ["tsubame/h100_subpipe_repeat_8650257",    # p=767, 5, 2+1+1
+               "tsubame/h100_subpipe_repeat_8650967",
+               "tsubame/h100_subpipe_repeat_8652177"],
+              ["tsubame/h100_subpipe_repeat_8631255"]],  # p=63/511/575/767, 4, 2
+    "A100":  [["wisteria/a100_subpipe_repeat_9592751"],  # p=7/15/31, 6, 3
+              ["wisteria/a100_subpipe_repeat_9593022"],  # p=63, 6, 3
+              ["wisteria/a100_subpipe_repeat_9593023"],  # p=127, 6, 3
+              ["wisteria/a100_subpipe_repeat_9592752"],  # p=63/511/575, 4, 3
+              ["wisteria/a100_subpipe_repeat_9579033"]], # p=63/511/575, 4, 2-3
+}
+# W2, balance axis: the MPS sweep's own rounds (GB200 3, A100 2; section
+# 5AE.1).  The job id is the CSV row's `job`; the directory is found by glob.
+BAL_ROUNDS = ["mps_balance_%s", "*/a100_mps_balance_%s", "*/h100_mps_balance_%s"]
+
 
 def cell(axis, tag, ratio, rp, rm, ledger=True):
     # The leave-one-out GROUP (U1).  The report defines eps_family as "the
@@ -92,44 +169,53 @@ def cell(axis, tag, ratio, rp, rm, ledger=True):
     # INTERSECTION of the calibration and target ledgers.  Such a ratio is a
     # ratio of partial sums: it compares the two paths on the subset of kernels
     # both ledgers agree on, which is not the question "which path is faster".
+    #
+    # W1: err_log is |ln(rp/rm)|, the orientation-free counterpart of err.
     return dict(axis=axis, tag=tag, ratio=ratio, rp=rp, rm=rm, grp=tag.split()[0],
                 err=abs(rp / rm - 1.0) * 100.0, hit=(rp > 1) == (rm > 1),
-                ledger=bool(ledger))
+                err_log=abs(math.log(rp / rm)), ledger=bool(ledger))
 
 
-def direction_cells(srcs, tgt, grp=None):
+def direction_cells(srcs, tgt, grp=None, ratios=None):
     """Ratio cells of one transfer direction.  `grp` overrides the leave-one-out
     group, which the isolated pools need: a GB200 -> A100 transfer contributes
     to H100's pool, and there it has to carry H100's group tag so that the
-    pool is keyed by the machine being SCORED."""
-    got, led = {}, {}
+    pool is keyed by the machine being SCORED.  `ratios` defaults to the 7
+    published ones (W3 passes ALL_PAIRS)."""
+    got, led, roles = {}, {}, {}
     for p in sp.ORDERS:
         for path in sp.LOGO_PATHS:
-            pr, me, _, ok = sp.predict_case(srcs, tgt, p, path)
+            pr, me, rows, ok = sp.predict_case(srcs, tgt, p, path)
             if pr is None or not me:
                 continue
             got.setdefault(p, {})[path] = (pr, me)
             led[(p, path)] = ok
+            # W2: the kernel ledger r_meas was summed over, so that the width
+            # can be taken on the same quantity.
+            roles[(p, path)] = [r["role"] for r in rows]
     cells = []
-    for num, den in sp.RATIOS:
+    for num, den in ratios or sp.RATIOS:
         for p, r in sorted(got.items()):
             if num in r and den in r:
-                cells.append(cell("machine", "%s p=%d" % (grp or tgt, p),
-                                  num + " / " + den,
-                                  r[num][0] / r[den][0],
-                                  r[num][1] / r[den][1],
-                                  ledger=led[(p, num)] and led[(p, den)]))
+                c = cell("machine", "%s p=%d" % (grp or tgt, p),
+                         num + " / " + den,
+                         r[num][0] / r[den][0],
+                         r[num][1] / r[den][1],
+                         ledger=led[(p, num)] and led[(p, den)])
+                c["mach"], c["order"] = tgt, p
+                c["roles"] = (roles[(p, num)], roles[(p, den)])
+                cells.append(c)
     return cells
 
 
-def machine_axis():
+def machine_axis(ratios=None):
     cells = []
     for srcs, tgt in LOGO:
-        cells += direction_cells(srcs, tgt)
+        cells += direction_cells(srcs, tgt, ratios=ratios)
     return cells
 
 
-def isolated_pools():
+def isolated_pools(ratios=None):
     """V3.  grp -> the cells of the two single-machine transfers between the
     OTHER two machines.  Used only as the family-error denominator; these cells
     are never scored themselves."""
@@ -137,13 +223,13 @@ def isolated_pools():
     for tgt, dirs in SINGLE_POOL.items():
         cs = []
         for srcs, t in dirs:
-            cs += direction_cells(srcs, t, grp=tgt)
+            cs += direction_cells(srcs, t, grp=tgt, ratios=ratios)
         out[tgt] = cs
     return out
 
 
-def balance_axis(files=None, jobs=None):
-    meas, sm_of, seen = {}, {}, {}
+def balance_axis(files=None, jobs=None, ratios=None):
+    meas, sm_of, seen, job_of = {}, {}, {}, {}
     for fn in files or [BAL_TIMES]:
         with open(fn) as fh:
             for r in csv.DictReader(fh):
@@ -167,6 +253,7 @@ def balance_axis(files=None, jobs=None):
                 seen[(key, r["path"])] = r["job"]
                 meas.setdefault(key, {})[r["path"]] = float(r["device_s_median"])
                 sm_of[key] = int(r["sm"])
+                job_of[key] = r["job"]
     pred = {}
     for (mach, order, pct), sm in sorted(sm_of.items()):
         key = "%s@%dpct" % (mach, pct)
@@ -184,7 +271,7 @@ def balance_axis(files=None, jobs=None):
     for k in sorted(meas):
         if k[2] == 100:                          # the calibration point itself
             continue
-        for num, den in sp.RATIOS:
+        for num, den in ratios or sp.RATIOS:
             m, q = meas[k], pred.get(k, {})
             if num in m and den in m and num in q and den in q:
                 # ledger=True, and vacuously so: the pseudo target has no
@@ -194,9 +281,10 @@ def balance_axis(files=None, jobs=None):
                 # path totals, which is what the ledger flag is there to
                 # guarantee -- but it is not evidence the way a machine-axis
                 # ledger_ok is.
-                cells.append(cell("balance", "%s p=%d %d%%" % (k[0], k[1], k[2]),
-                                  num + " / " + den,
-                                  q[num] / q[den], m[num] / m[den]))
+                c = cell("balance", "%s p=%d %d%%" % (k[0], k[1], k[2]),
+                         num + " / " + den, q[num] / q[den], m[num] / m[den])
+                c["mach"], c["order"], c["pct"], c["job"] = k[0], k[1], k[2], job_of[k]
+                cells.append(c)
     return cells
 
 
@@ -222,32 +310,44 @@ def set_famerr(cells, pool=None):
     scored machine appears nowhere.  A cell whose group has no pool entry for
     its ratio falls back to the leave-one-out group median, and the caller is
     told how many did.
+
+    W1.  fam_log / sn_log are computed beside fam_loo / sn_prior from the SAME
+    pool (or the same leave-one-out group when the pool has no entry), with
+    |ln(rp/rm)| in place of |rp/rm - 1| and |ln rp| in place of |rp - 1|.
+    Which pool a cell uses is decided once, so a cell is never isolated in one
+    column and loo-group in the other.
     """
     fam = collections.defaultdict(list)
     for c in cells:
-        fam[(c["axis"], c["ratio"])].append((c["grp"], c["err"]))
+        fam[(c["axis"], c["ratio"])].append((c["grp"], c["err"], c["err_log"]))
     pfam = collections.defaultdict(list)
     if pool:
         keep = {(c["axis"], c["grp"], c["ratio"]) for c in cells}
         for grp, pcells in pool.items():
             for c in pcells:
                 if (c["axis"], grp, c["ratio"]) in keep:
-                    pfam[(c["axis"], grp, c["ratio"])].append(c["err"])
+                    pfam[(c["axis"], grp, c["ratio"])].append(
+                        (c["err"], c["err_log"]))
     n_fallback = 0
     for c in cells:
         key = (c["axis"], c["grp"], c["ratio"])
         if pool and pfam.get(key):
-            c["fam_loo"] = st.median(pfam[key])
+            c["fam_loo"] = st.median([e for e, _ in pfam[key]])
+            c["fam_log"] = st.median([e for _, e in pfam[key]])
         else:
-            rest = [e for g, e in fam[(c["axis"], c["ratio"])]
+            rest = [(e, el) for g, e, el in fam[(c["axis"], c["ratio"])]
                     if g != c["grp"]]
-            c["fam_loo"] = st.median(rest) if rest else c["err"]
+            c["fam_loo"] = st.median([e for e, _ in rest]) if rest else c["err"]
+            c["fam_log"] = (st.median([e for _, e in rest]) if rest
+                            else c["err_log"])
             # Only count it as a fallback if the pool covers this axis at all;
             # the balance axis has no isolated pool by construction.
             n_fallback += bool(pool) and any(
                 pc["axis"] == c["axis"] for pcs in pool.values() for pc in pcs)
         c["sn_post"] = (abs(c["rm"] - 1) * 100 / c["err"]) if c["err"] else 9e9
         c["sn_prior"] = abs(c["rp"] - 1) * 100 / c["fam_loo"]
+        c["sn_log"] = (abs(math.log(c["rp"])) / c["fam_log"] if c["fam_log"]
+                       else 9e9)
     return n_fallback
 
 
@@ -262,7 +362,8 @@ def score(cells, label, pool=None, why=True):
              "  [%d cells fell back to the loo-group family error]" % n_fb
              if n_fb else ""))
     for key, name in (("sn_post", "posterior S/N (published: uses r_meas)"),
-                      ("sn_prior", "prior S/N (|r_pred-1| / family error)")):
+                      ("sn_prior", "prior S/N (|r_pred-1| / family error)"),
+                      ("sn_log", "log S/N (|ln r_pred| / median |ln err|, W1)")):
         print("  %s" % name)
         for t in (1.0, 1.1, 1.5, 2.0):
             hi = [c for c in cells if c[key] >= t]
@@ -324,6 +425,148 @@ def keep_axis(cells, key="axis"):
     """
     for c in cells:
         c["fam_" + key], c["sn_" + key] = c["fam_loo"], c["sn_prior"]
+        c["famlog_" + key], c["snlog_" + key] = c["fam_log"], c["sn_log"]
+
+
+def score_quiet(cells, pool=None):
+    """The S/N columns of report_axis() without the printing: fam_axis /
+    sn_axis over all cells, fam_led / sn_led over the ledger-consistent ones
+    (each with its pool restricted the same way), and the all-cells values
+    restored afterwards.  W3 uses it for the all-pairs dump."""
+    set_famerr(cells, pool)
+    keep_axis(cells, "axis")
+    ok = [c for c in cells if c["ledger"]]
+    pool_ok = ({g: [c for c in cs if c["ledger"]] for g, cs in pool.items()}
+               if pool else None)
+    set_famerr(ok, pool_ok)
+    keep_axis(ok, "led")
+    set_famerr(cells, pool)
+
+
+_ROUND_CACHE = {}
+
+
+def round_totals(d, order, path, rnd):
+    """W2.  {role: median launch duration} of one round of one repeat job,
+    with the roles split into occurrences exactly as load_case_raw does, so
+    that the role names match the scored ledger.  None when the round has no
+    file.  Only the _a pass is read: it carries `dur`."""
+    key = (d, order, path, rnd)
+    if key in _ROUND_CACHE:
+        return _ROUND_CACHE[key]
+    files = sorted(glob.glob(os.path.join(sp.ROOT, d, "ncu",
+                                          "p%d_%s_8x8x4_none_r%s_a.csv"
+                                          % (order, path, rnd))))
+    per_role, seq = collections.defaultdict(list), []
+    for f in files:
+        for _, (role, mets) in sorted(sp.read_csv(f).items(),
+                                      key=lambda kv: int(kv[0])):
+            if role and "dur" in mets:
+                per_role[role].append(mets)
+                seq.append(role)
+    out = None
+    if per_role:
+        per_role = sp.split_occurrences(per_role, sp.launch_multiplicity(seq))
+        out = {r: st.median([x["dur"] for x in lst])
+               for r, lst in per_role.items()}
+    _ROUND_CACHE[key] = out
+    return out
+
+
+def rounds_of(dirs, order, path):
+    """(directory, round) keys of one job's rounds of (order, path)."""
+    out = []
+    for d in dirs:
+        for f in sorted(glob.glob(os.path.join(sp.ROOT, d, "ncu",
+                                               "p%d_%s_8x8x4_none_r*_a.csv"
+                                               % (order, path)))):
+            out.append((d, os.path.basename(f).split("_r")[-1].split("_")[0]))
+    return out
+
+
+def job_name(dirs):
+    return "+".join(d.rstrip("/").split("/")[-1].split("_")[-1] for d in dirs)
+
+
+def width_of(vals):
+    return (max(vals) - min(vals)) / min(vals) * 100.0
+
+
+def set_widths(cells):
+    """W2.  Write width / resolved / width_job on every cell that a repeat job
+    covers.  Machine axis: the ratio of the two paths' per-round totals, each
+    summed over the cell's scored ledger (c["roles"]); a round that lacks a
+    scored role is unusable and a job with fewer than two usable rounds common
+    to both paths is skipped.  Balance axis: the ratio of the two paths'
+    per-round `CUDA device` sums from the MPS job's logs, the same quantity
+    subpipe_balance_distill takes the median of."""
+    n = 0
+    for c in cells:
+        c["width"] = c["width_job"] = None
+        num, den = [x.strip() for x in c["ratio"].split("/")]
+        rr = None
+        if c["axis"] == "machine":
+            rn, rd = c["roles"]
+            for dirs in REPEATS.get(c["mach"], []):
+                tot = {}
+                for path, roles in ((num, rn), (den, rd)):
+                    tot[path] = {}
+                    for rk in rounds_of(dirs, c["order"], path):
+                        t = round_totals(rk[0], c["order"], path, rk[1])
+                        if t and all(r in t for r in roles):
+                            tot[path][rk] = sum(t[r] for r in roles)
+                common = sorted(set(tot[num]) & set(tot[den]))
+                if len(common) >= 2:
+                    rr = [tot[num][k] / tot[den][k] for k in common]
+                    c["width_job"] = job_name(dirs)
+                    break
+        else:
+            outdir = None
+            for pat in BAL_ROUNDS:
+                hit = sorted(glob.glob(os.path.join(sp.ROOT, pat % c["job"])))
+                if hit:
+                    outdir = hit[0]
+                    break
+            if outdir:
+                import subpipe_balance_distill as bd
+                tot = {}
+                for path in (num, den):
+                    tot[path] = {}
+                    for log in glob.glob(os.path.join(
+                            outdir, "logs", "r*_p%d_%dpct_%s.log"
+                            % (c["order"], c["pct"], path))):
+                        t = bd.device_sum(log)
+                        if t is not None:
+                            tot[path][os.path.basename(log).split("_")[0]] = t
+                common = sorted(set(tot[num]) & set(tot[den]))
+                if len(common) >= 2:
+                    rr = [tot[num][k] / tot[den][k] for k in common]
+                    c["width_job"] = c["job"]
+        if rr is not None:
+            c["width"] = width_of(rr)
+            c["width_n"] = len(rr)
+            c["resolved"] = abs(c["rm"] - 1) * 100.0 > c["width"]
+            n += 1
+    return n
+
+
+def report_widths(cells, label):
+    have = [c for c in cells if c.get("width") is not None]
+    print("\n=== %s: run-to-run width on %d of %d cells" % (label, len(have),
+                                                             len(cells)))
+    if not have:
+        return
+    w = [c["width"] for c in have]
+    print("    width median %.3f%% / max %.3f%%; resolved (|r_meas-1| > width) "
+          "%d/%d" % (st.median(w), max(w), sum(c["resolved"] for c in have),
+                     len(have)))
+    by = collections.Counter(c["width_job"] for c in have)
+    print("    jobs: " + ", ".join("%s x%d" % kv for kv in sorted(by.items())))
+    miss = collections.Counter(c["tag"].split(" ")[0] + " " + c["tag"].split(" ")[1]
+                               for c in cells if c.get("width") is None)
+    if miss:
+        print("    no width: " + ", ".join("%s x%d" % kv
+                                          for kv in sorted(miss.items())))
 
 
 def report_axis(cells, label, pool=None):
@@ -381,6 +624,14 @@ def main():
                          "family error as a fraction, the a priori S/N and the "
                          "hit.  The MPS fraction of a balance cell is not "
                          "carried: the figure does not distinguish them.")
+    ap.add_argument("--dump-all-pairs",
+                    help="W3: write the same schema as --dump-cells for ALL "
+                         "15 pairs of the six transferred paths (ALL_PAIRS), "
+                         "both axes as selected by --axis, with the family "
+                         "error of each pair from its own pool.  The rows of "
+                         "the 7 published pairs are identical to --dump-cells.")
+    ap.add_argument("--no-width", action="store_true",
+                    help="skip W2 (the repeat-job scan); width columns empty")
     ap.add_argument("--shape", default="static",
                     choices=["static", "static-only", "target"],
                     help="passed through to subpipe_predict.SHAPE_SRC; see "
@@ -434,25 +685,69 @@ def main():
                         for g, cs in pool.items()} if pool else None)
             score(ok, "both axes -- ledger-consistent cells only", pool_ok,
                   why=False)
+    if not a.no_width and (a.dump_cells or a.dump_all_pairs):
+        set_widths(cells)
+        for ax in ("machine", "balance"):
+            sub = [c for c in cells if c["axis"] == ax]
+            if sub:
+                report_widths(sub, ax + " axis")
     if a.dump_cells:
-        with open(a.dump_cells, "w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(["axis", "grp", "order", "num", "den", "pred", "meas",
-                        "famerr", "sn", "hit", "ledger_ok", "famerr_led",
-                        "sn_led"])
-            for c in cells:
-                grp = c["tag"].split()[0]
-                order = int(c["tag"].split("p=")[1].split()[0])
-                num, den = [x.strip() for x in c["ratio"].split("/")]
-                w.writerow([c["axis"], grp, order, num, den,
-                            "%.4f" % c["rp"], "%.4f" % c["rm"],
-                            "%.4f" % (c["fam_axis"] / 100.0),
-                            "%.4f" % c["sn_axis"], int(c["hit"]),
-                            int(c["ledger"]),
-                            "%.4f" % (c["fam_led"] / 100.0)
-                            if "fam_led" in c else "",
-                            "%.4f" % c["sn_led"] if "sn_led" in c else ""])
-        print("\nwrote %s (%d cells)" % (a.dump_cells, len(cells)))
+        dump(a.dump_cells, cells)
+    if a.dump_all_pairs:
+        # W3.  Rebuilt from scratch with ALL_PAIRS; the scoring is the quiet
+        # twin of what report_axis did above, per axis, with the same pool
+        # convention, so the 7 published pairs come out identical.
+        allc = []
+        if a.axis in ("machine", "both"):
+            ma = machine_axis(ALL_PAIRS)
+            score_quiet(ma, isolated_pools(ALL_PAIRS)
+                        if a.famerr == "isolated" else None)
+            allc += ma
+        if a.axis in ("balance", "both"):
+            ba = balance_axis(a.bal_times.split(","),
+                              set(a.bal_jobs.split(",")) - {""}, ALL_PAIRS)
+            score_quiet(ba)
+            allc += ba
+        if not a.no_width:
+            set_widths(allc)
+        dump(a.dump_all_pairs, allc)
+
+
+def dump(fn, cells):
+    """--dump-cells schema.  The first 13 columns are the published ones and
+    are written exactly as before; W1 / W2 add columns at the END only.
+    famerr_log is the median |ln(r_pred/r_meas)| itself (already
+    dimensionless, unlike famerr, which is a fraction of 1); width is in
+    percent; resolved is 1/0, empty when there is no width; pct is the MPS
+    fraction of a balance cell (the published columns do not carry it, so
+    the five fractions of one (machine, order, ratio) were told apart only by
+    row order) and empty on the machine axis."""
+    with open(fn, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["axis", "grp", "order", "num", "den", "pred", "meas",
+                    "famerr", "sn", "hit", "ledger_ok", "famerr_led",
+                    "sn_led",
+                    "famerr_log", "sn_log", "famerr_led_log", "sn_led_log",
+                    "width", "resolved", "width_job", "pct"])
+        for c in cells:
+            grp = c["tag"].split()[0]
+            order = int(c["tag"].split("p=")[1].split()[0])
+            num, den = [x.strip() for x in c["ratio"].split("/")]
+            w.writerow([c["axis"], grp, order, num, den,
+                        "%.4f" % c["rp"], "%.4f" % c["rm"],
+                        "%.4f" % (c["fam_axis"] / 100.0),
+                        "%.4f" % c["sn_axis"], int(c["hit"]),
+                        int(c["ledger"]),
+                        "%.4f" % (c["fam_led"] / 100.0)
+                        if "fam_led" in c else "",
+                        "%.4f" % c["sn_led"] if "sn_led" in c else "",
+                        "%.4f" % c["famlog_axis"], "%.4f" % c["snlog_axis"],
+                        "%.4f" % c["famlog_led"] if "famlog_led" in c else "",
+                        "%.4f" % c["snlog_led"] if "snlog_led" in c else "",
+                        "%.3f" % c["width"] if c.get("width") is not None else "",
+                        int(c["resolved"]) if c.get("width") is not None else "",
+                        c.get("width_job") or "", c.get("pct", "")])
+    print("\nwrote %s (%d cells)" % (fn, len(cells)))
 
 
 if __name__ == "__main__":

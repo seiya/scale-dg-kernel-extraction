@@ -276,7 +276,10 @@ performance win must never be treated as implicit permission to redefine it.
   (`subpipe_inputs_export.py`: the same rows with provenance, kernel names,
   launch configuration, every counter the sweep requested and the model's
   derived quantities, checked column by column against `subpipe_inputs.csv`;
-  §5AH.2). Same reasoning as the `jobs/` allowlist: a
+  §5AH.2), and the summary that re-derives the paper's S/N-rule numbers from
+  the distributed CSVs alone (`sn_cells_summary.py`: the log-symmetric S/N,
+  the run-to-run width of every scored cell, and the fastest-path choice
+  against every competitor; §5AJ). Same reasoning as the `jobs/` allowlist: a
   published cross-machine prediction is only reproducible if the code that
   made it is. Ad-hoc analysis still does not go here -- only what a report
   cites.
