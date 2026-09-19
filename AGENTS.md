@@ -284,7 +284,10 @@ performance win must never be treated as implicit permission to redefine it.
   columns stay in the CSV as the record of the earlier form (§5AJ.6). The
   script prints the threshold table of both forms, the run-to-run width of
   every scored cell, the fastest-path choice against every competitor, and
-  the per-ratio tables. Same reasoning as the `jobs/` allowlist: a
+  the per-ratio tables. The closure of the shared sub-pipe balance, kernel
+  by kernel, is `subpipe_closure_export.py`, which reads only the published
+  counter table and writes the per-kernel closure CSV and its summary
+  (`subpipe_transfer_model.md` §5AK). Same reasoning as the `jobs/` allowlist: a
   published cross-machine prediction is only reproducible if the code that
   made it is. Ad-hoc analysis still does not go here -- only what a report
   cites.
