@@ -35,11 +35,22 @@ p=255 `GEMM_FUSED` −119、`GEMM_CUTE` −132、`FUSED` −59）を引いてい
   通る。同じ nsys で p=7 `GEMM_FUSED`、p ≥ 31 の `FUSED_TC` は通る。
   **nsys 2025.1.3（cuda/12.9.2 同梱）は p=7 `FUSED_TC` も graph・node 両粒度で
   3〜4 s で完走する。**
-- 止まっているのはホスト側: プロセスは CPU 97.8% で回り続け（`ps` の
-  STAT `R`）、GPU 使用率は 0%。gdb は `ptrace_scope` で attach できず、
-  どの呼び出しで回っているかは未確認（**未解明**。なぜ p ≤ 15 の fused
-  経路だけかも問わない）。`Ne` を 8³ / 64³ に変えても、
-  `--cuda-event-trace=false` でも同じ。
+- 止まっている場所（Slurm `124810`、gdb を親にして取ったバックトレース）:
+  主スレッドは `main.f90:223` の `!$acc wait(ACC_QUEUE)` →
+  `__pgi_uacc_cuda_wait` → **`cuStreamSynchronize` の中でスピン**している
+  （CPU 97.8%、`ps` の STAT `R`；strace では 10 ms の `ppoll` / `futex` の
+  タイムアウトを繰り返す libcuda の待ちループ）。他のスレッド（CUPTI worker、
+  cuda-EvtHandlr、NSys Comms）は全部 futex / poll 待ち。GPU 使用率は 0%。
+  つまり step ループは最後まで発行を終え、**2 回目の graph launch が GPU 上で
+  完了しない**（開始したかどうかは分からない）まま、末尾の同期で待ち続けて
+  いる。なぜその launch が完了しないかは**未解明**。`Ne` を 8³ / 64³ に
+  変えても、`--cuda-event-trace=false` でも同じ。
+- 構造の切り分け（同 `124810`）: p=31 `FUSED_TC` は既定ビルド（y を xz の
+  PDL 従属にする `P31_PDL_STAGE=1`）では通るが、**PDL を外したビルド
+  （`-DP31_PDL_STAGE=0`、xz と y を通常の stream 順で起動）では止まる**。
+  一方 p=255 `FUSED_TC`（PDL 無し、通常起動 3 本、動的 shared 付き）は通る。
+  したがって「PDL の有無」だけでも「fused か否か」だけでも説明できず、
+  止まる graph の共通項は特定できていない。
 - 2026-08-25 の job `45707`（2026.1.1、p=7 `FUSED_TC`、180 s timeout、
   `PROCESSED (EMPTY RESULTS)`）はこの再現であり、`overall_summary_report.md`
   §8.3 と `p15` / `p31` / `p1023` の各 gap study の「nsys は graph 経路に
@@ -67,8 +78,11 @@ p=255 `GEMM_FUSED` −119、`GEMM_CUTE` −132、`FUSED` −59）を引いてい
   止まった側は `RUNTIME` が 460 行（`cuInit` と `cuGetProcAddress` のみ）、
   `KERNEL` テーブル無し、`CUDA_GRAPH_EVENTS` に "Graph Creation" 1 行 —
   capture までは到達している。
-- スクリプト `jobs/nsys_graph2.sh` / `nsys_graph3.sh` / `nsys_graph4.sh`
-  （ローカル、未コミット）。出力 `nsys_graph2_124792/` 等（未コミット）。
+- スクリプト `jobs/nsys_graph2.sh` / `nsys_graph3.sh` / `nsys_graph4.sh` /
+  `nsys_graph5.sh`（ローカル、未コミット）。出力 `nsys_graph2_124792/` 等
+  （未コミット）。`124810` の p=31 PDL 無しは同じ tree を
+  `GPUNVCCFLAGS="-arch=sm_100 -DP31_PDL_STAGE=0"` でビルドした凍結コピー
+  `exe_nsys_graph5_p31nopdl`。
 
 ### 1.3 全試行
 
@@ -110,12 +124,20 @@ p=255 `GEMM_FUSED` −119、`GEMM_CUTE` −132、`FUSED` −59）を引いてい
 | 124798 | c051 | 2026.1.1 | graph | p7 FUSED_TC Ne=64³ | 124 | 31 s | 空 |
 | 124798 | c051 | 2026.1.1 | graph | p7 FUSED_TC Ne=8³ | 124 | 31 s | 空 |
 | 124798 | c051 | 2026.1.1 | graph | p7 FUSED_TC（診断） | — | 15 s 時点 | CPU 97.8% (STAT R)、GPU util 0%、gdb attach 不可 (ptrace_scope) |
+| 124810 | c051 | 2026.1.1 | graph | p7 FUSED_TC、gdb 親、25 s で SIGINT | 124 | — | 主スレッド `cuStreamSynchronize`（`main.f90:223` の `acc wait`）でスピン、他スレッドは futex/poll 待ち |
+| 124810 | c051 | 2026.1.1 | graph | p7 FUSED_TC、strace 親、25 s | 124 | — | 主スレッド: `ppoll` 10 ms ↔ `futex` ETIMEDOUT の繰り返し（4314 行 / 直近 5000 行） |
+| 124810 | c051 | **2025.1.3** | graph | p7 FUSED_TC、strace 親（対照） | **0** | — | 完走、`ioctl` 主体 |
+| 124810 | c051 | 2026.1.1 | graph | p31 FUSED_TC 既定ビルド（PDL あり） | **0** | 3 s | 完走 |
+| 124810 | c051 | 2026.1.1 | graph | **p31 FUSED_TC `P31_PDL_STAGE=0`**（`exe_nsys_graph5_p31nopdl`） | 124 | 32 s | **止まる** |
+| 124810 | c051 | 2026.1.1 | `--trace=cuda-hw` | p7 FUSED_TC | 1 | 0 s | この版の `nsys profile` は `cuda-hw` を受け付けない（usage エラー、未試行のまま） |
 | 45707 (2026-08-25) | — | 2026.1.1 | graph / node | p7 FUSED_TC | 124 | 180 s | EMPTY RESULTS（当時の記録、`overall_summary_report.md` §8.3） |
 
 まとめると、止まる条件は **{2025.6.3, 2026.1.1, 2026.1.3, 2026.2.1} × {p=7, 15}
-× {FUSED, FUSED_TC, FUSED_DFMA} × 2 回目以降の graph launch**。それ以外
-（旧版 2025.1.3、p=7 の GEMM_FUSED、p ≥ 31 の fused 経路、GEMM 系全部）は
-graph 粒度でも node 粒度でも採れる。Web 上に同じ症状の既知 issue は
+× {FUSED, FUSED_TC, FUSED_DFMA} × 2 回目以降の graph launch**（＋ PDL を
+外した p=31 `FUSED_TC`）。それ以外（旧版 2025.1.3、p=7 の GEMM_FUSED、
+既定ビルドの p ≥ 31 fused 経路、GEMM 系全部）は graph 粒度でも node 粒度
+でも採れる。止まるときは 2 回目の graph launch が GPU 上で完了せず、ホストが
+`cuStreamSynchronize` で待ち続ける。Web 上に同じ症状の既知 issue は
 見つからなかった（Nsight Systems Release Notes の Known Issues に載る graph
 関連 2 件は driver < 12.0 向け；CUPTI 13.x のリリースノートに sm_100 の
 graph トレースの既知問題は無い；2026-09-19 調査）。
@@ -129,8 +151,9 @@ graph トレースの既知問題は無い；2026-09-19 調査）。
 > replays in general, at graph or node granularity; in our environment,
 > Nsight Systems 2025.6 and later (including the 2026.1.1 that produced all
 > profiles here) did not finish on the graph-replay runs of the p ≤ 15 fused
-> paths of this program, stalling at the second graph launch with the GPU
-> idle, whereas the same binary traced normally at p ≥ 31, on the GEMM
+> paths of this program: the second graph launch never completed on the GPU,
+> which sat idle while the host waited in `cuStreamSynchronize`, whereas the
+> same binary traced normally at p ≥ 31, on the GEMM
 > paths at every order, and under Nsight Systems 2025.1.3 at p = 7 (Section
 > Y of the supplemental material). We did not pursue the cause. The graph's
 > effect on the rankings is measured directly instead (Section Z): ...
