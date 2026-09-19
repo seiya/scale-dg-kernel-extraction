@@ -277,9 +277,14 @@ performance win must never be treated as implicit permission to redefine it.
   launch configuration, every counter the sweep requested and the model's
   derived quantities, checked column by column against `subpipe_inputs.csv`;
   §5AH.2), and the summary that re-derives the paper's S/N-rule numbers from
-  the distributed CSVs alone (`sn_cells_summary.py`: the log-symmetric S/N,
-  the run-to-run width of every scored cell, and the fastest-path choice
-  against every competitor; §5AJ). Same reasoning as the `jobs/` allowlist: a
+  the distributed CSVs alone (`sn_cells_summary.py`; §5AJ). The paper scores
+  every ranking in the log-symmetric form, `|ln r_pred| / median
+  |ln(r_pred/r_meas)|`, which is the `sn_log` / `sn_led_log` columns of
+  `sn_cells.csv` and the script's default `--col`; the linear `sn` / `sn_led`
+  columns stay in the CSV as the record of the earlier form (§5AJ.6). The
+  script prints the threshold table of both forms, the run-to-run width of
+  every scored cell, the fastest-path choice against every competitor, and
+  the per-ratio tables. Same reasoning as the `jobs/` allowlist: a
   published cross-machine prediction is only reproducible if the code that
   made it is. Ad-hoc analysis still does not go here -- only what a report
   cites.

@@ -601,13 +601,19 @@ def report_axis(cells, label, pool=None):
         keep_axis(ok, "led")
     if pool:
         pe = [c["err"] for cs in pool.values() for c in cs]
+        pl = [c["err_log"] for cs in pool.values() for c in cs]
+        ce = [c["err"] for c in cells]
+        cl = [c["err_log"] for c in cells]
         print("  CONSTRAINT of --famerr isolated: the denominator is a "
               "single-machine calibration, a different configuration.  Its "
               "|ratio err| median is %.2f%% over %d cells, against %.2f%% "
-              "over the %d two-machine cells being scored (%.2fx)."
-              % (st.median(pe), len(pe),
-                 st.median([c["err"] for c in cells]), len(cells),
-                 st.median(pe) / st.median([c["err"] for c in cells])))
+              "over the %d two-machine cells being scored (%.2fx); in the "
+              "log form the paper scores on (W1), median |ln err| is %.2f%% "
+              "against %.2f%% (%.2fx)."
+              % (st.median(pe), len(pe), st.median(ce), len(cells),
+                 st.median(pe) / st.median(ce),
+                 100 * st.median(pl), 100 * st.median(cl),
+                 st.median(pl) / st.median(cl)))
 
 
 def main():
